@@ -28,6 +28,7 @@ impl TableName {
         Ok(Self(name))
     }
 
+    /// The validated, lower-cased name.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -512,6 +513,18 @@ mod tests {
         ] {
             assert!(rejected(name), "expected '{name}' to be rejected");
         }
+    }
+
+    #[test]
+    fn rejects_the_names_java_tests_reject() {
+        // PostgresqlDurableQueuesTest.initializeWithInvalidOverriddenTableName
+        assert!(rejected("where"));
+        assert!(rejected("OR 1=1"));
+        // initializeWithOverriddenTableName
+        assert_eq!(
+            TableName::new("overridden_table_name").unwrap().as_str(),
+            "overridden_table_name"
+        );
     }
 
     #[test]

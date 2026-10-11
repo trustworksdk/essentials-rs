@@ -25,6 +25,7 @@ impl<S: QueueStorage> DurableQueues<S> {
     /// Java's `DEFAULT_MESSAGE_HANDLING_TIMEOUT`.
     pub const DEFAULT_MESSAGE_HANDLING_TIMEOUT: Duration = Duration::from_secs(30);
 
+    /// Queues on `storage`, with Java's default 30 s message handling timeout.
     pub fn new(storage: S) -> Self {
         Self {
             storage,
@@ -42,6 +43,7 @@ impl<S: QueueStorage> DurableQueues<S> {
         self
     }
 
+    /// The underlying storage - for queries this type does not wrap, such as [`QueueStorage::find_entry`].
     pub fn storage(&self) -> &S {
         &self.storage
     }
@@ -247,4 +249,18 @@ pub(crate) fn after(now: DateTime<Utc>, delay: Duration) -> DateTime<Utc> {
         .ok()
         .and_then(|delay| now.checked_add_signed(delay))
         .unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_message_handling_timeout_is_thirty_seconds() {
+        // PostgresqlDurableQueuesBuilderDefaultsTest
+        assert_eq!(
+            DurableQueues::<PostgresQueueStorage>::DEFAULT_MESSAGE_HANDLING_TIMEOUT,
+            Duration::from_secs(30)
+        );
+    }
 }

@@ -10,7 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, warn};
+use tracing::{Instrument, Span, debug, error, field, info_span, warn};
 
 use crate::durable_queues::{ConsumerRegistration, after};
 use crate::error::{DurableQueuesError, Result};
@@ -24,6 +24,7 @@ use crate::types::QueueName;
 ///
 /// Implemented for any `Fn(QueuedMessage<M>) -> impl Future<Output = Result<(), HandlerError>>`.
 pub trait MessageHandler<M>: Send + Sync + 'static {
+    /// Handles one delivery: `Ok` acknowledges it, an error settles it as described on [`HandlerError`].
     fn handle(
         &self,
         message: QueuedMessage<M>,
@@ -44,7 +45,9 @@ where
 }
 
 #[derive(Debug, Clone)]
+/// How a consumer runs - Java's `ConsumeFromQueue`.
 pub struct ConsumerConfig {
+    /// The queue to consume.
     pub queue_name: QueueName,
     /// Required, as in Java: what happens to a message whose handler failed.
     pub redelivery_policy: RedeliveryPolicy,
@@ -60,6 +63,7 @@ pub struct ConsumerConfig {
 }
 
 impl ConsumerConfig {
+    /// A consumer of `queue_name` with one worker slot, Java's 20 ms polling interval and a 10 s shutdown timeout.
     pub fn new(queue_name: impl Into<QueueName>, redelivery_policy: RedeliveryPolicy) -> Self {
         Self {
             queue_name: queue_name.into(),
@@ -71,21 +75,25 @@ impl ConsumerConfig {
         }
     }
 
+    /// Enables adaptive polling for idle queues; see [`PollingBackoff`].
     pub fn with_polling_backoff(mut self, polling_backoff: PollingBackoff) -> Self {
         self.polling_backoff = Some(polling_backoff);
         self
     }
 
+    /// Sets how many messages are handled concurrently.
     pub fn with_parallel_consumers(mut self, parallel_consumers: usize) -> Self {
         self.parallel_consumers = parallel_consumers;
         self
     }
 
+    /// Sets the pause after a poll that did not fill every free slot.
     pub fn with_polling_interval(mut self, polling_interval: Duration) -> Self {
         self.polling_interval = polling_interval;
         self
     }
 
+    /// Sets how long [`QueueConsumer::stop`] waits for in-flight handlers.
     pub fn with_shutdown_timeout(mut self, shutdown_timeout: Duration) -> Self {
         self.shutdown_timeout = shutdown_timeout;
         self
@@ -125,6 +133,7 @@ impl QueueConsumer {
     {
         let cancel = CancellationToken::new();
         let queue_name = config.queue_name.clone();
+        let queue_name_for_span = queue_name.clone();
         let fetcher = Fetcher {
             storage,
             handler: Arc::new(handler),
@@ -141,10 +150,14 @@ impl QueueConsumer {
         Self {
             queue_name,
             cancel,
-            task: Some(tokio::spawn(fetcher.run())),
+            task: Some(tokio::spawn(fetcher.run().instrument(info_span!(
+                "durable_queue_consumer",
+                queue_name = %queue_name_for_span,
+            )))),
         }
     }
 
+    /// The queue this consumer consumes.
     pub fn queue_name(&self) -> &QueueName {
         &self.queue_name
     }
@@ -228,13 +241,22 @@ impl<M: QueueMessage, H: MessageHandler<M>, S: QueueStorage> Fetcher<M, H, S> {
                 let slot = slots
                     .split(1)
                     .expect("never more messages claimed than slots held");
-                in_flight.spawn(deliver(
+                let span = info_span!(
+                    "deliver_message",
+                    queue_name = %entry.queue_name,
+                    queue_entry_id = %entry.id,
+                    attempt = entry.total_attempts,
+                    redelivery_attempts = entry.redelivery_attempts,
+                    outcome = field::Empty,
+                );
+                let delivery = deliver(
                     self.storage.clone(),
                     self.handler.clone(),
                     self.redelivery_policy.clone(),
                     entry,
                     slot,
-                ));
+                );
+                in_flight.spawn(delivery.instrument(span));
             }
             drop(slots);
 
@@ -314,6 +336,8 @@ fn log_task_failure(
 }
 
 /// Decodes, handles and settles one claimed message. Each step that touches the database is its own transaction.
+/// Runs inside the `deliver_message` span, which carries the queue, the message id and the attempt, and records
+/// the outcome. Nothing here logs payloads.
 async fn deliver<M: QueueMessage, H: MessageHandler<M>, S: QueueStorage>(
     storage: S,
     handler: Arc<H>,
@@ -322,7 +346,6 @@ async fn deliver<M: QueueMessage, H: MessageHandler<M>, S: QueueStorage>(
     _slot: OwnedSemaphorePermit,
 ) {
     let id = entry.id.clone();
-    let queue_name = entry.queue_name.clone();
     let payload_type = entry.message_payload_type.clone();
     let (total_attempts, redelivery_attempts) = (entry.total_attempts, entry.redelivery_attempts);
 
@@ -330,11 +353,13 @@ async fn deliver<M: QueueMessage, H: MessageHandler<M>, S: QueueStorage>(
         Ok(message) => message,
         Err(e) => {
             // Permanent: dead-letter without reading the row back, like Java's markAsDeadLetterMessageDirect.
-            error!(queue = %queue_name, id = %id, payload_type, error = %e, "cannot decode message; dead-lettering it");
+            // The stored reason keeps serde's full message; the log gets a redacted one, which cannot quote the payload.
+            record_outcome("dead_lettered_undecodable");
+            error!(payload_type, error = %e.redacted(), "cannot decode message; dead-lettering it");
             let reason =
                 format!("Failed to deserialize message payload of type {payload_type}: {e}");
             if let Err(e) = storage.mark_as_dead_letter_direct(&id, &reason).await {
-                error!(queue = %queue_name, id = %id, error = %e, "failed to dead-letter undecodable message");
+                error!(error = %e, "failed to dead-letter undecodable message");
             }
             return;
         }
@@ -346,13 +371,16 @@ async fn deliver<M: QueueMessage, H: MessageHandler<M>, S: QueueStorage>(
         Ok(Ok(())) => {
             match storage.acknowledge(&id).await {
                 Ok(true) => {
-                    debug!(queue = %queue_name, id = %id, "message handled and acknowledged")
+                    record_outcome("acknowledged");
+                    debug!("message handled and acknowledged");
                 }
                 Ok(false) => {
-                    error!(queue = %queue_name, id = %id, "could not acknowledge message - it may already have been deleted")
+                    record_outcome("acknowledge_missed");
+                    error!("could not acknowledge message - it may already have been deleted");
                 }
                 Err(e) => {
-                    error!(queue = %queue_name, id = %id, error = %e, "failed to acknowledge message; it will be redelivered")
+                    record_outcome("acknowledge_failed");
+                    error!(error = %e, "failed to acknowledge message; it will be redelivered");
                 }
             }
             return;
@@ -368,27 +396,41 @@ async fn deliver<M: QueueMessage, H: MessageHandler<M>, S: QueueStorage>(
     let report = error.report();
     let settled = match redelivery_policy.decide(&error, total_attempts, redelivery_attempts) {
         FailureOutcome::Retry { delay } => {
-            debug!(queue = %queue_name, id = %id, error = %error, ?delay, redelivery_attempts, "message handling failed; will redeliver");
+            record_outcome("retry");
+            debug!(error = %error, ?delay, "message handling failed; will redeliver");
+            storage
+                .retry(&id, after(Utc::now(), delay), &report)
+                .await
+                .map(|_| ())
+        }
+        FailureOutcome::RedeliveryRequested { delay } => {
+            record_outcome("redelivery_requested");
+            debug!(?delay, "handler requested redelivery");
             storage
                 .retry(&id, after(Utc::now(), delay), &report)
                 .await
                 .map(|_| ())
         }
         FailureOutcome::DeadLetter { reason } => {
+            record_outcome("dead_lettered");
             match reason {
                 DeadLetterReason::PermanentError => {
-                    error!(queue = %queue_name, id = %id, error = %error, "permanent error; marking message as dead letter")
+                    error!(error = %error, "permanent error; marking message as dead letter")
                 }
                 DeadLetterReason::RedeliveriesExhausted => {
-                    warn!(queue = %queue_name, id = %id, error = %error, total_attempts, "too many deliveries; marking message as dead letter")
+                    warn!(error = %error, "too many deliveries; marking message as dead letter")
                 }
             }
             storage.mark_as_dead_letter(&id, &report).await.map(|_| ())
         }
     };
     if let Err(e) = settled {
-        error!(queue = %queue_name, id = %id, error = %e, "failed to settle failed message; stuck-message recovery will redeliver it");
+        error!(error = %e, "failed to settle failed message; stuck-message recovery will redeliver it");
     }
+}
+
+fn record_outcome(outcome: &'static str) {
+    Span::current().record("outcome", outcome);
 }
 
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {

@@ -21,3 +21,4 @@ uuid = { version = "1.28.0", features = ["v7"] }
 [dev-dependencies]
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }

@@ -1,6 +1,8 @@
 //! Rust port of the Trustworks Essentials PostgreSQL Durable Queues, schema- and behaviour-compatible with
 //! Essentials 0.60.0. `docs/CONTRACT.md` is the behaviour this crate reproduces.
 
+#![warn(missing_docs)]
+
 mod consumer;
 mod durable_queues;
 mod error;
@@ -15,8 +17,8 @@ pub use consumer::{ConsumerConfig, MessageHandler, QueueConsumer};
 pub use durable_queues::DurableQueues;
 pub use error::{DurableQueuesError, Result};
 pub use message::{
-    BoxError, DecodeError, HandlerError, Message, MessageMetaData, MessageType, QueueMessage,
-    QueuedMessage,
+    BoxError, DecodeError, HandlerError, MANUALLY_REQUESTED_REDELIVERY, Message, MessageMetaData,
+    MessageType, QueueMessage, QueuedMessage,
 };
 pub use polling::PollingBackoff;
 pub use redelivery::RedeliveryPolicy;

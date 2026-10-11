@@ -8,10 +8,12 @@ use thiserror::Error;
 pub struct QueueName(String);
 
 impl QueueName {
+    /// A queue name - any text, used verbatim.
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
 
+    /// The name.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -41,14 +43,17 @@ impl fmt::Display for QueueName {
 pub struct QueueEntryId(String);
 
 impl QueueEntryId {
+    /// Wraps an existing id.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    /// A new UUID v7 id.
     pub fn random() -> Self {
         Self(uuid::Uuid::now_v7().to_string())
     }
 
+    /// The id text.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -76,6 +81,7 @@ pub enum DeliveryMode {
 }
 
 impl DeliveryMode {
+    /// Java's enum name, as stored in `delivery_mode`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Normal => "NORMAL",
@@ -86,7 +92,11 @@ impl DeliveryMode {
 
 #[derive(Debug, Error)]
 #[error("unknown delivery mode '{0}', expected NORMAL or IN_ORDER")]
-pub struct UnknownDeliveryMode(pub String);
+/// A `delivery_mode` value other than `NORMAL` or `IN_ORDER`.
+pub struct UnknownDeliveryMode(
+    /// The value found.
+    pub String,
+);
 
 impl FromStr for DeliveryMode {
     type Err = UnknownDeliveryMode;

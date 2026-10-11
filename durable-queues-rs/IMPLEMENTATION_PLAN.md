@@ -248,7 +248,44 @@ version.
 
 ---
 
-## Phase 4 — Hardening: tracing, ported Java tests, edge cases
+## Phase 4 — Hardening: tracing, ported Java tests, edge cases ✅ done
+
+**Delivered, item by item against the list below:**
+- **Tracing:**
+  - spans `durable_queue_consumer` (queue) and `deliver_message` (queue_name, queue_entry_id, attempt,
+    redelivery_attempts, and a recorded `outcome`)
+  - one debug span per storage operation (`durable_queues.claim`, `.acknowledge`, `.retry`, …) with table,
+    queue, id and count fields; arguments are skipped
+  - `tests/tracing.rs` captures every span and event and asserts that no payload value appears
+- **Java tests:** [`docs/JAVA_TEST_CHECKLIST.md`](docs/JAVA_TEST_CHECKLIST.md) maps every Java test method.
+  - 23 are ported or reproduced (`tests/java_ports.rs` and earlier suites), with Java's numbers.
+  - 7 wait for Phase 5 (ordered).
+  - The rest are N/A, each with a reason: interceptors, batched fetch, observer/metrics, schema migration,
+    Java utilities.
+  - Java's `*_with_db_connectivity_issues` tests use `docker pause` for 5 s; so does the port.
+- **Edge cases:** `tests/edge_cases.rs`
+  - a failed ack is redelivered after the timeout, through a `QueueStorage` test double
+  - a real container stop and start
+  - a pool smaller than the parallelism
+  - a handler outliving the timeout (documented duplicate)
+  - shutdown with in-flight messages is covered by Phase 2's tests
+- **Moved here from Phase 3:** handler-requested redelivery is `Err(HandlerError::redeliver_in(delay))`. Like
+  Java's `markForRedeliveryIn`, it bypasses the policy and stores "Manually requested redelivery".
+- **Lint and docs:** `#![warn(missing_docs)]` with every public item documented.
+  `RUSTDOCFLAGS="-D warnings" cargo doc`, `cargo fmt --check` and `cargo clippy --all-targets -D warnings` are
+  all clean.
+
+**Bug found and fixed:** serde_json's error messages quote the offending input, so the "cannot decode message" log
+line leaked payload values. Logs now get `DecodeError::redacted()` (error category and position). The full message
+is still stored in `last_delivery_error`, next to the payload it describes. The tracing test fails if the
+redaction is removed.
+
+**Not ported (by the experiment's scope):** Java's query and admin API (queue names, counts,
+`getQueuedMessages`, `purgeQueue`, `queryForMessagesSoonReadyForDelivery`), `queueMessageAsDeadLetterMessage`
+and interceptors. The checklist notes which Java assertions this leaves out.
+
+**Original plan:**
+
 
 - `tracing` spans per message (`queue_name`, `queue_entry_id`, `attempt`) and per SQL operation. Structured
   fields only; payloads are never logged.

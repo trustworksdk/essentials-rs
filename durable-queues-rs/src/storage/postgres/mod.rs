@@ -27,8 +27,11 @@ pub enum SchemaOwnership {
 }
 
 #[derive(Debug, Clone, Default)]
+/// Settings for [`PostgresQueueStorage::new`].
 pub struct PostgresQueueStorageConfig {
+    /// The shared queue table; default `durable_queues`.
     pub table_name: TableName,
+    /// Whether this crate creates the table or only verifies it.
     pub schema_ownership: SchemaOwnership,
 }
 
@@ -61,6 +64,7 @@ impl PostgresQueueStorage {
         })
     }
 
+    /// The queue table.
     pub fn table_name(&self) -> &TableName {
         &self.table_name
     }
@@ -89,6 +93,7 @@ impl PostgresQueueStorage {
 }
 
 impl QueueStorage for PostgresQueueStorage {
+    #[tracing::instrument(name = "durable_queues.insert", level = "debug", skip_all, fields(table = %self.table_name, queue_name = %queue_name, count = entries.ids.len()))]
     async fn insert_messages(
         &self,
         queue_name: &QueueName,
@@ -102,6 +107,7 @@ impl QueueStorage for PostgresQueueStorage {
 
     /// Claims up to `limit` ready normal messages (CONTRACT.md §4.1). With `reset_stuck`, first returns this queue's
     /// messages claimed before the threshold to the queue (§6) - in the same transaction, as Java's fetcher does.
+    #[tracing::instrument(name = "durable_queues.claim", level = "debug", skip_all, fields(table = %self.table_name, queue_name = %queue_name, limit, reset_stuck = reset_stuck.is_some()))]
     async fn claim_unordered(
         &self,
         queue_name: &QueueName,
@@ -132,6 +138,7 @@ impl QueueStorage for PostgresQueueStorage {
     }
 
     /// Returns a failed message to the queue for redelivery at `next_delivery_ts`. `false` if the row is gone.
+    #[tracing::instrument(name = "durable_queues.retry", level = "debug", skip_all, fields(table = %self.table_name, queue_entry_id = %id))]
     async fn retry(
         &self,
         id: &QueueEntryId,
@@ -149,6 +156,7 @@ impl QueueStorage for PostgresQueueStorage {
     }
 
     /// Dead-letters a message. `None` if it does not exist or already is a dead letter.
+    #[tracing::instrument(name = "durable_queues.mark_as_dead_letter", level = "debug", skip_all, fields(table = %self.table_name, queue_entry_id = %id))]
     async fn mark_as_dead_letter(
         &self,
         id: &QueueEntryId,
@@ -162,6 +170,7 @@ impl QueueStorage for PostgresQueueStorage {
     }
 
     /// Makes a dead letter deliverable again at `next_delivery_ts`. `None` if it is not a dead letter.
+    #[tracing::instrument(name = "durable_queues.resurrect_dead_letter", level = "debug", skip_all, fields(table = %self.table_name, queue_entry_id = %id))]
     async fn resurrect_dead_letter(
         &self,
         id: &QueueEntryId,
@@ -174,6 +183,7 @@ impl QueueStorage for PostgresQueueStorage {
             .await?)
     }
 
+    #[tracing::instrument(name = "durable_queues.dead_letters", level = "debug", skip_all, fields(table = %self.table_name, queue_name = %queue_name, offset, limit))]
     async fn dead_letters(
         &self,
         queue_name: &QueueName,
@@ -195,6 +205,7 @@ impl QueueStorage for PostgresQueueStorage {
 
     /// Deletes a handled message. Like Java, a message that was dead-lettered while being handled also counts as
     /// acknowledged; `false` means the row was already gone.
+    #[tracing::instrument(name = "durable_queues.acknowledge", level = "debug", skip_all, fields(table = %self.table_name, queue_entry_id = %id))]
     async fn acknowledge(&self, id: &QueueEntryId) -> Result<bool> {
         let deleted = sqlx::query(self.sql.acknowledge.clone())
             .bind(id.as_str())
@@ -211,6 +222,7 @@ impl QueueStorage for PostgresQueueStorage {
     }
 
     /// Dead-letters a message without reading it back - for payloads that cannot be decoded.
+    #[tracing::instrument(name = "durable_queues.mark_as_dead_letter_direct", level = "debug", skip_all, fields(table = %self.table_name, queue_entry_id = %id))]
     async fn mark_as_dead_letter_direct(&self, id: &QueueEntryId, error: &str) -> Result<bool> {
         Ok(sqlx::query(self.sql.mark_as_dead_letter_direct.clone())
             .bind(id.as_str())
@@ -222,6 +234,7 @@ impl QueueStorage for PostgresQueueStorage {
     }
 
     /// Loads one row by id, whatever its state.
+    #[tracing::instrument(name = "durable_queues.find_entry", level = "debug", skip_all, fields(table = %self.table_name, queue_entry_id = %id))]
     async fn find_entry(&self, id: &QueueEntryId) -> Result<Option<QueueEntry>> {
         Ok(sqlx::query_as(self.sql.select_entry_by_id.clone())
             .bind(id.as_str())

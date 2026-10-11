@@ -18,7 +18,7 @@ pub const JAVA_ROWS: &str = include_str!("../../docs/fixtures/java_rows.sql");
 
 pub struct TestDatabase {
     pub pool: PgPool,
-    _container: ContainerAsync<Postgres>,
+    container: ContainerAsync<Postgres>,
 }
 
 impl TestDatabase {
@@ -28,6 +28,49 @@ impl TestDatabase {
             .start()
             .await
             .expect("start PostgreSQL container");
+        Self::connect(container).await
+    }
+
+    /// A database on a fixed host port, so connection URLs stay valid across [`Self::restart`].
+    pub async fn start_restartable() -> Self {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("find a free port")
+            .port();
+        let container = Postgres::default()
+            .with_tag("17-alpine")
+            .with_mapped_port(
+                port,
+                testcontainers_modules::testcontainers::core::IntoContainerPort::tcp(5432),
+            )
+            .start()
+            .await
+            .expect("start PostgreSQL container");
+        Self::connect(container).await
+    }
+
+    /// Stops PostgreSQL, keeps it down for `downtime`, starts it again and waits until it accepts connections.
+    pub async fn restart(&self, downtime: Duration) {
+        self.container.stop().await.expect("stop PostgreSQL");
+        tokio::time::sleep(downtime).await;
+        self.container.start().await.expect("start PostgreSQL");
+        let options = (*self.pool.connect_options()).clone();
+        eventually("PostgreSQL to accept connections again", || {
+            let options = options.clone();
+            async move { sqlx::ConnectOptions::connect(&options).await.is_ok() }
+        })
+        .await;
+    }
+
+    /// Java's `disruptDatabaseConnection` / `restoreDatabaseConnection`: freezes the PostgreSQL container
+    /// (`docker pause`) for `duration`. Connections stay open but nothing answers until it is unpaused.
+    pub async fn pause_for(&self, duration: Duration) {
+        self.container.pause().await.expect("pause PostgreSQL");
+        tokio::time::sleep(duration).await;
+        self.container.unpause().await.expect("unpause PostgreSQL");
+    }
+
+    async fn connect(container: ContainerAsync<Postgres>) -> Self {
         let host = container.get_host().await.expect("container host");
         let port = container
             .get_host_port_ipv4(5432)
@@ -40,10 +83,7 @@ impl TestDatabase {
             ))
             .await
             .expect("connect to PostgreSQL container");
-        Self {
-            pool,
-            _container: container,
-        }
+        Self { pool, container }
     }
 
     /// A pool with one already-open connection, standing in for a separate application node.

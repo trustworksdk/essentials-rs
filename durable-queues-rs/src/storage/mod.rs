@@ -89,22 +89,35 @@ pub trait QueueStorage: Clone + Send + Sync + 'static {
 /// One stored message, whatever its state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueueEntry {
+    /// The `id` column - opaque text.
     pub id: QueueEntryId,
+    /// The queue it belongs to.
     pub queue_name: QueueName,
+    /// The payload JSON.
     pub message_payload: Value,
     /// The payload's type name. For Java-produced rows: the Java FQCN.
     pub message_payload_type: String,
+    /// When it was queued.
     pub added_ts: DateTime<Utc>,
     /// `None` while the message is being delivered and for dead letters.
     pub next_delivery_ts: Option<DateTime<Utc>>,
+    /// When the current delivery claimed it; `None` unless it is being delivered.
     pub delivery_ts: Option<DateTime<Utc>>,
+    /// Deliveries so far, including a current one.
     pub total_attempts: i32,
+    /// Redeliveries so far.
     pub redelivery_attempts: i32,
+    /// Why the last delivery failed, or why it was dead-lettered.
     pub last_delivery_error: Option<String>,
+    /// Whether a consumer has claimed it.
     pub is_being_delivered: bool,
+    /// Whether it is a dead letter.
     pub is_dead_letter_message: bool,
+    /// The metadata JSON; NULL counts as empty.
     pub meta_data: Option<Value>,
+    /// Normal or ordered.
     pub delivery_mode: DeliveryMode,
+    /// The ordering key of an ordered message.
     pub key: Option<String>,
     /// -1 for [`DeliveryMode::Normal`].
     pub key_order: i64,
@@ -113,9 +126,13 @@ pub struct QueueEntry {
 /// Messages to insert, as parallel arrays with one element per message.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct NewEntries {
+    /// Message ids.
     pub ids: Vec<String>,
+    /// Payload JSON.
     pub payloads: Vec<Value>,
+    /// Payload type names.
     pub payload_types: Vec<String>,
+    /// Metadata JSON objects.
     pub meta_data: Vec<Value>,
 }
 
@@ -127,7 +144,9 @@ pub struct StuckMessageReset {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// What [`QueueStorage::claim_unordered`] did.
 pub struct ClaimResult {
+    /// The claimed messages, now being delivered.
     pub claimed: Vec<QueueEntry>,
     /// Stuck messages returned to the queue before claiming.
     pub reset: u64,
@@ -137,7 +156,9 @@ pub struct ClaimResult {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum QueueingSortOrder {
     #[default]
+    /// Oldest first.
     Ascending,
+    /// Newest first.
     Descending,
 }
 

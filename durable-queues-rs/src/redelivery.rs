@@ -37,8 +37,16 @@ enum Backoff {
 /// What to do with a message whose delivery failed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum FailureOutcome {
-    Retry { delay: Duration },
-    DeadLetter { reason: DeadLetterReason },
+    Retry {
+        delay: Duration,
+    },
+    /// The handler asked for the redelivery; the policy was not consulted.
+    RedeliveryRequested {
+        delay: Duration,
+    },
+    DeadLetter {
+        reason: DeadLetterReason,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +105,7 @@ impl RedeliveryPolicy {
         self
     }
 
+    /// Redeliveries allowed after the first delivery.
     pub fn max_redeliveries(&self) -> u32 {
         self.max_redeliveries
     }
@@ -147,6 +156,9 @@ impl RedeliveryPolicy {
         total_attempts: i32,
         redelivery_attempts: i32,
     ) -> FailureOutcome {
+        if let HandlerError::RedeliveryRequested(delay) = error {
+            return FailureOutcome::RedeliveryRequested { delay: *delay };
+        }
         if error.is_permanent() || self.classifies_as_permanent(error) {
             return FailureOutcome::DeadLetter {
                 reason: DeadLetterReason::PermanentError,
@@ -167,7 +179,10 @@ impl RedeliveryPolicy {
         let Some(is_permanent) = &self.permanent_error_classifier else {
             return false;
         };
-        let mut current: Option<&(dyn StdError + 'static)> = Some(error.error());
+        let mut current: Option<&(dyn StdError + 'static)> = match error.error() {
+            Some(e) => Some(e),
+            None => return false,
+        };
         // Bounded like Java's cause-chain walk, in case a source chain is cyclic.
         for _ in 0..100 {
             let Some(e) = current else { break };
@@ -316,6 +331,15 @@ mod tests {
         assert_eq!(
             policy.decide(&transient("boom"), 3, 2),
             FailureOutcome::Retry { delay: ms(300) }
+        );
+    }
+
+    #[test]
+    fn a_requested_redelivery_ignores_the_cap_and_the_policy_delay() {
+        let policy = RedeliveryPolicy::fixed_backoff(ms(200), 1);
+        assert_eq!(
+            policy.decide(&HandlerError::redeliver_in(ms(150)), 10, 9),
+            FailureOutcome::RedeliveryRequested { delay: ms(150) }
         );
     }
 
