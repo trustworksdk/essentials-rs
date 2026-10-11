@@ -20,5 +20,18 @@ uuid = { version = "1.28.0", features = ["v7"] }
 
 [dev-dependencies]
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "process", "io-util"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
+
+[features]
+# Phase 6: the `interop` binary and the Java <-> Rust tests in tests/interop.rs (they need Docker and build the Java
+# harness image). Run with `cargo test --features interop --test interop`.
+interop = []
+
+[[bin]]
+name = "interop"
+required-features = ["interop"]
+
+[[test]]
+name = "interop"
+required-features = ["interop"]

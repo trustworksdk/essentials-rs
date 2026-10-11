@@ -84,15 +84,20 @@ statements.** The cleanup belongs to Java's migration path; Rust must never drop
 | `key`, `key_order` | NORMAL: `NULL`, `-1`. IN_ORDER: `key` non-null and `order >= 0` (both validated) | |
 | `added_ts` | `Instant.now()` on the **app clock** | |
 | `next_delivery_ts` | `added_ts + deliveryDelay` (0 by default); `NULL` when enqueued directly as a dead letter | |
-| `last_delivery_error` | **The full Java stack trace** (`Exceptions.getStackTrace(e)`), the `markAsDeadLetter` reason string, the literal `"Handler Processing of the Message was determined to have Timed Out"` for a stuck reset, or `RetryMessage.MANUALLY_REQUESTED_REDELIVERY` for a manual retry | |
+| `last_delivery_error` | **The full Java stack trace** (`Exceptions.getStackTrace(e)`). For a failed handler it is the trace of the `UnitOfWorkException` that `SingleOperationTransactionDurableQueuesInterceptor` wraps the handler's exception in, so it starts `dk.trustworks…UnitOfWorkException: <handler exception>` (seen in Phase 6). Otherwise: the `markAsDeadLetter` reason string, the literal `"Handler Processing of the Message was determined to have Timed Out"` for a stuck reset, or `RetryMessage.MANUALLY_REQUESTED_REDELIVERY` for a manual retry | |
 | `is_being_delivered` | Not set on insert (DEFAULT FALSE) | |
 
 **Clock source: every timestamp, including `:now` in every claim/reset predicate, comes from the application clock**
 (`Instant.now()` bound as a parameter). No statement uses DB `now()`. Consequences for mixed Java/Rust nodes:
 
 - Clock skew between nodes shifts delayed delivery by that skew.
-- A node whose clock runs ahead resets other nodes' in-flight messages early (§6). Keep nodes NTP-synced; Phase 6
-  scenario 7 measures this.
+- A node whose clock runs ahead resets other nodes' in-flight messages early (§6). Keep nodes NTP-synced.
+- **Measured in Phase 6, scenario 7** (libfaketime on the Java node):
+  - A Java producer 10 s ahead stamps `added_ts` / `next_delivery_ts` 10 s ahead. A Rust consumer on true time
+    delivers the message about 10 s late.
+  - A Java consumer 60 s ahead, with the default 30 s timeout, resets a Rust node's claim at its first poll. Java
+    then handles the message (counters 2 / 1) while Rust is still running it, so both handle it.
+  - The same follows for Rust nodes, which also stamp from their own clock.
 - Precision: PG stores microseconds. Rust must write UTC `TIMESTAMPTZ` values; chrono's nanoseconds are truncated
   by PG, the same as Java's.
 
@@ -343,22 +348,35 @@ is done in `double` nanoseconds. Worked example `exponential(500ms, 500ms, 2.0, 
 
 ## 12. Interop hazards to test in Phase 6
 
+Phase 6 tests each of these against the real Java (`tests/interop.rs`).
+
 1. **Unknown payload types are dead-lettered, not skipped.** On a queue with Java *and* Rust consumers, every
    consumer must understand every `message_payload_type` on that queue. Otherwise the node that claims the message
    dead-letters it. This is true in pure Java as well (class missing on one node). Mixed queues need the same type
-   registry on both sides.
+   registry on both sides. *Verified both ways: Java writes a `DurableQueueDeserializationException` trace.*
 2. **Rust payloads must deserialize in Jackson.** A Rust producer must write `message_payload_type` = a Java FQCN
    the Java consumer has, and JSON that Jackson 3 + Essentials' mapper accepts (field names, `SingleValueType`s
-   serialized as bare strings or numbers, `Instant`s as ISO-8601 strings).
-3. **Clock skew** (§2): resets and delayed delivery depend on each node's clock.
-4. **Ordered rows** are never claimed by Rust before Phase 5 (§4.3).
+   serialized as bare strings or numbers, `Instant`s as ISO-8601 strings). *Verified (scenario 2): `CharSequenceType`
+   ids, `BigDecimal` and `Instant` round-trip through Jackson unchanged.*
+3. **Clock skew** (§2): resets and delayed delivery depend on each node's clock. *Measured, see §2.*
+4. **Ordered rows** are never claimed by Rust before Phase 5 (§4.3). *Since Phase 5 they are, in key order, in both
+   directions (scenarios 1 and 2).*
+5. **Java reports every claimed message as `NORMAL`** (found in Phase 6). `DefaultQueuedMessage.getDeliveryMode()`
+   is hard-coded, while `getMessage()` is an `OrderedMessage` with the right key and order. The column is
+   unaffected; only a Java handler that asks for the delivery mode gets the wrong answer.
 
 ## 13. Golden fixtures
 
 There is no JDK in this devcontainer, so the fixtures in [`fixtures/java_rows.sql`](fixtures/java_rows.sql) are
 **synthetic**: they are written to match exactly what `queueMessage` / `queueMessages` insert (§2) and are used by
-the Phase 2 compatibility tests. Phase 6 replaces them with rows dumped from the real Java harness and diffs the
-two. A mismatch is a contract bug.
+the Phase 2 compatibility tests.
+
+**Verified in Phase 6.** The Java harness's `produce-fixture` queues the same messages through the real API.
+`tests/interop.rs::the_synthetic_java_fixture_matches_what_java_writes` compares the two on every column except ids
+and absolute timestamps, including the delay `next_delivery_ts − added_ts` and the first line of the error. They
+match. Row 7, a payload that does not fit its type, cannot be produced through Java's serializer and is left out.
+The file is kept rather than replaced, because the Phase 2 tests rely on its fixed ids and on row 7. A mismatch is
+still a contract bug.
 
 ## 14. Java test checklist (Phase 4 porting source)
 

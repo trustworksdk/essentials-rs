@@ -18,6 +18,8 @@ pub const JAVA_ROWS: &str = include_str!("../../docs/fixtures/java_rows.sql");
 
 pub struct TestDatabase {
     pub pool: PgPool,
+    /// The `postgres://` URL the pool connected with, as seen from the host.
+    pub url: String,
     container: ContainerAsync<Postgres>,
 }
 
@@ -25,6 +27,18 @@ impl TestDatabase {
     pub async fn start() -> Self {
         let container = Postgres::default()
             .with_tag("17-alpine")
+            .start()
+            .await
+            .expect("start PostgreSQL container");
+        Self::connect(container).await
+    }
+
+    /// A database other containers on `network` reach as `container_name:5432`.
+    pub async fn start_on_network(network: &str, container_name: &str) -> Self {
+        let container = Postgres::default()
+            .with_tag("17-alpine")
+            .with_network(network)
+            .with_container_name(container_name)
             .start()
             .await
             .expect("start PostgreSQL container");
@@ -76,14 +90,17 @@ impl TestDatabase {
             .get_host_port_ipv4(5432)
             .await
             .expect("container port");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
         let pool = PgPoolOptions::new()
             .max_connections(16)
-            .connect(&format!(
-                "postgres://postgres:postgres@{host}:{port}/postgres"
-            ))
+            .connect(&url)
             .await
             .expect("connect to PostgreSQL container");
-        Self { pool, container }
+        Self {
+            pool,
+            url,
+            container,
+        }
     }
 
     /// A pool with one already-open connection, standing in for a separate application node.

@@ -34,7 +34,7 @@ Key answers (details in CONTRACT.md):
   (only if empty) the unordered claim, limited to free worker slots, in one transaction.
 
 **Deviation:** the golden fixtures are synthetic, because there is no JDK here. Phase 6 diffs them against rows
-from the real Java harness.
+from the real Java harness (done: they match).
 
 **Exit gate:** CONTRACT.md reviewed. Open decisions are in CONTRACT.md §15 (ordered messages in scope; resurrect
 keeps counters; UUID v7 ids).
@@ -347,7 +347,84 @@ exactly as Java does.
 
 ---
 
-## Phase 6 — Java ↔ Rust interoperability and crash recovery
+## Phase 6 — Java ↔ Rust interoperability and crash recovery ✅ done
+
+**Delivered, item by item against the list below:**
+- **Java harness:** `interop/java-harness/`, built from Essentials 0.60.0 on Maven Central, with the pinned versions.
+  - `Harness.java` runs `PostgresqlDurableQueues` with default settings (centralized fetcher, Essentials' JSON
+    serializer) through a `JdbiUnitOfWorkFactory`. It offers `produce`, `consume` and `consume-and-crash-after K`.
+  - Payload classes are named as in the fixture: `com.acme.orders.OrderPlaced`, with `CharSequenceType` ids, a
+    `BigDecimal` and an `Instant`; `OrderEvent$OrderAdded` for ordered messages; `OrderEvent$OrderCancelled`;
+    `com.acme.billing.InvoiceIssued`.
+  - The POM declares JDBI, the PostgreSQL driver, Jackson 3, reactor-core and SLF4J itself (S2.1).
+  - The Dockerfile has two stages, a `~/.m2` cache mount, and a fat jar on `eclipse-temurin:25-jre`. The image
+    builds in about 35 s cold; the tests rebuild it on first use (cached).
+- **Rust node:** the `interop` binary (`src/bin/interop.rs`). It has the same commands, options and JSON-lines
+  events as the Java harness, so a test drives either side the same way. Its payload enum dispatches on the Java
+  FQCNs.
+- **Tests:** `tests/interop.rs`, 13 tests, all green, plus 5 consecutive full-suite runs (all 13 in parallel, about
+  21 s each). Each test gets its own PostgreSQL on a private Docker network. Java nodes are containers; Rust nodes
+  are child processes. A Java crash is a `docker kill`, a Rust crash a SIGKILL. The scenarios:
+  1. Java → Rust and 2. Rust → Java: 20 normal plus 3 keys × 5 ordered. Every message is handled once, and type,
+     payload and metadata equal the stored row. On the Java side the payload is Jackson's re-serialization of the
+     deserialized class, so Jackson read every field. Each key is handled in order.
+  3. Competing consumers: Java and Rust (2 workers each) share 200 messages from both producers. The union is all
+     200, there are no duplicates, and both nodes handled some.
+  4. / 5. Crash recovery, both directions: the crashed node hangs on its 4th message and is killed. The other side
+     redelivers it with `total_attempts` 2 and `redelivery_attempts` 1, no earlier than its own handling timeout
+     (3 s) and within 2 × timeout + 5 s.
+  6. Written by one side, observed by the other:
+     - **Dead letters:** each side exhausts the other's message (max 2 redeliveries, 3 deliveries). The rows have
+       identical counters and flags, `(3, 2, dead, not delivering, NULL, NULL)`. The opposite side resurrects each
+       dead letter and handles it with counters 4 / 2.
+     - **Delay and retry:** a delay written by one side and a retry written by the other are both honoured, in
+       both directions.
+  7. Clock skew: libfaketime moves the Java wall clock.
+     - A producer 10 s ahead stamps `added_ts` 10 s ahead, so its messages wait 10 s on every consumer.
+     - A consumer 60 s ahead (default 30 s timeout) resets a Rust node's fresh claim at its first poll and handles
+       the message while Rust is still running it: a duplicate.
+     - CONTRACT.md §2 has the details.
+- **Golden fixtures (CONTRACT.md §13):** the Java harness queues the fixture's messages (`produce-fixture`).
+  `the_synthetic_java_fixture_matches_what_java_writes` compares them with `java_rows.sql` on every column except
+  ids and absolute timestamps. That covers payloads, metadata, delivery mode, key / order, counters, the 1 h delay,
+  and the direct dead letter (NULL `next_delivery_ts`, the first line of the error). They matched on the first run,
+  so no contract bug was found.
+- **Hazard 1 (CONTRACT.md §12):** `unknown_payload_types_are_dead_lettered_by_either_side`. Java dead-letters a
+  Rust-only type (`DurableQueueDeserializationException`), and Rust dead-letters a Java-only type.
+
+**Mutation checks:**
+- Without Rust's stuck-message reset, scenario 4 never recovers.
+- With Rust resetting at `now` instead of `now − timeout`, scenario 4 redelivers after 140 ms and fails.
+- Without `next_delivery_ts <= now` in Rust's claim, the Java-delayed message is delivered early.
+
+**Found in Java (for Phase 8):**
+- **Bug:** `DefaultQueuedMessage.getDeliveryMode()` returns a hard-coded `NORMAL` (`DefaultQueuedMessage.java:111`).
+  The row mapper builds an `OrderedMessage` for `IN_ORDER` rows, but a handler asking the queued message for its
+  delivery mode is told `NORMAL`. Ordering is unaffected. Pinned by `java_reports_every_queued_message_as_normal`;
+  not patched around.
+- **Contract detail:** for a failed handler, `last_delivery_error` is the stack trace of a `UnitOfWorkException`
+  wrapping the handler's exception. That wrapper comes from 0.60's `SingleOperationTransactionDurableQueuesInterceptor`.
+  CONTRACT.md §2 updated.
+
+**No Rust bugs found.** Two test-side races were fixed. Nodes print `handled` before the ack, so "table empty" is
+awaited, and a consumer is kept running until its ack has landed.
+
+**Deviations, all additive:**
+- **Rust node:** an `[[bin]]` in this crate rather than a new workspace member. It needs no dependencies of its
+  own, the condition the cross-phase note sets for splitting.
+- **Gating:** the binary and `tests/interop.rs` use `required-features = ["interop"]` rather than `#[ignore]`.
+  Plain `cargo test` skips them; `cargo test --features interop --test interop` runs them.
+- **Harness extras** beyond produce / consume / crash: `produce-fixture` (for §13), `resurrect` (scenario 6), and
+  the `--fail-attempts`, `--handle-ms` and `--timeout-ms` options.
+- **Clock skew:** libfaketime is in the Java runtime image, inactive unless `LD_PRELOAD` and `FAKETIME` are set.
+- **Fixture file:** `java_rows.sql` is kept rather than replaced by a dump. The Phase 2 tests depend on its ids and
+  on row 7, which Java's serializer cannot produce. The interop test diffs it against real Java rows on every run.
+- **Versions:** `reactor-core` 3.8.4 is not in stack-pins.md (Spring Boot manages it in an application), and
+  Jackson 3.1.5 and PostgreSQL JDBC 42.7.13 come from the Essentials 0.60.0 root POM. The tests use
+  `postgres:17-alpine` like the rest of the suite; stack-pins.md lists 18.4.
+- **Two extra tests:** the Java delivery-mode bug, and hazard 1.
+
+**Original plan:**
 
 **Agreed approach (decided before starting):**
 - **Getting Essentials.** Essentials 0.60.0 is published on Maven Central (`dk.trustworks.essentials.components`;

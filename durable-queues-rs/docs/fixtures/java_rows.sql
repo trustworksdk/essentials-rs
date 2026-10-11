@@ -1,5 +1,6 @@
 -- SYNTHETIC golden fixtures: rows shaped exactly as Essentials 0.60.0 PostgresqlDurableQueues#queueMessage
--- inserts them (see docs/CONTRACT.md §2). Phase 6 replaces these with rows dumped from the real Java harness.
+-- inserts them (see docs/CONTRACT.md §2). Phase 6 verified them against the real Java harness (CONTRACT.md §13):
+-- tests/interop.rs diffs every row except 7 with what Essentials 0.60.0 writes for the same messages.
 -- Assumes the table from CONTRACT.md §1 exists with the default name `durable_queues`.
 -- Timestamps are relative to now() so "ready" rows are ready and "delayed" rows are in the future whenever loaded.
 
