@@ -24,16 +24,27 @@ pub trait QueueStorage: Clone + Send + Sync + 'static {
         next_delivery_ts: DateTime<Utc>,
     ) -> impl Future<Output = Result<u64>> + Send;
 
-    /// Claims up to `limit` normal messages due at `now`, so that no two callers claim the same message (§4.1).
-    /// With `reset_stuck`, first returns this queue's messages claimed at or before its threshold to the queue (§6),
-    /// atomically with the claim.
-    fn claim_unordered(
+    /// Claims up to `limit` messages due at `now`, so that no two callers claim the same message - Java's fetch
+    /// (CONTRACT.md §4.3), atomically:
+    /// 1. with `reset_stuck`, returns this queue's messages claimed at or before its threshold to the queue (§6);
+    /// 2. claims ordered messages that head their key (§4.2), skipping `exclude_keys` - the keys this node is
+    ///    handling;
+    /// 3. only if step 2 claimed nothing, claims normal messages (§4.1).
+    fn claim(
         &self,
         queue_name: &QueueName,
         limit: i64,
         now: DateTime<Utc>,
         reset_stuck: Option<StuckMessageReset>,
+        exclude_keys: &[String],
     ) -> impl Future<Output = Result<ClaimResult>> + Send;
+
+    /// Whether the queue holds any ordered message for `key`, dead letters included.
+    fn has_ordered_message_queued_for_key(
+        &self,
+        queue_name: &QueueName,
+        key: &str,
+    ) -> impl Future<Output = Result<bool>> + Send;
 
     /// Deletes a handled message. A message dead-lettered while it was handled also counts as acknowledged;
     /// `false` means it was already gone (§5).
@@ -134,9 +145,15 @@ pub struct NewEntries {
     pub payload_types: Vec<String>,
     /// Metadata JSON objects.
     pub meta_data: Vec<Value>,
+    /// Java's `delivery_mode` names: `NORMAL` or `IN_ORDER`.
+    pub delivery_modes: Vec<String>,
+    /// Ordering keys; `None` for normal messages.
+    pub keys: Vec<Option<String>>,
+    /// Orders within the key; -1 for normal messages.
+    pub key_orders: Vec<i64>,
 }
 
-/// Asks [`QueueStorage::claim_unordered`] to recover stuck messages first.
+/// Asks [`QueueStorage::claim`] to recover stuck messages first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StuckMessageReset {
     /// Messages whose `delivery_ts` is at or before this are considered stuck.
@@ -144,7 +161,7 @@ pub struct StuckMessageReset {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-/// What [`QueueStorage::claim_unordered`] did.
+/// What [`QueueStorage::claim`] did.
 pub struct ClaimResult {
     /// The claimed messages, now being delivered.
     pub claimed: Vec<QueueEntry>,

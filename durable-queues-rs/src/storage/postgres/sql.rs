@@ -12,6 +12,8 @@ pub(crate) struct QueueSql {
     pub create_ordered_head_index: SqlStr,
     pub select_entry_by_id: SqlStr,
     pub insert_messages: SqlStr,
+    pub claim_ordered: SqlStr,
+    pub has_ordered_message_for_key: SqlStr,
     pub claim_unordered: SqlStr,
     pub acknowledge: SqlStr,
     pub is_dead_letter: SqlStr,
@@ -80,8 +82,55 @@ impl QueueSql {
                     id, queue_name, message_payload, message_payload_type, added_ts, next_delivery_ts,
                     last_delivery_error, is_dead_letter_message, meta_data, delivery_mode, key, key_order
                 )
-                SELECT m.id, $1, m.payload, m.payload_type, $2, $3, NULL, FALSE, m.meta_data, 'NORMAL', NULL, -1
-                FROM UNNEST($4::text[], $5::jsonb[], $6::text[], $7::jsonb[]) AS m(id, payload, payload_type, meta_data)",
+                SELECT m.id, $1, m.payload, m.payload_type, $2, $3, NULL, FALSE, m.meta_data,
+                       m.delivery_mode, m.key, m.key_order
+                FROM UNNEST($4::text[], $5::jsonb[], $6::text[], $7::jsonb[], $8::text[], $9::text[], $10::bigint[])
+                     AS m(id, payload, payload_type, meta_data, delivery_mode, key, key_order)",
+            ),
+            // buildOrderedSqlStatement, verbatim but for the key exclusion: Java appends `AND key NOT IN (<list>)`
+            // only when the list is non-empty; `NOT (key = ANY($4))` is the same for every list, including an empty
+            // one, because `key` is never NULL here. $1 queue_name, $2 now, $3 limit, $4 keys in process on this node
+            claim_ordered: bind(
+                "WITH cte_ordered AS (
+                  SELECT id
+                  FROM {table} q
+                  WHERE
+                       queue_name             = $1
+                   AND is_dead_letter_message = FALSE
+                   AND is_being_delivered     = FALSE
+                   AND next_delivery_ts      <= $2
+                   AND key IS NOT NULL
+                   -- full per-key barrier:
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM {table} q2
+                     WHERE q2.key        = q.key
+                       AND q2.queue_name = q.queue_name
+                       AND q2.key_order  < q.key_order
+                   )
+                   AND NOT (key = ANY($4))
+                  ORDER BY key_order, next_delivery_ts
+                  LIMIT $3
+                  FOR UPDATE SKIP LOCKED
+                )
+                UPDATE {table} q
+                SET
+                  total_attempts       = q.total_attempts + 1,
+                  next_delivery_ts     = NULL,
+                  is_being_delivered   = TRUE,
+                  delivery_ts          = $2
+                FROM cte_ordered o
+                WHERE q.id = o.id
+                  AND q.queue_name = $1
+                RETURNING q.*",
+            ),
+            // getHasOrderedMessageQueuedForKeySql, verbatim. Dead letters count. $1 queue_name, $2 key
+            has_ordered_message_for_key: bind(
+                "SELECT count(*) FROM {table}
+                WHERE
+                queue_name = $1 AND
+                key = $2 AND
+                delivery_mode = 'IN_ORDER'",
             ),
             // buildUnorderedSqlStatement, verbatim. $1 queue_name, $2 now, $3 limit
             claim_unordered: bind(

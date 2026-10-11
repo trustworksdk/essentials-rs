@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use common::{JAVA_ROWS, JAVA_SCHEMA, TestDatabase, eventually};
 use durable_queues_rs::{
     ConsumerConfig, DecodeError, DeliveryMode, DurableQueuesError, HandlerError, Message,
-    MessageType, QueueEntryId, QueueMessage, QueueName, QueueStorage, QueuedMessage,
+    MessageOrder, MessageType, QueueEntryId, QueueMessage, QueueName, QueueStorage, QueuedMessage,
     RedeliveryPolicy,
 };
 use serde::{Deserialize, Serialize};
@@ -42,6 +42,16 @@ struct OrderCancelled {
 enum OrderMessage {
     Placed(OrderPlaced),
     Cancelled(OrderCancelled),
+    Added(OrderAdded),
+}
+
+const ORDER_ADDED: &str = "com.acme.orders.OrderEvent$OrderAdded";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrderAdded {
+    order_id: String,
+    step: u32,
 }
 
 impl QueueMessage for OrderMessage {
@@ -49,6 +59,7 @@ impl QueueMessage for OrderMessage {
         match self {
             Self::Placed(_) => OrderPlaced::TYPE_NAME,
             Self::Cancelled(_) => "com.acme.orders.OrderEvent$OrderCancelled",
+            Self::Added(_) => ORDER_ADDED,
         }
     }
 
@@ -56,6 +67,7 @@ impl QueueMessage for OrderMessage {
         match self {
             Self::Placed(m) => serde_json::to_value(m),
             Self::Cancelled(m) => serde_json::to_value(m),
+            Self::Added(m) => serde_json::to_value(m),
         }
     }
 
@@ -65,6 +77,7 @@ impl QueueMessage for OrderMessage {
             "com.acme.orders.OrderEvent$OrderCancelled" => {
                 Ok(Self::Cancelled(serde_json::from_value(payload)?))
             }
+            ORDER_ADDED => Ok(Self::Added(serde_json::from_value(payload)?)),
             other => Err(DecodeError::UnknownPayloadType(other.to_owned())),
         }
     }
@@ -194,7 +207,8 @@ async fn queued_rows_have_the_shape_java_writes() {
 }
 
 #[tokio::test]
-async fn java_rows_are_consumed_and_ordered_delayed_and_foreign_rows_are_left_alone() {
+async fn java_rows_are_consumed_ordered_rows_in_order_and_delayed_and_foreign_rows_are_left_alone()
+{
     let db = TestDatabase::start().await;
     db.run_script(JAVA_SCHEMA).await;
     db.run_script(JAVA_ROWS).await;
@@ -209,11 +223,13 @@ async fn java_rows_are_consumed_and_ordered_delayed_and_foreign_rows_are_left_al
     );
     let consumer = consumer.unwrap();
     let mut handled = HashMap::new();
-    for _ in 0..2 {
+    let mut arrival = Vec::new();
+    for _ in 0..4 {
         let message = tokio::time::timeout(Duration::from_secs(10), received.recv())
             .await
             .unwrap()
             .unwrap();
+        arrival.push(message.id.clone());
         handled.insert(message.id.clone(), message);
     }
     eventually("the undecodable row to be dead-lettered", || async {
@@ -225,7 +241,7 @@ async fn java_rows_are_consumed_and_ordered_delayed_and_foreign_rows_are_left_al
     })
     .await;
     eventually("the handled rows to be deleted", || async {
-        db.count("SELECT count(*) FROM durable_queues WHERE id LIKE '%0002' OR id LIKE '%0003'")
+        db.count("SELECT count(*) FROM durable_queues WHERE right(id, 4) IN ('0002', '0003', '0005', '0006')")
             .await
             == 0
     })
@@ -246,6 +262,25 @@ async fn java_rows_are_consumed_and_ordered_delayed_and_foreign_rows_are_left_al
         ("order-1", 125.5)
     );
     assert!(handled.contains_key(&fixture("0003")));
+    // The two ordered rows of key order-4, in key order.
+    let ordered: Vec<_> = arrival
+        .iter()
+        .filter(|id| [fixture("0005"), fixture("0006")].contains(id))
+        .collect();
+    assert_eq!(ordered, [&fixture("0005"), &fixture("0006")]);
+    let head = &handled[&fixture("0005")];
+    assert_eq!(
+        head.message.order,
+        Some(MessageOrder {
+            key: "order-4".into(),
+            order: 0
+        })
+    );
+    assert_eq!(head.delivery_mode, DeliveryMode::InOrder);
+    assert!(matches!(
+        head.message.payload,
+        OrderMessage::Added(OrderAdded { step: 0, .. })
+    ));
     assert!(
         received.try_recv().is_err(),
         "nothing else may be delivered"
@@ -266,7 +301,7 @@ async fn java_rows_are_consumed_and_ordered_delayed_and_foreign_rows_are_left_al
         ),
         (false, None, None)
     );
-    for untouched in ["0004", "0005", "0006", "0009"] {
+    for untouched in ["0004", "0009"] {
         let row = storage
             .find_entry(&fixture(untouched))
             .await

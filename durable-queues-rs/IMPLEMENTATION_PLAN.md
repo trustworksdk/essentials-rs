@@ -303,7 +303,37 @@ and interceptors. The checklist notes which Java assertions this leaves out.
 
 ---
 
-## Phase 5 — Ordered messages (optional; decided in Phase 0)
+## Phase 5 — Ordered messages ✅ done
+
+**Delivered, item by item against the list below:**
+- **Ordered messages:** `Message::in_order(key, order)` writes `IN_ORDER`, `key`, `key_order`. Java's order ≥ 0
+  rule is enforced at enqueue (`InvalidMessage`), and a batch can mix ordered and normal messages. Claimed
+  messages carry their `MessageOrder`. `has_ordered_message_queued_for_key` is Java's query, verbatim.
+- **Claiming:** `QueueStorage::claim` (renamed from `claim_unordered`) runs Java's fetch sequence in one
+  transaction: stuck reset, the verbatim ordered claim with this consumer's in-flight keys excluded, then normal
+  messages only if no ordered one was claimed. In-flight keys are a per-consumer set; a lease releases each key
+  once its message is settled.
+- **Per-node caveat:** kept, as in Java. CONTRACT.md §4.3 now explains which mechanism protects what, and why
+  ordering is per node.
+- **The Phase 2 restriction:** Rust now claims ordered rows; the Phase 2 Java-fixture test asserts they arrive in
+  key order.
+- **Tests:** `tests/ordered.rs`, 11 tests. They cover the 7 Java ordered tests (checklist updated, now 30 Java tests
+  ported or reproduced) and the exit gate: 10 parallel consumers, a retried head holds back only its own key, and a
+  node never runs one key twice at once.
+
+**Mutation checks:**
+- Without the per-key barrier, ordering and per-key exclusivity fail in 4 tests.
+- Without the key exclusion, a message outliving the handling timeout is handled twice concurrently.
+
+**Fixed along the way:** the "key already in flight" invariant check was a `debug_assert!`. In debug builds it
+panicked and killed the consumer's fetch loop. It now logs an error, because a `QueueStorage` that ignores
+`exclude_keys` is not a reason to stop consuming.
+
+**Build note:** a full `cargo test` links about 9 test binaries in parallel, and once ran out of memory in this
+container (the linker was killed with signal 9). `cargo test -j 2` avoids it.
+
+**Original plan:**
+
 
 - `OrderedMessage { key, order }` maps to `delivery_mode = 'IN_ORDER'`, `key`, `key_order`.
 - Claim the ordered head using the Java SQL and the `_ordered_head` index. Locally, track in-flight keys
@@ -318,6 +348,27 @@ exactly as Java does.
 ---
 
 ## Phase 6 — Java ↔ Rust interoperability and crash recovery
+
+**Agreed approach (decided before starting):**
+- **Getting Essentials.** Essentials 0.60.0 is published on Maven Central (`dk.trustworks.essentials.components`;
+  checked with `curl` against `repo1.maven.org/.../maven-metadata.xml`). Download it there; do not build it from
+  source.
+- **Harness location.** The Java harness lives in `durable-queues-rs/interop/java-harness/`: a `pom.xml` and a
+  small main class taking produce / consume / consume-and-crash-after-K arguments plus a JDBC URL.
+- **Dockerfile, two stages.**
+  - Build: `maven:3.9-eclipse-temurin-25` runs `mvn package`, with a BuildKit cache mount for `~/.m2`.
+  - Runtime: `eclipse-temurin:25-jre` with a single fat jar.
+  - Nothing Java is installed in the devcontainer.
+- **Versions** come from the Essentials plugin's `references/stack/stack-pins.md`: Java 25, `essentials.version`
+  0.60.0, JDBI BOM 3.55.0, Maven 3.9.16.
+- **Dependencies.** Essentials' framework dependencies are `provided` and not transitive (stack contract S2.1). The
+  harness POM must declare JDBI, the PostgreSQL JDBC driver, Jackson 3 and an SLF4J binding explicitly.
+- **Running it.** The Rust interop tests start the harness image through Testcontainers on the same Docker network
+  as PostgreSQL. Crashes use `docker kill`, and connectivity loss uses `docker pause`, as Java's own tests do.
+- **Java source for reference.** The 0.60.0 source used for CONTRACT.md is not in the repo. Re-clone it when
+  needed into a scratch directory:
+  `git clone --depth 1 --branch 0.60.0 https://github.com/trustworksdk/essentials-project.git`.
+
 
 **Setup:** this devcontainer has no JDK, so the Java side runs in Docker. Build a minimal Java harness app
 (`interop/java-harness/`, Maven, Essentials 0.60.0, `eclipse-temurin` image). It takes CLI/env commands

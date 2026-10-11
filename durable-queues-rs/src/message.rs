@@ -59,15 +59,18 @@ impl<T: MessageType> QueueMessage for T {
 /// parse on the next attempt either, so the message is dead-lettered (Java's `DurableQueueDeserializationException`).
 #[derive(Debug, Error)]
 pub enum DecodeError {
-    #[error("no message type is registered for payload type '{0}'")]
     /// The stored `message_payload_type` is not one this queue's message type knows.
+    #[error("no message type is registered for payload type '{0}'")]
     UnknownPayloadType(String),
-    #[error("payload does not match its type: {0}")]
     /// The payload JSON does not deserialize into the type its `message_payload_type` names.
+    #[error("payload does not match its type: {0}")]
     InvalidPayload(#[from] serde_json::Error),
-    #[error("meta_data is not a JSON object of strings")]
     /// The stored `meta_data` is not a JSON object of strings.
+    #[error("meta_data is not a JSON object of strings")]
     InvalidMetaData,
+    /// A row with `delivery_mode` IN_ORDER has no `key`.
+    #[error("ordered message has no key")]
+    OrderedMessageWithoutKey,
 }
 
 impl DecodeError {
@@ -166,15 +169,38 @@ pub struct Message<M> {
     pub payload: M,
     /// Stored as `meta_data`.
     pub metadata: MessageMetaData,
+    /// `Some` for an ordered message (Java's `OrderedMessage`): delivered after every message of the same queue and
+    /// key with a lower order has been handled.
+    pub order: Option<MessageOrder>,
+}
+
+/// The position of an ordered message within its key - the `key` and `key_order` columns.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MessageOrder {
+    /// Groups the messages that must be handled in sequence, e.g. an aggregate id.
+    pub key: String,
+    /// The sequence number within the key; must be 0 or larger, as in Java.
+    pub order: i64,
 }
 
 impl<M> Message<M> {
-    /// A message without metadata.
+    /// A normal, unordered message without metadata.
     pub fn new(payload: M) -> Self {
         Self {
             payload,
             metadata: MessageMetaData::new(),
+            order: None,
         }
+    }
+
+    /// Makes this an ordered message: handled after every message of the same queue and `key` with a lower `order`.
+    /// Ordering holds per node only, as in Java (see CONTRACT.md §4.2).
+    pub fn in_order(mut self, key: impl Into<String>, order: i64) -> Self {
+        self.order = Some(MessageOrder {
+            key: key.into(),
+            order,
+        });
+        self
     }
 
     /// Adds a metadata entry.
@@ -211,10 +237,21 @@ impl<M: QueueMessage> QueuedMessage<M> {
     pub(crate) fn decode(entry: QueueEntry) -> Result<Self, DecodeError> {
         let payload = M::from_payload(&entry.message_payload_type, entry.message_payload)?;
         let metadata = MessageMetaData::from_json(entry.meta_data)?;
+        let order = match entry.delivery_mode {
+            DeliveryMode::Normal => None,
+            DeliveryMode::InOrder => Some(MessageOrder {
+                key: entry.key.ok_or(DecodeError::OrderedMessageWithoutKey)?,
+                order: entry.key_order,
+            }),
+        };
         Ok(Self {
             id: entry.id,
             queue_name: entry.queue_name,
-            message: Message { payload, metadata },
+            message: Message {
+                payload,
+                metadata,
+                order,
+            },
             added_ts: entry.added_ts,
             delivery_ts: entry.delivery_ts,
             total_attempts: entry.total_attempts,

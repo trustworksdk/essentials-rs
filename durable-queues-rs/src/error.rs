@@ -24,6 +24,10 @@ pub enum DurableQueuesError {
         problems: Vec<String>,
     },
 
+    /// A message cannot be queued as it is, e.g. an ordered message with a negative order.
+    #[error("invalid message: {0}")]
+    InvalidMessage(&'static str),
+
     /// A payload could not be serialized to JSON while queueing.
     #[error("failed to serialize a message: {0}")]
     Serialization(#[from] serde_json::Error),

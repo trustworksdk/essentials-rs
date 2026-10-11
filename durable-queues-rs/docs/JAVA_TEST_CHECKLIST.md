@@ -14,7 +14,7 @@ per-consumer fetcher. Rust has one fetch loop per consumer, so each base test ma
 - **N/A:** tests a feature outside the experiment's scope; the note says which.
 
 Rust test files: `tests/java_ports.rs` (jp), `tests/consume.rs` (c), `tests/redelivery.rs` (r),
-`tests/edge_cases.rs` (e), `tests/schema.rs` (s), unit tests in `src/` (u).
+`tests/edge_cases.rs` (e), `tests/schema.rs` (s), `tests/ordered.rs` (o), unit tests in `src/` (u).
 
 ## foundation-test: DurableQueuesIT
 
@@ -23,8 +23,8 @@ Rust test files: `tests/java_ports.rs` (jp), `tests/consume.rs` (c), `tests/rede
 | `test_simple_enqueueing_and_afterwards_querying_queued_messages` | Reproduced (core) | c `queued_rows_have_the_shape_java_writes`, c `a_queued_message_is_delivered_with_its_metadata_and_removed_once_handled` | Row shape, counters, metadata and timestamps are checked. Java's query and admin API (`getQueueNames`, `getQueueNameFor`, counts, `getQueuedMessages`, `queryForMessagesSoonReadyForDelivery`, `purgeQueue`) is deferred by the experiment ("defer admin APIs, statistics"). |
 | `verify_queued_messages_are_dequeued_in_order` | Ported | jp `verify_queued_messages_are_dequeued_in_order` | The `getQueueNames` assertions are skipped (admin API). |
 | `verify_a_message_queues_as_a_dead_letter_message_is_marked_as_such_and_will_not_be_delivered_to_the_consumer` | Reproduced | jp `verify_a_message_queued_as_a_dead_letter_message_is_not_delivered` | `queueMessageAsDeadLetterMessage` is not ported; queue-then-mark gives the same row state. |
-| `verify_a_that_as_long_as_an_ordered_message_with_same_key_and_a_lower_key_order_exists_as_a_dead_letter_message…` | Phase 5 | | Ordered messages. |
-| `verify_hasOrderedMessageQueuedForKey` | Phase 5 | | Ordered messages. |
+| `verify_a_that_as_long_as_an_ordered_message_with_same_key_and_a_lower_key_order_exists_as_a_dead_letter_message…` | Reproduced | o `verify_that_an_ordered_dead_letter_blocks_its_key_until_it_is_resurrected` | Key1Msg3 is queued then marked as a dead letter before delivery starts, instead of being queued as one. Same 7-then-3 deliveries, with parallel 2. |
+| `verify_hasOrderedMessageQueuedForKey` | Reproduced | o `verify_has_ordered_message_queued_for_key` | Messages are acknowledged by consuming them instead of by hand. Dead letters count. Java's final `deleteMessage` step is not ported (no delete API). |
 | `verify_failed_messages_are_redelivered` | Ported | jp `verify_failed_messages_are_redelivered` | |
 | `verify_a_message_that_failed_too_many_times_is_marked_as_dead_letter_message_AND_the_message_can_be_resurrected` | Ported | jp `verify_a_message_that_failed_too_many_times_is_marked_as_dead_letter_message_and_can_be_resurrected` | 6 deliveries; the dead letter has total 6 and redelivery 5; resurrection gives a 7th delivery. |
 | `test_two_stage_redelivery_where_a_message_about_to_be_marked_as_a_deadletter_message_is_queued_with_a_redelivery_delay` | N/A | (r `a_resurrected_dead_letter_is_delivered_again_with_its_counters_kept` covers resurrection) | Built on a `DurableQueuesInterceptor` that resurrects inside `markAsDeadLetter`. Interceptors are not ported. |
@@ -43,8 +43,8 @@ Rust test files: `tests/java_ports.rs` (jp), `tests/consume.rs` (c), `tests/rede
 | `DuplicateConsumptionDurableQueuesIT.verify_no_duplicate_message_consumption` | Ported | jp `verify_no_duplicate_message_consumption` | 40 messages, 2 instances with their own pools, 1 s handlers, 10 s timeout, second instance 200 ms later; each message exactly once. |
 | `…_with_db_connectivity_issues` | Ported | jp `…_with_db_connectivity_issues` | Same pause. |
 | `DurableQueuesLoadIT.queue_a_large_number_of_messages` | Ported | jp `queue_a_large_number_of_messages` | 20 000 single-statement enqueues in one transaction, then more than 10 handled within 5 s. Java asserts exactly 20 000 queued although its consumer is already running; Rust asserts queued + handled = 20 000. |
-| `LocalOrderedMessagesDurableQueueIT.verify_queued_ordered_messages_are_dequeued_in_order_per_key` | Phase 5 | | |
-| `LocalOrderedMessagesRedeliveryDurableQueueIT.verify_…_even_if_some_messages_are_redelivered` | Phase 5 | | |
+| `LocalOrderedMessagesDurableQueueIT.verify_queued_ordered_messages_are_dequeued_in_order_per_key` | Ported | o `verify_queued_ordered_messages_are_dequeued_in_order_per_key` | 2000 messages, 45 keys, 20 parallel; per key, order i is the i-th handled. |
+| `LocalOrderedMessagesRedeliveryDurableQueueIT.verify_…_even_if_some_messages_are_redelivered` | Ported | o `verify_queued_ordered_messages_are_dequeued_in_order_per_key_even_if_some_messages_are_redelivered` | Java's failure rule (fail while the attempts trail a global counter, up to 5 redeliveries); no dead letters. |
 
 ## postgresql-queue module
 
@@ -55,9 +55,9 @@ Rust test files: `tests/java_ports.rs` (jp), `tests/consume.rs` (c), `tests/rede
 | `PostgresqlDurableQueuesTest.initializeWithDefaultTableName` / `…OverriddenTableName` / `…InvalidOverriddenTableName` | Ported | u `default_is_durable_queues`, u `rejects_the_names_java_tests_reject` | |
 | `PostgresqlDurableQueuesBuilderDefaultsTest.test_the_default_message_handling_timeout_is_thirty_seconds` | Ported | u `the_default_message_handling_timeout_is_thirty_seconds` | |
 | `PostgresqlDurableQueuesBuilderDefaultsTest.test_the_builder_needs_nothing_but_a_unitOfWorkFactory` | Reproduced | s, c (every test builds from a pool and the default config) | |
-| `PostgresqlDurableQueuesMixedBatchIT.*` (2 tests) | Phase 5 | | Batches mixing ordered and unordered messages. |
+| `PostgresqlDurableQueuesMixedBatchIT.*` (2 tests) | Ported | o `a_batch_starting_with_an_ordered_message_can_also_contain_unordered_messages`, o `a_batch_starting_with_an_unordered_message_can_also_contain_ordered_messages` | Also checks that the mixed queue drains. |
 | `CentralizedFetcherDurableQueueIT.test_multiple_queues_with_different_thread_configurations` | Ported | jp `test_multiple_queues_with_different_thread_configurations` | 1000 messages over three queues with 10/5/2 parallel; no message crosses queues. |
-| `CentralizedFetcherDurableQueueIT.verify_ordered_messages_are_processed_in_order` | Phase 5 | | |
+| `CentralizedFetcherDurableQueueIT.verify_ordered_messages_are_processed_in_order` | Ported | o `verify_ordered_messages_are_processed_in_order` | 10 keys × 20 orders, queued shuffled, 15 parallel, 10 ms per message. |
 | `BatchedFetchStrategyIT.*` (20 tests) | N/A | | Java's opt-in batched fetch (`useBatchedFetch`, off by default) is out of scope (CONTRACT.md §4.3). |
 | `DurableQueueMessageObserverIT.*` (5 tests) | N/A | | Message observer, statistics and admin API are deferred by the experiment. |
 | `LegacyQueueStatisticsRemovalIT.*` (3 tests) | N/A | | Java's 0.60 migration; Rust never drops or migrates schema (Phase 1 decision). |
@@ -79,8 +79,7 @@ Rust test files: `tests/java_ports.rs` (jp), `tests/consume.rs` (c), `tests/rede
 
 | Status | Java tests |
 |---|---|
-| Ported or reproduced | 23, plus the 5 edge cases from the plan |
-| Phase 5 (ordered messages) | 7 |
+| Ported or reproduced | 30, plus the 5 edge cases from the plan |
 | N/A, feature out of scope | 29: `test_two_stage_redelivery…` (interceptors), `BatchedFetchStrategyIT` (20), `DurableQueueMessageObserverIT` (5), `LegacyQueueStatisticsRemovalIT` (3) |
 | N/A, Java-only utilities and fixtures | `IOExceptionUtilTest`, `ImmutablePayloadSerializationTest`, `TestMessageFactoryTest`, `DurableLocalCommandBus*IT` (methods not counted) |
 | Phase 7 | the benchmark classes |

@@ -86,6 +86,9 @@ impl PostgresQueueStorage {
             .bind(entries.payloads)
             .bind(entries.payload_types)
             .bind(entries.meta_data)
+            .bind(entries.delivery_modes)
+            .bind(entries.keys)
+            .bind(entries.key_orders)
             .execute(executor)
             .await?
             .rows_affected())
@@ -105,15 +108,14 @@ impl QueueStorage for PostgresQueueStorage {
             .await
     }
 
-    /// Claims up to `limit` ready normal messages (CONTRACT.md §4.1). With `reset_stuck`, first returns this queue's
-    /// messages claimed before the threshold to the queue (§6) - in the same transaction, as Java's fetcher does.
-    #[tracing::instrument(name = "durable_queues.claim", level = "debug", skip_all, fields(table = %self.table_name, queue_name = %queue_name, limit, reset_stuck = reset_stuck.is_some()))]
-    async fn claim_unordered(
+    #[tracing::instrument(name = "durable_queues.claim", level = "debug", skip_all, fields(table = %self.table_name, queue_name = %queue_name, limit, reset_stuck = reset_stuck.is_some(), excluded_keys = exclude_keys.len(), ordered))]
+    async fn claim(
         &self,
         queue_name: &QueueName,
         limit: i64,
         now: DateTime<Utc>,
         reset_stuck: Option<StuckMessageReset>,
+        exclude_keys: &[String],
     ) -> Result<ClaimResult> {
         let mut tx = self.pool.begin().await?;
         let reset = match reset_stuck {
@@ -127,14 +129,39 @@ impl QueueStorage for PostgresQueueStorage {
                 .rows_affected(),
             None => 0,
         };
-        let claimed = sqlx::query_as(self.sql.claim_unordered.clone())
+        let mut claimed: Vec<QueueEntry> = sqlx::query_as(self.sql.claim_ordered.clone())
             .bind(queue_name.as_str())
             .bind(now)
             .bind(limit)
+            .bind(exclude_keys)
             .fetch_all(&mut *tx)
             .await?;
+        tracing::Span::current().record("ordered", claimed.len());
+        // Java's fetch: normal messages only when no ordered message could be claimed.
+        if claimed.is_empty() {
+            claimed = sqlx::query_as(self.sql.claim_unordered.clone())
+                .bind(queue_name.as_str())
+                .bind(now)
+                .bind(limit)
+                .fetch_all(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(ClaimResult { claimed, reset })
+    }
+
+    #[tracing::instrument(name = "durable_queues.has_ordered_message_queued_for_key", level = "debug", skip_all, fields(table = %self.table_name, queue_name = %queue_name))]
+    async fn has_ordered_message_queued_for_key(
+        &self,
+        queue_name: &QueueName,
+        key: &str,
+    ) -> Result<bool> {
+        let count: i64 = sqlx::query_scalar(self.sql.has_ordered_message_for_key.clone())
+            .bind(queue_name.as_str())
+            .bind(key)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count > 0)
     }
 
     /// Returns a failed message to the queue for redelivery at `next_delivery_ts`. `false` if the row is gone.

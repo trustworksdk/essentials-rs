@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use std::panic::AssertUnwindSafe;
@@ -143,6 +144,7 @@ impl QueueConsumer {
             config,
             message_handling_timeout,
             last_stuck_reset: None,
+            in_flight_keys: InFlightKeys::default(),
             cancel: cancel.clone(),
             _registration: registration,
             _message: PhantomData,
@@ -179,6 +181,43 @@ impl Drop for QueueConsumer {
     }
 }
 
+/// The ordering keys of the messages a consumer is handling. Java tracks the same set per node
+/// (`inProcessOrderedKeys`) and excludes it from its ordered claims.
+#[derive(Debug, Clone, Default)]
+struct InFlightKeys(Arc<Mutex<HashSet<String>>>);
+
+impl InFlightKeys {
+    fn snapshot(&self) -> Vec<String> {
+        self.0.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Marks `key` as in flight until the returned lease drops. `None` if it already is - which the claim's key
+    /// exclusion and per-key barrier rule out; it is handled rather than trusted.
+    fn lease(&self, key: &str) -> Option<KeyLease> {
+        let inserted = self.0.lock().unwrap().insert(key.to_owned());
+        if !inserted {
+            // A storage that ignores `exclude_keys` - not a reason to stop consuming.
+            error!("claimed an ordered message for a key already in flight on this node");
+        }
+        inserted.then(|| KeyLease {
+            keys: self.clone(),
+            key: key.to_owned(),
+        })
+    }
+}
+
+/// Keeps an ordering key in flight; held by the delivery task until its message is settled.
+struct KeyLease {
+    keys: InFlightKeys,
+    key: String,
+}
+
+impl Drop for KeyLease {
+    fn drop(&mut self) {
+        self.keys.0.lock().unwrap().remove(&self.key);
+    }
+}
+
 struct Fetcher<M, H, S> {
     storage: S,
     handler: Arc<H>,
@@ -190,6 +229,8 @@ struct Fetcher<M, H, S> {
     /// Java's `messageHandlingTimeout`: a message claimed longer ago than this is considered stuck.
     message_handling_timeout: Duration,
     last_stuck_reset: Option<Instant>,
+    /// Ordering keys of the ordered messages this consumer is handling - excluded from its claims, as in Java.
+    in_flight_keys: InFlightKeys,
     cancel: CancellationToken,
     _registration: ConsumerRegistration,
     _message: PhantomData<fn() -> M>,
@@ -217,9 +258,10 @@ impl<M: QueueMessage, H: MessageHandler<M>, S: QueueStorage> Fetcher<M, H, S> {
             let wanted = slots.num_permits();
             let now = Utc::now();
             let reset_stuck = self.stuck_message_reset_due(now);
+            let exclude_keys = self.in_flight_keys.snapshot();
             let claimed = match self
                 .storage
-                .claim_unordered(&queue_name, wanted as i64, now, reset_stuck)
+                .claim(&queue_name, wanted as i64, now, reset_stuck, &exclude_keys)
                 .await
             {
                 Ok(result) => {
@@ -249,12 +291,17 @@ impl<M: QueueMessage, H: MessageHandler<M>, S: QueueStorage> Fetcher<M, H, S> {
                     redelivery_attempts = entry.redelivery_attempts,
                     outcome = field::Empty,
                 );
+                let key = entry
+                    .key
+                    .as_deref()
+                    .and_then(|key| self.in_flight_keys.lease(key));
                 let delivery = deliver(
                     self.storage.clone(),
                     self.handler.clone(),
                     self.redelivery_policy.clone(),
                     entry,
                     slot,
+                    key,
                 );
                 in_flight.spawn(delivery.instrument(span));
             }
@@ -344,6 +391,7 @@ async fn deliver<M: QueueMessage, H: MessageHandler<M>, S: QueueStorage>(
     redelivery_policy: Arc<RedeliveryPolicy>,
     entry: QueueEntry,
     _slot: OwnedSemaphorePermit,
+    _key: Option<KeyLease>,
 ) {
     let id = entry.id.clone();
     let payload_type = entry.message_payload_type.clone();

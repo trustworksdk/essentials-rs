@@ -203,8 +203,20 @@ A row that fails to deserialize is dead-lettered with `markAsDeadLetterMessageDi
 The traditional consumer (`getNextMessageReadyForDelivery`) does the same with `limit = 1`, plus a per-queue stuck
 reset (§6).
 
-**Rust implication:** with no ordered support (before Phase 5), only claim 4.1 is run. Rust then never claims an
-`IN_ORDER` row, so Java's ordering stays intact on a shared queue.
+**Rust (Phase 5):** `QueueStorage::claim` runs the same sequence in one transaction: stuck reset, the ordered claim
+excluding this consumer's in-flight keys, then the unordered claim only if the ordered one returned nothing. The
+in-flight key set is per consumer, as Java's is per node. The key exclusion is written `AND NOT (key = ANY($4))`,
+which also covers the empty list Java leaves out.
+
+**What carries the ordering guarantee (verified by mutation tests):**
+- **The per-key barrier (`NOT EXISTS` a lower `key_order`)** keeps a key's messages in sequence. A later order
+  cannot be claimed while any earlier row of the key exists, whether it is being delivered, waiting for a retry, or
+  a dead letter. Because the barrier lives in the database, this also holds across nodes.
+- **The in-flight key exclusion** matters when a handler outlives `messageHandlingTimeout`. Stuck-message recovery
+  then returns the head row to the queue while its handler still runs, and the barrier does not stop a head. The
+  exclusion keeps that node from claiming it again and running the key twice at once. Another node does not have
+  the key in its exclusion list, so it can redeliver the head. That is a per-key duplicate across nodes, and it is
+  why Java documents ordering as per node unless a single global consumer is used.
 
 ## 5. Handler outcome → SQL (each in its own transaction, after the claim transaction committed)
 

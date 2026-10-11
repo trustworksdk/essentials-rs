@@ -7,10 +7,10 @@ use sqlx::PgConnection;
 
 use crate::consumer::{ConsumerConfig, MessageHandler, QueueConsumer};
 use crate::error::{DurableQueuesError, Result};
-use crate::message::{Message, QueueMessage};
+use crate::message::{Message, MessageOrder, QueueMessage};
 use crate::storage::postgres::PostgresQueueStorage;
 use crate::storage::{NewEntries, QueueEntry, QueueStorage, QueueingSortOrder};
-use crate::types::{QueueEntryId, QueueName};
+use crate::types::{DeliveryMode, QueueEntryId, QueueName};
 
 /// Queues messages and runs consumers on one [`QueueStorage`] - the Rust counterpart of Java's `DurableQueues`.
 /// Cheap to clone; clones share the same consumers.
@@ -147,6 +147,18 @@ impl<S: QueueStorage> DurableQueues<S> {
             .await
     }
 
+    /// Whether `queue_name` holds any ordered message for `key`, dead letters included - Java's
+    /// `hasOrderedMessageQueuedForKey`.
+    pub async fn has_ordered_message_queued_for_key(
+        &self,
+        queue_name: &QueueName,
+        key: &str,
+    ) -> Result<bool> {
+        self.storage
+            .has_ordered_message_queued_for_key(queue_name, key)
+            .await
+    }
+
     /// Dead-letters a message by hand. `None` if it does not exist or already is a dead letter.
     pub async fn mark_as_dead_letter_message(
         &self,
@@ -199,6 +211,18 @@ fn new_entries<M: QueueMessage>(
     let mut entries = NewEntries::default();
     let mut ids = Vec::with_capacity(messages.len());
     for message in messages {
+        let (delivery_mode, key, key_order) = match &message.order {
+            None => (DeliveryMode::Normal, None, -1),
+            Some(MessageOrder { key, order }) => {
+                // Java: "An OrderedMessage requires an order >= 0".
+                if *order < 0 {
+                    return Err(DurableQueuesError::InvalidMessage(
+                        "an ordered message requires an order >= 0",
+                    ));
+                }
+                (DeliveryMode::InOrder, Some(key.clone()), *order)
+            }
+        };
         let id = QueueEntryId::random();
         entries.ids.push(id.as_str().to_owned());
         entries.payloads.push(message.payload.to_payload()?);
@@ -206,6 +230,11 @@ fn new_entries<M: QueueMessage>(
             .payload_types
             .push(message.payload.payload_type().to_owned());
         entries.meta_data.push(message.metadata.to_json());
+        entries
+            .delivery_modes
+            .push(delivery_mode.as_str().to_owned());
+        entries.keys.push(key);
+        entries.key_orders.push(key_order);
         ids.push(id);
     }
     Ok((entries, ids))

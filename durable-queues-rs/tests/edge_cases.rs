@@ -53,15 +53,26 @@ impl QueueStorage for FailingAcknowledgements {
             .await
     }
 
-    async fn claim_unordered(
+    async fn claim(
         &self,
         queue_name: &QueueName,
         limit: i64,
         now: DateTime<Utc>,
         reset_stuck: Option<StuckMessageReset>,
+        exclude_keys: &[String],
     ) -> Result<ClaimResult> {
         self.inner
-            .claim_unordered(queue_name, limit, now, reset_stuck)
+            .claim(queue_name, limit, now, reset_stuck, exclude_keys)
+            .await
+    }
+
+    async fn has_ordered_message_queued_for_key(
+        &self,
+        queue_name: &QueueName,
+        key: &str,
+    ) -> Result<bool> {
+        self.inner
+            .has_ordered_message_queued_for_key(queue_name, key)
             .await
     }
 

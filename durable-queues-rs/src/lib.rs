@@ -18,7 +18,7 @@ pub use durable_queues::DurableQueues;
 pub use error::{DurableQueuesError, Result};
 pub use message::{
     BoxError, DecodeError, HandlerError, MANUALLY_REQUESTED_REDELIVERY, Message, MessageMetaData,
-    MessageType, QueueMessage, QueuedMessage,
+    MessageOrder, MessageType, QueueMessage, QueuedMessage,
 };
 pub use polling::PollingBackoff;
 pub use redelivery::RedeliveryPolicy;
