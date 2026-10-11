@@ -1,14 +1,14 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Rust port of the Trustworks Essentials PostgreSQL Durable Queues, schema- and behaviour-compatible with
+//! Essentials 0.60.0. `docs/CONTRACT.md` is the behaviour this crate reproduces.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod error;
+mod storage;
+mod table_name;
+mod types;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use error::{DurableQueuesError, Result};
+pub use storage::postgres::{
+    PostgresQueueStorage, PostgresQueueStorageConfig, QueueEntry, SchemaOwnership,
+};
+pub use table_name::{MAX_IDENTIFIER_LENGTH, TableName};
+pub use types::{DeliveryMode, QueueEntryId, QueueName, UnknownDeliveryMode};
