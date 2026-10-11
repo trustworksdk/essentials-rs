@@ -1,0 +1,13 @@
+{
+  "worktree": {
+    "baseRef": "head"
+  },
+  "extraKnownMarketplaces": {
+    "trustworks-plugins": {
+      "source": {
+        "source": "directory",
+        "path": "/opt/claude-seed/marketplaces/trustworks-plugins"
+      }
+    }
+  }
+}

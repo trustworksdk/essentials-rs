@@ -1,0 +1,27 @@
+# PostgreSQL for local development, run through Docker-in-Docker inside the
+# devcontainer. Start:  docker compose -f docker-compose.postgres.yml up -d
+# Connection:           postgresql://postgres:postgres@localhost:5432/app_db
+# Testcontainers-based tests start their own database and do not need this.
+services:
+  postgres:
+    image: postgres:18
+    container_name: essentials-rs-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app_db
+    ports:
+      - "5432:5432"
+    volumes:
+      # PostgreSQL 18+ images keep data under /var/lib/postgresql/<major>/,
+      # so the volume mounts one level up from the pre-18 /var/lib/postgresql/data.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

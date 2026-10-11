@@ -1,0 +1,28 @@
+# --- devcontainer line-ending policy ---
+# Default: detect text, normalize to LF (the devcontainer runs everything in Linux)
+* text=auto eol=lf
+
+# Shell scripts and makefiles must stay LF or they break inside the container
+*.sh     text eol=lf
+*.bash   text eol=lf
+Makefile text eol=lf
+*.mk     text eol=lf
+
+# Windows-native scripts keep CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Explicit binary (git usually autodetects; this is a safeguard)
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.wasm  binary

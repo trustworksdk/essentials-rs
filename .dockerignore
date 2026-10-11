@@ -1,0 +1,67 @@
+# =============================================================================
+# .dockerignore — Exclude from Docker build context
+# Dramatically reduces build time by not sending large directories to the daemon.
+# =============================================================================
+
+# Version control
+.git
+.gitignore
+
+# Node.js
+node_modules
+.npm
+.yarn
+.pnp.*
+
+# Python
+__pycache__
+*.pyc
+.venv
+venv
+.mypy_cache
+.pytest_cache
+.ruff_cache
+
+# Rust (cargo build output)
+target
+**/target
+**/*.rs.bk
+
+# Build outputs
+dist
+build
+out
+.next
+.nuxt
+
+# IDE and editor
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code settings/memory (not needed in build context)
+.claude
+
+# Plugin marketplace git metadata (cloned repos — content needed, git history is not)
+.devcontainer/.plugin-marketplace/**/.git
+
+# CodeGraph index (lives on a container volume)
+.codegraph
+
+# Docker (prevent recursive context)
+.devcontainer/scripts/__pycache__
+
+# Misc large files
+*.zip
+*.tar.gz
+*.tgz
+*.log
+coverage
+.coverage
+htmlcov

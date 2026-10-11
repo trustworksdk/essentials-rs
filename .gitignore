@@ -1,0 +1,16 @@
+# --- devcontainer ---
+# Plugin marketplace repos cloned on the host by fetch-marketplaces.sh
+.devcontainer/.plugin-marketplace/
+# Per-developer git identity (copy .devcontainer/.env.local.example)
+.devcontainer/.env.local
+# Claude Code: personal settings and agent worktrees
+.claude/settings.local.json
+.claude/worktrees/
+# CodeGraph index (lives on a container volume)
+.codegraph/
+
+# Rust build output (workspace-level)
+/target/
+
+# OS
+.DS_Store

@@ -1,0 +1,444 @@
+{
+    "name": "essentials-rs",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".",
+        "args": {
+            // Project identity — used for container naming and Docker labels
+            "PROJECT_NAME": "essentials-rs",
+
+            // Installation toggles (true/false)
+            "INSTALL_CLAUDE": "true",
+            // Rust toolchain (rustup-managed: cargo, rustfmt, clippy, rust-analyzer).
+            "INSTALL_RUST": "true",
+            // WASM / full-stack add-on: wasm32-unknown-unknown target + trunk +
+            // cargo-leptos + binaryen. Requires INSTALL_RUST=true. Leave "false"
+            // unless this is a Leptos/Yew/WASM web project — the first build
+            // compiles trunk + cargo-leptos from source (~3 min each, then cached).
+            "INSTALL_RUST_WASM": "false",
+            "INSTALL_GITNEXUS": "false",
+            // CodeGraph — knowledge-graph indexer.
+            // MUTUALLY EXCLUSIVE with INSTALL_GITNEXUS / INSTALL_GRAPHIFY. At most
+            // one indexer "true"; all "false" skips indexer install entirely.
+            "INSTALL_CODEGRAPH": "true",
+            "ALLOW_NPM_SCRIPTS": "true",
+
+            // JetBrains Gateway support
+            "INSTALL_JETBRAINS": "true",
+
+            // Docs pipeline (Sphinx + sphinx-needs + PlantUML + Graphviz).
+            // Enable when the project uses the trustworks-plugins methodology
+            // plugins that render diagrams via `make -C docs html` — refac, arch,
+            // discovery, sdd, workspace. Installs graphviz (~5 MB), pandoc
+            // (rst → MyST for /discovery:adopt), fonts-dejavu-core, and
+            // default-jre-headless. Python packages are NOT installed in the
+            // image — each plugin's /setup-docs creates docs/.venv/ and
+            // pip-installs them on demand. Sphinx 9.1 needs Python 3.12+: keep
+            // the Python feature below at 3.12 or newer.
+            "INSTALL_DOCS_PIPELINE": "false",
+
+            // In-repo build directories kept on container volumes instead of the
+            // bind-mounted checkout (space-separated paths relative to /workspace,
+            // e.g. "target" for the Cargo workspace). On macOS the bind mount costs
+            // milliseconds per file operation, and these directories churn many
+            // small files. The Dockerfile pre-creates each path owned by vscode so
+            // the volume inherits that ownership. Every path here needs a matching
+            // "In-repo build directories" line under mounts. "" = off.
+            "BUILD_DIR_VOLUMES": "",
+
+            // Docker Content Trust (image signature verification)
+            // Enable only if all images you pull are signed with Notary v1.
+            // Most Docker Hub/GHCR images are NOT signed — enabling this will break pulls.
+            "ENABLE_DCT": "false",
+
+            // Git identity is in containerEnv (not here) to avoid leaking PII into image layers.
+
+            // Rust toolchain channel (stable / beta / nightly). Passed to rustup.
+            "RUST_TOOLCHAIN": "stable",
+
+            // JetBrains IDE backend — for reference/scripts only.
+            // To change the actual IDE, edit customizations.jetbrains.backend below.
+            "JETBRAINS_BACKEND": "IntelliJ"
+        }
+    },
+    "workspaceFolder": "/workspace",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
+
+    // ==========================================================================
+    // DevContainer Features
+    // ==========================================================================
+    "features": {
+        // Docker-in-Docker support for Testcontainers and container workflows.
+        // Needs --privileged (see runArgs), and membership of the docker group is
+        // root-equivalent: anything in the container can become root through it.
+        // moby: false → installs Docker CE from download.docker.com instead of Microsoft's
+        // Moby packages. Required on Debian trixie+ (Moby packages removed from trixie).
+        "ghcr.io/devcontainers/features/docker-in-docker:2": {
+            "version": "latest",
+            "moby": false,
+            "dockerDashComposeVersion": "v2"
+        },
+        // Node.js via DevContainer feature.
+        // nodeGypDependencies: true → ensures gcc/g++/make/python3 are available for
+        // native npm addons (bcrypt, sharp, sqlite3, better-sqlite3, canvas, etc.).
+        // Cost is minimal since Dockerfile already installs build-essential.
+        "ghcr.io/devcontainers/features/node:1": {
+            "version": "24",
+            "nodeGypDependencies": true
+        },
+        // Python via DevContainer feature
+        "ghcr.io/devcontainers/features/python:1": {
+            "version": "3.14",
+            "installTools": true
+        }
+    },
+
+    // ==========================================================================
+    // User Configuration
+    // ==========================================================================
+    "remoteUser": "vscode",
+    // Start the container (PID 1) as root; lifecycle commands, terminals and the
+    // IDE still run as remoteUser. Do not remove it:
+    // - The Docker-in-Docker entrypoint starts dockerd with `sudo` unless it runs
+    //   as root, and vscode has no sudo (see the Dockerfile's sudo block).
+    // - If the egress firewall is added later, init-firewall.sh reads its
+    //   allow-list from PID 1's environment and ignores a non-root PID 1 (a PID 1
+    //   running as vscode can have its memory rewritten by any vscode process).
+    "containerUser": "root",
+
+    // ==========================================================================
+    // Environment Variables
+    // ==========================================================================
+    "containerEnv": {
+        "LANG": "en_US.UTF-8",
+        "LANGUAGE": "en_US:en",
+        "LC_ALL": "en_US.UTF-8",
+        // JetBrains remote development
+        "JETBRAINS_REMOTE_DEV_NON_INTERACTIVE": "1",
+        // Timezone — follows the host's TZ environment variable at container start
+        "TZ": "${localEnv:TZ}",
+        // Optional host-side overrides for the local-worker plugin, passed through
+        // from your host shell. Empty means the plugin auto-detects the backend.
+        "LOCAL_WORKER_BASE_URL": "${localEnv:LOCAL_WORKER_BASE_URL}",
+        "LOCAL_WORKER_MODEL": "${localEnv:LOCAL_WORKER_MODEL}",
+        "LOCAL_WORKER_API_KEY": "${localEnv:LOCAL_WORKER_API_KEY}",
+        // Git identity — each developer creates .devcontainer/.env.local
+        // (gitignored, see .env.local.example) which post-create.sh sources
+        // before running `git config --global`. Left empty here so the vars
+        // exist in the container environment; .env.local supplies the values.
+        "GIT_USER_NAME": "",
+        "GIT_USER_EMAIL": "",
+        // Development
+        "NODE_ENV": "development",
+        // Telemetry opt-out. CodeGraph is telemetry default-on and posts events to
+        // telemetry.getcodegraph.com (→ PostHog, US). Per its docs it shares only
+        // anonymous aggregates — random local machine_id, version, OS/arch, Node
+        // major, CI flag, plus install/index/daily-usage/uninstall events (language
+        // names, coarse file-count & duration buckets, per-tool call counts) — and
+        // explicitly NOT source code, file/dir/repo names or paths, symbol names,
+        // search queries, IPs, hostnames, usernames, emails, or env vars. Restrained,
+        // but default-on to a managed backend, so we disable it in all Trustworks containers.
+        // These vars disable it for every process in the container — including the
+        // `codegraph serve --mcp` server Claude Code spawns and the `codegraph init --yes`
+        // run in post-create.sh. CODEGRAPH_TELEMETRY=0 is CodeGraph-specific; DO_NOT_TRACK=1
+        // is the cross-tool opt-out standard (https://consoledonottrack.com).
+        // post-create.sh also runs `codegraph telemetry off` as a third, persisted
+        // opt-out ("off means off" — no events recorded, no connection opened, no opt-out ping).
+        "CODEGRAPH_TELEMETRY": "0",
+        "DO_NOT_TRACK": "1",
+        // CodeGraph also background-checks GitHub for a newer release from the
+        // long-lived `codegraph serve --mcp` process (>= 1.5.0). DO_NOT_TRACK=1
+        // already suppresses it; this is the dedicated switch, pinned explicitly so
+        // the opt-out does not rest on one incidental var.
+        // NOTE (not an env var): `codegraph install` / `codegraph upgrade` offer a
+        // one-time Pro beta-waitlist prompt that POSTs an email to
+        // getcodegraph.com/api/waitlist. Strictly opt-in, and post-create.sh never
+        // runs either command, so the bootstrap cannot trigger it — but do not
+        // answer it if you run those commands by hand.
+        "CODEGRAPH_NO_UPDATE_CHECK": "1",
+        // Native LSP layer: enable Claude Code's built-in LSP tool (semantic
+        // go-to-definition / find-references / diagnostics). Auto-on for recent
+        // Claude Code (≥ 2.1.50); setting it explicitly is harmless and covers
+        // earlier builds. post-create.sh registers per-language LSP plugins from
+        // the official marketplace only when this is "1".
+        "ENABLE_LSP_TOOL": "1",
+        // Plugin marketplace seed directory — populated at runtime by a live
+        // bind-mount of .devcontainer/.plugin-marketplace (see mounts below).
+        // initializeCommand refreshes the host clone on every start, so the
+        // seed is always current without a rebuild. No runtime auth needed.
+        "CLAUDE_CODE_PLUGIN_SEED_DIR": "/opt/claude-seed",
+        // Claude Code authentication — long-lived OAuth token, propagated from the host.
+        // Generate once on the host with `claude setup-token`, export it in your shell,
+        // then rebuild the container. If unset, falls back to interactive login inside
+        // the container (run `claude` there — it offers a paste-code flow that
+        // works without a localhost callback).
+        "CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN}",
+        // Claude Code telemetry beyond DO_NOT_TRACK. DO_NOT_TRACK=1 (above) already
+        // turns off Claude Code's usage metrics, error reports and session surveys;
+        // these two say so explicitly, so the opt-out survives a session launched
+        // without DO_NOT_TRACK (claude-rc on Claude Code < 2.1.283 — see
+        // scripts/claude-rc.sh). Error reports (Pro/Max sign-ins, v2.1.198+) go to
+        // a third-party error tracker; neither switch affects feature flags, so
+        // Remote Control keeps working. DISABLE_ERROR_REPORTING reads only "set or
+        // not" ("0" still opts out) — delete the line to opt back in.
+        "DISABLE_ERROR_REPORTING": "1",
+        "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+        // Claude Code — auto permission mode. "true" has post-create.sh merge
+        // permissions.defaultMode="auto" into the USER settings file
+        // (~/.claude/settings.json) on every container start. This is the only
+        // supported way to set auto mode: as of Claude Code v2.1.142 the "auto" value
+        // is IGNORED in project .claude/settings.json (a repo cannot grant itself auto
+        // mode). Best-effort — it also needs an eligible account (Claude Code
+        // v2.1.83+); an ineligible session silently starts in "default" mode.
+        // Note: autoMode.environment (trusted infrastructure) belongs in
+        // .claude/settings.local.json (gitignored), NOT .claude/settings.json.
+        "CLAUDE_DEFAULT_MODE_AUTO": "true",
+        // Claude Code — status line. "true" has post-create.sh register
+        // .devcontainer/scripts/statusline.sh as the footer in the USER settings
+        // file (~/.claude/settings.json), rendering:
+        //   <model>[:effort] [⚡fast] │ <used>/<window> (<pct>%) │ ⎇ <branch> │ <dir>
+        // USER scope on purpose: project settings WIN over user settings, so a
+        // tracked statusLine would silently replace whatever footer each
+        // contributor already chose. post-create.sh never overwrites an existing
+        // statusLine. Claude Code has no built-in setting for model/context in
+        // the footer — statusLine is the only supported route.
+        "CLAUDE_STATUSLINE": "true",
+        // EXPERIMENTAL: These flags enable preview features in Claude Code.
+        // They may change semantics or be removed without notice across CLI versions.
+        // If Claude Code behaves unexpectedly, try removing these first.
+        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+        "CLAUDE_CODE_ENABLE_TASKS": "true",
+        "CLAUDE_CODE_FORK_SUBAGENT": "1"
+    },
+
+    // Environment for remoteUser's processes only (lifecycle commands, terminals,
+    // the IDE), not for the container's root processes. UV_CACHE_DIR must stay
+    // here, never in containerEnv or a Dockerfile ENV: a root-context `uv` run
+    // would otherwise write root-owned entries into the cache volume and break
+    // every `uv` command for vscode, across rebuilds. post-create.sh sets the
+    // same default for a tool that does not pass remoteEnv on.
+    "remoteEnv": {
+        "UV_CACHE_DIR": "/home/vscode/.uv-cache"
+    },
+
+    // ==========================================================================
+    // Volume Mounts for Caching
+    // Named volumes persist across container rebuilds.
+    // ${devcontainerId} scopes volumes per devcontainer instance.
+    // ==========================================================================
+    "mounts": [
+        // Node.js/NPM
+        "source=devcontainer-npm-cache-${devcontainerId},target=/home/vscode/.npm,type=volume",
+        // Rust/Cargo — cache the crate registry, git deps, the compiled toolchain
+        // binaries (~/.cargo/bin), and the rustup toolchain (~/.rustup, ~200 MB —
+        // persisted so it isn't re-downloaded each rebuild).
+        "source=devcontainer-cargo-registry-${devcontainerId},target=/home/vscode/.cargo/registry,type=volume",
+        "source=devcontainer-cargo-git-${devcontainerId},target=/home/vscode/.cargo/git,type=volume",
+        "source=devcontainer-cargo-bin-${devcontainerId},target=/home/vscode/.cargo/bin,type=volume",
+        "source=devcontainer-rustup-${devcontainerId},target=/home/vscode/.rustup,type=volume",
+        // Python/UV/pip. The uv cache volume name carries "-v2": the old
+        // devcontainer-uv-cache-* volume could hold root-owned entries (see
+        // remoteEnv), and mounting it at a new path would keep them.
+        "source=devcontainer-uv-cache-v2-${devcontainerId},target=/home/vscode/.uv-cache,type=volume",
+        "source=devcontainer-pip-cache-${devcontainerId},target=/home/vscode/.cache/pip,type=volume",
+
+        // Claude Code config and cache (named volumes — NOT bind-mounted to avoid host-path conflicts)
+        "source=devcontainer-claude-config-${devcontainerId},target=/home/vscode/.claude,type=volume",
+        "source=devcontainer-claude-cache-${devcontainerId},target=/home/vscode/.cache/claude-code,type=volume",
+
+        // Plugin marketplace seed — LIVE bind-mount of the host clone that
+        // fetch-marketplaces.sh (initializeCommand) refreshes on every start.
+        // Bind-mounting (instead of a Dockerfile COPY) means every container
+        // START picks up the latest plugin versions — no rebuild required.
+        // The host directory is populated on the host with host git credentials,
+        // so no credentials enter the container. readonly: the container only reads it.
+        "source=${localWorkspaceFolder}/.devcontainer/.plugin-marketplace,target=/opt/claude-seed/marketplaces,type=bind,readonly",
+
+        // .devcontainer/ is READ-ONLY inside the container. The workspace mount is
+        // writable, and this directory holds what runs outside the container's
+        // control: initializeCommand runs scripts/fetch-marketplaces.sh ON THE HOST
+        // at every start, devcontainer.json decides mounts and runArgs, and
+        // .plugin-marketplace/ is the clone behind the read-only seed above (a
+        // write through /workspace reached /opt/claude-seed). Edit these files on
+        // the host. Keep the target in step with workspaceMount's target.
+        "source=${localWorkspaceFolder}/.devcontainer,target=/workspace/.devcontainer,type=bind,readonly",
+
+        // In-repo build directories (only with BUILD_DIR_VOLUMES) — one line per
+        // path in that build arg, same path, volume name derived from it.
+
+        // CodeGraph knowledge graph index (persists across rebuilds)
+        "source=devcontainer-codegraph-${devcontainerId},target=/workspace/.codegraph,type=volume",
+
+        // JetBrains caches
+        "source=devcontainer-jetbrains-remote-${devcontainerId},target=/home/vscode/.cache/JetBrains/RemoteDev,type=volume",
+        "source=devcontainer-jetbrains-config-${devcontainerId},target=/home/vscode/.config/JetBrains,type=volume",
+        "source=devcontainer-jetbrains-cache-${devcontainerId},target=/home/vscode/.cache/JetBrains,type=volume",
+        "source=devcontainer-jetbrains-share-${devcontainerId},target=/home/vscode/.local/share/JetBrains,type=volume"
+    ],
+
+    // ==========================================================================
+    // Resource Limits & Security
+    // ==========================================================================
+    // What the resource tier expects of the machine. Advisory, not a limit:
+    // tools may warn when the host falls short; nothing is capped. Keep "memory"
+    // equal to --memory below and "cpus" at the tier's CPU count.
+    "hostRequirements": {
+        "cpus": 4,
+        "memory": "8gb"
+    },
+    "runArgs": [
+        "--name", "essentials-rs-devcontainer",
+        // Make the developer's machine reachable at host.docker.internal. Docker
+        // Desktop (macOS/Windows) provides this alias automatically; Docker CE on
+        // Linux does NOT, and without this flag a host-side LLM server (and any
+        // other host service) is unreachable by name. Harmless where the alias
+        // already exists. The host service must bind 0.0.0.0, not loopback.
+        "--add-host=host.docker.internal:host-gateway",
+        // No --cpus on purpose: Docker refuses to create the container when N exceeds
+        // the CPUs of the Docker host ("Range of CPUs is from 0.01 to 4.00"), so one
+        // value cannot fit every team member's machine. The CPU expectation lives in
+        // hostRequirements instead. --memory has no such check.
+        "--memory=8g",
+        "--pids-limit=2048",
+        // Docker-in-Docker needs privileged mode, which disables AppArmor, seccomp
+        // and capability restrictions.
+        "--privileged"
+    ],
+
+    // ==========================================================================
+    // Port Forwarding
+    // ==========================================================================
+    "forwardPorts": [],
+    "otherPortsAttributes": {
+        "onAutoForward": "notify"
+    },
+    "portsAttributes": {
+        "3000": { "label": "Node.js App", "onAutoForward": "notify" },
+        "5432": { "label": "PostgreSQL", "onAutoForward": "silent" },
+        "8000": { "label": "Python App", "onAutoForward": "notify" },
+        "8080": { "label": "HTTP (generic)", "onAutoForward": "notify" },
+        "9229": { "label": "Node.js Debug", "onAutoForward": "silent" },
+        "63342": { "label": "JetBrains Server", "onAutoForward": "silent" }
+    },
+
+    // ==========================================================================
+    // IDE Customizations
+    // ==========================================================================
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                // Core
+                "github.copilot"
+                ,"github.copilot-chat"
+                ,"ms-azuretools.vscode-docker"
+                ,"anthropic.claude-code"
+                // Node.js/TypeScript
+                ,"ms-vscode.vscode-typescript-next"
+                ,"dbaeumer.vscode-eslint"
+                ,"esbenp.prettier-vscode"
+                // Rust
+                ,"rust-lang.rust-analyzer"
+                ,"tamasfe.even-better-toml"
+                // Python
+                ,"ms-python.python"
+                ,"ms-python.vscode-pylance"
+                ,"charliermarsh.ruff"
+                // Database
+                //,"mtxr.sqltools"
+                //,"mtxr.sqltools-driver-pg"
+            ],
+            "settings": {
+                // Editor
+                "editor.formatOnSave": true,
+                "editor.tabCompletion": "on",
+                "editor.suggestSelection": "first",
+                "editor.codeActionsOnSave": {
+                    "source.organizeImports": "explicit"
+                },
+                // Terminal
+                "terminal.integrated.defaultProfile.linux": "bash",
+                // Claude Code agent worktrees: `isolation: "worktree"` subagents check out
+                // full copies of the repo under .claude/worktrees/<agent>/. Keep the IDE's
+                // file watcher and search out of them — otherwise every parallel agent's
+                // half-written files surface as diagnostics and duplicate search hits.
+                // NOTE: these are object-valued settings — VS Code REPLACES the shipped
+                // default rather than merging into it, so the defaults are restated here.
+                // Anything dropped from these lists stops being excluded.
+                "files.watcherExclude": {
+                    "**/.git/objects/**": true,
+                    "**/.git/subtree-cache/**": true,
+                    "**/.hg/store/**": true,
+                    "**/node_modules/*/**": true,
+                    "**/.claude/worktrees/**": true
+                },
+                "search.exclude": {
+                    "**/node_modules": true,
+                    "**/bower_components": true,
+                    "**/*.code-search": true,
+                    "**/.claude/worktrees": true
+                },
+                // Python settings
+                // The Python feature's own stable path — no root-owned symlink needed.
+                "python.defaultInterpreterPath": "/usr/local/python/current/bin/python",
+                "[python]": {
+                    "editor.defaultFormatter": "charliermarsh.ruff"
+                },
+                // Rust settings (rust-analyzer) — run clippy on save instead of plain check
+                "rust-analyzer.check.command": "clippy",
+                "[rust]": {
+                    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+                },
+                // TypeScript settings
+                "[typescript]": {
+                    "editor.defaultFormatter": "esbenp.prettier-vscode"
+                },
+                "[javascript]": {
+                    "editor.defaultFormatter": "esbenp.prettier-vscode"
+                },
+                // Telemetry (disabled)
+                "telemetry.telemetryLevel": "off"
+            }
+        },
+        // JetBrains Gateway configuration
+        // Change "backend" to "Rider" for .NET, "WebStorm" for JS/TS
+        "jetbrains": {
+            "gateway": {
+                "enabled": true
+            },
+            "backend": "IntelliJ"
+        }
+    },
+
+    // ==========================================================================
+    // Lifecycle Scripts
+    // ==========================================================================
+    // Runs on the HOST before every container start. Clones/updates plugin
+    // marketplace repos using the developer's local git credentials — credentials
+    // never enter the container. The clone is live bind-mounted to
+    // /opt/claude-seed/marketplaces (see mounts), so every START — not just a
+    // rebuild — picks up the latest plugin versions.
+    //
+    // The leading `mkdir -p` is REQUIRED and must run before anything else: the
+    // readonly bind mount of .devcontainer/.plugin-marketplace fails the container
+    // CREATE with "bind source path does not exist" when the directory is missing,
+    // so an empty directory is always created as a fallback. The script itself is
+    // then guarded — if a developer removed it, or it lives outside the repo, the
+    // container still starts; it just runs without a pre-seeded marketplace.
+    //
+    // Keep the ARRAY form. A string is handed to the host's shell — /bin/sh on
+    // macOS/Linux, but `cmd.exe /c` on Windows, which cannot parse this POSIX
+    // line and aborts the start before Docker is contacted. The array names the
+    // interpreter itself. Use `sh`, not `bash`: on Windows System32\bash.exe (the
+    // WSL launcher) comes first on PATH, while `sh` resolves only to Git for
+    // Windows — whose Git\bin must be on PATH (see README "Windows hosts").
+    "initializeCommand": [
+        "sh",
+        "-c",
+        "mkdir -p .devcontainer/.plugin-marketplace; if [ -f .devcontainer/scripts/fetch-marketplaces.sh ]; then bash .devcontainer/scripts/fetch-marketplaces.sh; else echo 'ℹ️  .devcontainer/scripts/fetch-marketplaces.sh not present — skipping plugin marketplace seed (container still starts).'; fi"
+    ],
+    "onCreateCommand": "echo '✅ DevContainer created successfully!'",
+    "postCreateCommand": "if [ -f /workspace/.devcontainer/scripts/post-create.sh ]; then bash /workspace/.devcontainer/scripts/post-create.sh; else echo '⚠️ post-create.sh not found, skipping...'; fi",
+    "postStartCommand": "git config --global --replace-all --fixed-value safe.directory /workspace /workspace 2>/dev/null; git config --global --replace-all --fixed-value safe.directory '/workspace/.claude/worktrees/*' '/workspace/.claude/worktrees/*' 2>/dev/null || true",
+    "waitFor": "postStartCommand",
+    "shutdownAction": "stopContainer"
+}
