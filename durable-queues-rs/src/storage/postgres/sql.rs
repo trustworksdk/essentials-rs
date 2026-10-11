@@ -11,6 +11,11 @@ pub(crate) struct QueueSql {
     pub create_unordered_ready_index: SqlStr,
     pub create_ordered_head_index: SqlStr,
     pub select_entry_by_id: SqlStr,
+    pub insert_messages: SqlStr,
+    pub claim_unordered: SqlStr,
+    pub acknowledge: SqlStr,
+    pub is_dead_letter: SqlStr,
+    pub mark_as_dead_letter_direct: SqlStr,
 }
 
 impl QueueSql {
@@ -61,6 +66,55 @@ impl QueueSql {
                     AND is_being_delivered     = FALSE",
             ),
             select_entry_by_id: bind("SELECT * FROM {table} WHERE id = $1"),
+            // Java's getQueueMessageSql, one row per UNNEST element - a JDBC batch in one round trip. Normal
+            // messages only: delivery_mode NORMAL, key NULL, key_order -1 (CONTRACT.md §2).
+            // $1 queue_name, $2 added_ts, $3 next_delivery_ts, $4 ids, $5 payloads, $6 payload types, $7 meta_data
+            insert_messages: bind(
+                "INSERT INTO {table} (
+                    id, queue_name, message_payload, message_payload_type, added_ts, next_delivery_ts,
+                    last_delivery_error, is_dead_letter_message, meta_data, delivery_mode, key, key_order
+                )
+                SELECT m.id, $1, m.payload, m.payload_type, $2, $3, NULL, FALSE, m.meta_data, 'NORMAL', NULL, -1
+                FROM UNNEST($4::text[], $5::jsonb[], $6::text[], $7::jsonb[]) AS m(id, payload, payload_type, meta_data)",
+            ),
+            // buildUnorderedSqlStatement, verbatim. $1 queue_name, $2 now, $3 limit
+            claim_unordered: bind(
+                "WITH cte_unordered AS (
+                  SELECT id
+                  FROM {table} q
+                  WHERE
+                       queue_name = $1
+                    AND is_dead_letter_message = FALSE
+                    AND is_being_delivered     = FALSE
+                    AND next_delivery_ts <= $2
+                    AND key IS NULL
+                  ORDER BY next_delivery_ts
+                  LIMIT $3
+                  FOR UPDATE SKIP LOCKED
+                )
+                UPDATE {table} q
+                SET
+                  total_attempts       = q.total_attempts + 1,
+                  next_delivery_ts     = NULL,
+                  is_being_delivered   = TRUE,
+                  delivery_ts          = $2
+                FROM cte_unordered u
+                WHERE q.id = u.id
+                  AND q.queue_name = $1
+                RETURNING q.*",
+            ),
+            acknowledge: bind("DELETE FROM {table} WHERE id = $1 AND is_dead_letter_message = FALSE"),
+            is_dead_letter: bind("SELECT EXISTS (SELECT 1 FROM {table} WHERE id = $1 AND is_dead_letter_message = TRUE)"),
+            // getMarkAsDeadLetterMessageDirectSql, verbatim. $1 id, $2 last_delivery_error
+            mark_as_dead_letter_direct: bind(
+                "UPDATE {table} SET
+                next_delivery_ts = NULL,
+                last_delivery_error = $2,
+                is_dead_letter_message = TRUE,
+                is_being_delivered = FALSE,
+                delivery_ts = NULL
+                WHERE id = $1 AND is_dead_letter_message = FALSE",
+            ),
         }
     }
 }

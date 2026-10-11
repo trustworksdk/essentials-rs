@@ -100,7 +100,41 @@ against a schema Java created (from the Phase 0 DDL) without altering it.
 
 ---
 
-## Phase 2 — Vertical slice: enqueue → claim → handle → acknowledge
+## Phase 2 — Vertical slice: enqueue → claim → handle → acknowledge ✅ done
+
+**Delivered:**
+- **Enqueueing.** `DurableQueues` has `queue_message(s)` and `queue_message(s)_in`; the `_in` variants take the
+  caller's transaction (Outbox). A batch is one `UNNEST` insert.
+- **Message typing.** The `QueueMessage` codec trait has a blanket impl for single `MessageType` structs and can be
+  implemented by hand on an enum, for queues that mix Java payload types.
+- **Message model.** `Message`, `MessageMetaData` (a flat string map; Java always writes `{}`) and
+  `QueuedMessage`.
+- **Consumer.** `ConsumerConfig`, a `QueueConsumer` handle, and a `MessageHandler` trait that also accepts plain
+  async closures.
+- **Tests.** 9 integration tests, and the consume suite passed 20 out of 20 runs.
+
+**Behaviour, all per CONTRACT.md:**
+- **Claiming.** The claim is the verbatim unordered statement, so ordered rows are never claimed. Its limit is the
+  number of free worker slots: a claimed message never waits in a local buffer.
+- **Settling.** Claim, handler and ack are separate transactions. An undecodable payload or metadata is
+  dead-lettered on the spot without reading the row back (Java's `markAsDeadLetterMessageDirect`).
+- **Concurrency.** One consumer per queue per `DurableQueues`. `stop()` stops claiming, waits for in-flight
+  handlers up to `shutdown_timeout`, then abandons them to stuck-message recovery.
+
+**Decisions:**
+- **No `QueueStorage` trait.** There is one backend; `DurableQueues` (typed API and consumers) sits directly on
+  `PostgresQueueStorage` (row-level SQL). Extract the trait when a second backend or a test double needs it.
+- **Per-queue fetcher.** Each consumer has its own fetch loop instead of Java's single fetcher across all queues.
+  The SQL per queue is identical; the difference is one poll per queue rather than one per instance. Revisit in
+  Phase 7 if polling load matters.
+- **Deferred to Phase 3, marked `TODO(phase 3)`:** a handler error or panic leaves the message claimed, so it
+  waits for stuck-message recovery, which Phase 3 also adds.
+
+**Mutation check:** without `FOR UPDATE SKIP LOCKED`, the exactly-once test fails in every run, with messages
+delivered 2–3 times.
+
+**Original plan:**
+
 
 **Goal:** the happy path, with correct concurrency.
 

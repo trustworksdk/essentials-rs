@@ -13,6 +13,15 @@ pub enum DurableQueuesError {
         problems: Vec<String>,
     },
 
+    #[error("failed to serialize a message: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("there is already a consumer for queue '{0}'")]
+    ConsumerAlreadyExists(crate::types::QueueName),
+
+    #[error("invalid consumer configuration: {0}")]
+    InvalidConsumerConfig(&'static str),
+
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }

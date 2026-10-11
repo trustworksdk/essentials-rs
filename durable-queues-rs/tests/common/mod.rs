@@ -1,4 +1,9 @@
 //! Shared Testcontainers fixture: one throwaway PostgreSQL per test, removed when the test's `TestDatabase` drops.
+#![allow(dead_code)] // each test binary uses a different subset
+
+use std::time::{Duration, Instant};
+
+use durable_queues_rs::{DurableQueues, PostgresQueueStorage};
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -43,12 +48,33 @@ impl TestDatabase {
 
     /// A pool with one already-open connection, standing in for a separate application node.
     pub async fn dedicated_pool(&self) -> PgPool {
+        self.node_pool(1).await
+    }
+
+    /// A pool of its own with `connections` already-open connections, standing in for a separate application node.
+    pub async fn node_pool(&self, connections: u32) -> PgPool {
         PgPoolOptions::new()
-            .max_connections(1)
-            .min_connections(1)
+            .max_connections(connections)
+            .min_connections(connections)
             .connect_with((*self.pool.connect_options()).clone())
             .await
-            .expect("open dedicated connection")
+            .expect("open node pool")
+    }
+
+    /// `DurableQueues` on the default table, creating it if needed.
+    pub async fn durable_queues(&self, pool: PgPool) -> DurableQueues {
+        DurableQueues::new(
+            PostgresQueueStorage::new(pool, Default::default())
+                .await
+                .expect("init storage"),
+        )
+    }
+
+    pub async fn count(&self, sql: &'static str) -> i64 {
+        sqlx::query_scalar(sql)
+            .fetch_one(&self.pool)
+            .await
+            .expect("count")
     }
 
     /// Runs a multi-statement script.
@@ -89,5 +115,18 @@ impl TestDatabase {
         .fetch_one(&self.pool)
         .await
         .expect("digest rows")
+    }
+}
+
+/// Polls `check` until it holds, failing the test after 30 s.
+pub async fn eventually<F, Fut>(what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !check().await {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

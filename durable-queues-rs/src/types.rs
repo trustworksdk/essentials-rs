@@ -23,6 +23,12 @@ impl From<&str> for QueueName {
     }
 }
 
+impl From<String> for QueueName {
+    fn from(name: String) -> Self {
+        Self(name)
+    }
+}
+
 impl fmt::Display for QueueName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
