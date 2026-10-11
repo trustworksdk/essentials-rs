@@ -122,8 +122,8 @@ against a schema Java created (from the Phase 0 DDL) without altering it.
   handlers up to `shutdown_timeout`, then abandons them to stuck-message recovery.
 
 **Decisions:**
-- **No `QueueStorage` trait.** There is one backend; `DurableQueues` (typed API and consumers) sits directly on
-  `PostgresQueueStorage` (row-level SQL). Extract the trait when a second backend or a test double needs it.
+- **No `QueueStorage` trait in Phase 2.** Superseded after Phase 3: the trait was added to match the
+  experiment's design (see the Phase 3 notes).
 - **Per-queue fetcher.** Each consumer has its own fetch loop instead of Java's single fetcher across all queues.
   The SQL per queue is identical; the difference is one poll per queue rather than one per instance. Revisit in
   Phase 7 if polling load matters.
@@ -170,7 +170,52 @@ delivered 2–3 times.
 
 ---
 
-## Phase 3 — Retries, delayed delivery, dead letters, stuck messages
+## Phase 3 — Retries, delayed delivery, dead letters, stuck messages ✅ done
+
+**Delivered, item by item against the list below:**
+- **`RedeliveryPolicy`:** fixed, linear and exponential backoff; `max_redeliveries`; Java's cap-with-`>=` and NaN
+  rules. The §7 decision and the §8 formulas are pure functions, unit-tested against the Java worked example.
+- **`HandlerError::{Transient, Permanent}`:** `?` gives `Transient`. `RedeliveryPolicy::stop_redelivery_on`
+  matches anywhere in the `source()` chain (Java's `stopRedeliveryOn`). A handler panic, raised either while the
+  handler is called or inside its future, is a transient failure (Java catches every `Throwable`).
+- **Retry and dead letter:** the verbatim §5 statements. `last_delivery_error` holds the error and its
+  `Caused by:` chain.
+- **Delayed delivery:** `queue_message_with_delay`.
+- **Stuck-message recovery:** the multi-queue reset, scoped to the consumer's queue. It runs in the same
+  transaction as the claim, on the first poll and then at most once per `message_handling_timeout`, which is set
+  on `DurableQueues` (default 30 s).
+- **Dead-letter operations:** `get_dead_letter_messages`, `resurrect_dead_letter_message` (counters kept, as in
+  Java) and `mark_as_dead_letter_message`.
+- **`PollingBackoff`:** Java's `CentralizedQueuePollingOptimizer` algorithm, opt-in.
+- **Tests:** 9 integration tests, one per item of the test list, plus panics and a backed-off idle consumer. The
+  Phase 3 suite passed 15 out of 15 runs.
+
+**Decisions:**
+- **`ConsumerConfig::new(queue, policy)` requires a policy.** Java has no default either.
+- **`RedeliveryPolicy` is a struct.** It wraps a private backoff enum, so the error classifier and
+  `max_redeliveries` are not repeated per variant.
+- **Dead-letter operations return stored rows (`QueueEntry`),** not typed messages: dead letters are often the
+  undecodable ones.
+- **Dead-letter listing is sorted by `(added_ts, id)`.** Java ignores its sort-order parameter and pages without
+  `ORDER BY` (CONTRACT.md §5).
+- **Not in this phase:** a handler asking for its own redelivery (Java's `markForRedeliveryIn`; CONTRACT.md §14
+  lists it under Phase 3 but this phase's list does not). It moves to Phase 4 with the test porting.
+
+**`QueueStorage` trait (added at the end of Phase 3, per the experiment's design):**
+- **The trait.** Every storage operation the queues use (insert, claim with stuck reset, ack, retry, dead-letter,
+  resurrect, list, find) is a `QueueStorage` method, with its contract section cited.
+- **Backend-neutral types.** `QueueEntry`, `NewEntries`, `ClaimResult`, `StuckMessageReset` and
+  `QueueingSortOrder` live in `storage`.
+- **Generic over storage.** `DurableQueues<S = PostgresQueueStorage>` and the consumer are generic over it.
+- **Postgres-only methods.** `queue_message(s)_in` (joining the caller's transaction) is only on
+  `DurableQueues<PostgresQueueStorage>`, since a `PgConnection` is not backend-neutral.
+
+**Bug found and fixed in testing:** the first panic guard wrapped only the handler's future. A closure handler
+that panics before returning its future escaped it and left its message claimed. The panic test fails with that
+version.
+
+**Original plan:**
+
 
 **Goal:** the full failure path of the experiment's initial scope.
 

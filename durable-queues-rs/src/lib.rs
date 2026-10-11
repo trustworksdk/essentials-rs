@@ -5,6 +5,8 @@ mod consumer;
 mod durable_queues;
 mod error;
 mod message;
+mod polling;
+mod redelivery;
 mod storage;
 mod table_name;
 mod types;
@@ -16,8 +18,12 @@ pub use message::{
     BoxError, DecodeError, HandlerError, Message, MessageMetaData, MessageType, QueueMessage,
     QueuedMessage,
 };
-pub use storage::postgres::{
-    PostgresQueueStorage, PostgresQueueStorageConfig, QueueEntry, SchemaOwnership,
+pub use polling::PollingBackoff;
+pub use redelivery::RedeliveryPolicy;
+pub use storage::postgres::{PostgresQueueStorage, PostgresQueueStorageConfig, SchemaOwnership};
+pub use storage::{
+    ClaimResult, NewEntries, QueueEntry, QueueStorage, QueueingSortOrder, STUCK_MESSAGE_ERROR,
+    StuckMessageReset,
 };
 pub use table_name::{MAX_IDENTIFIER_LENGTH, TableName};
 pub use types::{DeliveryMode, QueueEntryId, QueueName, UnknownDeliveryMode};

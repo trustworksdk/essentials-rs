@@ -9,7 +9,7 @@ use tokio::sync::Barrier;
 use common::{JAVA_ROWS, JAVA_SCHEMA, TestDatabase};
 use durable_queues_rs::{
     DeliveryMode, DurableQueuesError, PostgresQueueStorage, PostgresQueueStorageConfig,
-    QueueEntryId, SchemaOwnership, TableName,
+    QueueEntryId, QueueStorage, SchemaOwnership, TableName,
 };
 
 fn config(ownership: SchemaOwnership) -> PostgresQueueStorageConfig {

@@ -2,16 +2,22 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::panic::AssertUnwindSafe;
+
 use chrono::Utc;
+use futures_util::FutureExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
-use crate::durable_queues::ConsumerRegistration;
+use crate::durable_queues::{ConsumerRegistration, after};
 use crate::error::{DurableQueuesError, Result};
 use crate::message::{HandlerError, QueueMessage, QueuedMessage};
-use crate::storage::postgres::{PostgresQueueStorage, QueueEntry};
+use crate::polling::{PollingBackoff, PollingBackoffState};
+use crate::redelivery::{DeadLetterReason, FailureOutcome, RedeliveryPolicy};
+use crate::storage::{QueueEntry, QueueStorage, StuckMessageReset};
 use crate::types::QueueName;
 
 /// Handles messages claimed from a queue. Delivery is at-least-once, so handlers must be idempotent.
@@ -40,6 +46,8 @@ where
 #[derive(Debug, Clone)]
 pub struct ConsumerConfig {
     pub queue_name: QueueName,
+    /// Required, as in Java: what happens to a message whose handler failed.
+    pub redelivery_policy: RedeliveryPolicy,
     /// Messages handled concurrently - Java's `parallelConsumers`. Never more are claimed than there are free slots.
     pub parallel_consumers: usize,
     /// Pause after a poll that did not fill every free slot - Java's centralized fetcher polls every 20 ms.
@@ -47,16 +55,25 @@ pub struct ConsumerConfig {
     /// How long [`QueueConsumer::stop`] waits for in-flight handlers. Handlers still running after it are abandoned;
     /// their messages stay claimed until stuck-message recovery redelivers them.
     pub shutdown_timeout: Duration,
+    /// Optional adaptive pause for idle queues; replaces `polling_interval` after polls that found nothing.
+    pub polling_backoff: Option<PollingBackoff>,
 }
 
 impl ConsumerConfig {
-    pub fn new(queue_name: impl Into<QueueName>) -> Self {
+    pub fn new(queue_name: impl Into<QueueName>, redelivery_policy: RedeliveryPolicy) -> Self {
         Self {
             queue_name: queue_name.into(),
+            redelivery_policy,
             parallel_consumers: 1,
             polling_interval: Duration::from_millis(20),
             shutdown_timeout: Duration::from_secs(10),
+            polling_backoff: None,
         }
+    }
+
+    pub fn with_polling_backoff(mut self, polling_backoff: PollingBackoff) -> Self {
+        self.polling_backoff = Some(polling_backoff);
+        self
     }
 
     pub fn with_parallel_consumers(mut self, parallel_consumers: usize) -> Self {
@@ -94,15 +111,17 @@ pub struct QueueConsumer {
 }
 
 impl QueueConsumer {
-    pub(crate) fn start<M, H>(
-        storage: PostgresQueueStorage,
+    pub(crate) fn start<M, H, S>(
+        storage: S,
         config: ConsumerConfig,
         handler: H,
+        message_handling_timeout: Duration,
         registration: ConsumerRegistration,
     ) -> Self
     where
         M: QueueMessage,
         H: MessageHandler<M>,
+        S: QueueStorage,
     {
         let cancel = CancellationToken::new();
         let queue_name = config.queue_name.clone();
@@ -110,7 +129,11 @@ impl QueueConsumer {
             storage,
             handler: Arc::new(handler),
             slots: Arc::new(Semaphore::new(config.parallel_consumers)),
+            redelivery_policy: Arc::new(config.redelivery_policy.clone()),
+            backoff: config.polling_backoff.map(PollingBackoffState::new),
             config,
+            message_handling_timeout,
+            last_stuck_reset: None,
             cancel: cancel.clone(),
             _registration: registration,
             _message: PhantomData,
@@ -143,24 +166,29 @@ impl Drop for QueueConsumer {
     }
 }
 
-struct Fetcher<M, H> {
-    storage: PostgresQueueStorage,
+struct Fetcher<M, H, S> {
+    storage: S,
     handler: Arc<H>,
     /// One permit per worker slot; a delivery task holds its permit until the message is settled.
     slots: Arc<Semaphore>,
+    redelivery_policy: Arc<RedeliveryPolicy>,
+    backoff: Option<PollingBackoffState>,
     config: ConsumerConfig,
+    /// Java's `messageHandlingTimeout`: a message claimed longer ago than this is considered stuck.
+    message_handling_timeout: Duration,
+    last_stuck_reset: Option<Instant>,
     cancel: CancellationToken,
     _registration: ConsumerRegistration,
     _message: PhantomData<fn() -> M>,
 }
 
-impl<M: QueueMessage, H: MessageHandler<M>> Fetcher<M, H> {
-    async fn run(self) {
-        let queue_name = &self.config.queue_name;
+impl<M: QueueMessage, H: MessageHandler<M>, S: QueueStorage> Fetcher<M, H, S> {
+    async fn run(mut self) {
+        let queue_name = self.config.queue_name.clone();
         debug!(queue = %queue_name, parallel_consumers = self.config.parallel_consumers, "consumer started");
         let mut in_flight = JoinSet::new();
         loop {
-            reap(&mut in_flight, queue_name);
+            reap(&mut in_flight, &queue_name);
             let mut slots = tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => break,
@@ -174,18 +202,28 @@ impl<M: QueueMessage, H: MessageHandler<M>> Fetcher<M, H> {
             }
 
             let wanted = slots.num_permits();
+            let now = Utc::now();
+            let reset_stuck = self.stuck_message_reset_due(now);
             let claimed = match self
                 .storage
-                .claim_unordered(queue_name, wanted as i64, Utc::now())
+                .claim_unordered(&queue_name, wanted as i64, now, reset_stuck)
                 .await
             {
-                Ok(entries) => entries,
+                Ok(result) => {
+                    if reset_stuck.is_some() {
+                        self.last_stuck_reset = Some(Instant::now());
+                        if result.reset > 0 {
+                            warn!(queue = %queue_name, count = result.reset, "returned messages stuck in delivery to the queue");
+                        }
+                    }
+                    result.claimed
+                }
                 Err(e) => {
                     error!(queue = %queue_name, error = %e, "failed to claim messages");
                     Vec::new()
                 }
             };
-            let filled_every_slot = claimed.len() == wanted;
+            let found = claimed.len();
             for entry in claimed {
                 let slot = slots
                     .split(1)
@@ -193,20 +231,48 @@ impl<M: QueueMessage, H: MessageHandler<M>> Fetcher<M, H> {
                 in_flight.spawn(deliver(
                     self.storage.clone(),
                     self.handler.clone(),
+                    self.redelivery_policy.clone(),
                     entry,
                     slot,
                 ));
             }
             drop(slots);
 
-            if !filled_every_slot {
+            if found < wanted {
+                let pause = self.pause_after_poll(found);
                 tokio::select! {
                     _ = self.cancel.cancelled() => break,
-                    _ = tokio::time::sleep(self.config.polling_interval) => {}
+                    _ = tokio::time::sleep(pause) => {}
                 }
+            } else if let Some(backoff) = &mut self.backoff {
+                backoff.reset();
             }
         }
         self.shutdown(in_flight).await;
+    }
+
+    /// Java throttles the stuck-message reset to once per `messageHandlingTimeout` per queue; the first poll always
+    /// resets, so a restarted node immediately recovers what a crashed one left claimed.
+    fn stuck_message_reset_due(&self, now: chrono::DateTime<Utc>) -> Option<StuckMessageReset> {
+        let due = self
+            .last_stuck_reset
+            .is_none_or(|last| last.elapsed() > self.message_handling_timeout);
+        let timeout = chrono::TimeDelta::from_std(self.message_handling_timeout)
+            .unwrap_or(chrono::TimeDelta::MAX);
+        due.then(|| StuckMessageReset {
+            claimed_before: now.checked_sub_signed(timeout).unwrap_or(now),
+        })
+    }
+
+    fn pause_after_poll(&mut self, found: usize) -> Duration {
+        match &mut self.backoff {
+            Some(backoff) if found == 0 => backoff.after_empty_poll(),
+            Some(backoff) => {
+                backoff.reset();
+                self.config.polling_interval
+            }
+            None => self.config.polling_interval,
+        }
     }
 
     async fn shutdown(&self, mut in_flight: JoinSet<()>) {
@@ -242,21 +308,23 @@ fn log_task_failure(
     if let Err(e) = result
         && e.is_panic()
     {
-        // TODO(phase 3): treat a panic as a transient handler failure and schedule a retry.
-        error!(queue = %queue_name, "message handler panicked; the message stays claimed until stuck-message recovery");
+        // Handler panics are caught in `deliver`; this is a panic while settling, e.g. in a log formatter.
+        error!(queue = %queue_name, "delivery task panicked; its message stays claimed until stuck-message recovery");
     }
 }
 
 /// Decodes, handles and settles one claimed message. Each step that touches the database is its own transaction.
-async fn deliver<M: QueueMessage, H: MessageHandler<M>>(
-    storage: PostgresQueueStorage,
+async fn deliver<M: QueueMessage, H: MessageHandler<M>, S: QueueStorage>(
+    storage: S,
     handler: Arc<H>,
+    redelivery_policy: Arc<RedeliveryPolicy>,
     entry: QueueEntry,
     _slot: OwnedSemaphorePermit,
 ) {
     let id = entry.id.clone();
     let queue_name = entry.queue_name.clone();
     let payload_type = entry.message_payload_type.clone();
+    let (total_attempts, redelivery_attempts) = (entry.total_attempts, entry.redelivery_attempts);
 
     let message = match QueuedMessage::<M>::decode(entry) {
         Ok(message) => message,
@@ -272,19 +340,61 @@ async fn deliver<M: QueueMessage, H: MessageHandler<M>>(
         }
     };
 
-    match handler.handle(message).await {
-        Ok(()) => match storage.acknowledge(&id).await {
-            Ok(true) => debug!(queue = %queue_name, id = %id, "message handled and acknowledged"),
-            Ok(false) => {
-                error!(queue = %queue_name, id = %id, "could not acknowledge message - it may already have been deleted")
+    // The call to `handle` sits inside the guarded future: a closure handler can panic before it returns its future.
+    let handled = AssertUnwindSafe(async move { handler.handle(message).await });
+    let error = match handled.catch_unwind().await {
+        Ok(Ok(())) => {
+            match storage.acknowledge(&id).await {
+                Ok(true) => {
+                    debug!(queue = %queue_name, id = %id, "message handled and acknowledged")
+                }
+                Ok(false) => {
+                    error!(queue = %queue_name, id = %id, "could not acknowledge message - it may already have been deleted")
+                }
+                Err(e) => {
+                    error!(queue = %queue_name, id = %id, error = %e, "failed to acknowledge message; it will be redelivered")
+                }
             }
-            Err(e) => {
-                error!(queue = %queue_name, id = %id, error = %e, "failed to acknowledge message; it will be redelivered")
-            }
-        },
-        // TODO(phase 3): retry with the RedeliveryPolicy or dead-letter (CONTRACT.md §5, §7).
-        Err(e) => {
-            warn!(queue = %queue_name, id = %id, error = %e, "message handler failed; the message stays claimed until stuck-message recovery")
+            return;
         }
+        Ok(Err(error)) => error,
+        // Java catches every Throwable from a handler; a panic is the Rust equivalent of an unchecked exception.
+        Err(panic) => HandlerError::transient(format!(
+            "message handler panicked: {}",
+            panic_message(&*panic)
+        )),
+    };
+
+    let report = error.report();
+    let settled = match redelivery_policy.decide(&error, total_attempts, redelivery_attempts) {
+        FailureOutcome::Retry { delay } => {
+            debug!(queue = %queue_name, id = %id, error = %error, ?delay, redelivery_attempts, "message handling failed; will redeliver");
+            storage
+                .retry(&id, after(Utc::now(), delay), &report)
+                .await
+                .map(|_| ())
+        }
+        FailureOutcome::DeadLetter { reason } => {
+            match reason {
+                DeadLetterReason::PermanentError => {
+                    error!(queue = %queue_name, id = %id, error = %error, "permanent error; marking message as dead letter")
+                }
+                DeadLetterReason::RedeliveriesExhausted => {
+                    warn!(queue = %queue_name, id = %id, error = %error, total_attempts, "too many deliveries; marking message as dead letter")
+                }
+            }
+            storage.mark_as_dead_letter(&id, &report).await.map(|_| ())
+        }
+    };
+    if let Err(e) = settled {
+        error!(queue = %queue_name, id = %id, error = %e, "failed to settle failed message; stuck-message recovery will redeliver it");
     }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>")
 }

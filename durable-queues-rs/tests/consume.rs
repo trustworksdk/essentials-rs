@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use common::{JAVA_ROWS, JAVA_SCHEMA, TestDatabase, eventually};
 use durable_queues_rs::{
     ConsumerConfig, DecodeError, DeliveryMode, DurableQueuesError, HandlerError, Message,
-    MessageType, QueueEntryId, QueueMessage, QueueName, QueuedMessage,
+    MessageType, QueueEntryId, QueueMessage, QueueName, QueueStorage, QueuedMessage,
+    RedeliveryPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -78,6 +79,10 @@ impl MessageType for Job {
     const TYPE_NAME: &'static str = "com.acme.Job";
 }
 
+fn policy() -> RedeliveryPolicy {
+    RedeliveryPolicy::fixed_backoff(Duration::from_millis(100), 3)
+}
+
 fn order(id: &str) -> OrderPlaced {
     OrderPlaced {
         order_id: id.into(),
@@ -113,7 +118,10 @@ async fn a_queued_message_is_delivered_with_its_metadata_and_removed_once_handle
 
     let (sender, mut received) = mpsc::unbounded_channel::<QueuedMessage<OrderPlaced>>();
     let consumer = queues
-        .consume_from_queue(ConsumerConfig::new(queue.clone()), forward(sender))
+        .consume_from_queue(
+            ConsumerConfig::new(queue.clone(), policy()),
+            forward(sender),
+        )
         .unwrap();
     let delivered = tokio::time::timeout(Duration::from_secs(10), received.recv())
         .await
@@ -196,7 +204,7 @@ async fn java_rows_are_consumed_and_ordered_delayed_and_foreign_rows_are_left_al
 
     let (sender, mut received) = mpsc::unbounded_channel::<QueuedMessage<OrderMessage>>();
     let consumer = queues.consume_from_queue(
-        ConsumerConfig::new("Orders").with_parallel_consumers(4),
+        ConsumerConfig::new("Orders", policy()).with_parallel_consumers(4),
         forward(sender),
     );
     let consumer = consumer.unwrap();
@@ -306,7 +314,7 @@ async fn competing_nodes_handle_every_message_exactly_once() {
                 Ok(())
             }
         };
-        let config = ConsumerConfig::new(queue.clone()).with_parallel_consumers(4);
+        let config = ConsumerConfig::new(queue.clone(), policy()).with_parallel_consumers(4);
         consumers.push(node.consume_from_queue(config, handler).unwrap());
     }
 
@@ -354,7 +362,7 @@ async fn never_more_messages_are_claimed_or_handled_than_parallel_consumers() {
         }
     };
     let consumer = queues.consume_from_queue(
-        ConsumerConfig::new("Jobs").with_parallel_consumers(SLOTS),
+        ConsumerConfig::new("Jobs", policy()).with_parallel_consumers(SLOTS),
         handler,
     );
     let consumer = consumer.unwrap();
@@ -408,7 +416,7 @@ async fn a_message_queued_in_a_rolled_back_transaction_is_never_delivered() {
 
     let (sender, mut received) = mpsc::unbounded_channel::<QueuedMessage<Job>>();
     let consumer = queues
-        .consume_from_queue(ConsumerConfig::new(queue), forward(sender))
+        .consume_from_queue(ConsumerConfig::new(queue, policy()), forward(sender))
         .unwrap();
     let delivered = tokio::time::timeout(Duration::from_secs(10), received.recv())
         .await
@@ -437,7 +445,7 @@ async fn stop_waits_for_in_flight_handlers_and_acknowledges_them() {
         }
     };
     let consumer = queues
-        .consume_from_queue(ConsumerConfig::new("Jobs"), handler)
+        .consume_from_queue(ConsumerConfig::new("Jobs", policy()), handler)
         .unwrap();
     handler_started.recv().await.unwrap();
 
@@ -468,7 +476,8 @@ async fn stop_abandons_handlers_still_running_at_the_shutdown_timeout() {
             Ok(())
         }
     };
-    let config = ConsumerConfig::new("Jobs").with_shutdown_timeout(Duration::from_millis(200));
+    let config =
+        ConsumerConfig::new("Jobs", policy()).with_shutdown_timeout(Duration::from_millis(200));
     let consumer = queues.consume_from_queue(config, handler).unwrap();
     handler_started.recv().await.unwrap();
 
@@ -491,23 +500,23 @@ async fn one_consumer_per_queue_until_it_is_stopped() {
     let handler = |_: QueuedMessage<Job>| async { Ok(()) };
 
     let first = queues
-        .consume_from_queue(ConsumerConfig::new("Jobs"), handler)
+        .consume_from_queue(ConsumerConfig::new("Jobs", policy()), handler)
         .unwrap();
-    let second = queues.consume_from_queue(ConsumerConfig::new("Jobs"), handler);
+    let second = queues.consume_from_queue(ConsumerConfig::new("Jobs", policy()), handler);
     assert!(
         matches!(second, Err(DurableQueuesError::ConsumerAlreadyExists(q)) if q.as_str() == "Jobs")
     );
     let other_queue = queues
-        .consume_from_queue(ConsumerConfig::new("Other"), handler)
+        .consume_from_queue(ConsumerConfig::new("Other", policy()), handler)
         .unwrap();
 
     first.stop().await;
     let replacement = queues
-        .consume_from_queue(ConsumerConfig::new("Jobs"), handler)
+        .consume_from_queue(ConsumerConfig::new("Jobs", policy()), handler)
         .unwrap();
 
     let zero = queues.consume_from_queue(
-        ConsumerConfig::new("Zero").with_parallel_consumers(0),
+        ConsumerConfig::new("Zero", policy()).with_parallel_consumers(0),
         handler,
     );
     assert!(matches!(

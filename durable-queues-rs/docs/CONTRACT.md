@@ -226,6 +226,7 @@ Other operations:
 | Operation | SQL |
 |---|---|
 | Resurrect | `UPDATE … SET next_delivery_ts = :now+d, is_dead_letter_message = FALSE WHERE id = :id AND is_dead_letter_message = TRUE RETURNING *`. The counters are **not** reset, so the next failure dead-letters again immediately if `total_attempts` is already over the cap. |
+| Get dead letters | Java: `SELECT * … WHERE queue_name = :q AND is_dead_letter_message = TRUE LIMIT :pageSize OFFSET :offset`. Its `QueueingSortOrder` parameter is **ignored** and there is no `ORDER BY`, so pages are nondeterministic. Rust orders by `added_ts, id` in the requested direction (read-only, no interop impact). |
 | Get by id | `SELECT * FROM {table} WHERE id = :id AND is_dead_letter_message = :isDeadLetterMessage` |
 | Delete | `DELETE FROM {table} WHERE id = :id` |
 | Purge | `DELETE FROM {table} WHERE queue_name = :queueName` |

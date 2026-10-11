@@ -1,38 +1,11 @@
-use chrono::{DateTime, Utc};
-use serde_json::Value;
 use sqlx::postgres::PgRow;
 use sqlx::{FromRow, Row};
 
-use crate::types::{DeliveryMode, QueueEntryId, QueueName};
+use crate::storage::QueueEntry;
+use crate::types::{QueueEntryId, QueueName};
 
-/// One row of the queue table, as stored.
-///
-/// NULLs in the nullable counter/flag columns decode like Java's `QueuedMessageRowMapper` (JDBC `getInt`, `getLong`
-/// and `getBoolean` read NULL as 0 / false). The payload and metadata stay raw JSON; turning them into typed values
-/// is the consumer's job (Phase 2).
-#[derive(Debug, Clone, PartialEq)]
-pub struct QueueEntry {
-    pub id: QueueEntryId,
-    pub queue_name: QueueName,
-    pub message_payload: Value,
-    /// The payload's type name. For Java-produced rows: the Java FQCN.
-    pub message_payload_type: String,
-    pub added_ts: DateTime<Utc>,
-    /// `None` while the message is being delivered and for dead letters.
-    pub next_delivery_ts: Option<DateTime<Utc>>,
-    pub delivery_ts: Option<DateTime<Utc>>,
-    pub total_attempts: i32,
-    pub redelivery_attempts: i32,
-    pub last_delivery_error: Option<String>,
-    pub is_being_delivered: bool,
-    pub is_dead_letter_message: bool,
-    pub meta_data: Option<Value>,
-    pub delivery_mode: DeliveryMode,
-    pub key: Option<String>,
-    /// -1 for [`DeliveryMode::Normal`].
-    pub key_order: i64,
-}
-
+/// Decodes a row like Java's `QueuedMessageRowMapper`: NULLs in the nullable counter and flag columns read as
+/// 0 / false (JDBC `getInt`, `getLong`, `getBoolean`).
 impl<'r> FromRow<'r, PgRow> for QueueEntry {
     fn from_row(row: &'r PgRow) -> sqlx::Result<Self> {
         let delivery_mode: String = row.try_get("delivery_mode")?;

@@ -16,6 +16,12 @@ pub(crate) struct QueueSql {
     pub acknowledge: SqlStr,
     pub is_dead_letter: SqlStr,
     pub mark_as_dead_letter_direct: SqlStr,
+    pub mark_as_dead_letter: SqlStr,
+    pub retry: SqlStr,
+    pub resurrect_dead_letter: SqlStr,
+    pub reset_stuck_messages: SqlStr,
+    pub dead_letters_ascending: SqlStr,
+    pub dead_letters_descending: SqlStr,
 }
 
 impl QueueSql {
@@ -114,6 +120,66 @@ impl QueueSql {
                 is_being_delivered = FALSE,
                 delivery_ts = NULL
                 WHERE id = $1 AND is_dead_letter_message = FALSE",
+            ),
+            // getMarkAsDeadLetterMessageSql, verbatim. $1 id, $2 last_delivery_error
+            mark_as_dead_letter: bind(
+                "UPDATE {table} SET
+                next_delivery_ts = NULL,
+                last_delivery_error = $2,
+                is_dead_letter_message = TRUE,
+                is_being_delivered = FALSE,
+                delivery_ts = NULL
+                WHERE id = $1 AND is_dead_letter_message = FALSE
+                RETURNING *",
+            ),
+            // getRetryMessageSql, verbatim. $1 id, $2 next_delivery_ts, $3 last_delivery_error
+            retry: bind(
+                "UPDATE {table} SET
+                next_delivery_ts = $2,
+                last_delivery_error = $3,
+                redelivery_attempts = redelivery_attempts + 1,
+                is_being_delivered = FALSE,
+                delivery_ts = NULL
+                WHERE id = $1
+                RETURNING *",
+            ),
+            // getResurrectDeadLetterMessageSql, verbatim. Counters are deliberately not reset. $1 id, $2 next_delivery_ts
+            resurrect_dead_letter: bind(
+                "UPDATE {table} SET
+                next_delivery_ts = $2,
+                is_dead_letter_message = FALSE
+                WHERE id = $1 AND
+                is_dead_letter_message = TRUE
+                RETURNING *",
+            ),
+            // getResetMessagesStuckBeingDeliveredAcrossMultipleQueuesSql, verbatim but for `= ANY` in place of JDBI's
+            // `IN (<list>)`. The single-queue Java variant lacks the queue filter (CONTRACT.md §6) and is not used.
+            // $1 now, $2 threshold, $3 error, $4 queue names
+            reset_stuck_messages: bind(
+                "UPDATE {table} SET
+                is_being_delivered = FALSE,
+                delivery_ts = NULL,
+                redelivery_attempts = redelivery_attempts + 1,
+                next_delivery_ts = $1,
+                last_delivery_error = $3
+                WHERE is_being_delivered = TRUE
+                AND delivery_ts <= $2
+                AND queue_name = ANY($4)",
+            ),
+            // Java's queryQueuedMessages(DEAD_LETTER_MESSAGES) has no ORDER BY - its sort order parameter is ignored,
+            // so paging is nondeterministic. Ordering by (added_ts, id) is a read-only fix (CONTRACT.md §5).
+            // $1 queue_name, $2 limit, $3 offset
+            dead_letters_ascending: bind(
+                "SELECT * FROM {table}
+                WHERE queue_name = $1 AND is_dead_letter_message = TRUE
+                ORDER BY added_ts ASC, id ASC
+                LIMIT $2 OFFSET $3",
+            ),
+            dead_letters_descending: bind(
+                "SELECT * FROM {table}
+                WHERE queue_name = $1 AND is_dead_letter_message = TRUE
+                ORDER BY added_ts DESC, id DESC
+                LIMIT $2 OFFSET $3",
             ),
         }
     }

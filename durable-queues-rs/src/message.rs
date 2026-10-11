@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::storage::postgres::QueueEntry;
+use crate::storage::QueueEntry;
 use crate::types::{DeliveryMode, QueueEntryId, QueueName};
 
 pub type BoxError = Box<dyn StdError + Send + Sync>;
@@ -183,34 +183,74 @@ impl<M: QueueMessage> QueuedMessage<M> {
     }
 }
 
-/// A failed delivery. Built from any error with `?`. Phase 3 adds the transient/permanent distinction.
-pub struct HandlerError(BoxError);
+/// A failed delivery. `?` on any error produces [`HandlerError::Transient`].
+pub enum HandlerError {
+    /// Retried according to the consumer's [`RedeliveryPolicy`](crate::RedeliveryPolicy) until its redeliveries are
+    /// exhausted.
+    Transient(BoxError),
+    /// Dead-lettered on this attempt: retrying cannot succeed (Java's built-in permanent error list, or
+    /// `stopRedeliveryOn`).
+    Permanent(BoxError),
+}
 
 impl HandlerError {
-    pub fn new(error: impl Into<BoxError>) -> Self {
-        Self(error.into())
+    pub fn transient(error: impl Into<BoxError>) -> Self {
+        Self::Transient(error.into())
+    }
+
+    pub fn permanent(error: impl Into<BoxError>) -> Self {
+        Self::Permanent(error.into())
+    }
+
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, Self::Permanent(_))
+    }
+
+    pub fn error(&self) -> &(dyn StdError + Send + Sync + 'static) {
+        match self {
+            Self::Transient(e) | Self::Permanent(e) => e.as_ref(),
+        }
     }
 
     pub fn into_inner(self) -> BoxError {
-        self.0
+        match self {
+            Self::Transient(e) | Self::Permanent(e) => e,
+        }
+    }
+
+    /// The text stored in `last_delivery_error`: the error, then each `source()` on its own `Caused by:` line.
+    /// Java stores a stack trace here; Rust has none to offer, so the cause chain stands in for it.
+    pub(crate) fn report(&self) -> String {
+        let mut report = self.error().to_string();
+        let mut source = self.error().source();
+        for _ in 0..100 {
+            let Some(cause) = source else { break };
+            report.push_str("\nCaused by: ");
+            report.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        report
     }
 }
 
 impl<E: Into<BoxError>> From<E> for HandlerError {
     fn from(error: E) -> Self {
-        Self(error.into())
+        Self::Transient(error.into())
     }
 }
 
 impl fmt::Debug for HandlerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.0, f)
+        match self {
+            Self::Transient(e) => f.debug_tuple("Transient").field(e).finish(),
+            Self::Permanent(e) => f.debug_tuple("Permanent").field(e).finish(),
+        }
     }
 }
 
 impl fmt::Display for HandlerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
+        fmt::Display::fmt(self.error(), f)
     }
 }
 
@@ -252,6 +292,27 @@ mod tests {
             OrderPlaced::from_payload("com.acme.orders.OrderPlaced", json!({"unexpected": true})),
             Err(DecodeError::InvalidPayload(_))
         ));
+    }
+
+    #[test]
+    fn handler_error_reports_include_the_source_chain() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("connection refused")]
+        struct Io;
+        #[derive(Debug, thiserror::Error)]
+        #[error("failed to call billing")]
+        struct Billing(#[source] Io);
+
+        fn fails() -> Result<(), HandlerError> {
+            Err(Billing(Io))?
+        }
+        let error = fails().unwrap_err();
+        assert!(!error.is_permanent(), "? produces a transient error");
+        assert_eq!(
+            error.report(),
+            "failed to call billing\nCaused by: connection refused"
+        );
+        assert!(HandlerError::permanent("bad input").is_permanent());
     }
 
     #[test]
