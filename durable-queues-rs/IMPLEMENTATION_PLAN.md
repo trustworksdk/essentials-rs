@@ -469,7 +469,49 @@ Discrepancies are written down, not patched around.
 
 ---
 
-## Phase 7 — Benchmarks
+## Phase 7 — Benchmarks ✅ done
+
+**Delivered:**
+- `bench/run.py` (Python standard library only) and `bench/README.md`. One PostgreSQL 17 per run, the generator and
+  the consumer under test as containers. The consumer gets 2 CPUs and 1 GiB for both languages. Every metric in the
+  list below is measured. The generator is the same Rust `bench-produce` for both languages.
+- `interop/rust-node/Dockerfile`: the Rust node as an image. Both harnesses got `bench-consume`, and the Rust node
+  `bench-produce`, both with `--queues N`.
+- Results: `bench/results/20261012T064824Z/`, holding `results.md`, `summary.json` and raw JSON lines. The full run
+  takes about 50 min.
+
+**Deviations (named, as the plan asks):**
+- **`FetchPacing::FixedRate`** (new public API in `consumer.rs`). Java's fetcher polls at a fixed rate. That caps a
+  consumer at `parallel_consumers / polling_interval`: 400/s with 8 slots, and 4000/s with 10 queues × 8. Rust's
+  loop (now `FetchPacing::Eager`, still the default) has no such cap. `FixedRate` makes the language-to-language
+  comparison possible; `rust-eager` is reported separately as an algorithm difference. A mutation check routed
+  `FixedRate` to the eager loop, and `fixed_rate_pacing_claims_once_per_polling_interval_like_java` failed.
+- **10 queues** added at the user's request, beside the plan's single queue. `--queues 1,10`; each count is a full
+  run with `parallel_consumers` 8 and 128.
+- **Planner statistics pinned** for the benchmark (autovacuum off for the table, a fixed VACUUM + ANALYZE
+  routine). Without this, run-to-run variance reached 5×. See the next item.
+
+**Bugs and findings:**
+- **Stale statistics degrade the claim (Java and Rust alike, shared SQL).** When the statistics were taken while the
+  table was empty, the `UPDATE … FROM cte_unordered` join becomes a nested loop over the queue. That costs 10–50 ms
+  per claim with 20 000 queued. Recorded in CONTRACT.md §4.1 and measured as `saturation_stale_stats`.
+- **At equal pacing the languages issue identical SQL** (same calls per second per statement). Throughput and
+  latency match. Rust differs in resources:
+  - about 2.5 MiB idle against about 110 MiB;
+  - startup 70 ms against about 500 ms;
+  - roughly half the CPU under load;
+  - an image of 135 against 496 MiB.
+- **With 10 queues** two implementation differences show:
+  - At 128 slots per queue, Java's consumer is CPU-bound (199 % of 2 CPUs) and drains a backlog at 6.6k/s, against
+    16.9k/s for Rust fixed-rate.
+  - Rust's 10 independent fetchers make every statement on the database slower. The claim and even the shared
+    generator's INSERT run about 2× slower per call than with Java's single fetcher at the same call count. Rust's
+    idle CPU is also higher (14 % against 5 %). A likely cause, not verified: sqlx sends BEGIN and COMMIT as
+    separate round trips (they show up in `pg_stat_statements`), and 10 loops claim concurrently.
+- **Measurement limit:** a drain under about 2 s (`rust-eager` at 128 slots) falls between `docker stats` samples.
+  Its CPU and memory columns read 0 and are not valid.
+
+**Plan, as written:**
 
 - Workload generator plus harnesses for both languages, run as **containers with equal CPU and memory limits**
   against one dedicated PostgreSQL.

@@ -4,7 +4,7 @@ Java Essentials 0.60.0 against the Rust port: the same queue, the same SQL, the 
 limits. The procedure is `run.py` (Python standard library only); each run writes `results/<UTC timestamp>/`.
 
 ```sh
-python3 durable-queues-rs/bench/run.py           # full run, about 25 min
+python3 durable-queues-rs/bench/run.py           # full run, about 50 min
 python3 durable-queues-rs/bench/run.py --quick   # the same procedure with short windows, about 6 min
 python3 durable-queues-rs/bench/run.py --help    # levels, durations, variants, parallelism
 ```
@@ -30,10 +30,16 @@ at send time; every container reads the same host clock) and reports once a seco
 - `rust-eager`: the Rust crate's default `FetchPacing::Eager`. After a poll that filled every free slot, it polls
   again as soon as a slot frees up. It's an algorithm difference, reported apart.
 
-**Held constant:** payload (one `OrderPlaced`, about 100 bytes of JSON), one queue, `parallel_consumers` (8 and
-128, each a full run), a pool of at most 10 connections, a 20 ms polling interval, a 10 s warm-up and a 30 s
-measurement per level, and the container limits above. The JVM runs with its defaults (heap: 25 % of the
-container's memory).
+**Held constant:** payload (one `OrderPlaced`, about 100 bytes of JSON), the number of queues (1 and 10),
+`parallel_consumers` (8 and 128), a pool of at most 10 connections, a 20 ms polling interval, a 10 s warm-up and a
+30 s measurement per level, and the container limits above. Every combination of queues and `parallel_consumers` is a
+full run. The JVM runs with its defaults (heap: 25 % of the container's memory).
+
+**With 10 queues** (`Bench-0` … `Bench-9`) the generator spreads every batch evenly over them, one insert statement
+per queue, so the load levels are totals across all queues. The consumer node runs one consumer per queue, each with
+`parallel_consumers` slots, as an application consuming 10 queues would, and still shares one pool of 10
+connections. Java's centralized fetcher serves all 10 queues from one polling loop; Rust has one fetcher per consumer,
+so 10 polling loops share the pool.
 
 **Procedure per variant:**
 1. **Startup:** 1000 messages are queued; the time from `docker run` to the first message handled. Repeated 3 times,
@@ -73,8 +79,10 @@ Recorded as the plan requires. Anything here that is not in Java is reported sep
   nothing (Phase 5). The `consumer SQL` rows in the results are those statements only. At equal pacing, Java and
   Rust issue the same number of calls per message.
 - **Fetch pacing:** `rust-fixed-rate` matches Java; `rust-eager` does not (above).
-- **Fetcher:** Java has one fetcher per `DurableQueues` for all its queues, Rust one per consumer. With the one queue
-  used here they poll the same way.
+- **Fetcher:** Java has one fetcher per `DurableQueues` for all its queues, Rust one per consumer. With one queue
+  they poll the same way. With 10 queues both claim each queue separately, but Rust's 10 loops run independently
+  and compete for the pool, while Java's one loop visits the queues in turn. This is a design difference between the
+  implementations, not a language difference, and shows up in the 10-queue results.
 - **Connection pool:** HikariCP keeps all 10 connections open (its default `minimumIdle` = `maximumPoolSize`). sqlx
   opens connections on demand, up to 10. The idle connection counts differ for that reason, not because of the
   language.
@@ -95,6 +103,9 @@ A queue that is usually empty and suddenly fills up is exactly this case. It is 
 either language. `saturation_stale_stats` measures it for both.
 
 ## Reading the results
+
+The committed run is `results/20261012T064824Z/`. The findings are summarized in `IMPLEMENTATION_PLAN.md`, Phase 7.
+A drain shorter than about 2 s falls between `docker stats` samples, so its CPU and memory read 0 and are not valid.
 
 - `results/<run>/results.md`: the tables.
 - `results/<run>/summary.json`: every number, plus the top `pg_stat_statements` per level.

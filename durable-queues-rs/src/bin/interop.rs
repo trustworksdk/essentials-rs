@@ -7,8 +7,8 @@
 //!                                    [--max-redeliveries R] [--handle-ms H] [--timeout-ms T]
 //! interop consume-and-crash-after K  (consume options)
 //! interop resurrect                  --id ID [--delay-ms D]
-//! interop bench-produce              (--rate R --duration-s D | --count N) [--tick-ms T]
-//! interop bench-consume              [--parallel P]
+//! interop bench-produce              (--rate R --duration-s D | --count N) [--tick-ms T] [--queues N]
+//! interop bench-consume              [--parallel P] [--queues N]
 //! consume options: [--fetch-pacing eager|fixed-rate]  (default eager; fixed-rate is Java's polling)
 //! common: --database-url URL [--queue Q] [--node NAME] [--pool-size N]
 //! ```
@@ -144,6 +144,16 @@ impl Options {
             None | Some("eager") => FetchPacing::Eager,
             Some("fixed-rate") => FetchPacing::FixedRate,
             Some(other) => panic!("--fetch-pacing must be eager or fixed-rate, not {other}"),
+        }
+    }
+
+    /// The `bench-*` commands' queues: `--queue` itself, or with `--queues N` (N > 1) `<queue>-0` … `<queue>-<N-1>`.
+    fn bench_queues(&self) -> Vec<QueueName> {
+        match self.int("queues", 1) {
+            1 => vec![self.queue_name.clone()],
+            n => (0..n)
+                .map(|i| QueueName::new(format!("{}-{i}", self.queue_name.as_str())))
+                .collect(),
         }
     }
 
@@ -300,8 +310,9 @@ async fn consume(queues: &DurableQueues, options: Options) {
 
 /// Open-loop load at a fixed rate: every tick inserts as many messages as the rate owes since the start, in one
 /// `queue_messages` statement, so a slow insert is caught up on rather than lowering the rate. With `--count`, queues
-/// that many at once (a backlog) instead.
+/// that many at once (a backlog) instead. With `--queues N`, every batch is spread evenly over the N queues.
 async fn bench_produce(queues: &DurableQueues, options: &Options) {
+    let bench_queues = options.bench_queues();
     let batch = |count: i64| -> Vec<Message<Payload>> {
         let placed_at = Utc::now();
         (0..count)
@@ -320,10 +331,7 @@ async fn bench_produce(queues: &DurableQueues, options: &Options) {
         let count = options.int("count", 0);
         while sent < count {
             let chunk = (count - sent).min(1000);
-            queues
-                .queue_messages(&options.queue_name, &batch(chunk))
-                .await
-                .expect("queue backlog");
+            queue_spread(queues, &bench_queues, chunk, &batch).await;
             sent += chunk;
         }
     } else {
@@ -337,10 +345,7 @@ async fn bench_produce(queues: &DurableQueues, options: &Options) {
             ticks.tick().await;
             let owed = (rate * start.elapsed().as_secs_f64()) as i64 - sent;
             if owed > 0 {
-                queues
-                    .queue_messages(&options.queue_name, &batch(owed))
-                    .await
-                    .expect("queue messages");
+                queue_spread(queues, &bench_queues, owed, &batch).await;
                 sent += owed;
             }
             if reported.0.elapsed() >= Duration::from_secs(1) {
@@ -357,37 +362,63 @@ async fn bench_produce(queues: &DurableQueues, options: &Options) {
     emit(event);
 }
 
-/// A consumer with a no-op handler, reporting once a second. The first message handled is also reported on its own,
+/// Queues `count` messages spread evenly over `bench_queues`, one `queue_messages` statement per queue.
+async fn queue_spread(
+    queues: &DurableQueues,
+    bench_queues: &[QueueName],
+    count: i64,
+    batch: &impl Fn(i64) -> Vec<Message<Payload>>,
+) {
+    let n = bench_queues.len() as i64;
+    for (i, queue_name) in bench_queues.iter().enumerate() {
+        // The remainder goes to the first queues
+        let share = count / n + i64::from((i as i64) < count % n);
+        if share > 0 {
+            queues
+                .queue_messages(queue_name, &batch(share))
+                .await
+                .expect("queue messages");
+        }
+    }
+}
+
+/// A consumer with a no-op handler, reporting once a second; with `--queues N`, one consumer per queue (each with
+/// `--parallel` slots) sharing the report. The first message handled is also reported on its own,
 /// for startup time.
 async fn bench_consume(queues: &DurableQueues, options: Options) {
     let latencies = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
     let first = Arc::new(std::sync::Once::new());
-    let config = ConsumerConfig::new(
-        options.queue_name.clone(),
-        RedeliveryPolicy::fixed_backoff(Duration::from_millis(100), 5),
-    )
-    .with_parallel_consumers(options.int("parallel", 1) as usize)
-    .with_fetch_pacing(options.fetch_pacing());
     let options = Arc::new(options);
-    let handler_options = options.clone();
-    let handler_latencies = latencies.clone();
-    let _consumer = queues
-        .consume_from_queue(config, move |message: QueuedMessage<Payload>| {
-            let now = Utc::now();
-            first.call_once(|| {
-                let mut event = handler_options.event("first");
-                event.insert("at".to_owned(), json!(now.timestamp_millis()));
-                emit(event);
-            });
-            if let Payload::OrderPlaced(payload) = &message.message.payload {
-                let latency = (now - payload.placed_at)
-                    .num_microseconds()
-                    .unwrap_or(i64::MAX);
-                handler_latencies.lock().unwrap().push(latency);
-            }
-            async { Ok(()) }
-        })
-        .expect("start consumer");
+    let mut consumers = Vec::new();
+    for queue_name in options.bench_queues() {
+        let config = ConsumerConfig::new(
+            queue_name,
+            RedeliveryPolicy::fixed_backoff(Duration::from_millis(100), 5),
+        )
+        .with_parallel_consumers(options.int("parallel", 1) as usize)
+        .with_fetch_pacing(options.fetch_pacing());
+        let handler_options = options.clone();
+        let handler_latencies = latencies.clone();
+        let first = first.clone();
+        let consumer = queues
+            .consume_from_queue(config, move |message: QueuedMessage<Payload>| {
+                let now = Utc::now();
+                first.call_once(|| {
+                    let mut event = handler_options.event("first");
+                    event.insert("at".to_owned(), json!(now.timestamp_millis()));
+                    emit(event);
+                });
+                if let Payload::OrderPlaced(payload) = &message.message.payload {
+                    let latency = (now - payload.placed_at)
+                        .num_microseconds()
+                        .unwrap_or(i64::MAX);
+                    handler_latencies.lock().unwrap().push(latency);
+                }
+                async { Ok(()) }
+            })
+            .expect("start consumer");
+        consumers.push(consumer);
+    }
     emit(options.event("ready"));
     let mut ticks = tokio::time::interval(Duration::from_secs(1));
     loop {

@@ -47,6 +47,8 @@ VARIANTS = {
     "rust-eager": ("rust", ["--fetch-pacing", "eager"]),
 }
 QUEUE = "Bench"
+# The configuration being measured: with `queues` > 1 the nodes use `Bench-0` ... `Bench-<n-1>` (`--queues`)
+CURRENT = {"queues": 1}
 
 
 def sh(*args, check=True) -> str:
@@ -109,7 +111,7 @@ def node_args(lang):
 def run_node(lang, name, command, limits, *options):
     image, *connection = node_args(lang)
     sh("docker", "run", "-d", "--name", name, "--network", NETWORK, *limits, image, command,
-       "--queue", QUEUE, "--pool-size", str(POOL_SIZE), "--node", NODE_NAMES.get(command, lang), *options,
+       "--queue", QUEUE, "--queues", str(CURRENT["queues"]), "--pool-size", str(POOL_SIZE), "--node", NODE_NAMES.get(command, lang), *options,
        *connection)
 
 
@@ -133,7 +135,7 @@ def generate(*options):
 
 def reset_queue():
     if table_exists():
-        psql(f"DELETE FROM durable_queues WHERE queue_name = '{QUEUE}'")
+        psql(f"DELETE FROM durable_queues WHERE queue_name LIKE '{QUEUE}%'")
 
 
 def table_exists():
@@ -141,7 +143,7 @@ def table_exists():
 
 
 def queued():
-    return int(psql(f"SELECT count(*) FROM durable_queues WHERE queue_name = '{QUEUE}'")) if table_exists() else 0
+    return int(psql(f"SELECT count(*) FROM durable_queues WHERE queue_name LIKE '{QUEUE}%'")) if table_exists() else 0
 
 
 class Collector:
@@ -296,7 +298,7 @@ def measure_startup(variant, consume, reps):
 
 def measure(variant, parallel, args, out):
     lang, pacing = VARIANTS[variant]
-    label = f"{variant} p{parallel}"
+    label = f"{variant} q{CURRENT['queues']} p{parallel}"
 
     def consume(name):
         run_node(lang, name, "bench-consume", NODE_LIMITS, "--parallel", str(parallel), *pacing)
@@ -337,7 +339,7 @@ def measure(variant, parallel, args, out):
         log(f"  handled {level['throughput_per_s']}/s, p50 {level['latency_ms']['p50']} ms, "
             f"p99 {level['latency_ms']['p99']} ms, cpu {level['cpu_percent']['avg']}%")
     collector.stop()
-    write_raw(out, f"{variant}-p{parallel}-steady", collector)
+    write_raw(out, f"{variant}-q{CURRENT['queues']}-p{parallel}-steady", collector)
     sh("docker", "rm", "-f", "-v", name)
 
     for kind in ("saturation", "saturation_stale_stats"):
@@ -389,7 +391,7 @@ def drain_backlog(kind, variant, parallel, consume, lang, label, args, out):
                    statements=top_statements())
     log(f"  drained at {drained['throughput_per_s']}/s")
     collector.stop()
-    write_raw(out, f"{variant}-p{parallel}-{kind}", collector)
+    write_raw(out, f"{variant}-q{CURRENT['queues']}-p{parallel}-{kind}", collector)
     sh("docker", "rm", "-f", "-v", name)
     return drained
 
@@ -451,12 +453,13 @@ def write_report(results, out):
               f"| Container image | {sizes['java']['image_mib']} MiB | {sizes['rust']['image_mib']} MiB |",
               f"| Artifact | {sizes['java']['artifact_mib']} MiB ({sizes['java']['artifact']}) | "
               f"{sizes['rust']['artifact_mib']} MiB ({sizes['rust']['artifact']}) |", ""]
-    for parallel in settings["parallel_consumers"]:
-        runs = results.get(f"p{parallel}", {})
+    for queues, parallel in ((q, p) for q in settings["queues"] for p in settings["parallel_consumers"]):
+        runs = results.get(f"q{queues}-p{parallel}", {})
         variants = list(runs)
         if not variants:
             continue
-        lines += [f"## parallel_consumers = {parallel}", "",
+        lines += [f"## queues = {queues}, parallel_consumers = {parallel}"
+                  + (" (per queue)" if queues > 1 else ""), "",
                   "| | " + " | ".join(variants) + " |", "|---" * (len(variants) + 1) + "|"]
 
         def row(name, cell):
@@ -497,6 +500,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--variants", default=",".join(VARIANTS))
     parser.add_argument("--parallel", default="8,128", help="parallel_consumers settings, each a full run")
+    parser.add_argument("--queues", default="1,10",
+                        help="number of queues, each a full run with every --parallel; load is spread evenly")
     parser.add_argument("--levels", default="100,1000,5000")
     parser.add_argument("--warmup-s", type=int, default=10)
     parser.add_argument("--duration-s", type=int, default=30)
@@ -515,6 +520,7 @@ def main():
         args.saturation_count, args.startup_reps, args.levels = 2000, 1, "100,1000"
     args.levels = [int(level) for level in args.levels.split(",")]
     args.parallel = [int(p) for p in args.parallel.split(",")]
+    args.queues = [int(q) for q in args.queues.split(",")]
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out = args.out or BENCH / "results" / (stamp + ("-quick" if args.quick else ""))
     (out / "raw").mkdir(parents=True, exist_ok=True)
@@ -525,7 +531,7 @@ def main():
         "started": stamp,
         "settings": {"node_limits": NODE_LIMITS, "generator_limits": GENERATOR_LIMITS, "postgres_limits": PG_LIMITS,
                      "postgres_image": PG_IMAGE, "parallel_consumers": args.parallel, "pool_size": POOL_SIZE,
-                     "polling_interval_ms": 20, "queues": 1, "handler": "no-op",
+                     "polling_interval_ms": 20, "queues": args.queues, "handler": "no-op",
                      "warmup_s": args.warmup_s, "duration_s": args.duration_s, "levels": args.levels,
                      "saturation_count": args.saturation_count,
                      "host": {"cpus": sh("nproc").strip(),
@@ -534,16 +540,18 @@ def main():
         "sizes": sizes(),
     }
     try:
-        for parallel in args.parallel:
-            results[f"p{parallel}"] = {}
+        for queues, parallel in ((q, p) for q in args.queues for p in args.parallel):
+            CURRENT["queues"] = queues
+            config = f"q{queues}-p{parallel}"
+            results[config] = {}
             for variant in args.variants.split(","):
                 # A fresh database per run, so none inherits another's table bloat or statistics
                 start_postgres(args.auto_explain_ms)
                 try:
-                    results[f"p{parallel}"][variant] = measure(variant, parallel, args, out)
+                    results[config][variant] = measure(variant, parallel, args, out)
                 finally:
                     if args.auto_explain_ms is not None:
-                        (out / "raw" / f"postgres-{variant}-p{parallel}.log").write_text(
+                        (out / "raw" / f"postgres-{variant}-{config}.log").write_text(
                             subprocess.run(["docker", "logs", PG], capture_output=True, text=True).stderr)
     finally:
         stop_all()

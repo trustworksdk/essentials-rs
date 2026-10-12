@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *                                 [--handle-ms H] [--timeout-ms T]
  * harness consume-and-crash-after K  (consume options)
  * harness resurrect               --id ID [--delay-ms D]
- * harness bench-consume           [--parallel P]
+ * harness bench-consume           [--parallel P] [--queues N]
  * common: --jdbc-url URL [--user U] [--password P] [--queue Q] [--node NAME] [--pool-size N]
  * </pre>
  * {@code bench-consume} is Phase 7's: a no-op handler reporting, once a second, how many messages it handled and each
@@ -225,10 +225,14 @@ public final class Harness {
                 }
             }
         };
-        durableQueues.consumeFromQueue(queueName,
-                                       RedeliveryPolicy.fixedBackoff(Duration.ofMillis(100), 5),
-                                       (int) longOption("parallel", 1),
-                                       handler);
+        // With --queues N (N > 1): <queue>-0 ... <queue>-<N-1>, one consumer each, as the Rust node does
+        var queues = (int) longOption("queues", 1);
+        for (var i = 0; i < queues; i++) {
+            durableQueues.consumeFromQueue(queues == 1 ? queueName : QueueName.of(queueName + "-" + i),
+                                           RedeliveryPolicy.fixedBackoff(Duration.ofMillis(100), 5),
+                                           (int) longOption("parallel", 1),
+                                           handler);
+        }
         emit(event("ready"));
         while (true) {
             Thread.sleep(1000);
