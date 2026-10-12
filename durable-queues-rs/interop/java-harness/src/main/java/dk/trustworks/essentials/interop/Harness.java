@@ -10,6 +10,8 @@ import dk.trustworks.essentials.components.foundation.messaging.RedeliveryPolicy
 import dk.trustworks.essentials.components.foundation.messaging.queue.*;
 import dk.trustworks.essentials.components.foundation.transaction.jdbi.JdbiUnitOfWorkFactory;
 import dk.trustworks.essentials.components.queue.postgresql.PostgresqlDurableQueues;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 import org.jdbi.v3.core.Jdbi;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
@@ -17,8 +19,10 @@ import tools.jackson.databind.node.ObjectNode;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -33,8 +37,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  *                                 [--handle-ms H] [--timeout-ms T]
  * harness consume-and-crash-after K  (consume options)
  * harness resurrect               --id ID [--delay-ms D]
- * common: --jdbc-url URL [--user U] [--password P] [--queue Q] [--node NAME]
+ * harness bench-consume           [--parallel P]
+ * common: --jdbc-url URL [--user U] [--password P] [--queue Q] [--node NAME] [--pool-size N]
  * </pre>
+ * {@code bench-consume} is Phase 7's: a no-op handler reporting, once a second, how many messages it handled and each
+ * one's latency since the workload generator sent it ({@code OrderPlaced.placedAt}).
  */
 public final class Harness {
     private static final ObjectMapper MAPPER = EssentialsObjectMappers.createJackson3ObjectMapper();
@@ -72,14 +79,20 @@ public final class Harness {
             case "produce-fixture" -> harness.produceFixture();
             case "consume", "consume-and-crash-after" -> harness.consume();
             case "resurrect" -> harness.resurrect();
+            case "bench-consume" -> harness.benchConsume();
             default -> throw new IllegalArgumentException("unknown command " + command);
         }
     }
 
     private PostgresqlDurableQueues durableQueues() {
-        var jdbi = Jdbi.create(option("jdbc-url", System.getenv("JDBC_URL")),
-                               option("user", "postgres"),
-                               option("password", "postgres"));
+        var pool = new HikariConfig();
+        pool.setJdbcUrl(option("jdbc-url", System.getenv("JDBC_URL")));
+        pool.setUsername(option("user", "postgres"));
+        pool.setPassword(option("password", "postgres"));
+        pool.setMaximumPoolSize((int) longOption("pool-size", 10));
+        // The node name as application_name, so pg_stat_activity tells the nodes' connections apart (Phase 7)
+        pool.addDataSourceProperty("ApplicationName", node);
+        var jdbi = Jdbi.create(new HikariDataSource(pool));
         var builder = PostgresqlDurableQueues.builder()
                                              .setUnitOfWorkFactory(new JdbiUnitOfWorkFactory(jdbi))
                                              .setJsonSerializer(EssentialsObjectMappers.createJSONSerializer());
@@ -192,6 +205,45 @@ public final class Harness {
         }));
         emit(event("ready"));
         stopped.await();
+    }
+
+    private void benchConsume() throws InterruptedException {
+        var durableQueues = durableQueues();
+        var latencies     = new ArrayList<Long>();
+        var first         = new AtomicBoolean();
+        QueuedMessageHandler handler = message -> {
+            var now = Instant.now();
+            if (first.compareAndSet(false, true)) {
+                var event = event("first");
+                event.put("at", now.toEpochMilli());
+                emit(event);
+            }
+            if (message.getPayload() instanceof OrderPlaced payload) {
+                var latency = ChronoUnit.MICROS.between(payload.placedAt, now);
+                synchronized (latencies) {
+                    latencies.add(latency);
+                }
+            }
+        };
+        durableQueues.consumeFromQueue(queueName,
+                                       RedeliveryPolicy.fixedBackoff(Duration.ofMillis(100), 5),
+                                       (int) longOption("parallel", 1),
+                                       handler);
+        emit(event("ready"));
+        while (true) {
+            Thread.sleep(1000);
+            List<Long> tick;
+            synchronized (latencies) {
+                tick = new ArrayList<>(latencies);
+                latencies.clear();
+            }
+            var event = event("tick");
+            event.put("at", Instant.now().toEpochMilli());
+            event.put("count", tick.size());
+            var array = event.putArray("latencies_us");
+            tick.forEach(array::add);
+            emit(event);
+        }
     }
 
     private void resurrect() {

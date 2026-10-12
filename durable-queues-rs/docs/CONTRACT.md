@@ -152,6 +152,11 @@ WHERE q.id = u.id
 RETURNING q.*;
 ```
 
+**Planner note (found in Phase 7, applies to Java and Rust alike):** with table statistics from a time the table was
+nearly empty, PostgreSQL plans the `UPDATE … FROM cte_unordered u WHERE q.id = u.id` join as a nested loop over every
+row of the queue. A claim then costs time proportional to the backlog (about 42 ms per claim with 20 000 queued,
+against 1–2 ms with current statistics) until autoanalyze runs. `bench/README.md` has the measurement and the plan.
+
 ### 4.2 Ordered claim (verbatim)
 
 ```sql
@@ -327,6 +332,10 @@ is done in `double` nanoseconds. Worked example `exponential(500ms, 500ms, 2.0, 
 - **Polling:** the centralized fetcher polls every 20 ms by default. An optional optimizer (exponential backoff +
   jitter) is only active with LISTEN/NOTIFY. Rust Phase 3 uses a simple adaptive backoff; LISTEN/NOTIFY is out of
   scope.
+- **Polling pace** (found in Phase 7): Java's fetcher runs on `scheduleAtFixedRate`, one poll per interval whatever
+  the previous poll found. A consumer therefore handles at most `parallelConsumers / pollingInterval` messages a
+  second: 400/s with 8 slots and 20 ms. Rust's default loop (`FetchPacing::Eager`) polls again as soon as a slot
+  frees after a full poll, so it has no such ceiling. `FetchPacing::FixedRate` reproduces Java's pace.
 - **Concurrency:** `parallelConsumers` worker slots per queue. The fetcher claims at most the number of free slots,
   so claimed messages never sit in a local buffer, where they would age towards the stuck timeout.
 - **Ordered keys:** a key being handled on this node is excluded from the next ordered claim (`excludeKeys`).

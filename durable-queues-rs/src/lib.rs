@@ -13,7 +13,7 @@ mod storage;
 mod table_name;
 mod types;
 
-pub use consumer::{ConsumerConfig, MessageHandler, QueueConsumer};
+pub use consumer::{ConsumerConfig, FetchPacing, MessageHandler, QueueConsumer};
 pub use durable_queues::DurableQueues;
 pub use error::{DurableQueuesError, Result};
 pub use message::{

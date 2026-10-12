@@ -7,10 +7,16 @@
 //!                                    [--max-redeliveries R] [--handle-ms H] [--timeout-ms T]
 //! interop consume-and-crash-after K  (consume options)
 //! interop resurrect                  --id ID [--delay-ms D]
-//! common: --database-url URL [--queue Q] [--node NAME]
+//! interop bench-produce              (--rate R --duration-s D | --count N) [--tick-ms T]
+//! interop bench-consume              [--parallel P]
+//! consume options: [--fetch-pacing eager|fixed-rate]  (default eager; fixed-rate is Java's polling)
+//! common: --database-url URL [--queue Q] [--node NAME] [--pool-size N]
 //! ```
 //!
-//! A consumer runs until the process is killed.
+//! A consumer runs until the process is killed. The `bench-*` commands are Phase 7's: `bench-produce` is the workload
+//! generator for both languages, stamping each `OrderPlaced.placedAt` with its send time; `bench-consume` handles
+//! messages without doing any work and reports, once a second, how many it handled and each one's latency since it
+//! was sent.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,12 +25,12 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use durable_queues_rs::{
-    ConsumerConfig, DecodeError, DurableQueues, HandlerError, Message, PostgresQueueStorage,
-    QueueEntryId, QueueMessage, QueueName, QueuedMessage, RedeliveryPolicy,
+    ConsumerConfig, DecodeError, DurableQueues, FetchPacing, HandlerError, Message,
+    PostgresQueueStorage, QueueEntryId, QueueMessage, QueueName, QueuedMessage, RedeliveryPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 /// Java's `com.acme.orders.OrderPlaced`: `SingleValueType`s as bare strings, a `BigDecimal`, an `Instant`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +139,14 @@ impl Options {
         Duration::from_millis(self.int(name, default as i64) as u64)
     }
 
+    fn fetch_pacing(&self) -> FetchPacing {
+        match self.values.get("fetch-pacing").map(String::as_str) {
+            None | Some("eager") => FetchPacing::Eager,
+            Some("fixed-rate") => FetchPacing::FixedRate,
+            Some(other) => panic!("--fetch-pacing must be eager or fixed-rate, not {other}"),
+        }
+    }
+
     fn event(&self, name: &str) -> serde_json::Map<String, Value> {
         let mut event = serde_json::Map::new();
         event.insert("event".to_owned(), json!(name));
@@ -153,9 +167,15 @@ async fn main() {
         .next()
         .expect("usage: interop <command> [--option value]...");
     let options = Options::parse(&command, args);
+    // The node name as `application_name`, so pg_stat_activity tells the nodes' connections apart (Phase 7)
+    let connect_options = options
+        .string("database-url")
+        .parse::<PgConnectOptions>()
+        .expect("--database-url")
+        .application_name(&options.node);
     let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(options.string("database-url"))
+        .max_connections(options.int("pool-size", 10) as u32)
+        .connect_with(connect_options)
         .await
         .expect("connect to PostgreSQL");
     let mut queues = DurableQueues::new(
@@ -170,6 +190,8 @@ async fn main() {
         "produce" => produce(&queues, &options).await,
         "consume" | "consume-and-crash-after" => consume(&queues, options).await,
         "resurrect" => resurrect(&queues, &options).await,
+        "bench-produce" => bench_produce(&queues, &options).await,
+        "bench-consume" => bench_consume(&queues, options).await,
         other => panic!("unknown command {other}"),
     }
 }
@@ -239,7 +261,8 @@ async fn consume(queues: &DurableQueues, options: Options) {
         options.int("max-redeliveries", 5) as u32,
     );
     let config = ConsumerConfig::new(options.queue_name.clone(), policy)
-        .with_parallel_consumers(options.int("parallel", 1) as usize);
+        .with_parallel_consumers(options.int("parallel", 1) as usize)
+        .with_fetch_pacing(options.fetch_pacing());
     let fail_attempts = options.int("fail-attempts", 0);
     let handle_time = options.millis("handle-ms", 0);
     let hang_after = options.int("hang-after", -1);
@@ -273,6 +296,109 @@ async fn consume(queues: &DurableQueues, options: Options) {
         .expect("start consumer");
     emit(options.event("ready"));
     std::future::pending::<()>().await;
+}
+
+/// Open-loop load at a fixed rate: every tick inserts as many messages as the rate owes since the start, in one
+/// `queue_messages` statement, so a slow insert is caught up on rather than lowering the rate. With `--count`, queues
+/// that many at once (a backlog) instead.
+async fn bench_produce(queues: &DurableQueues, options: &Options) {
+    let batch = |count: i64| -> Vec<Message<Payload>> {
+        let placed_at = Utc::now();
+        (0..count)
+            .map(|i| {
+                Message::new(Payload::OrderPlaced(OrderPlaced {
+                    order_id: format!("bench-{i}"),
+                    customer_id: "customer".to_owned(),
+                    amount: 1.into(),
+                    placed_at,
+                }))
+            })
+            .collect()
+    };
+    let mut sent = 0;
+    if options.values.contains_key("count") {
+        let count = options.int("count", 0);
+        while sent < count {
+            let chunk = (count - sent).min(1000);
+            queues
+                .queue_messages(&options.queue_name, &batch(chunk))
+                .await
+                .expect("queue backlog");
+            sent += chunk;
+        }
+    } else {
+        let rate = options.int("rate", 100) as f64;
+        let duration = Duration::from_secs(options.int("duration-s", 10) as u64);
+        let mut ticks = tokio::time::interval(options.millis("tick-ms", 10));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let start = tokio::time::Instant::now();
+        let mut reported = (start, 0);
+        while start.elapsed() < duration {
+            ticks.tick().await;
+            let owed = (rate * start.elapsed().as_secs_f64()) as i64 - sent;
+            if owed > 0 {
+                queues
+                    .queue_messages(&options.queue_name, &batch(owed))
+                    .await
+                    .expect("queue messages");
+                sent += owed;
+            }
+            if reported.0.elapsed() >= Duration::from_secs(1) {
+                let mut event = options.event("produced");
+                event.insert("at".to_owned(), json!(Utc::now().timestamp_millis()));
+                event.insert("count".to_owned(), json!(sent - reported.1));
+                emit(event);
+                reported = (tokio::time::Instant::now(), sent);
+            }
+        }
+    }
+    let mut event = options.event("done");
+    event.insert("sent".to_owned(), json!(sent));
+    emit(event);
+}
+
+/// A consumer with a no-op handler, reporting once a second. The first message handled is also reported on its own,
+/// for startup time.
+async fn bench_consume(queues: &DurableQueues, options: Options) {
+    let latencies = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+    let first = Arc::new(std::sync::Once::new());
+    let config = ConsumerConfig::new(
+        options.queue_name.clone(),
+        RedeliveryPolicy::fixed_backoff(Duration::from_millis(100), 5),
+    )
+    .with_parallel_consumers(options.int("parallel", 1) as usize)
+    .with_fetch_pacing(options.fetch_pacing());
+    let options = Arc::new(options);
+    let handler_options = options.clone();
+    let handler_latencies = latencies.clone();
+    let _consumer = queues
+        .consume_from_queue(config, move |message: QueuedMessage<Payload>| {
+            let now = Utc::now();
+            first.call_once(|| {
+                let mut event = handler_options.event("first");
+                event.insert("at".to_owned(), json!(now.timestamp_millis()));
+                emit(event);
+            });
+            if let Payload::OrderPlaced(payload) = &message.message.payload {
+                let latency = (now - payload.placed_at)
+                    .num_microseconds()
+                    .unwrap_or(i64::MAX);
+                handler_latencies.lock().unwrap().push(latency);
+            }
+            async { Ok(()) }
+        })
+        .expect("start consumer");
+    emit(options.event("ready"));
+    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        ticks.tick().await;
+        let latencies = std::mem::take(&mut *latencies.lock().unwrap());
+        let mut event = options.event("tick");
+        event.insert("at".to_owned(), json!(Utc::now().timestamp_millis()));
+        event.insert("count".to_owned(), json!(latencies.len()));
+        event.insert("latencies_us".to_owned(), json!(latencies));
+        emit(event);
+    }
 }
 
 async fn resurrect(queues: &DurableQueues, options: &Options) {

@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use common::{JAVA_ROWS, JAVA_SCHEMA, TestDatabase, eventually};
 use durable_queues_rs::{
-    ConsumerConfig, DecodeError, DeliveryMode, DurableQueuesError, HandlerError, Message,
-    MessageOrder, MessageType, QueueEntryId, QueueMessage, QueueName, QueueStorage, QueuedMessage,
-    RedeliveryPolicy,
+    ConsumerConfig, DecodeError, DeliveryMode, DurableQueuesError, FetchPacing, HandlerError,
+    Message, MessageOrder, MessageType, PollingBackoff, QueueEntryId, QueueMessage, QueueName,
+    QueueStorage, QueuedMessage, RedeliveryPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -560,4 +560,82 @@ async fn one_consumer_per_queue_until_it_is_stopped() {
     ));
     replacement.stop().await;
     other_queue.stop().await;
+}
+
+/// How long `pacing` takes to drain 20 messages with 2 slots and a 100 ms polling interval.
+async fn drain_time(pacing: FetchPacing) -> Duration {
+    let db = TestDatabase::start().await;
+    let queues = db.durable_queues(db.pool.clone()).await;
+    let jobs: Vec<_> = (0..20).map(|n| Message::new(Job { n })).collect();
+    queues.queue_messages(&"Jobs".into(), &jobs).await.unwrap();
+    let handled = Arc::new(AtomicUsize::new(0));
+    let handler = {
+        let handled = handled.clone();
+        move |_: QueuedMessage<Job>| {
+            handled.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        }
+    };
+    let started = Instant::now();
+    let consumer = queues
+        .consume_from_queue(
+            ConsumerConfig::new("Jobs", policy())
+                .with_parallel_consumers(2)
+                .with_polling_interval(Duration::from_millis(100))
+                .with_fetch_pacing(pacing),
+            handler,
+        )
+        .unwrap();
+    eventually("all 20 messages to be handled", || async {
+        handled.load(Ordering::SeqCst) == 20
+    })
+    .await;
+    let elapsed = started.elapsed();
+    consumer.stop().await;
+    elapsed
+}
+
+#[tokio::test]
+async fn fixed_rate_pacing_claims_once_per_polling_interval_like_java() {
+    // Java's centralized fetcher: at most the free slots per poll, one poll per interval. 20 messages in 2 slots
+    // take 10 polls, the first at once: at least 900 ms.
+    let elapsed = drain_time(FetchPacing::FixedRate).await;
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "drained in {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn eager_pacing_polls_again_as_soon_as_a_full_poll_frees_a_slot() {
+    let elapsed = drain_time(FetchPacing::Eager).await;
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "drained in {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn fixed_rate_pacing_rejects_a_polling_backoff_and_a_zero_interval() {
+    let db = TestDatabase::start().await;
+    let queues = db.durable_queues(db.pool.clone()).await;
+    let fixed_rate =
+        ConsumerConfig::new("Jobs", policy()).with_fetch_pacing(FetchPacing::FixedRate);
+    let backoff = PollingBackoff::new(
+        Duration::from_millis(10),
+        Duration::from_millis(200),
+        2.0,
+        0.1,
+    )
+    .unwrap();
+    for config in [
+        fixed_rate.clone().with_polling_backoff(backoff),
+        fixed_rate.with_polling_interval(Duration::ZERO),
+    ] {
+        let result = queues.consume_from_queue(config, |_: QueuedMessage<Job>| async { Ok(()) });
+        assert!(matches!(
+            result,
+            Err(DurableQueuesError::InvalidConsumerConfig(_))
+        ));
+    }
 }

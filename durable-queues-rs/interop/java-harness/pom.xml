@@ -23,6 +23,8 @@
         <slf4j.version>2.0.20</slf4j.version>
         <!-- Spring Boot manages reactor-core in an Essentials application; this harness has no Boot parent -->
         <reactor-core.version>3.8.4</reactor-core.version>
+        <!-- The pool a Spring Boot application gets; pool size is held equal to the Rust node's in Phase 7 -->
+        <hikaricp.version>7.0.2</hikaricp.version>
     </properties>
 
     <dependencyManagement>
@@ -74,6 +76,11 @@
             <groupId>io.projectreactor</groupId>
             <artifactId>reactor-core</artifactId>
             <version>${reactor-core.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.zaxxer</groupId>
+            <artifactId>HikariCP</artifactId>
+            <version>${hikaricp.version}</version>
         </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>

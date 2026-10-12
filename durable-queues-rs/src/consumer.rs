@@ -54,13 +54,32 @@ pub struct ConsumerConfig {
     pub redelivery_policy: RedeliveryPolicy,
     /// Messages handled concurrently - Java's `parallelConsumers`. Never more are claimed than there are free slots.
     pub parallel_consumers: usize,
-    /// Pause after a poll that did not fill every free slot - Java's centralized fetcher polls every 20 ms.
+    /// With [`FetchPacing::Eager`], the pause after a poll that did not fill every free slot; with
+    /// [`FetchPacing::FixedRate`], the time between polls. Java's centralized fetcher polls every 20 ms.
     pub polling_interval: Duration,
+    /// When the consumer polls; see [`FetchPacing`].
+    pub fetch_pacing: FetchPacing,
     /// How long [`QueueConsumer::stop`] waits for in-flight handlers. Handlers still running after it are abandoned;
     /// their messages stay claimed until stuck-message recovery redelivers them.
     pub shutdown_timeout: Duration,
-    /// Optional adaptive pause for idle queues; replaces `polling_interval` after polls that found nothing.
+    /// Optional adaptive pause for idle queues; replaces `polling_interval` after polls that found nothing. Only with
+    /// [`FetchPacing::Eager`].
     pub polling_backoff: Option<PollingBackoff>,
+}
+
+/// When a consumer polls for messages. Both claim at most the free worker slots, with the same SQL; they differ in
+/// throughput once a queue has a backlog. With fixed-rate pacing a consumer handles at most
+/// `parallel_consumers / polling_interval` messages a second (400/s with 8 slots and 20 ms); eager pacing has no such
+/// ceiling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FetchPacing {
+    /// Polls again as soon as a slot frees up after a poll that filled every free slot, and pauses for
+    /// `polling_interval` after a poll that did not. Not what Java does.
+    #[default]
+    Eager,
+    /// Java's centralized fetcher (`scheduleAtFixedRate`): one poll every `polling_interval`, skipped while no slot is
+    /// free. A poll that overruns its interval is followed by the missed ones at once, as in Java.
+    FixedRate,
 }
 
 impl ConsumerConfig {
@@ -71,6 +90,7 @@ impl ConsumerConfig {
             redelivery_policy,
             parallel_consumers: 1,
             polling_interval: Duration::from_millis(20),
+            fetch_pacing: FetchPacing::default(),
             shutdown_timeout: Duration::from_secs(10),
             polling_backoff: None,
         }
@@ -88,9 +108,15 @@ impl ConsumerConfig {
         self
     }
 
-    /// Sets the pause after a poll that did not fill every free slot.
+    /// Sets the polling interval; what it means depends on the [`FetchPacing`].
     pub fn with_polling_interval(mut self, polling_interval: Duration) -> Self {
         self.polling_interval = polling_interval;
+        self
+    }
+
+    /// Sets when the consumer polls; see [`FetchPacing`].
+    pub fn with_fetch_pacing(mut self, fetch_pacing: FetchPacing) -> Self {
+        self.fetch_pacing = fetch_pacing;
         self
     }
 
@@ -105,6 +131,16 @@ impl ConsumerConfig {
         if self.parallel_consumers == 0 || self.parallel_consumers > u32::MAX as usize {
             return Err(DurableQueuesError::InvalidConsumerConfig(
                 "parallel_consumers must be between 1 and u32::MAX",
+            ));
+        }
+        if self.polling_backoff.is_some() && self.fetch_pacing == FetchPacing::FixedRate {
+            return Err(DurableQueuesError::InvalidConsumerConfig(
+                "polling_backoff requires FetchPacing::Eager",
+            ));
+        }
+        if self.polling_interval.is_zero() && self.fetch_pacing == FetchPacing::FixedRate {
+            return Err(DurableQueuesError::InvalidConsumerConfig(
+                "FetchPacing::FixedRate needs a polling_interval greater than zero",
             ));
         }
         Ok(())
@@ -239,13 +275,21 @@ struct Fetcher<M, H, S> {
 impl<M: QueueMessage, H: MessageHandler<M>, S: QueueStorage> Fetcher<M, H, S> {
     async fn run(mut self) {
         let queue_name = self.config.queue_name.clone();
-        debug!(queue = %queue_name, parallel_consumers = self.config.parallel_consumers, "consumer started");
+        debug!(queue = %queue_name, parallel_consumers = self.config.parallel_consumers, pacing = ?self.config.fetch_pacing, "consumer started");
         let mut in_flight = JoinSet::new();
+        match self.config.fetch_pacing {
+            FetchPacing::Eager => self.run_eager(&mut in_flight).await,
+            FetchPacing::FixedRate => self.run_fixed_rate(&mut in_flight).await,
+        }
+        self.shutdown(in_flight).await;
+    }
+
+    async fn run_eager(&mut self, in_flight: &mut JoinSet<()>) {
         loop {
-            reap(&mut in_flight, &queue_name);
+            reap(in_flight, &self.config.queue_name);
             let mut slots = tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => break,
+                _ = self.cancel.cancelled() => return,
                 permit = self.slots.clone().acquire_owned() => permit.expect("the slot semaphore is never closed"),
             };
             let free = self.slots.available_permits();
@@ -256,68 +300,99 @@ impl<M: QueueMessage, H: MessageHandler<M>, S: QueueStorage> Fetcher<M, H, S> {
             }
 
             let wanted = slots.num_permits();
-            let now = Utc::now();
-            let reset_stuck = self.stuck_message_reset_due(now);
-            let exclude_keys = self.in_flight_keys.snapshot();
-            let claimed = match self
-                .storage
-                .claim(&queue_name, wanted as i64, now, reset_stuck, &exclude_keys)
-                .await
-            {
-                Ok(result) => {
-                    if reset_stuck.is_some() {
-                        self.last_stuck_reset = Some(Instant::now());
-                        if result.reset > 0 {
-                            warn!(queue = %queue_name, count = result.reset, "returned messages stuck in delivery to the queue");
-                        }
-                    }
-                    result.claimed
-                }
-                Err(e) => {
-                    error!(queue = %queue_name, error = %e, "failed to claim messages");
-                    Vec::new()
-                }
-            };
-            let found = claimed.len();
-            for entry in claimed {
-                let slot = slots
-                    .split(1)
-                    .expect("never more messages claimed than slots held");
-                let span = info_span!(
-                    "deliver_message",
-                    queue_name = %entry.queue_name,
-                    queue_entry_id = %entry.id,
-                    attempt = entry.total_attempts,
-                    redelivery_attempts = entry.redelivery_attempts,
-                    outcome = field::Empty,
-                );
-                let key = entry
-                    .key
-                    .as_deref()
-                    .and_then(|key| self.in_flight_keys.lease(key));
-                let delivery = deliver(
-                    self.storage.clone(),
-                    self.handler.clone(),
-                    self.redelivery_policy.clone(),
-                    entry,
-                    slot,
-                    key,
-                );
-                in_flight.spawn(delivery.instrument(span));
-            }
-            drop(slots);
-
+            let found = self.poll(slots, in_flight).await;
             if found < wanted {
                 let pause = self.pause_after_poll(found);
                 tokio::select! {
-                    _ = self.cancel.cancelled() => break,
+                    _ = self.cancel.cancelled() => return,
                     _ = tokio::time::sleep(pause) => {}
                 }
             } else if let Some(backoff) = &mut self.backoff {
                 backoff.reset();
             }
         }
-        self.shutdown(in_flight).await;
+    }
+
+    async fn run_fixed_rate(&mut self, in_flight: &mut JoinSet<()>) {
+        // tokio's default `MissedTickBehavior::Burst` catches up on missed ticks, like `scheduleAtFixedRate`
+        let mut ticks = tokio::time::interval(self.config.polling_interval);
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return,
+                _ = ticks.tick() => {}
+            }
+            reap(in_flight, &self.config.queue_name);
+            let free = self.slots.available_permits();
+            // Java: "No worker capacity available, skipping fetch and distribute"
+            if free == 0 {
+                continue;
+            }
+            if let Ok(slots) = self.slots.clone().try_acquire_many_owned(free as u32) {
+                self.poll(slots, in_flight).await;
+            }
+        }
+    }
+
+    /// One claim for the `slots` held, each claimed message spawned as a delivery holding one of them. Returns the
+    /// number claimed; unused slots are released.
+    async fn poll(
+        &mut self,
+        mut slots: OwnedSemaphorePermit,
+        in_flight: &mut JoinSet<()>,
+    ) -> usize {
+        let queue_name = &self.config.queue_name;
+        let wanted = slots.num_permits();
+        let now = Utc::now();
+        let reset_stuck = self.stuck_message_reset_due(now);
+        let exclude_keys = self.in_flight_keys.snapshot();
+        let claimed = match self
+            .storage
+            .claim(queue_name, wanted as i64, now, reset_stuck, &exclude_keys)
+            .await
+        {
+            Ok(result) => {
+                if reset_stuck.is_some() {
+                    self.last_stuck_reset = Some(Instant::now());
+                    if result.reset > 0 {
+                        warn!(queue = %queue_name, count = result.reset, "returned messages stuck in delivery to the queue");
+                    }
+                }
+                result.claimed
+            }
+            Err(e) => {
+                error!(queue = %queue_name, error = %e, "failed to claim messages");
+                Vec::new()
+            }
+        };
+        let found = claimed.len();
+        for entry in claimed {
+            let slot = slots
+                .split(1)
+                .expect("never more messages claimed than slots held");
+            let span = info_span!(
+                "deliver_message",
+                queue_name = %entry.queue_name,
+                queue_entry_id = %entry.id,
+                attempt = entry.total_attempts,
+                redelivery_attempts = entry.redelivery_attempts,
+                outcome = field::Empty,
+            );
+            let key = entry
+                .key
+                .as_deref()
+                .and_then(|key| self.in_flight_keys.lease(key));
+            let delivery = deliver(
+                self.storage.clone(),
+                self.handler.clone(),
+                self.redelivery_policy.clone(),
+                entry,
+                slot,
+                key,
+            );
+            in_flight.spawn(delivery.instrument(span));
+        }
+        found
     }
 
     /// Java throttles the stuck-message reset to once per `messageHandlingTimeout` per queue; the first poll always
