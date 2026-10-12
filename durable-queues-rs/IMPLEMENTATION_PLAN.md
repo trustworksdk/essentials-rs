@@ -533,7 +533,21 @@ Discrepancies are written down, not patched around.
 
 ---
 
-## Phase 8 — Evaluation report
+## Phase 8 — Evaluation report ✅ done
+
+**Delivered:** [`docs/EVALUATION.md`](docs/EVALUATION.md). It has:
+- the experiment's comparison table, filled in from the Phase 7 run;
+- effort per phase;
+- code size (`tokei`, against the Java 0.60.0 source);
+- test counts and the Java checklist tally;
+- bugs found in each implementation;
+- operational notes, ergonomics and a recommendation.
+
+**Deviation:** effort was not tracked as hours while the work happened. It is reconstructed from the Claude Code
+session transcripts: active time with gaps capped at 15 min, cut at each phase's commit. Work before the first
+transcript (14:23 UTC, 2026-10-11) is not counted.
+
+**Plan, as written:**
 
 Fill in the experiment's comparison table: effort (hours per phase, tracked from Phase 1 onwards), code size
 (`tokei`), test count, bugs found in each implementation, operational notes, and a recommendation. This answers the
