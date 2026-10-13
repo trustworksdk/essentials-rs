@@ -1,0 +1,8 @@
+# Only the Cargo workspace goes into the build context
+*
+!Cargo.toml
+!Cargo.lock
+!durable-queues-rs/Cargo.toml
+!durable-queues-rs/src
+!durable-queues-rs/tests
+!durable-queues-rs/docs/fixtures
