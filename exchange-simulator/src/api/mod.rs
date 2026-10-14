@@ -20,7 +20,7 @@ pub use error::ApiError;
 pub use model::*;
 
 use crate::domain::{Instrument, InstrumentId, Participant};
-use crate::engine::{Dispatcher, SubmitOutcome};
+use crate::engine::{DispatchError, Dispatcher, ExchangeError, SubmitOutcome};
 use crate::events::EventEnvelope;
 use crate::persistence::{ExecutionFilter, InstrumentFilter, Store};
 use crate::webhooks::NewSubscription;
@@ -67,6 +67,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/instruments",
             post(register_instrument).get(list_instruments),
+        )
+        .route(
+            "/api/instruments/{id}",
+            axum::routing::patch(update_instrument),
         )
         .route("/api/participants", post(register_participant))
         .route("/api/orders", post(submit_order))
@@ -120,6 +124,26 @@ async fn list_instruments(
     };
     let instruments = state.read(move |store| store.instruments(&filter)).await?;
     Ok(Json(instruments.iter().map(InstrumentView::from).collect()))
+}
+
+/// Changes an instrument's trading status. Resting orders stay; cancels keep working while it is disabled.
+async fn update_instrument(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Result<Json<InstrumentPatch>, JsonRejection>,
+) -> Result<Json<InstrumentView>, ApiError> {
+    let Json(patch) = body?;
+    let instrument = state
+        .dispatcher
+        .set_instrument_enabled(InstrumentId(id), patch.enabled)
+        .await
+        .map_err(|error| match error {
+            DispatchError::Exchange(ExchangeError::UnknownInstrument(id)) => {
+                ApiError::not_found(format!("unknown instrument {id}"))
+            }
+            other => other.into(),
+        })?;
+    Ok(Json(InstrumentView::from(&instrument)))
 }
 
 async fn register_participant(

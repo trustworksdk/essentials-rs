@@ -21,6 +21,7 @@ fn acme() -> Instrument {
         currency_scale: 2,
         tick_size_minor: 1,
         lot_size: 1,
+        enabled: true,
     }
 }
 
@@ -722,4 +723,62 @@ fn sequential_ids_are_deterministic() {
     let mut ids = SequentialIds::default();
     assert_eq!(ids.next_id(), Uuid::from_u128(1));
     assert_eq!(ids.next_id(), Uuid::from_u128(2));
+}
+
+#[test]
+fn a_disabled_instrument_rejects_orders_but_still_cancels() {
+    let mut h = Harness::new();
+    let resting = h.limit("A", Side::Sell, 10000, 10);
+    h.book.set_enabled(false);
+    assert!(!h.book.instrument().enabled);
+
+    let buy = h.limit("B", Side::Buy, 10000, 10);
+    assert_eq!(buy.rejection, Some(RejectReason::InstrumentDisabled));
+    assert_eq!(
+        (buy.order.status, buy.order.remaining_quantity),
+        (OrderStatus::Rejected, 10)
+    );
+    assert!(buy.executions.is_empty() && buy.fills.is_empty());
+    let market = h.market("B", Side::Buy, 5);
+    assert_eq!(market.rejection, Some(RejectReason::InstrumentDisabled));
+    assert_eq!(
+        h.book.depth(Side::Sell),
+        [level(10000, 10, 1)],
+        "resting orders stay"
+    );
+    assert!(
+        h.book.depth(Side::Buy).is_empty(),
+        "a rejected limit order does not rest"
+    );
+
+    let other = h.limit("C", Side::Sell, 10100, 5);
+    assert_eq!(other.rejection, Some(RejectReason::InstrumentDisabled));
+    let cancelled = h.book.cancel(resting.order.id).unwrap();
+    assert_eq!(
+        cancelled.order.status,
+        OrderStatus::Cancelled,
+        "cancels work while disabled"
+    );
+    let again = h.limit("A", Side::Sell, 10000, 10);
+    assert_eq!(again.rejection, Some(RejectReason::InstrumentDisabled));
+
+    h.book.set_enabled(true);
+    h.limit("A", Side::Sell, 10000, 10);
+    assert_eq!(
+        h.limit("B", Side::Buy, 10000, 10).executions.len(),
+        1,
+        "trading resumes"
+    );
+}
+
+#[test]
+fn switching_trading_makes_earlier_plans_stale() {
+    let mut h = Harness::new();
+    let resting = h.limit("A", Side::Sell, 10000, 10);
+    let planned = h.book.plan_cancel(resting.order.id).unwrap();
+    h.book.set_enabled(false);
+    assert!(matches!(
+        h.book.apply(&planned),
+        Err(BookError::StaleUpdate { .. })
+    ));
 }

@@ -39,6 +39,7 @@ enum Request {
     Cancel(Uuid, Reply<(BookUpdate, Instrument)>),
     Snapshot(InstrumentId, oneshot::Sender<Option<BookSnapshot>>),
     RegisterWebhook(NewSubscription, Reply<Subscription>),
+    SetInstrumentEnabled(InstrumentId, bool, Reply<Instrument>),
     ClaimDeliveries(u32, std::time::Duration, Reply<Vec<DeliveryJob>>),
     RecordDeliveries(Vec<DeliveryResult>, Reply<()>),
 }
@@ -96,6 +97,15 @@ impl Dispatcher {
         let (reply, response) = oneshot::channel();
         self.enqueue(Request::Snapshot(instrument_id, reply))?;
         response.await.map_err(|_| DispatchError::Stopped)
+    }
+
+    pub async fn set_instrument_enabled(
+        &self,
+        id: InstrumentId,
+        enabled: bool,
+    ) -> Result<Instrument, DispatchError> {
+        self.call(|reply| Request::SetInstrumentEnabled(id, enabled, reply))
+            .await
     }
 
     pub async fn register_webhook(
@@ -209,6 +219,10 @@ fn handle(exchange: &mut Exchange, request: Request) -> (&'static str, &'static 
             });
             ("cancel", answer(reply, result))
         }
+        Request::SetInstrumentEnabled(id, enabled, reply) => (
+            "set_instrument_enabled",
+            answer(reply, exchange.set_instrument_enabled(&id, enabled)),
+        ),
         Request::RegisterWebhook(request, reply) => (
             "register_webhook",
             answer(reply, exchange.register_webhook(request)),

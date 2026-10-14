@@ -58,8 +58,8 @@ impl Store {
         self.conn
             .prepare_cached(
                 "INSERT INTO instruments (id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor,
-                                          lot_size)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                          lot_size, enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?
             .execute(params![
                 instrument.id.0,
@@ -71,14 +71,25 @@ impl Store {
                 instrument.currency_scale,
                 to_sql(instrument.tick_size_minor),
                 to_sql(instrument.lot_size),
+                instrument.enabled,
             ])
             .map(drop)
+    }
+
+    pub fn set_instrument_enabled(
+        &self,
+        id: &InstrumentId,
+        enabled: bool,
+    ) -> rusqlite::Result<usize> {
+        self.conn
+            .prepare_cached("UPDATE instruments SET enabled = ?2 WHERE id = ?1")?
+            .execute(params![id.0, enabled])
     }
 
     pub fn instruments(&self, filter: &InstrumentFilter) -> rusqlite::Result<Vec<Instrument>> {
         self.conn
             .prepare_cached(
-                "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size
+                "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size, enabled
                  FROM instruments
                  WHERE (?1 IS NULL OR symbol = ?1) AND (?2 IS NULL OR mic = ?2)
                    AND (?3 IS NULL OR isin = ?3) AND (?4 IS NULL OR cusip = ?4)
@@ -91,7 +102,7 @@ impl Store {
     pub fn instrument(&self, id: &InstrumentId) -> rusqlite::Result<Option<Instrument>> {
         self.conn
             .prepare_cached(
-                "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size
+                "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size, enabled
                  FROM instruments WHERE id = ?1",
             )?
             .query_row([&id.0], instrument_row)
@@ -504,6 +515,7 @@ fn instrument_row(row: &Row<'_>) -> rusqlite::Result<Instrument> {
         currency_scale: row.get(6)?,
         tick_size_minor: from_sql(row, 7)?,
         lot_size: from_sql(row, 8)?,
+        enabled: row.get(9)?,
     })
 }
 

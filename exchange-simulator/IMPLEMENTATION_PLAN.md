@@ -23,7 +23,7 @@ Sizes: **S** is under a step of Milestone 1, **M** about one, **L** two or more.
 |---|---|---|---|
 | 1.1 | Commit the containerized acceptance test; push `exchange-simulator-m1`; open a PR to `main` | S | |
 | 1.2 ✅ | Investigate the 57–180 ms commit spikes | S | **Done 2026-10-14.** The cause is the disk, not SQLite. `bench checkpoint` replaces SQLite's auto-checkpoint with an identical observed one: checkpoint commits peak at 8.1 ms, and every commit over 10 ms is an ordinary one. Raw fsync on the same VM disk stalls for 141–950 ms on its own. Checkpoints still cost about 10 % of durable time and most of the p99, so 4.3 is re-scoped. Turning auto-checkpointing off halves throughput. Results: `bench/results/2026-10-14-checkpoint.md`. |
-| 1.3 | Backlog from plan §3/§5 that Milestone 1 skipped (1.3a ✅, 1.3b ✅) | M | Instrument `enabled` flag (a disabled instrument rejects orders); participant settlement metadata (free-form JSON, carried into `TradeExecuted`); HMAC-SHA256 webhook signing (`X-Signature`, a per-subscription secret); an optional serialized-delivery flag per subscription (one in-flight delivery per subscription, in `sequence` order). All four are needed soon (D5), so they come before Milestone 2; split into 1.3a signing, 1.3b ordered delivery, 1.3c instrument `enabled`, 1.3d participant metadata. Each 1.3 item adds a migration to the schema, starting with `002`, so Milestone 2's settlement migration takes the next free number. |
+| 1.3 | Backlog from plan §3/§5 that Milestone 1 skipped (1.3a ✅, 1.3b ✅, 1.3c ✅) | M | Instrument `enabled` flag (a disabled instrument rejects orders); participant settlement metadata (free-form JSON, carried into `TradeExecuted`); HMAC-SHA256 webhook signing (`X-Signature`, a per-subscription secret); an optional serialized-delivery flag per subscription (one in-flight delivery per subscription, in `sequence` order). All four are needed soon (D5), so they come before Milestone 2; split into 1.3a signing, 1.3b ordered delivery, 1.3c instrument `enabled`, 1.3d participant metadata. Each 1.3 item adds a migration to the schema, starting with `002`, so Milestone 2's settlement migration takes the next free number. |
 
 ### Progress
 
@@ -80,6 +80,34 @@ Sizes: **S** is under a step of Milestone 1, **M** about one, **L** two or more.
   - The early-return change to the worker loop is a performance change. No test fails without it, because the tests'
     20 ms poll hides it.
 - `/health` `schemaVersion` is now 3. The README shows it as `<n>`, so it no longer goes stale.
+
+**1.3c — instrument `enabled` flag ✅ (2026-10-14).**
+- **Delivered:**
+  - Migration `004_instrument_enabled.sql` adds `instruments.enabled` (default 1), and `Instrument` gets an `enabled`
+    field.
+  - Registration accepts `enabled` (default `true`). `PATCH /api/instruments/{id}` with `{ "enabled": bool }` (only
+    that field) toggles it durably: the store first, then the book, through the exchange thread.
+  - `OrderBook::set_enabled` bumps the book version, so updates planned before a toggle are stale.
+  - A disabled book turns every incoming order into a recorded rejection before matching, with the new
+    `RejectReason::InstrumentDisabled` (`INSTRUMENT_DISABLED`): sequenced, stored `REJECTED`, `OrderRejected` emitted,
+    `201`. Cancels still work and resting orders stay.
+  - Instrument listings and the book snapshot show `enabled`.
+- **Tests:**
+  - Book level: limit and market orders rejected with nothing traded or rested; resting orders kept; cancel works;
+    trading resumes; toggling makes earlier plans stale.
+  - Store and coordinator: the flag survives restart (also when set at registration); the rejection and its event are
+    stored; the rejected order's sequence is not reused; unknown instrument.
+  - API: halt, reject, cancel, restart, resume; `400` for a bad body or a field other than `enabled`; `404` for an
+    unknown instrument.
+- **Mutation checks**, each made a test fail: the disabled check removed; no version bump; the toggle not persisted;
+  registration ignoring `enabled`. The last one first survived, since tests only looked at the in-memory instrument,
+  and a restart assertion was added to catch it.
+- **Decisions:**
+  - Orders on a halted instrument are *recorded rejections*, not input errors: a halt is a business outcome that
+    consumers should see as an `OrderRejected` event.
+  - Resting orders are kept, not cancelled, on a halt.
+  - Toggling emits no event; an `InstrumentStatusChanged` event type would be a contract addition, left for later.
+- The schema test now names its columns, so later migrations do not break it. `/health` `schemaVersion` is now 4.
 
 ## Milestone 2 — settlement simulation
 

@@ -41,7 +41,8 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
   rests on the book; a `MARKET` remainder is cancelled (status `CANCELLED`, `remainingQuantity` keeps the unfilled
   part).
 - **Self-trade:** an incoming order that would trade against its own participant's resting order is rejected whole.
-  It is recorded with status `REJECTED` and `rejectReason: "SELF_TRADE"`.
+  It is recorded with status `REJECTED` and `rejectReason: "SELF_TRADE"`. Orders for a disabled instrument are recorded
+  the same way, with `rejectReason: "INSTRUMENT_DISABLED"`.
 - **Durability:** a successful response means the order, any resting orders it traded with, its executions, its events
   and their pending webhook deliveries are committed in one SQLite transaction. Books are rebuilt from SQLite on
   startup.
@@ -66,16 +67,27 @@ All bodies are JSON with camelCase fields. Errors look like `{"error": "<code>",
 
 ```json
 { "id": "ACME", "symbol": "ACME", "mic": "XCSE", "isin": "DK0010274414", "cusip": null,
-  "currency": "DKK", "currencyScale": 2, "tickSizeMinor": 1, "lotSize": 1 }
+  "currency": "DKK", "currencyScale": 2, "tickSizeMinor": 1, "lotSize": 1, "enabled": true }
 ```
 
-`mic`, `isin`, `cusip` are optional; `tickSizeMinor` and `lotSize` default to 1. `id` is the immutable key that
+`mic`, `isin`, `cusip` are optional; `tickSizeMinor` and `lotSize` default to 1, and `enabled` to `true`. `id` is the immutable key that
 orders reference. `(mic, symbol)` must be unique when `mic` is given; ISIN and CUSIP may be shared by several
 listings. Returns `201` with the instrument, plus `tickSize` as a decimal string.
 
 ### `GET /api/instruments?symbol=&mic=&isin=&cusip=`
 
 All filters are optional and combined with AND. External identifiers can match several listings.
+
+### `PATCH /api/instruments/{id}`
+
+`{ "enabled": false }` halts trading and `{ "enabled": true }` resumes it. It returns `200` with the instrument, or
+`404` for an unknown ID; `enabled` is the only field that can change. While an instrument is disabled:
+- **Orders are recorded rejections:** every new order is sequenced and stored with status `REJECTED` and
+  `rejectReason: "INSTRUMENT_DISABLED"`, and an `OrderRejected` event is emitted (`201`, like a self-trade).
+- **Cancels keep working.**
+- **Resting orders stay** on the book, and trade again once the instrument is re-enabled.
+
+The flag survives restarts. Switching it emits no event (there is no instrument-status event type yet).
 
 ### `POST /api/participants`
 
@@ -112,11 +124,12 @@ Cancels the remaining quantity of an `OPEN` or `PARTIALLY_FILLED` order. Returns
 ### `GET /api/orderbooks/{instrumentId}`
 
 ```json
-{ "instrumentId": "ACME", "currency": "DKK", "lastSequence": 2,
+{ "instrumentId": "ACME", "currency": "DKK", "enabled": true, "lastSequence": 2,
   "bids": [], "asks": [{ "priceTicks": 10025, "price": "100.25", "quantity": 50, "orders": 1 }] }
 ```
 
-Levels are listed best first. `lastSequence` is the sequence of the last order processed before the snapshot.
+Levels are listed best first. `enabled` shows whether the instrument is trading. `lastSequence` is the sequence of the
+last order processed before the snapshot.
 
 ### `GET /api/trades?instrumentId=&participantId=&orderId=&limit=`
 

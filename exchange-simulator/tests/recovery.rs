@@ -62,6 +62,7 @@ fn acme() -> Instrument {
         currency_scale: 2,
         tick_size_minor: 1,
         lot_size: 1,
+        enabled: true,
     }
 }
 
@@ -904,5 +905,84 @@ fn an_ordered_subscription_has_one_delivery_in_flight_in_sequence_order() {
             ordered.id
         ),
         [3]
+    );
+}
+
+#[test]
+fn disabling_an_instrument_is_durable_and_rejections_are_recorded() {
+    let db = TempDb::new();
+    let mut exchange = setup(&db);
+    let resting = processed(exchange.submit(order("A", Side::Sell, Some(10025), 100)));
+    let disabled = exchange.set_instrument_enabled(&acme().id, false).unwrap();
+    assert!(!disabled.enabled);
+    let rejected = processed(exchange.submit(order("B", Side::Buy, Some(10025), 10)));
+    assert_eq!(rejected.order.status, OrderStatus::Rejected);
+    assert!(matches!(
+        exchange.set_instrument_enabled(&InstrumentId("NOPE".into()), false),
+        Err(ExchangeError::UnknownInstrument(_))
+    ));
+    drop(exchange);
+
+    let mut restarted = open(&db.path(), IdentifierPolicy::Strict);
+    assert!(
+        !restarted.book(&acme().id).unwrap().instrument().enabled,
+        "still disabled after restart"
+    );
+    assert!(
+        restarted
+            .book(&acme().id)
+            .unwrap()
+            .order(resting.order.id)
+            .is_some(),
+        "resting order restored"
+    );
+    assert_eq!(
+        stored(&restarted, rejected.order.id).status,
+        OrderStatus::Rejected
+    );
+    let events = restarted
+        .store()
+        .events(0, 100, Some("OrderRejected"))
+        .unwrap();
+    assert_eq!(events[0].payload["rejectReason"], "INSTRUMENT_DISABLED");
+    assert!(
+        !restarted
+            .store()
+            .instruments(&InstrumentFilter::default())
+            .unwrap()[0]
+            .enabled
+    );
+
+    restarted.set_instrument_enabled(&acme().id, true).unwrap();
+    let trade = processed(restarted.submit(order("B", Side::Buy, Some(10025), 10)));
+    assert_eq!(trade.executions.len(), 1);
+    assert_eq!(
+        trade.order.sequence, 3,
+        "the rejected order kept its sequence"
+    );
+
+    let late = Instrument {
+        id: InstrumentId("HALTED".into()),
+        symbol: "HALT".into(),
+        enabled: false,
+        ..acme()
+    };
+    restarted.register_instrument(late).unwrap();
+    let halted = SubmitOrder {
+        instrument_id: InstrumentId("HALTED".into()),
+        ..order("A", Side::Buy, Some(1), 1)
+    };
+    assert_eq!(
+        processed(restarted.submit(halted))
+            .rejection
+            .map(|r| r.code()),
+        Some("INSTRUMENT_DISABLED")
+    );
+    drop(restarted);
+    let reopened = open(&db.path(), IdentifierPolicy::Strict);
+    let halted_book = reopened.book(&InstrumentId("HALTED".into())).unwrap();
+    assert!(
+        !halted_book.instrument().enabled,
+        "registered disabled, still disabled after restart"
     );
 }

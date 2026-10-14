@@ -30,6 +30,8 @@ pub struct Instrument {
     pub currency_scale: u8,
     pub tick_size_minor: u64,
     pub lot_size: u64,
+    /// Whether the instrument trades. Orders for a disabled instrument are rejected; cancels still work.
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -179,6 +181,7 @@ mod tests {
             currency_scale: 2,
             tick_size_minor: 1,
             lot_size: 1,
+            enabled: true,
         }
     }
 

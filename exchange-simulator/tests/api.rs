@@ -14,7 +14,7 @@ async fn health_reports_ok_with_schema_version() {
         app.get("/health").await,
         (
             StatusCode::OK,
-            json!({ "status": "ok", "schemaVersion": 3 })
+            json!({ "status": "ok", "schemaVersion": 4 })
         )
     );
 }
@@ -64,7 +64,7 @@ async fn milestone_acceptance_over_http_including_restart() {
     );
     assert!(resting["createdAt"].is_string() && resting["updatedAt"].is_string());
 
-    let expected_book = json!({ "instrumentId": "ACME", "currency": "DKK", "bids": [],
+    let expected_book = json!({ "instrumentId": "ACME", "currency": "DKK", "enabled": true, "bids": [],
         "asks": [{ "priceTicks": 10025, "price": "100.25", "quantity": 50, "orders": 1 }], "lastSequence": 2 });
     assert_eq!(
         app.get("/api/orderbooks/ACME").await,
@@ -435,4 +435,108 @@ async fn concurrent_submissions_are_serialized_without_loss() {
         200 * 10,
         "every submitted unit traded (counted on both sides), rests, or was rejected"
     );
+}
+
+#[tokio::test]
+async fn instruments_can_be_halted_and_resumed() {
+    let mut app = TestApp::start().await;
+    app.seed().await;
+    let (_, resting) = app.order("A", "SELL", Some(10025), 100).await;
+    let resting_id = resting["order"]["orderId"].as_str().unwrap().to_string();
+    app.order("A", "SELL", Some(10030), 100).await;
+
+    let (status, halted) = app
+        .call(
+            axum::http::Method::PATCH,
+            "/api/instruments/ACME",
+            Some(json!({ "enabled": false })),
+        )
+        .await;
+    assert_eq!(
+        (status, &halted["enabled"]),
+        (StatusCode::OK, &json!(false))
+    );
+    assert_eq!(
+        app.get("/api/instruments?symbol=ACME").await.1[0]["enabled"],
+        false
+    );
+    assert_eq!(app.get("/api/orderbooks/ACME").await.1["enabled"], false);
+
+    let (status, rejected) = app.order("B", "BUY", Some(10025), 10).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a halt rejection is a recorded outcome"
+    );
+    assert_eq!(
+        (
+            &rejected["order"]["status"],
+            &rejected["order"]["rejectReason"]
+        ),
+        (&json!("REJECTED"), &json!("INSTRUMENT_DISABLED"))
+    );
+    let (status, cancelled) = app.delete(&format!("/api/orders/{resting_id}")).await;
+    assert_eq!(
+        (status, &cancelled["order"]["status"]),
+        (StatusCode::OK, &json!("CANCELLED"))
+    );
+
+    app.restart().await;
+    assert_eq!(
+        app.get("/api/orderbooks/ACME").await.1["enabled"],
+        false,
+        "the halt survives a restart"
+    );
+    let (status, resumed) = app
+        .call(
+            axum::http::Method::PATCH,
+            "/api/instruments/ACME",
+            Some(json!({ "enabled": true })),
+        )
+        .await;
+    assert_eq!(
+        (status, &resumed["enabled"]),
+        (StatusCode::OK, &json!(true))
+    );
+    let (_, trade) = app.order("B", "BUY", Some(10030), 10).await;
+    assert_eq!(
+        trade["executions"][0]["priceTicks"], 10030,
+        "trading resumes against the remaining book"
+    );
+
+    let patch = |body: Value| {
+        app.call(
+            axum::http::Method::PATCH,
+            "/api/instruments/ACME",
+            Some(body),
+        )
+    };
+    assert_eq!(
+        patch(json!({ "enabled": "no" })).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        patch(json!({ "symbol": "X" })).await.0,
+        StatusCode::BAD_REQUEST,
+        "only enabled may change"
+    );
+    let (status, _) = app
+        .call(
+            axum::http::Method::PATCH,
+            "/api/instruments/NOPE",
+            Some(json!({ "enabled": false })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, created) = app
+        .post(
+            "/api/instruments",
+            json!({ "id": "HALTED", "symbol": "HLT", "currency": "DKK", "currencyScale": 2, "enabled": false }),
+        )
+        .await;
+    assert_eq!(
+        (status, &created["enabled"]),
+        (StatusCode::CREATED, &json!(false))
+    );
+    app.stop().await;
 }

@@ -160,6 +160,21 @@ impl Exchange {
         Ok(())
     }
 
+    /// Switches trading in an instrument on or off, durably, and returns the updated instrument.
+    pub fn set_instrument_enabled(
+        &mut self,
+        id: &InstrumentId,
+        enabled: bool,
+    ) -> Result<Instrument, ExchangeError> {
+        let book = self
+            .books
+            .get_mut(id)
+            .ok_or_else(|| ExchangeError::UnknownInstrument(id.clone()))?;
+        self.store.set_instrument_enabled(id, enabled)?;
+        book.set_enabled(enabled);
+        Ok(book.instrument().clone())
+    }
+
     pub fn register_participant(&mut self, participant: Participant) -> Result<(), ExchangeError> {
         if participant.id.0.trim().is_empty() || participant.name.trim().is_empty() {
             return Err(ExchangeError::InvalidParticipant);

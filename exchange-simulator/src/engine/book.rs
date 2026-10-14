@@ -26,6 +26,8 @@ pub enum InvalidOrder {
 pub enum RejectReason {
     #[error("order would trade against a resting order of the same participant")]
     SelfTrade,
+    #[error("trading in the instrument is disabled")]
+    InstrumentDisabled,
 }
 
 impl RejectReason {
@@ -33,6 +35,7 @@ impl RejectReason {
     pub const fn code(self) -> &'static str {
         match self {
             Self::SelfTrade => "SELF_TRADE",
+            Self::InstrumentDisabled => "INSTRUMENT_DISABLED",
         }
     }
 }
@@ -108,6 +111,13 @@ impl OrderBook {
         &self.instrument
     }
 
+    /// Switches trading on or off. A disabled book rejects every incoming order (`INSTRUMENT_DISABLED`) but still
+    /// cancels; resting orders stay. Updates planned before the switch become stale.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.instrument.enabled = enabled;
+        self.version += 1;
+    }
+
     /// Checks an incoming order's shape against the instrument, without consulting book state.
     pub fn validate(&self, order: &Order) -> Result<(), BookError> {
         if order.instrument_id != self.instrument.id {
@@ -136,7 +146,8 @@ impl OrderBook {
     ///
     /// The order trades against the best opposite prices it crosses, oldest first within a price, each fill at the
     /// resting order's price. A limit remainder rests; a market remainder is cancelled. If the order would trade
-    /// against a resting order of the same participant it is rejected whole, with no executions.
+    /// against a resting order of the same participant it is rejected whole, with no executions. While the instrument
+    /// is disabled every order is rejected before matching.
     #[must_use = "a planned update changes nothing until it is applied"]
     pub fn plan_submit(
         &self,
@@ -152,6 +163,9 @@ impl OrderBook {
                 last: self.last_sequence,
                 got: order.sequence,
             });
+        }
+        if !self.instrument.enabled {
+            return Ok(self.rejection(order, RejectReason::InstrumentDisabled));
         }
 
         let mut taker = order;

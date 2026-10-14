@@ -16,6 +16,17 @@ fn one() -> u64 {
     1
 }
 
+fn yes() -> bool {
+    true
+}
+
+/// `PATCH /api/instruments/{id}`: the fields that may change after registration.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstrumentPatch {
+    pub enabled: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InstrumentRequest {
@@ -30,6 +41,9 @@ pub struct InstrumentRequest {
     pub tick_size_minor: u64,
     #[serde(default = "one")]
     pub lot_size: u64,
+    /// Default true.
+    #[serde(default = "yes")]
+    pub enabled: bool,
 }
 
 impl From<InstrumentRequest> for Instrument {
@@ -44,6 +58,7 @@ impl From<InstrumentRequest> for Instrument {
             currency_scale: r.currency_scale,
             tick_size_minor: r.tick_size_minor,
             lot_size: r.lot_size,
+            enabled: r.enabled,
         }
     }
 }
@@ -62,6 +77,7 @@ pub struct InstrumentView {
     /// One tick as a decimal price, e.g. `"0.01"`.
     pub tick_size: String,
     pub lot_size: u64,
+    pub enabled: bool,
 }
 
 impl From<&Instrument> for InstrumentView {
@@ -77,6 +93,7 @@ impl From<&Instrument> for InstrumentView {
             tick_size_minor: i.tick_size_minor,
             tick_size: i.ticks_to_price(1),
             lot_size: i.lot_size,
+            enabled: i.enabled,
         }
     }
 }
@@ -281,6 +298,8 @@ pub struct LevelView {
 pub struct BookView {
     pub instrument_id: InstrumentId,
     pub currency: String,
+    /// Whether the instrument trades; a disabled book rejects new orders.
+    pub enabled: bool,
     /// Best (highest) first.
     pub bids: Vec<LevelView>,
     /// Best (lowest) first.
@@ -306,6 +325,7 @@ impl From<BookSnapshot> for BookView {
             asks: levels(s.asks.clone()),
             instrument_id: s.instrument.id.clone(),
             currency: s.instrument.currency.clone(),
+            enabled: s.instrument.enabled,
             last_sequence: s.last_sequence,
         }
     }

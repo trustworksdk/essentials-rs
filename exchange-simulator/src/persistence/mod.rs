@@ -14,6 +14,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/001_initial.sql"),
     include_str!("../../migrations/002_webhook_signing.sql"),
     include_str!("../../migrations/003_ordered_delivery.sql"),
+    include_str!("../../migrations/004_instrument_enabled.sql"),
 ];
 
 /// Opens (creating if needed) the database at `path`, applies connection pragmas and runs pending migrations.
@@ -114,7 +115,7 @@ mod tests {
     fn schema_enforces_foreign_keys_and_checks() {
         let conn = memory();
         conn.execute_batch(
-            "INSERT INTO instruments VALUES ('ACME', 'ACME', 'XCSE', NULL, NULL, 'DKK', 2, 1, 1);
+            "INSERT INTO instruments (id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size) VALUES ('ACME', 'ACME', 'XCSE', NULL, NULL, 'DKK', 2, 1, 1);
              INSERT INTO participants VALUES ('A', 'Participant A');",
         )
         .unwrap();
@@ -148,12 +149,12 @@ mod tests {
             "duplicate sequence"
         );
         assert!(
-            conn.execute("INSERT INTO instruments VALUES ('ACME2', 'ACME', 'XCSE', NULL, NULL, 'DKK', 2, 1, 1)", [])
+            conn.execute("INSERT INTO instruments (id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size) VALUES ('ACME2', 'ACME', 'XCSE', NULL, NULL, 'DKK', 2, 1, 1)", [])
                 .is_err(),
             "duplicate (mic, symbol)"
         );
         conn.execute(
-            "INSERT INTO instruments VALUES ('ACME3', 'ACME', 'XSTO', NULL, NULL, 'DKK', 2, 1, 1)",
+            "INSERT INTO instruments (id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size) VALUES ('ACME3', 'ACME', 'XSTO', NULL, NULL, 'DKK', 2, 1, 1)",
             [],
         )
         .expect("same symbol on another market");
