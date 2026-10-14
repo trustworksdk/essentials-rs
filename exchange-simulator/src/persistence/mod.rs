@@ -1,4 +1,8 @@
-//! SQLite access: connection setup and schema migrations.
+//! SQLite access: connection setup, schema migrations and the [`Store`] repository.
+
+mod store;
+
+pub use store::{InstrumentFilter, OrderRecord, Store};
 
 use std::path::Path;
 use std::time::Duration;
@@ -105,7 +109,9 @@ mod tests {
                             price: Option<i64>,
                             sequence: i64| {
             conn.execute(
-                "INSERT INTO orders VALUES (?1, 'ACME', ?2, 'BUY', ?3, ?4, 10, 10, ?5, 'OPEN', 'now', 'now')",
+                "INSERT INTO orders (id, instrument_id, participant_id, side, order_type, limit_price_ticks, quantity,
+                     remaining_quantity, sequence, status, created_at, updated_at)
+                 VALUES (?1, 'ACME', ?2, 'BUY', ?3, ?4, 10, 10, ?5, 'OPEN', 'now', 'now')",
                 rusqlite::params![id, participant, order_type, price, sequence],
             )
         };

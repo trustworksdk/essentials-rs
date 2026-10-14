@@ -2,6 +2,8 @@
 
 use serde::Deserialize;
 
+use crate::domain::IdentifierPolicy;
+
 const DEFAULTS: &str = include_str!("../config/default.yaml");
 
 /// Environment variable naming an optional YAML file layered over the defaults.
@@ -10,6 +12,7 @@ pub const CONFIG_FILE_ENV: &str = "EXCHANGE_CONFIG";
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
+    pub exchange: ExchangeConfig,
     pub database: DatabaseConfig,
     pub logging: LoggingConfig,
 }
@@ -17,6 +20,12 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ServerConfig {
     pub bind: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ExchangeConfig {
+    /// `strict` validates MIC/ISIN/CUSIP formats and check digits at registration; `permissive` checks lengths only.
+    pub identifier_policy: IdentifierPolicy,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -71,5 +80,6 @@ mod tests {
             .unwrap();
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert_eq!(config.logging.format, LogFormat::Pretty);
+        assert_eq!(config.exchange.identifier_policy, IdentifierPolicy::Strict);
     }
 }

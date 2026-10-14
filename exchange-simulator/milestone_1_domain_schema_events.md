@@ -309,7 +309,24 @@ Steps refer to "First implementation sequence" above.
 - `Execution::executed_at` is `chrono::DateTime<Utc>`, not `String`.
 - `rusqlite` is pinned to 0.39 (not 0.40): the workspace's `sqlx` restricts `libsqlite3-sys` to `< 0.38`, and only one crate may link `sqlite3`.
 
-**Open, from the plan but not in this document** (not built; decide before step 3)
-- Plan §8 asks for a unique constraint for idempotent order submission (e.g. client order ID). `orders` has no such column.
-- Plan §2/§5 envelopes carry `source` and `simulationId`; the `events` table here does not.
-- Plan §3 lists an instrument `enabled` flag and participant settlement metadata; the domain types here do not.
+**Open, from the plan but not in this document** — resolved 2026-10-14 (see step 3)
+- Idempotent order submission: added `orders.client_order_id`, unique per participant.
+- `events.source` and `events.simulation_id`: added.
+- Plan §3 instrument `enabled` flag and participant settlement metadata: still not built.
+
+### Step 3 — transactional repository and startup reconstruction ✅ done (2026-10-14)
+
+**Delivered**
+- Migration 001 amended in place (nothing deployed yet): `orders.client_order_id` (1–64 chars) with a partial unique index on `(participant_id, client_order_id)`; `events.source TEXT NOT NULL` and `events.simulation_id TEXT`. The event columns are written from step 5.
+- `persistence::Store` wraps the single writer connection. It inserts and lists instruments (filters on `symbol`/`mic`/`isin`/`cusip`) and participants, and reads active orders in sequence order, the max sequence, and orders by ID or by `(participant, client order ID)`. `commit(&BookUpdate)` writes the subject order (upsert), the makers it traded with, and its executions in one transaction. Timestamps are RFC 3339 UTC with microseconds.
+- `engine::Exchange`, the persistence coordinator, owns the books, the store, the participant set and the global sequence. Each command is planned on the book, committed, and only then applied. A failed commit drops the plan and does not consume a sequence. `recover` rebuilds every book from active limit orders in sequence order and resumes sequencing after the highest stored sequence, rejected orders included. Registration is validated with the configured `exchange.identifier_policy`.
+- `main` recovers the exchange at startup and logs the instrument count, resting orders and last sequence; `/health` reads through it.
+- Tests (`tests/recovery.rs`, 7): the acceptance trade, committed and restored after restart; a forced commit failure (SQLite trigger) leaves memory and storage unchanged and the retry succeeds; client order ID duplicates and conflicts, also across restart; rejected, market and cancelled orders are stored but never restored; unknown instrument or participant; the registration rules (same symbol on two MICs, shared ISIN, optional CUSIP, bad check digits in strict but not permissive mode, filters, ambiguous symbol-only lookup). A seeded run of 600 commands × 3 seeds that restarts the exchange every 97 commands produces exactly the same outcomes, trades and final book as an uninterrupted run.
+- Mutation checks, each made a test fail: applying the update even when the commit fails; restoring in reverse sequence order; not updating a maker's remaining quantity; reusing a rejected order's sequence; skipping the client order ID lookup; skipping book restore; skipping the participant check.
+
+**Decisions**
+- A repeated client order ID with the same terms (instrument, side, type, price, quantity) returns `SubmitOutcome::Duplicate` with the order's *current* state. With different terms it fails with `ClientOrderIdConflict`. The unique index is the backstop.
+- Instrument and participant existence and duplicate listings are checked against in-memory state the coordinator owns (loaded at startup), not by querying SQLite per command. The client order ID check does query SQLite through an index.
+- No default simulator MIC. `mic` may be absent, and symbol-only lookups can return several listings; callers disambiguate with the instrument ID.
+- The clock reading is truncated to microseconds, so in-memory and stored timestamps agree.
+- Concurrency is not wired yet: `AppState` holds the `Exchange` behind a mutex. The bounded command queue and instrument sharding come with the REST endpoints (step 4).

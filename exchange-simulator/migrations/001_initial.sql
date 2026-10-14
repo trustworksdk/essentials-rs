@@ -27,6 +27,8 @@ CREATE TABLE participants (
 
 CREATE TABLE orders (
   id TEXT PRIMARY KEY,
+  -- Optional participant-chosen ID; makes order submission idempotent per participant.
+  client_order_id TEXT CHECK (client_order_id IS NULL OR length(client_order_id) BETWEEN 1 AND 64),
   instrument_id TEXT NOT NULL REFERENCES instruments(id),
   participant_id TEXT NOT NULL REFERENCES participants(id),
   side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
@@ -43,6 +45,8 @@ CREATE TABLE orders (
   CHECK ((order_type = 'MARKET' AND limit_price_ticks IS NULL)
       OR (order_type = 'LIMIT' AND limit_price_ticks IS NOT NULL AND limit_price_ticks > 0))
 );
+CREATE UNIQUE INDEX idx_orders_client_order_id ON orders(participant_id, client_order_id)
+  WHERE client_order_id IS NOT NULL;
 CREATE INDEX idx_orders_active ON orders(instrument_id, side, limit_price_ticks, sequence)
   WHERE status IN ('OPEN', 'PARTIALLY_FILLED');
 
@@ -64,6 +68,11 @@ CREATE TABLE events (
   event_id TEXT NOT NULL UNIQUE,
   event_type TEXT NOT NULL,
   schema_version INTEGER NOT NULL,
+  -- Which component produced the event (e.g. 'exchange'; later the settlement simulator), so lifecycle authority
+  -- stays explicit when external and simulated settlement run side by side.
+  source TEXT NOT NULL,
+  -- Optional identifier of the simulation run the event belongs to.
+  simulation_id TEXT,
   aggregate_id TEXT NOT NULL,
   correlation_id TEXT,
   payload TEXT NOT NULL CHECK (json_valid(payload)),

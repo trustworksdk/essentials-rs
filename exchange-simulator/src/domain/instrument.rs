@@ -6,7 +6,8 @@ use super::identifiers::{
 type Validator = fn(&str) -> Result<(), IdentifierError>;
 
 /// How strictly external identifiers are checked at the boundary. The SQL schema enforces only lengths.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum IdentifierPolicy {
     /// Character sets and check digits are validated.
     #[default]

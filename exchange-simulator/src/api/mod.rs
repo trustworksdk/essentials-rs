@@ -6,19 +6,20 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
-use rusqlite::Connection;
 use serde_json::{Value, json};
+
+use crate::engine::Exchange;
 
 /// Shared handler state.
 #[derive(Clone)]
 pub struct AppState {
-    db: Arc<Mutex<Connection>>,
+    exchange: Arc<Mutex<Exchange>>,
 }
 
 impl AppState {
-    pub fn new(db: Connection) -> Self {
+    pub fn new(exchange: Exchange) -> Self {
         Self {
-            db: Arc::new(Mutex::new(db)),
+            exchange: Arc::new(Mutex::new(exchange)),
         }
     }
 }
@@ -31,12 +32,12 @@ pub fn router(state: AppState) -> Router {
 
 /// Liveness and readiness: the process is up and the database answers.
 async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let db = state.db.clone();
+    let exchange = state.exchange.clone();
     let probe = tokio::task::spawn_blocking(move || {
-        let conn = db
+        let exchange = exchange
             .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
-        crate::persistence::schema_version(&conn).map_err(|e| e.to_string())
+            .map_err(|_| "exchange lock poisoned".to_string())?;
+        crate::persistence::schema_version(exchange.store().connection()).map_err(|e| e.to_string())
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));

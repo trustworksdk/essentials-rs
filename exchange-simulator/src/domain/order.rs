@@ -75,6 +75,8 @@ impl OrderStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Order {
     pub id: Uuid,
+    /// Participant-chosen ID, unique per participant; resubmitting it returns the original order.
+    pub client_order_id: Option<String>,
     pub instrument_id: InstrumentId,
     pub participant_id: ParticipantId,
     pub side: Side,

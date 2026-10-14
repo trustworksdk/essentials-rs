@@ -5,7 +5,9 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use exchange_simulator::api::{AppState, router};
-use exchange_simulator::persistence;
+use exchange_simulator::domain::IdentifierPolicy;
+use exchange_simulator::engine::{Exchange, ExchangeOptions, SystemClock, UuidV7Ids};
+use exchange_simulator::persistence::{self, Store};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
@@ -15,7 +17,16 @@ async fn health_reports_ok_with_schema_version() {
     persistence::configure(&db, Duration::from_secs(1)).unwrap();
     persistence::migrate(&mut db).unwrap();
 
-    let response = router(AppState::new(db))
+    let exchange = Exchange::recover(
+        Store::new(db),
+        ExchangeOptions {
+            identifier_policy: IdentifierPolicy::Strict,
+            ids: Box::new(UuidV7Ids),
+            clock: Box::new(SystemClock),
+        },
+    )
+    .unwrap();
+    let response = router(AppState::new(exchange))
         .oneshot(Request::get("/health").body(Body::empty()).unwrap())
         .await
         .unwrap();

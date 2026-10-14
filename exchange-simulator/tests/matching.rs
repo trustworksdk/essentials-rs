@@ -51,6 +51,7 @@ impl Harness {
         self.sequence += 1;
         Order {
             id: Uuid::from_u128(u128::from(self.sequence)),
+            client_order_id: None,
             instrument_id: InstrumentId("ACME".into()),
             participant_id: ParticipantId(participant.into()),
             side,

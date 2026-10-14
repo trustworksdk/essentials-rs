@@ -2,6 +2,10 @@
 # variables prefixed EXCHANGE__ with `__` between levels, e.g. EXCHANGE__SERVER__BIND=0.0.0.0:9000.
 server:
   bind: "127.0.0.1:8080"
+exchange:
+  # "strict": MIC/ISIN/CUSIP formats and check digits are validated at registration.
+  # "permissive": lengths only, for fixtures that need deliberately invalid identifiers.
+  identifier_policy: "strict"
 database:
   path: "data/exchange.db"
   busy_timeout_ms: 5000
