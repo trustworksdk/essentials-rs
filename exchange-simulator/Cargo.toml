@@ -30,3 +30,12 @@ uuid = { version = "1.28.0", features = ["v7", "serde"] }
 http-body-util = "0.1.5"
 testcontainers-modules = "0.15.0"
 tower = { version = "0.5.3", features = ["util"] }
+
+[features]
+# The containerized acceptance test (tests/e2e.rs): builds the service image and runs it with MockServer on a Docker
+# network. Run with `cargo test -p exchange-simulator --features e2e --test e2e`.
+e2e = []
+
+[[test]]
+name = "e2e"
+required-features = ["e2e"]

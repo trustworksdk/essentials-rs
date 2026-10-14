@@ -436,4 +436,19 @@ Steps 1–6 are done. Definition of done:
 - Correctness, restart and webhook tests pass, including MockServer.
 - The performance baseline is measured.
 
-Still open from the checklist: a **Docker-based end-to-end** run of the full acceptance test, with the simulator *container* and MockServer on one compose network, including `docker compose restart`. Every step of it is already covered by in-process tests and manual container smoke runs, but not by one automated container run.
+The containerized acceptance test is now in place too (below), so Milestone 1 is complete.
+
+### Containerized acceptance test ✅ done (2026-10-14)
+
+`tests/e2e.rs`, behind the `e2e` feature (`cargo test -p exchange-simulator --features e2e --test e2e`, about 5 s with a warm image cache), follows durable-queues' `interop` pattern. It builds the service image from `Dockerfile` and starts it with MockServer 5.15.0 on a private Docker network; the service reaches MockServer by container name. It runs acceptance steps 1–10 of the plan:
+1. Fresh container and volume.
+2. ACME with tick size `0.01`, and two participants.
+3. A `TradeExecuted` subscription pointing at MockServer.
+4. and 5. Sell 200 at 100.25, then buy 150.
+6. One execution of 150; the sell has 50 left.
+7. The execution and its event are both stored.
+8. MockServer receives the canonical envelope with the replayed `eventId`.
+9. `docker restart` (SIGTERM, then start): the same book, the same replay, no re-delivery.
+10. With the consumer answering 500, a second trade is retried with the same `eventId` (4+ attempts). After recovery it is delivered, with two trades in total and two distinct event IDs.
+
+The run was repeated twice with no leftover containers or networks. Mutation check: with `MAX_ATTEMPTS=1` the delivery is dead-lettered and the test fails.

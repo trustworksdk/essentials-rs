@@ -186,6 +186,18 @@ Prometheus text format, with these series:
 - **Webhooks:** `webhook_delivery_attempts_total{outcome}`, `webhook_delivery_duration_seconds`, and the outbox
   backlog `webhook_outbox_deliveries{status}`, read from SQLite at scrape time.
 
+## Testing
+
+```sh
+cargo test -p exchange-simulator                          # unit, integration and HTTP tests; tests/mockserver.rs needs Docker
+cargo test -p exchange-simulator --features e2e --test e2e   # the acceptance test in containers (builds the image)
+```
+
+`tests/e2e.rs` runs the Milestone 1 acceptance scenario against the real image, with MockServer as the settlement
+consumer on one Docker network. It covers registration, the 200/150 trade, the webhook with a stable event ID, a
+`docker restart` that restores the book without repeating events, and a consumer outage whose retries create no
+trades.
+
 ## Benchmarks
 
 [`bench/README.md`](bench/README.md) covers how to run the harness and the baseline results.

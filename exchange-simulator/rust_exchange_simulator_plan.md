@@ -240,15 +240,15 @@ Keep one Cargo package initially; extract crates only if modularity or reuse jus
 
 **Goal:** Single Dockerized Rust service with real matching, authoritative SQLite state, and durable trade webhooks.
 
-- [ ] Create Cargo project, Axum server, configuration, tracing, Dockerfile, Compose.
-- [ ] Define domain types, matching invariants, REST/event contracts, and SQLite migration.
-- [ ] Implement instrument and participant registration, including symbol, optional ISIN/CUSIP, MIC, identifier validation, and lookup filters.
-- [ ] Implement limit/market order matching, price-time priority, partial fills, cancellation.
-- [ ] Persist orders, executions, and outbox events transactionally.
-- [ ] Restore active books from SQLite after restart.
-- [ ] Implement webhook subscriptions, durable delivery, retry, and attempt tracking.
-- [ ] Expose basic order book, trade, event, health, and metrics endpoints.
-- [ ] Add Rust unit/integration tests and Docker-based end-to-end tests (MockServer consumer).
+- [x] Create Cargo project, Axum server, configuration, tracing, Dockerfile, Compose.
+- [x] Define domain types, matching invariants, REST/event contracts, and SQLite migration.
+- [x] Implement instrument and participant registration, including symbol, optional ISIN/CUSIP, MIC, identifier validation, and lookup filters.
+- [x] Implement limit/market order matching, price-time priority, partial fills, cancellation.
+- [x] Persist orders, executions, and outbox events transactionally.
+- [x] Restore active books from SQLite after restart.
+- [x] Implement webhook subscriptions, durable delivery, retry, and attempt tracking.
+- [x] Expose basic order book, trade, event, health, and metrics endpoints.
+- [x] Add Rust unit/integration tests and Docker-based end-to-end tests (MockServer consumer).
 
 **Acceptance test:**
 
@@ -264,6 +264,8 @@ Keep one Cargo package initially; extract crates only if modularity or reuse jus
 10. Simulate webhook failure and recovery; assert retries do not generate additional trades.
 
 **Definition of done:** Reproducible Docker startup, documented API, passing correctness/restart/webhook tests, and baseline performance measurements. Do not claim the 1k–10k/sec target before measurement.
+
+**Status (2026-10-14): done.** Progress, decisions and deviations are in `milestone_1_domain_schema_events.md` ("Implementation progress"); baseline numbers are in `bench/README.md` (about 4–5k durable orders/s on the devcontainer VM's disk).
 
 ### Milestone 2 — Settlement simulation
 
