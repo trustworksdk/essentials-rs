@@ -31,6 +31,20 @@ pub struct Subscription {
     /// HMAC secret; deliveries are signed when set. Never serialized.
     #[serde(skip_serializing)]
     pub secret: Option<String>,
+    /// Deliver strictly in event sequence order, one at a time.
+    pub ordered: bool,
+}
+
+/// A request to register a subscription.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NewSubscription {
+    pub url: String,
+    pub event_types: Vec<String>,
+    /// 16–256 characters; deliveries are signed when set.
+    pub secret: Option<String>,
+    /// At most one delivery in flight, in sequence order. A failing delivery blocks later ones until it is delivered
+    /// or dead-lettered; after a dead letter delivery continues with the next event.
+    pub ordered: bool,
 }
 
 impl Subscription {

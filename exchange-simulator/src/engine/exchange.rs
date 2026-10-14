@@ -12,7 +12,7 @@ use crate::domain::{
 };
 use crate::events::{self, Command};
 use crate::persistence::Store;
-use crate::webhooks::{DeliveryJob, DeliveryResult, Subscription};
+use crate::webhooks::{DeliveryJob, DeliveryResult, NewSubscription, Subscription};
 
 /// A request to place an order; the exchange assigns its ID and sequence.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -267,14 +267,18 @@ impl Exchange {
     }
 
     /// Registers a webhook endpoint for the given event types. It receives events committed from now on; earlier
-    /// events can be replayed from the events API. With a `secret` (16–256 characters) every delivery is signed; see
-    /// [`crate::webhooks::signing`].
+    /// events can be replayed from the events API. With a `secret` (16–256 characters) every delivery is signed (see
+    /// [`crate::webhooks::signing`]); with `ordered`, deliveries go out one at a time in sequence order.
     pub fn register_webhook(
         &mut self,
-        url: String,
-        event_types: Vec<String>,
-        secret: Option<String>,
+        request: NewSubscription,
     ) -> Result<Subscription, ExchangeError> {
+        let NewSubscription {
+            url,
+            mut event_types,
+            secret,
+            ordered,
+        } = request;
         let parsed = reqwest::Url::parse(&url)
             .map_err(|e| ExchangeError::InvalidWebhook(format!("url: {e}")))?;
         if !matches!(parsed.scheme(), "http" | "https") {
@@ -302,7 +306,6 @@ impl Exchange {
                 "secret must be 16 to 256 characters".into(),
             ));
         }
-        let mut event_types = event_types;
         event_types.sort();
         event_types.dedup();
         let subscription = Subscription {
@@ -312,6 +315,7 @@ impl Exchange {
             enabled: true,
             created_at: self.now(),
             secret,
+            ordered,
         };
         self.store.insert_subscription(&subscription)?;
         self.subscriptions.push(subscription.clone());

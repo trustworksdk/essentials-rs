@@ -23,7 +23,7 @@ Sizes: **S** is under a step of Milestone 1, **M** about one, **L** two or more.
 |---|---|---|---|
 | 1.1 | Commit the containerized acceptance test; push `exchange-simulator-m1`; open a PR to `main` | S | |
 | 1.2 ✅ | Investigate the 57–180 ms commit spikes | S | **Done 2026-10-14.** The cause is the disk, not SQLite. `bench checkpoint` replaces SQLite's auto-checkpoint with an identical observed one: checkpoint commits peak at 8.1 ms, and every commit over 10 ms is an ordinary one. Raw fsync on the same VM disk stalls for 141–950 ms on its own. Checkpoints still cost about 10 % of durable time and most of the p99, so 4.3 is re-scoped. Turning auto-checkpointing off halves throughput. Results: `bench/results/2026-10-14-checkpoint.md`. |
-| 1.3 | Backlog from plan §3/§5 that Milestone 1 skipped (1.3a ✅) | M | Instrument `enabled` flag (a disabled instrument rejects orders); participant settlement metadata (free-form JSON, carried into `TradeExecuted`); HMAC-SHA256 webhook signing (`X-Signature`, a per-subscription secret); an optional serialized-delivery flag per subscription (one in-flight delivery per subscription, in `sequence` order). All four are needed soon (D5), so they come before Milestone 2; split into 1.3a signing, 1.3b ordered delivery, 1.3c instrument `enabled`, 1.3d participant metadata. Each 1.3 item adds a migration to the schema, starting with `002`, so Milestone 2's settlement migration takes the next free number. |
+| 1.3 | Backlog from plan §3/§5 that Milestone 1 skipped (1.3a ✅, 1.3b ✅) | M | Instrument `enabled` flag (a disabled instrument rejects orders); participant settlement metadata (free-form JSON, carried into `TradeExecuted`); HMAC-SHA256 webhook signing (`X-Signature`, a per-subscription secret); an optional serialized-delivery flag per subscription (one in-flight delivery per subscription, in `sequence` order). All four are needed soon (D5), so they come before Milestone 2; split into 1.3a signing, 1.3b ordered delivery, 1.3c instrument `enabled`, 1.3d participant metadata. Each 1.3 item adds a migration to the schema, starting with `002`, so Milestone 2's settlement migration takes the next free number. |
 
 ### Progress
 
@@ -51,6 +51,35 @@ Sizes: **S** is under a step of Milestone 1, **M** about one, **L** two or more.
     register a new subscription.
   - Signing stays opt-in per subscription, so existing consumers keep working.
 - `/health` `schemaVersion` is now 2.
+
+**1.3b — ordered delivery ✅ (2026-10-14).**
+- **Delivered:**
+  - Migration `003_ordered_delivery.sql` adds `webhook_subscriptions.ordered`, plus a partial index on unfinished
+    deliveries by `(subscription_id, event_sequence)`.
+  - `POST /api/webhooks` accepts `"ordered": true`, and responses show it.
+  - Ordering is enforced in the claim query alone: an ordered subscription's only claimable delivery is its unfinished
+    one with the lowest sequence. While that one is leased, or backing off after a failure, nothing else for the
+    subscription is due. That gives at most one in flight, sent in order, with no worker-side state.
+  - The worker now claims again until a claim comes back empty, rather than stopping after a partial batch. Otherwise
+    each next ordered event would wait a full poll interval.
+  - `register_webhook` takes a `NewSubscription` struct instead of a growing argument list.
+- **Tests:**
+  - Store level, with an ordered and an unordered subscription: only the ordered head is claimable; a leased or
+    backing-off head blocks the rest; after a dead letter the next event is claimable.
+  - End to end: a slow receiver (15 ms per request) failing two attempts, 11 events, an ordered and an unordered
+    subscriber. The ordered one never had two requests at once, received the events in `sequence` order, and was
+    attempted exactly twice more than the event count. The unordered one received everything.
+  - The webhook suite was repeated five times without failure.
+- **Mutation checks**, each made a test fail: the ordering predicate ignored; the head computed over finished
+  deliveries; an in-flight head not blocking; the flag not stored.
+- **Decisions:**
+  - After a dead letter, an ordered subscription *continues* with the next event, leaving a visible gap in
+    `sequence`, rather than blocking for good.
+  - Ordered throughput is one claim-POST-record round trip per event. It has not been measured; batching consecutive
+    events per request is a possible later improvement.
+  - The early-return change to the worker loop is a performance change. No test fails without it, because the tests'
+    20 ms poll hides it.
+- `/health` `schemaVersion` is now 3. The README shows it as `<n>`, so it no longer goes stale.
 
 ## Milestone 2 — settlement simulation
 

@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use super::{BookUpdate, Exchange, ExchangeError, Level, SubmitOrder, SubmitOutcome};
 use crate::domain::{Instrument, InstrumentId, Participant, Side};
-use crate::webhooks::{DeliveryJob, DeliveryResult, Subscription};
+use crate::webhooks::{DeliveryJob, DeliveryResult, NewSubscription, Subscription};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
@@ -38,7 +38,7 @@ enum Request {
     Submit(SubmitOrder, Reply<(SubmitOutcome, Instrument)>),
     Cancel(Uuid, Reply<(BookUpdate, Instrument)>),
     Snapshot(InstrumentId, oneshot::Sender<Option<BookSnapshot>>),
-    RegisterWebhook(String, Vec<String>, Option<String>, Reply<Subscription>),
+    RegisterWebhook(NewSubscription, Reply<Subscription>),
     ClaimDeliveries(u32, std::time::Duration, Reply<Vec<DeliveryJob>>),
     RecordDeliveries(Vec<DeliveryResult>, Reply<()>),
 }
@@ -100,11 +100,9 @@ impl Dispatcher {
 
     pub async fn register_webhook(
         &self,
-        url: String,
-        event_types: Vec<String>,
-        secret: Option<String>,
+        request: NewSubscription,
     ) -> Result<Subscription, DispatchError> {
-        self.call(|reply| Request::RegisterWebhook(url, event_types, secret, reply))
+        self.call(|reply| Request::RegisterWebhook(request, reply))
             .await
     }
 
@@ -211,9 +209,9 @@ fn handle(exchange: &mut Exchange, request: Request) -> (&'static str, &'static 
             });
             ("cancel", answer(reply, result))
         }
-        Request::RegisterWebhook(url, event_types, secret, reply) => (
+        Request::RegisterWebhook(request, reply) => (
             "register_webhook",
-            answer(reply, exchange.register_webhook(url, event_types, secret)),
+            answer(reply, exchange.register_webhook(request)),
         ),
         Request::ClaimDeliveries(limit, lease, reply) => (
             "claim_deliveries",

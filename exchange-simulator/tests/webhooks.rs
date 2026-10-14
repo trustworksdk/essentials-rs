@@ -4,6 +4,7 @@
 mod common;
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,6 +21,8 @@ struct Received {
     /// The body bytes exactly as received, for signature checks.
     raw: Vec<u8>,
     headers: HeaderMap,
+    /// The status this receiver answered with.
+    status: u16,
 }
 
 #[derive(Clone, Default)]
@@ -28,6 +31,10 @@ struct ReceiverState {
     /// Status codes to answer with, in order; when empty, `fallback`.
     script: Arc<Mutex<VecDeque<u16>>>,
     fallback: Arc<Mutex<u16>>,
+    /// How long each request takes to answer, in milliseconds.
+    delay_ms: Arc<AtomicU64>,
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: Arc<AtomicUsize>,
 }
 
 /// An HTTP endpoint that records every request.
@@ -59,6 +66,17 @@ impl Receiver {
     fn received(&self) -> Vec<Received> {
         self.state.received.lock().unwrap().clone()
     }
+
+    fn slow(&self, delay: Duration) {
+        self.state
+            .delay_ms
+            .store(delay.as_millis() as u64, AtomicOrdering::Relaxed);
+    }
+
+    /// The most requests this receiver was ever handling at the same time.
+    fn max_in_flight(&self) -> usize {
+        self.state.max_in_flight.load(AtomicOrdering::Relaxed)
+    }
 }
 
 async fn receive(
@@ -66,11 +84,21 @@ async fn receive(
     headers: HeaderMap,
     raw: axum::body::Bytes,
 ) -> StatusCode {
+    let concurrent = state.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+    state
+        .max_in_flight
+        .fetch_max(concurrent, AtomicOrdering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(
+        state.delay_ms.load(AtomicOrdering::Relaxed),
+    ))
+    .await;
+    state.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
     let body = serde_json::from_slice(&raw).expect("JSON body");
     state.received.lock().unwrap().push(Received {
         body,
         raw: raw.to_vec(),
         headers,
+        status: 0,
     });
     let status = state
         .script
@@ -78,6 +106,7 @@ async fn receive(
         .unwrap()
         .pop_front()
         .unwrap_or(*state.fallback.lock().unwrap());
+    state.received.lock().unwrap().last_mut().unwrap().status = status;
     StatusCode::from_u16(status).unwrap()
 }
 
@@ -561,5 +590,86 @@ async fn deliveries_to_a_subscription_with_a_secret_are_signed() {
     app.restart().await;
     let (_, listed) = app.get("/api/webhooks").await;
     assert_eq!(listed[0]["signed"], true, "the secret survives a restart");
+    app.stop().await;
+}
+
+#[tokio::test]
+async fn an_ordered_subscription_receives_events_one_at_a_time_in_sequence_order() {
+    let mut app = TestApp::start().await;
+    app.seed().await;
+    let ordered = Receiver::start().await;
+    ordered.slow(Duration::from_millis(15));
+    ordered.respond(&[200, 500, 500], 200);
+    let (status, created) = app
+        .post(
+            "/api/webhooks",
+            json!({ "url": ordered.url, "eventTypes": ["TradeExecuted", "OrderFilled"], "ordered": true }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["ordered"], true);
+    let unordered = Receiver::start().await;
+    unordered.slow(Duration::from_millis(15));
+    subscribe(&app, &unordered.url, &["TradeExecuted", "OrderFilled"]).await;
+
+    // One resting sell of 50 and five buys of 10: each buy gives TradeExecuted plus OrderFilled (the buy), and the
+    // last also fills the sell, so 11 events.
+    assert_eq!(
+        app.order("A", "SELL", Some(10025), 50).await.0,
+        StatusCode::CREATED
+    );
+    for buyer in ["B", "C", "D", "B", "C"] {
+        assert_eq!(
+            app.order(buyer, "BUY", Some(10025), 10).await.0,
+            StatusCode::CREATED
+        );
+    }
+    let expected: Vec<u64> = app
+        .get("/api/events?limit=1000")
+        .await
+        .1
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["eventType"] == "TradeExecuted" || e["eventType"] == "OrderFilled")
+        .map(|e| e["sequence"].as_u64().unwrap())
+        .collect();
+    assert_eq!(expected.len(), 11);
+
+    let delivered = |receiver: &Receiver| -> Vec<u64> {
+        receiver
+            .received()
+            .iter()
+            .filter(|r| r.status == 200)
+            .map(|r| r.body["sequence"].as_u64().unwrap())
+            .collect()
+    };
+    eventually("all ordered deliveries", || {
+        delivered(&ordered).len() == expected.len()
+    })
+    .await;
+    eventually("all unordered deliveries", || {
+        let mut got = delivered(&unordered);
+        got.sort_unstable();
+        got == expected
+    })
+    .await;
+
+    assert_eq!(ordered.max_in_flight(), 1, "never two requests at once");
+    assert_eq!(delivered(&ordered), expected, "delivered in sequence order");
+    let attempted: Vec<u64> = ordered
+        .received()
+        .iter()
+        .map(|r| r.body["sequence"].as_u64().unwrap())
+        .collect();
+    assert!(
+        attempted.windows(2).all(|w| w[0] <= w[1]),
+        "no later event before an earlier one: {attempted:?}"
+    );
+    assert_eq!(
+        attempted.len(),
+        expected.len() + 2,
+        "the second event was retried twice, blocking the rest"
+    );
     app.stop().await;
 }

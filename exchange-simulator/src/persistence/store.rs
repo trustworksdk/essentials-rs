@@ -306,8 +306,8 @@ impl Store {
             serde_json::to_string(&subscription.event_types).expect("strings serialize");
         self.conn
             .prepare_cached(
-                "INSERT INTO webhook_subscriptions (id, url, enabled, event_types, created_at, secret)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO webhook_subscriptions (id, url, enabled, event_types, created_at, secret, ordered)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?
             .execute(params![
                 subscription.id.to_string(),
@@ -316,6 +316,7 @@ impl Store {
                 event_types,
                 timestamp(subscription.created_at),
                 subscription.secret,
+                subscription.ordered,
             ])
             .map(drop)
     }
@@ -323,7 +324,7 @@ impl Store {
     pub fn subscriptions(&self) -> rusqlite::Result<Vec<Subscription>> {
         self.conn
             .prepare_cached(
-                "SELECT id, url, enabled, event_types, created_at, secret
+                "SELECT id, url, enabled, event_types, created_at, secret, ordered
                  FROM webhook_subscriptions ORDER BY created_at, id",
             )?
             .query_map([], |row| {
@@ -337,13 +338,15 @@ impl Store {
                     })?,
                     created_at: parsed(row, 4)?,
                     secret: row.get(5)?,
+                    ordered: row.get(6)?,
                 })
             })?
             .collect()
     }
 
     /// Claims up to `limit` deliveries that are due at `now` (pending, or in flight with an expired lease), oldest
-    /// due first, and leases them until `lease_until`.
+    /// due first, and leases them until `lease_until`. For an ordered subscription only its unfinished delivery with
+    /// the lowest sequence is eligible, so it never has two in flight and later events wait behind a failing one.
     pub fn claim_deliveries(
         &mut self,
         now: DateTime<Utc>,
@@ -358,6 +361,9 @@ impl Store {
                  JOIN webhook_subscriptions s ON s.id = d.subscription_id
                  JOIN events e ON e.sequence = d.event_sequence
                  WHERE d.status IN ('PENDING', 'IN_FLIGHT') AND d.next_attempt_at <= ?1
+                   AND (s.ordered = 0 OR d.event_sequence = (
+                         SELECT MIN(u.event_sequence) FROM webhook_deliveries u
+                         WHERE u.subscription_id = d.subscription_id AND u.status IN ('PENDING', 'IN_FLIGHT')))
                  ORDER BY d.next_attempt_at, d.event_sequence
                  LIMIT ?2"
             ))?;

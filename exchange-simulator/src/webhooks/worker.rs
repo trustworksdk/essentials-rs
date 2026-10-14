@@ -112,7 +112,7 @@ impl DeliveryWorker {
     }
 }
 
-/// Claims and delivers batches until nothing is due.
+/// Claims and delivers batches until a claim comes back empty.
 async fn deliver_due(
     dispatcher: &Dispatcher,
     client: &reqwest::Client,
@@ -125,16 +125,14 @@ async fn deliver_due(
         if jobs.is_empty() {
             return Ok(());
         }
-        let claimed = jobs.len();
         let results: Vec<DeliveryResult> = futures_util::stream::iter(jobs)
             .map(|job| deliver(client, &config.retry, job))
             .buffer_unordered(config.concurrency.max(1))
             .collect()
             .await;
         record(dispatcher, results).await?;
-        if claimed < config.batch_size as usize {
-            return Ok(());
-        }
+        // Claim again even after a partial batch: an ordered subscription's next event only becomes eligible once
+        // the one before it is recorded. The loop ends when nothing is due.
     }
 }
 

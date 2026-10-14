@@ -23,6 +23,7 @@ use crate::domain::{Instrument, InstrumentId, Participant};
 use crate::engine::{Dispatcher, SubmitOutcome};
 use crate::events::EventEnvelope;
 use crate::persistence::{ExecutionFilter, InstrumentFilter, Store};
+use crate::webhooks::NewSubscription;
 
 /// Shared handler state.
 #[derive(Clone)]
@@ -270,7 +271,12 @@ async fn register_webhook(
     let Json(body) = body?;
     let subscription = state
         .dispatcher
-        .register_webhook(body.url, body.event_types, body.secret)
+        .register_webhook(NewSubscription {
+            url: body.url,
+            event_types: body.event_types,
+            secret: body.secret,
+            ordered: body.ordered,
+        })
         .await?;
     Ok((
         StatusCode::CREATED,

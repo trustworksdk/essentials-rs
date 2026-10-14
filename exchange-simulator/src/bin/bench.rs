@@ -21,6 +21,7 @@ use exchange_simulator::engine::{
 };
 use exchange_simulator::events::EVENT_TYPES;
 use exchange_simulator::persistence::{self, Store};
+use exchange_simulator::webhooks::NewSubscription;
 
 const USAGE: &str = "usage: bench [all|matching|durable|http|checkpoint] [--quick] [--seed N] [--matching-orders N] \
                      [--durable-orders N] [--http-orders N] [--concurrency N] [--dir DIR] [--out FILE]
@@ -305,11 +306,11 @@ fn durable_exchange(dir: &std::path::Path, subscribed: bool) -> Exchange {
     }
     if subscribed {
         exchange
-            .register_webhook(
-                "http://127.0.0.1:9/unused".into(),
-                EVENT_TYPES.iter().map(|t| t.to_string()).collect(),
-                None,
-            )
+            .register_webhook(NewSubscription {
+                url: "http://127.0.0.1:9/unused".into(),
+                event_types: EVENT_TYPES.iter().map(|t| t.to_string()).collect(),
+                ..Default::default()
+            })
             .unwrap();
     }
     exchange

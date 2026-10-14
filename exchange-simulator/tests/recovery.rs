@@ -14,6 +14,7 @@ use exchange_simulator::engine::{
     UuidV7Ids,
 };
 use exchange_simulator::persistence::{self, InstrumentFilter, Store};
+use exchange_simulator::webhooks::NewSubscription;
 use uuid::Uuid;
 
 /// A database file in its own directory, removed on drop.
@@ -94,6 +95,14 @@ fn order(participant: &str, side: Side, price: Option<i64>, quantity: u64) -> Su
         },
         limit_price_ticks: price,
         quantity,
+    }
+}
+
+fn hook(url: &str, event_types: &[&str]) -> NewSubscription {
+    NewSubscription {
+        url: url.into(),
+        event_types: event_types.iter().map(|t| t.to_string()).collect(),
+        ..Default::default()
     }
 }
 
@@ -627,25 +636,18 @@ fn events_and_webhook_deliveries_commit_or_roll_back_with_the_trade() {
         exchange.register_participant(participant(id)).unwrap();
     }
     let trades = exchange
-        .register_webhook(
-            "http://localhost:1/trades".into(),
-            vec!["TradeExecuted".into()],
-            None,
-        )
+        .register_webhook(hook("http://localhost:1/trades", &["TradeExecuted"]))
         .unwrap();
     let all = exchange
-        .register_webhook(
-            "http://localhost:1/all".into(),
-            [
+        .register_webhook(hook(
+            "http://localhost:1/all",
+            &[
                 "OrderAccepted",
                 "TradeExecuted",
                 "OrderFilled",
                 "OrderPartiallyFilled",
-            ]
-            .map(String::from)
-            .to_vec(),
-            None,
-        )
+            ],
+        ))
         .unwrap();
 
     processed(exchange.submit(order("A", Side::Sell, Some(10025), 200)));
@@ -710,23 +712,22 @@ fn events_and_webhook_deliveries_commit_or_roll_back_with_the_trade() {
     assert_eq!(deliveries(all.id), 5);
 
     assert!(matches!(
-        exchange.register_webhook("ftp://x".into(), vec!["TradeExecuted".into()], None),
+        exchange.register_webhook(hook("ftp://x", &["TradeExecuted"])),
         Err(ExchangeError::InvalidWebhook(_))
     ));
     assert!(matches!(
-        exchange.register_webhook("http://x".into(), vec![], None),
+        exchange.register_webhook(hook("http://x", &[])),
         Err(ExchangeError::InvalidWebhook(_))
     ));
     assert!(matches!(
-        exchange.register_webhook("http://x".into(), vec!["Trade".into()], None),
+        exchange.register_webhook(hook("http://x", &["Trade"])),
         Err(ExchangeError::InvalidWebhook(_))
     ));
     assert!(matches!(
-        exchange.register_webhook(
-            "http://x".into(),
-            vec!["TradeExecuted".into()],
-            Some("too-short".into())
-        ),
+        exchange.register_webhook(NewSubscription {
+            secret: Some("too-short".into()),
+            ..hook("http://x", &["TradeExecuted"])
+        }),
         Err(ExchangeError::InvalidWebhook(_))
     ));
 }
@@ -739,11 +740,7 @@ fn a_delivery_claim_is_a_lease_and_late_results_do_not_overwrite() {
     let db = TempDb::new();
     let mut exchange = setup(&db);
     exchange
-        .register_webhook(
-            "http://localhost:1/hook".into(),
-            vec!["OrderAccepted".into()],
-            None,
-        )
+        .register_webhook(hook("http://localhost:1/hook", &["OrderAccepted"]))
         .unwrap();
     processed(exchange.submit(order("A", Side::Sell, Some(10025), 200)));
     drop(exchange);
@@ -797,5 +794,115 @@ fn a_delivery_claim_is_a_lease_and_late_results_do_not_overwrite() {
             .claim_deliveries(at(50), at(55), 10)
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn an_ordered_subscription_has_one_delivery_in_flight_in_sequence_order() {
+    use chrono::{TimeZone, Utc};
+    use exchange_simulator::webhooks::{DeliveryOutcome, DeliveryResult};
+
+    let db = TempDb::new();
+    let mut exchange = setup(&db);
+    let ordered = exchange
+        .register_webhook(NewSubscription {
+            ordered: true,
+            ..hook("http://localhost:1/ordered", &["OrderAccepted"])
+        })
+        .unwrap();
+    let unordered = exchange
+        .register_webhook(hook("http://localhost:1/any", &["OrderAccepted"]))
+        .unwrap();
+    for price in [10_000, 10_001, 10_002] {
+        processed(exchange.submit(order("A", Side::Sell, Some(price), 10)));
+    }
+    drop(exchange);
+
+    let mut store = Store::new(persistence::open(db.path(), Duration::from_secs(5)).unwrap());
+    let at = |second: u32| Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, second).unwrap();
+    let of = |jobs: &[exchange_simulator::webhooks::DeliveryJob], subscription: Uuid| -> Vec<u64> {
+        jobs.iter()
+            .filter(|j| j.subscription_id == subscription)
+            .map(|j| j.event.sequence)
+            .collect()
+    };
+    let record =
+        |store: &mut Store, job: &exchange_simulator::webhooks::DeliveryJob, outcome, at| {
+            store
+                .record_deliveries(
+                    &[DeliveryResult {
+                        delivery_id: job.delivery_id,
+                        outcome,
+                    }],
+                    at,
+                )
+                .unwrap();
+        };
+
+    let first = store.claim_deliveries(at(0), at(10), 100).unwrap();
+    assert_eq!(
+        of(&first, unordered.id),
+        [1, 2, 3],
+        "unordered: everything due at once"
+    );
+    assert_eq!(of(&first, ordered.id), [1], "ordered: only the oldest");
+    assert!(
+        store
+            .claim_deliveries(at(1), at(10), 100)
+            .unwrap()
+            .is_empty(),
+        "the head is in flight"
+    );
+
+    let head = first
+        .iter()
+        .find(|j| j.subscription_id == ordered.id)
+        .unwrap();
+    let retry = DeliveryOutcome::Retry {
+        at: at(20),
+        error: "HTTP 500".into(),
+    };
+    record(&mut store, head, retry, at(2));
+    assert!(
+        store
+            .claim_deliveries(at(5), at(15), 100)
+            .unwrap()
+            .is_empty(),
+        "a failing head blocks the rest"
+    );
+
+    let again = store.claim_deliveries(at(20), at(30), 100).unwrap();
+    assert_eq!(of(&again, ordered.id), [1], "the head is retried first");
+    record(
+        &mut store,
+        again
+            .iter()
+            .find(|j| j.subscription_id == ordered.id)
+            .unwrap(),
+        DeliveryOutcome::Dead {
+            error: "gave up".into(),
+        },
+        at(21),
+    );
+    let next = store.claim_deliveries(at(21), at(30), 100).unwrap();
+    assert_eq!(
+        of(&next, ordered.id),
+        [2],
+        "after a dead letter, delivery continues with the next event"
+    );
+    record(
+        &mut store,
+        next.iter()
+            .find(|j| j.subscription_id == ordered.id)
+            .unwrap(),
+        DeliveryOutcome::Delivered,
+        at(22),
+    );
+    assert_eq!(
+        of(
+            &store.claim_deliveries(at(22), at(30), 100).unwrap(),
+            ordered.id
+        ),
+        [3]
     );
 }

@@ -126,7 +126,8 @@ order. `limit` is 1–1000 (default 100). `Trade`: `executionId`, `instrumentId`
 
 ### `GET /health`
 
-`{"status": "ok", "schemaVersion": 2}` (the database migration version), or `503` if the database does not answer.
+`{"status": "ok", "schemaVersion": <n>}` (the number of the last applied migration in `migrations/`), or `503` if
+the database does not answer.
 
 ### `GET /api/events?after=&limit=&eventType=`
 
@@ -157,8 +158,8 @@ incoming order's fill event, then `OrderCancelled` for a market remainder. A com
 
 ### `POST /api/webhooks`
 
-`{ "url": "http://consumer:8080/trades", "eventTypes": ["TradeExecuted"], "secret": "…" }` → `201`
-`{ "id", "url", "eventTypes", "enabled", "signed", "createdAt" }`. The URL must be `http` or `https`, and the event
+`{ "url": "http://consumer:8080/trades", "eventTypes": ["TradeExecuted"], "secret": "…", "ordered": false }` → `201`
+`{ "id", "url", "eventTypes", "enabled", "signed", "ordered", "createdAt" }`. The URL must be `http` or `https`, and the event
 types must be ones listed above. `secret` is optional (16–256 characters). When it is given, deliveries are signed. It
 is never returned; responses show `signed: true` instead. A subscription receives events committed after it was registered; replay earlier events with
 `/api/events`.
@@ -169,7 +170,14 @@ Delivery is a `POST` of the event envelope with headers `X-Event-Id`, `X-Event-T
   retried with exponential backoff and jitter, up to `webhooks.max_attempts`; then the delivery is marked `DEAD`.
 - **At least once:** deliveries are durable and survive restarts, and a consumer may receive the same event more than
   once. Deduplicate by `eventId`.
-- **Ordering:** deliveries are sent concurrently and may arrive out of order; use `sequence` for canonical order.
+- **Ordering:** by default deliveries are sent concurrently and may arrive out of order; use `sequence` for canonical
+  order. With `"ordered": true`:
+  - The subscription has at most one delivery in flight, always its unfinished event with the lowest `sequence`, so
+    events arrive in `sequence` order.
+  - A failing delivery blocks the ones behind it while it is retried.
+  - If it is dead-lettered, delivery continues with the next event. The consumer sees a gap in `sequence` and can fill
+    it from `/api/events`.
+  - Throughput per ordered subscription is one round trip per event.
 - **Signing:** for a subscription with a secret, each attempt also carries `X-Signature-Timestamp` (unix seconds, the
   time of the attempt) and `X-Signature: sha256=<hex>`, the HMAC-SHA256 under the secret of
   `"{X-Signature-Timestamp}.{raw body}"`. A retry is signed again with a new timestamp; its body is byte-identical.

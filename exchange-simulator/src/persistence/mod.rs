@@ -13,6 +13,7 @@ use rusqlite::Connection;
 const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/001_initial.sql"),
     include_str!("../../migrations/002_webhook_signing.sql"),
+    include_str!("../../migrations/003_ordered_delivery.sql"),
 ];
 
 /// Opens (creating if needed) the database at `path`, applies connection pragmas and runs pending migrations.
@@ -172,7 +173,7 @@ mod tests {
         .unwrap();
 
         migrate(&mut conn).unwrap();
-        assert_eq!(schema_version(&conn).unwrap(), 2);
+        assert_eq!(schema_version(&conn).unwrap() as usize, MIGRATIONS.len());
         let secret: Option<String> = conn
             .query_row(
                 "SELECT secret FROM webhook_subscriptions WHERE id = 's1'",

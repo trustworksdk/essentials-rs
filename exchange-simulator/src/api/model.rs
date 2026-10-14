@@ -328,6 +328,9 @@ pub struct WebhookRequest {
     pub event_types: Vec<String>,
     /// Optional HMAC secret (16–256 characters); when set, every delivery is signed. Never returned.
     pub secret: Option<String>,
+    /// Deliver one at a time in event sequence order (default false).
+    #[serde(default)]
+    pub ordered: bool,
 }
 
 /// A subscription as the API shows it: the secret is never returned, only whether there is one.
@@ -339,6 +342,7 @@ pub struct SubscriptionView {
     pub event_types: Vec<String>,
     pub enabled: bool,
     pub signed: bool,
+    pub ordered: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -350,6 +354,7 @@ impl From<Subscription> for SubscriptionView {
             event_types: s.event_types,
             enabled: s.enabled,
             signed: s.secret.is_some(),
+            ordered: s.ordered,
             created_at: s.created_at,
         }
     }
