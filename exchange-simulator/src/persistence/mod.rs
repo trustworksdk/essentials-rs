@@ -2,7 +2,7 @@
 
 mod store;
 
-pub use store::{InstrumentFilter, OrderRecord, Store};
+pub use store::{ExecutionFilter, InstrumentFilter, OrderRecord, Store};
 
 use std::path::Path;
 use std::time::Duration;
@@ -31,6 +31,17 @@ pub fn open(path: impl AsRef<Path>, busy_timeout: Duration) -> rusqlite::Result<
         tracing::warn!(journal_mode = %mode, "SQLite did not switch to WAL");
     }
     migrate(&mut conn)?;
+    Ok(conn)
+}
+
+/// Opens an extra read-only connection to a database [`open`] already created. In WAL mode readers see every committed
+/// transaction without blocking the writer.
+pub fn open_reader(path: impl AsRef<Path>, busy_timeout: Duration) -> rusqlite::Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    configure(&conn, busy_timeout)?;
     Ok(conn)
 }
 

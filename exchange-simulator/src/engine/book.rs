@@ -28,6 +28,15 @@ pub enum RejectReason {
     SelfTrade,
 }
 
+impl RejectReason {
+    /// Stable machine-readable code for APIs and events.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::SelfTrade => "SELF_TRADE",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BookError {
     #[error(transparent)]

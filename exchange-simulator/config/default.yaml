@@ -6,6 +6,8 @@ exchange:
   # "strict": MIC/ISIN/CUSIP formats and check digits are validated at registration.
   # "permissive": lengths only, for fixtures that need deliberately invalid identifiers.
   identifier_policy: "strict"
+  # Commands waiting for the exchange thread. When full, requests fail fast with 503 instead of queueing unbounded.
+  command_queue_capacity: 10000
 database:
   path: "data/exchange.db"
   busy_timeout_ms: 5000

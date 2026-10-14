@@ -330,3 +330,34 @@ Steps refer to "First implementation sequence" above.
 - No default simulator MIC. `mic` may be absent, and symbol-only lookups can return several listings; callers disambiguate with the instrument ID.
 - The clock reading is truncated to microseconds, so in-memory and stored timestamps agree.
 - Concurrency is not wired yet: `AppState` holds the `Exchange` behind a mutex. The bounded command queue and instrument sharding come with the REST endpoints (step 4).
+
+### Step 4 — REST endpoints and HTTP integration tests ✅ done (2026-10-14)
+
+**Delivered**
+- Endpoints from the API table: `POST/GET /api/instruments` (filters `symbol`, `mic`, `isin`, `cusip`), `POST /api/participants`, `POST /api/orders`, `GET/DELETE /api/orders/{id}`, `GET /api/orderbooks/{instrumentId}`, `GET /api/trades` (filters `instrumentId`, `participantId`, `orderId`, `limit`), and `/health`. They are documented in `README.md`, with the error-code table. `/api/events` and `/api/webhooks` are step 5; `/metrics` is step 6.
+- `engine::Dispatcher`: one named OS thread owns the `Exchange` (and so the single SQLite writer) and executes commands from a bounded `tokio::mpsc` queue (`exchange.command_queue_capacity`, default 10,000). A full queue fails fast with `503 overloaded`. Callers get their answer after the commit. On shutdown the thread drains the commands it already accepted (`App::shutdown`).
+- Reads (orders, trades, instruments, health) use a separate read-only connection (`persistence::open_reader`), so they do not queue behind writes. In WAL mode a reader sees each commit as soon as the response is sent. Book snapshots come from the exchange thread, because the books live there.
+- `app::App` assembles the service from `Config` (database, recovery, exchange thread, router) for both `main` and the tests.
+- Tests (`tests/api.rs`, 8, through the real router and exchange thread on a SQLite file):
+  - the acceptance scenario over HTTP, including a restart
+  - validation and error codes
+  - self-trade rejection, market remainder, and client order ID duplicates and conflicts
+  - cancel and lookup errors
+  - registration and filters
+  - trade filters and ordering
+  - 200 concurrent submissions: sequences 1–200 with no gaps, response and stored trade quantities agree, and every unit submitted is traded, resting or rejected
+  - plus a unit test for queue overload and a stopped exchange thread
+- Container smoke: the acceptance steps 1–6 with `curl`, then `docker compose restart`; the book and trade are unchanged.
+- Mutation checks, each made a test fail: a duplicate answered `201`; an unknown participant answered `404`; the `duplicate` flag dropped; the participant trade filter matching buyers only; trades returned out of order.
+
+**Decisions**
+- Status codes:
+  - `201` for every processed order, including exchange rejections (recorded with `rejectReason`)
+  - `200` with `duplicate: true` for a repeated client order ID
+  - `422` when the body references an unknown instrument or participant; `404` for unknown path resources
+  - `409` for conflicts
+  - `400` for malformed input, including unknown JSON fields (`deny_unknown_fields`)
+- Requests carry `priceTicks` only; responses add the decimal `price`. No decimal-price input yet.
+- `lastSequence` in a book snapshot is the exchange-wide sequence at snapshot time. A book's own high-water mark would read lower after a restart, because only resting orders are restored. The HTTP restart test caught that.
+- Instrument sharding is not done: one exchange thread serves all instruments. The plan schedules sharded workers in Milestone 4.
+- `GET /api/trades` returns the oldest trades first with a `limit`. It has no cursor yet; ordered replay is `/api/events` (step 5).

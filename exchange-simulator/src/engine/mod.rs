@@ -4,9 +4,11 @@
 //! it owns the books and the SQLite store and runs the plan, commit, apply cycle.
 
 mod book;
+mod dispatcher;
 mod exchange;
 
 pub use book::{BookError, BookUpdate, InvalidOrder, Level, OrderBook, RejectReason};
+pub use dispatcher::{BookSnapshot, DispatchError, Dispatcher};
 pub use exchange::{Exchange, ExchangeError, ExchangeOptions, SubmitOrder, SubmitOutcome};
 
 use chrono::{DateTime, Utc};

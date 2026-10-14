@@ -3,6 +3,7 @@
 //! `milestone_1_domain_schema_events.md` for the design.
 
 pub mod api;
+pub mod app;
 pub mod config;
 pub mod domain;
 pub mod engine;

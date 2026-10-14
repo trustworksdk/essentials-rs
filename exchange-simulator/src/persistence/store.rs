@@ -3,7 +3,7 @@ use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
-use crate::domain::{Instrument, InstrumentId, Order, Participant, ParticipantId};
+use crate::domain::{Execution, Instrument, InstrumentId, Order, Participant, ParticipantId};
 use crate::engine::BookUpdate;
 
 /// Repository over the single writer connection. Every state change a matching step produces is written by
@@ -19,6 +19,17 @@ pub struct InstrumentFilter {
     pub mic: Option<String>,
     pub isin: Option<String>,
     pub cusip: Option<String>,
+}
+
+/// Optional filters for listing executions; unset fields match everything. Results come in insertion order.
+#[derive(Clone, Debug, Default)]
+pub struct ExecutionFilter {
+    pub instrument_id: Option<InstrumentId>,
+    /// Matches executions where the participant is buyer or seller.
+    pub participant_id: Option<ParticipantId>,
+    /// Matches executions where the order is the buy or the sell order.
+    pub order_id: Option<Uuid>,
+    pub limit: u32,
 }
 
 /// An order with the timestamps stored alongside it.
@@ -71,19 +82,53 @@ impl Store {
                    AND (?3 IS NULL OR isin = ?3) AND (?4 IS NULL OR cusip = ?4)
                  ORDER BY id",
             )?
-            .query_map(params![filter.symbol, filter.mic, filter.isin, filter.cusip], |row| {
-                Ok(Instrument {
-                    id: InstrumentId(row.get(0)?),
-                    symbol: row.get(1)?,
-                    mic: row.get(2)?,
-                    isin: row.get(3)?,
-                    cusip: row.get(4)?,
-                    currency: row.get(5)?,
-                    currency_scale: row.get(6)?,
-                    tick_size_minor: from_sql(row, 7)?,
-                    lot_size: from_sql(row, 8)?,
-                })
-            })?
+            .query_map(params![filter.symbol, filter.mic, filter.isin, filter.cusip], instrument_row)?
+            .collect()
+    }
+
+    pub fn instrument(&self, id: &InstrumentId) -> rusqlite::Result<Option<Instrument>> {
+        self.conn
+            .prepare_cached(
+                "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size
+                 FROM instruments WHERE id = ?1",
+            )?
+            .query_row([&id.0], instrument_row)
+            .optional()
+    }
+
+    pub fn executions(&self, filter: &ExecutionFilter) -> rusqlite::Result<Vec<Execution>> {
+        self.conn
+            .prepare_cached(
+                "SELECT id, instrument_id, buy_order_id, sell_order_id, buyer_id, seller_id, price_ticks, quantity,
+                        executed_at
+                 FROM executions
+                 WHERE (?1 IS NULL OR instrument_id = ?1)
+                   AND (?2 IS NULL OR buyer_id = ?2 OR seller_id = ?2)
+                   AND (?3 IS NULL OR buy_order_id = ?3 OR sell_order_id = ?3)
+                 ORDER BY rowid
+                 LIMIT ?4",
+            )?
+            .query_map(
+                params![
+                    filter.instrument_id.as_ref().map(|i| &i.0),
+                    filter.participant_id.as_ref().map(|p| &p.0),
+                    filter.order_id.map(|o| o.to_string()),
+                    filter.limit,
+                ],
+                |row| {
+                    Ok(Execution {
+                        id: parsed(row, 0)?,
+                        instrument_id: InstrumentId(row.get(1)?),
+                        buy_order_id: parsed(row, 2)?,
+                        sell_order_id: parsed(row, 3)?,
+                        buyer_id: ParticipantId(row.get(4)?),
+                        seller_id: ParticipantId(row.get(5)?),
+                        price_ticks: row.get(6)?,
+                        quantity: from_sql(row, 7)?,
+                        executed_at: parsed(row, 8)?,
+                    })
+                },
+            )?
             .collect()
     }
 
@@ -220,6 +265,20 @@ where
     let text: String = row.get(index)?;
     text.parse()
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e)))
+}
+
+fn instrument_row(row: &Row<'_>) -> rusqlite::Result<Instrument> {
+    Ok(Instrument {
+        id: InstrumentId(row.get(0)?),
+        symbol: row.get(1)?,
+        mic: row.get(2)?,
+        isin: row.get(3)?,
+        cusip: row.get(4)?,
+        currency: row.get(5)?,
+        currency_scale: row.get(6)?,
+        tick_size_minor: from_sql(row, 7)?,
+        lot_size: from_sql(row, 8)?,
+    })
 }
 
 fn order_record(row: &Row<'_>) -> rusqlite::Result<OrderRecord> {

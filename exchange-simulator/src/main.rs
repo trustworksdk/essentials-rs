@@ -1,10 +1,6 @@
-use std::time::Duration;
-
 use anyhow::Context;
-use exchange_simulator::api::{self, AppState};
+use exchange_simulator::app::App;
 use exchange_simulator::config::{Config, LogFormat};
-use exchange_simulator::engine::{Exchange, ExchangeOptions, SystemClock, UuidV7Ids};
-use exchange_simulator::persistence::{self, Store};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -12,41 +8,15 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load().context("loading configuration")?;
     init_tracing(&config);
 
-    let db = persistence::open(
-        &config.database.path,
-        Duration::from_millis(config.database.busy_timeout_ms),
-    )
-    .with_context(|| format!("opening database {}", config.database.path))?;
-    let exchange = Exchange::recover(
-        Store::new(db),
-        ExchangeOptions {
-            identifier_policy: config.exchange.identifier_policy,
-            ids: Box::new(UuidV7Ids),
-            clock: Box::new(SystemClock),
-        },
-    )
-    .context("recovering order books")?;
-    let instruments = exchange.store().instruments(&Default::default())?;
-    let resting_orders: usize = instruments
-        .iter()
-        .filter_map(|i| exchange.book(&i.id))
-        .map(|b| b.len())
-        .sum();
-    tracing::info!(
-        path = %config.database.path,
-        instruments = instruments.len(),
-        resting_orders,
-        last_sequence = exchange.last_sequence(),
-        "database ready, books recovered"
-    );
-
+    let app = App::start(&config)?;
     let listener = tokio::net::TcpListener::bind(&config.server.bind)
         .await
         .with_context(|| format!("binding {}", config.server.bind))?;
     tracing::info!(address = %listener.local_addr()?, "exchange simulator listening");
-    axum::serve(listener, api::router(AppState::new(exchange)))
+    axum::serve(listener, app.router.clone())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    tokio::task::spawn_blocking(move || app.shutdown()).await?;
     tracing::info!("shut down");
     Ok(())
 }

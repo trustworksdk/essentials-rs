@@ -26,6 +26,8 @@ pub struct ServerConfig {
 pub struct ExchangeConfig {
     /// `strict` validates MIC/ISIN/CUSIP formats and check digits at registration; `permissive` checks lengths only.
     pub identifier_policy: IdentifierPolicy,
+    /// Bound of the exchange command queue; a full queue rejects requests with 503.
+    pub command_queue_capacity: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
