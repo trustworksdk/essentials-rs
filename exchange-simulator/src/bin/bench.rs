@@ -22,7 +22,7 @@ use exchange_simulator::engine::{
 use exchange_simulator::events::EVENT_TYPES;
 use exchange_simulator::persistence::{self, Store};
 
-const USAGE: &str = "usage: bench [all|matching|durable|http] [--quick] [--seed N] [--matching-orders N] \
+const USAGE: &str = "usage: bench [all|matching|durable|http|checkpoint] [--quick] [--seed N] [--matching-orders N] \
                      [--durable-orders N] [--http-orders N] [--concurrency N] [--dir DIR] [--out FILE]
 
 --dir: where the SQLite files go (default: the system temp dir). Check the reported fsync latency: on tmpfs it is
@@ -56,7 +56,7 @@ impl Options {
             let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
             let number = |text: String| text.parse::<usize>().map_err(|e| format!("{text}: {e}"));
             match arg.as_str() {
-                "all" | "matching" | "durable" | "http" => options.mode = arg,
+                "all" | "matching" | "durable" | "http" | "checkpoint" => options.mode = arg,
                 "--quick" => {
                     options.matching_orders = 200_000;
                     options.durable_orders = 10_000;
@@ -240,36 +240,7 @@ fn bench_matching(options: &Options, report: &mut Report) {
 /// The coordinator on a SQLite file: every order committed (orders, executions, events, outbox) before the next.
 fn bench_durable(options: &Options, report: &mut Report, subscribed: bool) {
     let dir = temp_dir(&options.dir, "durable");
-    let path = dir.join("exchange.db");
-    let conn = persistence::open(&path, Duration::from_secs(5)).unwrap();
-    let mut exchange = Exchange::recover(
-        Store::new(conn),
-        ExchangeOptions {
-            identifier_policy: IdentifierPolicy::Strict,
-            ids: Box::new(UuidV7Ids),
-            clock: Box::new(SystemClock),
-            simulation_id: None,
-            delivery_signal: None,
-        },
-    )
-    .unwrap();
-    exchange.register_instrument(acme()).unwrap();
-    for p in 0..PARTICIPANTS {
-        exchange
-            .register_participant(Participant {
-                id: ParticipantId(format!("P{p:02}")),
-                name: format!("P{p}"),
-            })
-            .unwrap();
-    }
-    if subscribed {
-        exchange
-            .register_webhook(
-                "http://127.0.0.1:9/unused".into(),
-                EVENT_TYPES.iter().map(|t| t.to_string()).collect(),
-            )
-            .unwrap();
-    }
+    let mut exchange = durable_exchange(&dir, subscribed);
     let commands = workload(options.seed, options.durable_orders);
     let mut latencies = Latencies::default();
     let started = Instant::now();
@@ -305,6 +276,158 @@ fn bench_durable(options: &Options, report: &mut Report, subscribed: bool) {
         &notes,
     );
     drop(exchange);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// An `Exchange` on a fresh SQLite file in `dir`, with ACME and the participants registered.
+fn durable_exchange(dir: &std::path::Path, subscribed: bool) -> Exchange {
+    let path = dir.join("exchange.db");
+    let conn = persistence::open(&path, Duration::from_secs(5)).unwrap();
+    let mut exchange = Exchange::recover(
+        Store::new(conn),
+        ExchangeOptions {
+            identifier_policy: IdentifierPolicy::Strict,
+            ids: Box::new(UuidV7Ids),
+            clock: Box::new(SystemClock),
+            simulation_id: None,
+            delivery_signal: None,
+        },
+    )
+    .unwrap();
+    exchange.register_instrument(acme()).unwrap();
+    for p in 0..PARTICIPANTS {
+        exchange
+            .register_participant(Participant {
+                id: ParticipantId(format!("P{p:02}")),
+                name: format!("P{p}"),
+            })
+            .unwrap();
+    }
+    if subscribed {
+        exchange
+            .register_webhook(
+                "http://127.0.0.1:9/unused".into(),
+                EVENT_TYPES.iter().map(|t| t.to_string()).collect(),
+            )
+            .unwrap();
+    }
+    exchange
+}
+
+/// Commit latency above this counts as a spike (normal p99.9 is about 2 ms on the VM disk).
+const SPIKE: Duration = Duration::from_millis(10);
+
+/// Checkpoints run by [`observed_autocheckpoint`]; a plain `fn` hook cannot capture state.
+static CHECKPOINTS: AtomicUsize = AtomicUsize::new(0);
+
+/// A WAL hook that does exactly what SQLite's built-in auto-checkpoint does (a PASSIVE checkpoint, inside the
+/// committing call, once the WAL holds at least 1000 frames) and counts it, so a slow commit can be attributed.
+fn observed_autocheckpoint(
+    wal: &rusqlite::hooks::Wal,
+    frames: std::ffi::c_int,
+) -> rusqlite::Result<()> {
+    if frames >= 1000 {
+        CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+        // SQLite's default hook ignores the result too: a checkpoint that cannot finish is retried on a later commit.
+        let _ = wal.checkpoint();
+    }
+    Ok(())
+}
+
+/// Item 1.2: attributes durable commit latency spikes. Runs the durable workload (no subscribers) with SQLite's
+/// auto-checkpoint replaced by an identical, observed one, then with auto-checkpointing off, and measures raw fsync
+/// latency in the same directory.
+fn bench_checkpoint(options: &Options, report: &mut Report) {
+    let spikes = |latencies: &[Duration]| latencies.iter().filter(|l| **l > SPIKE).count();
+    for observed in [true, false] {
+        let dir = temp_dir(&options.dir, "checkpoint");
+        let mut exchange = durable_exchange(&dir, false);
+        let conn = exchange.store().connection();
+        if observed {
+            conn.wal_hook(Some(observed_autocheckpoint));
+        } else {
+            conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        }
+        CHECKPOINTS.store(0, Ordering::Relaxed);
+        let mut latencies = Latencies::default();
+        let mut in_checkpoint = Vec::new();
+        let mut without = Vec::new();
+        let started = Instant::now();
+        for command in workload(options.seed, options.durable_orders) {
+            let before = CHECKPOINTS.load(Ordering::Relaxed);
+            let t = Instant::now();
+            exchange.submit(command).expect("submit");
+            let latency = t.elapsed();
+            latencies.0.push(latency);
+            if CHECKPOINTS.load(Ordering::Relaxed) > before {
+                in_checkpoint.push(latency);
+            } else {
+                without.push(latency);
+            }
+        }
+        let elapsed = started.elapsed();
+        let wal_mib =
+            std::fs::metadata(dir.join("exchange.db-wal")).map_or(0, |m| m.len()) / (1 << 20);
+        let notes = if observed {
+            let mut checkpointed = Latencies(in_checkpoint.clone());
+            format!(
+                "{} checkpoints; commits running one: {} spikes > {} ms, {}; other commits: {} spikes, max {}; WAL {wal_mib} MiB",
+                in_checkpoint.len(),
+                spikes(&in_checkpoint),
+                SPIKE.as_millis(),
+                if in_checkpoint.is_empty() {
+                    "–".into()
+                } else {
+                    checkpointed.summary()
+                },
+                spikes(&without),
+                micros(without.iter().max().copied().unwrap_or_default()),
+            )
+        } else {
+            format!(
+                "{} spikes > {} ms; WAL grew to {wal_mib} MiB",
+                spikes(&without),
+                SPIKE.as_millis()
+            )
+        };
+        let scenario = if observed {
+            "durable, auto-checkpoint every 1000 pages (default, observed)"
+        } else {
+            "durable, auto-checkpoint off"
+        };
+        report.row(
+            scenario,
+            options.durable_orders,
+            elapsed,
+            &latencies.summary(),
+            &notes,
+        );
+        drop(exchange);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // The disk on its own: 4 KiB appends, each followed by fsync, as many as the durable run made commits.
+    use std::io::Write;
+    let dir = temp_dir(&options.dir, "fsync");
+    let mut file = std::fs::File::create(dir.join("probe")).unwrap();
+    let mut latencies = Latencies::default();
+    let started = Instant::now();
+    for _ in 0..options.durable_orders {
+        let t = Instant::now();
+        file.write_all(&[0u8; 4096]).unwrap();
+        file.sync_all().unwrap();
+        latencies.0.push(t.elapsed());
+    }
+    let elapsed = started.elapsed();
+    let notes = format!("{} spikes > {} ms", spikes(&latencies.0), SPIKE.as_millis());
+    report.row(
+        "raw 4 KiB write + fsync, no SQLite",
+        options.durable_orders,
+        elapsed,
+        &latencies.summary(),
+        &notes,
+    );
+    drop(file);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -561,6 +684,9 @@ async fn main() {
     let all = options.mode == "all";
     if all || options.mode == "matching" {
         bench_matching(&options, &mut report);
+    }
+    if options.mode == "checkpoint" {
+        bench_checkpoint(&options, &mut report);
     }
     if all || options.mode == "durable" {
         bench_durable(&options, &mut report, false);

@@ -10,6 +10,7 @@ reported separately, as the plan requires:
 | durable + outbox | the same, plus one subscription to all six event types | the extra cost of writing a delivery row per event |
 | HTTP end to end | the service on a TCP port, N concurrent `reqwest` clients posting `POST /api/orders` | acknowledged-after-commit throughput and client-observed latency |
 | HTTP + webhook | the same, plus a local consumer subscribed to `TradeExecuted` | the cost of delivery running alongside, and when the last trade event was delivered |
+| `checkpoint` (run on its own, not part of `all`) | durable with an observed auto-checkpoint, durable with auto-checkpoint off, raw fsync | which commits are slow, and why (item 1.2) |
 
 ```sh
 # from the workspace root; always --release
@@ -53,9 +54,24 @@ disk was slower (1,857 orders/s) and is not counted.
   measure there before quoting a figure for a specific deployment.
 - **The outbox costs about 20 %** with a subscriber to every event type (3.3 extra rows per order). Webhook delivery
   through the same writer thread costs another 20 % of HTTP throughput.
-- **Latency spikes:** maximum commit latencies of 57–180 ms recur on the VM disk. A likely cause is SQLite's
-  automatic WAL checkpoint, which runs inside the committing transaction every 1,000 pages. Not yet investigated.
+- **Latency spikes come from the disk, not SQLite** (item 1.2, `bench checkpoint`,
+  [`results/2026-10-14-checkpoint.md`](results/2026-10-14-checkpoint.md)). Maximum commit latencies of 57–180 ms recur
+  on the VM disk. The experiment replaced SQLite's auto-checkpoint with an identical one that records which commits
+  run a checkpoint:
+  - **Checkpoint commits** (570 per 50k orders) took 1.7–2.9 ms p50 and at most 8.1 ms. None crossed 10 ms in three
+    runs.
+  - **Every commit over 10 ms** was an ordinary commit.
+  - **Raw 4 KiB write + fsync on the same disk, without SQLite,** shows the same pattern: 6–52 fsyncs over 10 ms per
+    50k, with maxima of 141–950 ms.
+
+  The VM's virtual disk occasionally stalls an fsync. Re-measure on the target hardware before treating spikes as an
+  application problem.
+- **Checkpoints still cost something:** about 1.1 % of commits run one at roughly 1.7 ms, about 10 % of a durable
+  run's time and most of its p99. Turning auto-checkpointing off is *not* the fix: the WAL grows without bound
+  (2.2 GiB per 50k orders), the p50 commit latency more than doubles, and throughput halves (≈2.5k/s), because every
+  commit then extends the WAL file instead of reusing it.
 
 **Levers for Milestone 4** (not built): group commit, meaning several orders per transaction while still
-acknowledging only after commit; moving the WAL checkpoint off the hot path; instrument-sharded matching in front of
-the writer; and the plan's explicitly non-durable fast mode.
+acknowledging only after commit; moving the WAL checkpoint to a background connection, which keeps the WAL bounded
+but takes it off the commit path; instrument-sharded matching in front of the writer; and the plan's explicitly
+non-durable fast mode.
