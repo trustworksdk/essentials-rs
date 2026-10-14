@@ -38,7 +38,7 @@ enum Request {
     Submit(SubmitOrder, Reply<(SubmitOutcome, Instrument)>),
     Cancel(Uuid, Reply<(BookUpdate, Instrument)>),
     Snapshot(InstrumentId, oneshot::Sender<Option<BookSnapshot>>),
-    RegisterWebhook(String, Vec<String>, Reply<Subscription>),
+    RegisterWebhook(String, Vec<String>, Option<String>, Reply<Subscription>),
     ClaimDeliveries(u32, std::time::Duration, Reply<Vec<DeliveryJob>>),
     RecordDeliveries(Vec<DeliveryResult>, Reply<()>),
 }
@@ -102,8 +102,9 @@ impl Dispatcher {
         &self,
         url: String,
         event_types: Vec<String>,
+        secret: Option<String>,
     ) -> Result<Subscription, DispatchError> {
-        self.call(|reply| Request::RegisterWebhook(url, event_types, reply))
+        self.call(|reply| Request::RegisterWebhook(url, event_types, secret, reply))
             .await
     }
 
@@ -210,9 +211,9 @@ fn handle(exchange: &mut Exchange, request: Request) -> (&'static str, &'static 
             });
             ("cancel", answer(reply, result))
         }
-        Request::RegisterWebhook(url, event_types, reply) => (
+        Request::RegisterWebhook(url, event_types, secret, reply) => (
             "register_webhook",
-            answer(reply, exchange.register_webhook(url, event_types)),
+            answer(reply, exchange.register_webhook(url, event_types, secret)),
         ),
         Request::ClaimDeliveries(limit, lease, reply) => (
             "claim_deliveries",

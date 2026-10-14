@@ -267,11 +267,13 @@ impl Exchange {
     }
 
     /// Registers a webhook endpoint for the given event types. It receives events committed from now on; earlier
-    /// events can be replayed from the events API.
+    /// events can be replayed from the events API. With a `secret` (16–256 characters) every delivery is signed; see
+    /// [`crate::webhooks::signing`].
     pub fn register_webhook(
         &mut self,
         url: String,
         event_types: Vec<String>,
+        secret: Option<String>,
     ) -> Result<Subscription, ExchangeError> {
         let parsed = reqwest::Url::parse(&url)
             .map_err(|e| ExchangeError::InvalidWebhook(format!("url: {e}")))?;
@@ -293,6 +295,13 @@ impl Exchange {
                 "unknown event type {unknown}"
             )));
         }
+        if let Some(secret) = &secret
+            && !(16..=256).contains(&secret.chars().count())
+        {
+            return Err(ExchangeError::InvalidWebhook(
+                "secret must be 16 to 256 characters".into(),
+            ));
+        }
         let mut event_types = event_types;
         event_types.sort();
         event_types.dedup();
@@ -302,6 +311,7 @@ impl Exchange {
             event_types,
             enabled: true,
             created_at: self.now(),
+            secret,
         };
         self.store.insert_subscription(&subscription)?;
         self.subscriptions.push(subscription.clone());

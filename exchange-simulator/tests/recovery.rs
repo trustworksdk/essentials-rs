@@ -630,6 +630,7 @@ fn events_and_webhook_deliveries_commit_or_roll_back_with_the_trade() {
         .register_webhook(
             "http://localhost:1/trades".into(),
             vec!["TradeExecuted".into()],
+            None,
         )
         .unwrap();
     let all = exchange
@@ -643,6 +644,7 @@ fn events_and_webhook_deliveries_commit_or_roll_back_with_the_trade() {
             ]
             .map(String::from)
             .to_vec(),
+            None,
         )
         .unwrap();
 
@@ -708,15 +710,23 @@ fn events_and_webhook_deliveries_commit_or_roll_back_with_the_trade() {
     assert_eq!(deliveries(all.id), 5);
 
     assert!(matches!(
-        exchange.register_webhook("ftp://x".into(), vec!["TradeExecuted".into()]),
+        exchange.register_webhook("ftp://x".into(), vec!["TradeExecuted".into()], None),
         Err(ExchangeError::InvalidWebhook(_))
     ));
     assert!(matches!(
-        exchange.register_webhook("http://x".into(), vec![]),
+        exchange.register_webhook("http://x".into(), vec![], None),
         Err(ExchangeError::InvalidWebhook(_))
     ));
     assert!(matches!(
-        exchange.register_webhook("http://x".into(), vec!["Trade".into()]),
+        exchange.register_webhook("http://x".into(), vec!["Trade".into()], None),
+        Err(ExchangeError::InvalidWebhook(_))
+    ));
+    assert!(matches!(
+        exchange.register_webhook(
+            "http://x".into(),
+            vec!["TradeExecuted".into()],
+            Some("too-short".into())
+        ),
         Err(ExchangeError::InvalidWebhook(_))
     ));
 }
@@ -732,6 +742,7 @@ fn a_delivery_claim_is_a_lease_and_late_results_do_not_overwrite() {
         .register_webhook(
             "http://localhost:1/hook".into(),
             vec!["OrderAccepted".into()],
+            None,
         )
         .unwrap();
     processed(exchange.submit(order("A", Side::Sell, Some(10025), 200)));

@@ -5,7 +5,7 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use tokio::sync::{Notify, watch};
 
-use super::{DeliveryJob, DeliveryOutcome, DeliveryResult};
+use super::{DeliveryJob, DeliveryOutcome, DeliveryResult, signing};
 use crate::engine::{DispatchError, Dispatcher};
 
 /// Exponential backoff with jitter, and the attempt budget before a delivery is dead-lettered.
@@ -164,16 +164,26 @@ async fn deliver(
 ) -> DeliveryResult {
     let attempt = job.attempts + 1;
     let started = std::time::Instant::now();
-    let response = client
+    // Serialized once: these exact bytes are signed and sent.
+    let body = serde_json::to_vec(&job.event).expect("envelopes serialize");
+    let mut request = client
         .post(&job.url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header("X-Event-Id", job.event.event_id.to_string())
         .header("X-Event-Type", &job.event.event_type)
         .header("X-Event-Sequence", job.event.sequence.to_string())
         .header("X-Subscription-Id", job.subscription_id.to_string())
-        .header("X-Delivery-Attempt", attempt.to_string())
-        .json(&job.event)
-        .send()
-        .await;
+        .header("X-Delivery-Attempt", attempt.to_string());
+    if let Some(secret) = &job.secret {
+        let timestamp = Utc::now().timestamp();
+        request = request
+            .header(signing::TIMESTAMP_HEADER, timestamp.to_string())
+            .header(
+                signing::SIGNATURE_HEADER,
+                signing::sign(secret, timestamp, &body),
+            );
+    }
+    let response = request.body(body).send().await;
     let outcome = match response {
         Ok(response) if response.status().is_success() => DeliveryOutcome::Delivered,
         Ok(response) => retry.after_failure(job.attempts, format!("HTTP {}", response.status())),

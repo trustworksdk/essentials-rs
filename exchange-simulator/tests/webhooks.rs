@@ -7,16 +7,18 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
-use axum::{Json, Router};
 use common::TestApp;
 use serde_json::{Value, json};
 
 #[derive(Clone, Debug)]
 struct Received {
     body: Value,
+    /// The body bytes exactly as received, for signature checks.
+    raw: Vec<u8>,
     headers: HeaderMap,
 }
 
@@ -62,13 +64,14 @@ impl Receiver {
 async fn receive(
     State(state): State<ReceiverState>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    raw: axum::body::Bytes,
 ) -> StatusCode {
-    state
-        .received
-        .lock()
-        .unwrap()
-        .push(Received { body, headers });
+    let body = serde_json::from_slice(&raw).expect("JSON body");
+    state.received.lock().unwrap().push(Received {
+        body,
+        raw: raw.to_vec(),
+        headers,
+    });
     let status = state
         .script
         .lock()
@@ -468,4 +471,95 @@ async fn metrics_text(app: &TestApp) -> String {
             .to_vec(),
     )
     .unwrap()
+}
+
+/// Recomputes an `X-Signature` with the `hmac` crate directly, independently of the service's signing code.
+fn expected_signature(secret: &str, timestamp: &str, raw: &[u8]) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(format!("{timestamp}.").as_bytes());
+    mac.update(raw);
+    let hex: String = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("sha256={hex}")
+}
+
+#[tokio::test]
+async fn deliveries_to_a_subscription_with_a_secret_are_signed() {
+    const SECRET: &str = "whsec_e2e_0123456789abcdef";
+    let mut app = TestApp::start().await;
+    app.seed().await;
+    let signed = Receiver::start().await;
+    signed.respond(&[500], 200);
+    let unsigned = Receiver::start().await;
+    let (status, created) = app
+        .post(
+            "/api/webhooks",
+            json!({ "url": signed.url, "eventTypes": ["TradeExecuted"], "secret": SECRET }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["signed"], true);
+    assert!(
+        created.get("secret").is_none(),
+        "the secret is never returned"
+    );
+    subscribe(&app, &unsigned.url, &["TradeExecuted"]).await;
+    trade(&app).await;
+
+    eventually("a failed and a successful signed attempt", || {
+        signed.received().len() == 2
+    })
+    .await;
+    eventually("the unsigned delivery", || unsigned.received().len() == 1).await;
+    let now = chrono::Utc::now().timestamp();
+    for attempt in signed.received() {
+        let timestamp = header(&attempt, "x-signature-timestamp");
+        assert!(
+            (now - timestamp.parse::<i64>().unwrap()).abs() < 60,
+            "timestamp is the attempt time"
+        );
+        assert_eq!(
+            header(&attempt, "x-signature"),
+            expected_signature(SECRET, &timestamp, &attempt.raw)
+        );
+        assert_eq!(attempt.body["eventType"], "TradeExecuted");
+    }
+    let attempts = signed.received();
+    assert_eq!(
+        attempts[0].raw, attempts[1].raw,
+        "a retry sends the identical body"
+    );
+    let delivered = &unsigned.received()[0];
+    assert!(delivered.headers.get("x-signature").is_none());
+    assert!(delivered.headers.get("x-signature-timestamp").is_none());
+
+    let (_, listed) = app.get("/api/webhooks").await;
+    let signed_flags: Vec<_> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["signed"].clone())
+        .collect();
+    assert_eq!(signed_flags, [json!(true), json!(false)]);
+    assert!(
+        !listed.to_string().contains(SECRET),
+        "the secret is not listed"
+    );
+
+    let (status, _) = app
+        .post(
+            "/api/webhooks",
+            json!({ "url": signed.url, "eventTypes": ["TradeExecuted"], "secret": "short" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    app.restart().await;
+    let (_, listed) = app.get("/api/webhooks").await;
+    assert_eq!(listed[0]["signed"], true, "the secret survives a restart");
+    app.stop().await;
 }

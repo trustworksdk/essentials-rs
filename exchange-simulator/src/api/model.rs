@@ -10,6 +10,7 @@ use crate::domain::{
     Side,
 };
 use crate::engine::{BookSnapshot, Level, RejectReason, SubmitOrder};
+use crate::webhooks::Subscription;
 
 fn one() -> u64 {
     1
@@ -325,4 +326,31 @@ pub struct EventQuery {
 pub struct WebhookRequest {
     pub url: String,
     pub event_types: Vec<String>,
+    /// Optional HMAC secret (16–256 characters); when set, every delivery is signed. Never returned.
+    pub secret: Option<String>,
+}
+
+/// A subscription as the API shows it: the secret is never returned, only whether there is one.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionView {
+    pub id: Uuid,
+    pub url: String,
+    pub event_types: Vec<String>,
+    pub enabled: bool,
+    pub signed: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<Subscription> for SubscriptionView {
+    fn from(s: Subscription) -> Self {
+        Self {
+            id: s.id,
+            url: s.url,
+            event_types: s.event_types,
+            enabled: s.enabled,
+            signed: s.secret.is_some(),
+            created_at: s.created_at,
+        }
+    }
 }

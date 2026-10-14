@@ -23,7 +23,6 @@ use crate::domain::{Instrument, InstrumentId, Participant};
 use crate::engine::{Dispatcher, SubmitOutcome};
 use crate::events::EventEnvelope;
 use crate::persistence::{ExecutionFilter, InstrumentFilter, Store};
-use crate::webhooks::Subscription;
 
 /// Shared handler state.
 #[derive(Clone)]
@@ -267,17 +266,28 @@ async fn list_events(
 async fn register_webhook(
     State(state): State<AppState>,
     body: Result<Json<WebhookRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<Subscription>), ApiError> {
+) -> Result<(StatusCode, Json<SubscriptionView>), ApiError> {
     let Json(body) = body?;
     let subscription = state
         .dispatcher
-        .register_webhook(body.url, body.event_types)
+        .register_webhook(body.url, body.event_types, body.secret)
         .await?;
-    Ok((StatusCode::CREATED, Json(subscription)))
+    Ok((
+        StatusCode::CREATED,
+        Json(SubscriptionView::from(subscription)),
+    ))
 }
 
-async fn list_webhooks(State(state): State<AppState>) -> Result<Json<Vec<Subscription>>, ApiError> {
-    Ok(Json(state.read(|store| store.subscriptions()).await?))
+async fn list_webhooks(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<SubscriptionView>>, ApiError> {
+    let subscriptions = state.read(|store| store.subscriptions()).await?;
+    Ok(Json(
+        subscriptions
+            .into_iter()
+            .map(SubscriptionView::from)
+            .collect(),
+    ))
 }
 
 /// Prometheus text exposition. The outbox gauges are refreshed from SQLite on each scrape.

@@ -306,15 +306,16 @@ impl Store {
             serde_json::to_string(&subscription.event_types).expect("strings serialize");
         self.conn
             .prepare_cached(
-                "INSERT INTO webhook_subscriptions (id, url, enabled, event_types, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO webhook_subscriptions (id, url, enabled, event_types, created_at, secret)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?
             .execute(params![
                 subscription.id.to_string(),
                 subscription.url,
                 subscription.enabled,
                 event_types,
-                timestamp(subscription.created_at)
+                timestamp(subscription.created_at),
+                subscription.secret,
             ])
             .map(drop)
     }
@@ -322,7 +323,8 @@ impl Store {
     pub fn subscriptions(&self) -> rusqlite::Result<Vec<Subscription>> {
         self.conn
             .prepare_cached(
-                "SELECT id, url, enabled, event_types, created_at FROM webhook_subscriptions ORDER BY created_at, id",
+                "SELECT id, url, enabled, event_types, created_at, secret
+                 FROM webhook_subscriptions ORDER BY created_at, id",
             )?
             .query_map([], |row| {
                 let event_types: String = row.get(3)?;
@@ -334,6 +336,7 @@ impl Store {
                         rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(e))
                     })?,
                     created_at: parsed(row, 4)?,
+                    secret: row.get(5)?,
                 })
             })?
             .collect()
@@ -350,7 +353,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         let jobs = {
             let mut select = tx.prepare_cached(&format!(
-                "SELECT d.id, d.subscription_id, s.url, d.attempts, {EVENT_COLUMNS}
+                "SELECT d.id, d.subscription_id, s.url, d.attempts, {EVENT_COLUMNS}, s.secret
                  FROM webhook_deliveries d
                  JOIN webhook_subscriptions s ON s.id = d.subscription_id
                  JOIN events e ON e.sequence = d.event_sequence
@@ -366,6 +369,7 @@ impl Store {
                         url: row.get(2)?,
                         attempts: row.get(3)?,
                         event: event_row(row, 4)?,
+                        secret: row.get(14)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

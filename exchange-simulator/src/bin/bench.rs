@@ -308,6 +308,7 @@ fn durable_exchange(dir: &std::path::Path, subscribed: bool) -> Exchange {
             .register_webhook(
                 "http://127.0.0.1:9/unused".into(),
                 EVENT_TYPES.iter().map(|t| t.to_string()).collect(),
+                None,
             )
             .unwrap();
     }

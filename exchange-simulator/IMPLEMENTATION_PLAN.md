@@ -23,7 +23,34 @@ Sizes: **S** is under a step of Milestone 1, **M** about one, **L** two or more.
 |---|---|---|---|
 | 1.1 | Commit the containerized acceptance test; push `exchange-simulator-m1`; open a PR to `main` | S | |
 | 1.2 ✅ | Investigate the 57–180 ms commit spikes | S | **Done 2026-10-14.** The cause is the disk, not SQLite. `bench checkpoint` replaces SQLite's auto-checkpoint with an identical observed one: checkpoint commits peak at 8.1 ms, and every commit over 10 ms is an ordinary one. Raw fsync on the same VM disk stalls for 141–950 ms on its own. Checkpoints still cost about 10 % of durable time and most of the p99, so 4.3 is re-scoped. Turning auto-checkpointing off halves throughput. Results: `bench/results/2026-10-14-checkpoint.md`. |
-| 1.3 | Backlog from plan §3/§5 that Milestone 1 skipped | M | Instrument `enabled` flag (a disabled instrument rejects orders); participant settlement metadata (free-form JSON, carried into `TradeExecuted`); HMAC-SHA256 webhook signing (`X-Signature`, a per-subscription secret); an optional serialized-delivery flag per subscription (one in-flight delivery per subscription, in `sequence` order). All four are needed soon (D5), so they come before Milestone 2; split into 1.3a signing, 1.3b ordered delivery, 1.3c instrument `enabled`, 1.3d participant metadata. Each 1.3 item adds a migration to the schema, starting with `002`, so Milestone 2's settlement migration takes the next free number. |
+| 1.3 | Backlog from plan §3/§5 that Milestone 1 skipped (1.3a ✅) | M | Instrument `enabled` flag (a disabled instrument rejects orders); participant settlement metadata (free-form JSON, carried into `TradeExecuted`); HMAC-SHA256 webhook signing (`X-Signature`, a per-subscription secret); an optional serialized-delivery flag per subscription (one in-flight delivery per subscription, in `sequence` order). All four are needed soon (D5), so they come before Milestone 2; split into 1.3a signing, 1.3b ordered delivery, 1.3c instrument `enabled`, 1.3d participant metadata. Each 1.3 item adds a migration to the schema, starting with `002`, so Milestone 2's settlement migration takes the next free number. |
+
+### Progress
+
+**1.3a — HMAC webhook signing ✅ (2026-10-14).**
+- **Delivered:**
+  - Migration `002_webhook_signing.sql` adds `webhook_subscriptions.secret`: nullable, 16–256 characters (CHECK),
+    and validated by the API as well.
+  - `POST /api/webhooks` accepts an optional `secret`. Responses never include it and show `signed` instead
+    (`SubscriptionView`).
+  - The worker serializes the envelope once and signs and sends those exact bytes. It adds `X-Signature-Timestamp`
+    (attempt time) and `X-Signature: sha256=hex(HMAC-SHA256(secret, "{timestamp}.{body}"))` (`webhooks::signing`,
+    using RustCrypto `hmac` 0.13 and `sha2` 0.11).
+  - The README documents verification, with a Python example.
+- **Tests:**
+  - A signing vector computed with Python's `hmac` module.
+  - An end-to-end test with signed and unsigned receivers: each attempt verifies, using the `hmac` crate directly,
+    over the raw bytes received. The retry body is byte-identical, unsigned subscriptions carry no signature headers,
+    the secret is never listed, a short secret gets 400, and the secret survives a restart.
+  - Upgrading a version-1 database keeps existing subscriptions unsigned.
+- **Mutation checks**, each made a test fail: the timestamp left out of the MAC; sent bytes different from the signed
+  ones; the secret not stored; the length check skipped.
+- **Decisions:**
+  - The secret is client-supplied, as GitHub and Stripe do it, rather than generated, so tests can know it.
+  - It is stored in plain text in SQLite, which is acceptable for a simulator. Rotation is not supported yet:
+    register a new subscription.
+  - Signing stays opt-in per subscription, so existing consumers keep working.
+- `/health` `schemaVersion` is now 2.
 
 ## Milestone 2 — settlement simulation
 

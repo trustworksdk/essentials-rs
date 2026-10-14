@@ -10,7 +10,10 @@ use std::time::Duration;
 use rusqlite::Connection;
 
 /// Ordered schema migrations; the index + 1 is the version recorded in `PRAGMA user_version`.
-const MIGRATIONS: &[&str] = &[include_str!("../../migrations/001_initial.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../../migrations/001_initial.sql"),
+    include_str!("../../migrations/002_webhook_signing.sql"),
+];
 
 /// Opens (creating if needed) the database at `path`, applies connection pragmas and runs pending migrations.
 pub fn open(path: impl AsRef<Path>, busy_timeout: Duration) -> rusqlite::Result<Connection> {
@@ -153,6 +156,36 @@ mod tests {
             [],
         )
         .expect("same symbol on another market");
+    }
+
+    #[test]
+    fn upgrading_from_version_1_keeps_existing_subscriptions_unsigned() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn, Duration::from_secs(1)).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO webhook_subscriptions (id, url, event_types, created_at)
+             VALUES ('s1', 'http://consumer', '[\"TradeExecuted\"]', 'now')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 2);
+        let secret: Option<String> = conn
+            .query_row(
+                "SELECT secret FROM webhook_subscriptions WHERE id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(secret, None);
+        assert!(
+            conn.execute("UPDATE webhook_subscriptions SET secret = 'short'", [])
+                .is_err(),
+            "secrets are 16 to 256 characters"
+        );
     }
 
     #[test]

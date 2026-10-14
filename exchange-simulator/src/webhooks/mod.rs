@@ -8,6 +8,7 @@
 //! claims. Consumers must therefore deduplicate by `eventId`. Concurrent deliveries may arrive out of order; the
 //! envelope's `sequence` gives the canonical order.
 
+pub mod signing;
 mod worker;
 
 pub use worker::{DeliveryWorker, RetryPolicy, WorkerConfig};
@@ -27,6 +28,9 @@ pub struct Subscription {
     pub event_types: Vec<String>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
+    /// HMAC secret; deliveries are signed when set. Never serialized.
+    #[serde(skip_serializing)]
+    pub secret: Option<String>,
 }
 
 impl Subscription {
@@ -43,6 +47,8 @@ pub struct DeliveryJob {
     pub url: String,
     /// Attempts made before this one.
     pub attempts: u32,
+    /// The subscription's signing secret, if any.
+    pub secret: Option<String>,
     pub event: EventEnvelope,
 }
 

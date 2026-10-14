@@ -126,7 +126,7 @@ order. `limit` is 1–1000 (default 100). `Trade`: `executionId`, `instrumentId`
 
 ### `GET /health`
 
-`{"status": "ok", "schemaVersion": 1}`, or `503` if the database does not answer.
+`{"status": "ok", "schemaVersion": 2}` (the database migration version), or `503` if the database does not answer.
 
 ### `GET /api/events?after=&limit=&eventType=`
 
@@ -157,9 +157,10 @@ incoming order's fill event, then `OrderCancelled` for a market remainder. A com
 
 ### `POST /api/webhooks`
 
-`{ "url": "http://consumer:8080/trades", "eventTypes": ["TradeExecuted"] }` → `201`
-`{ "id", "url", "eventTypes", "enabled", "createdAt" }`. The URL must be `http` or `https`, and the event types must
-be ones listed above. A subscription receives events committed after it was registered; replay earlier events with
+`{ "url": "http://consumer:8080/trades", "eventTypes": ["TradeExecuted"], "secret": "…" }` → `201`
+`{ "id", "url", "eventTypes", "enabled", "signed", "createdAt" }`. The URL must be `http` or `https`, and the event
+types must be ones listed above. `secret` is optional (16–256 characters). When it is given, deliveries are signed. It
+is never returned; responses show `signed: true` instead. A subscription receives events committed after it was registered; replay earlier events with
 `/api/events`.
 
 Delivery is a `POST` of the event envelope with headers `X-Event-Id`, `X-Event-Type`, `X-Event-Sequence`,
@@ -169,7 +170,22 @@ Delivery is a `POST` of the event envelope with headers `X-Event-Id`, `X-Event-T
 - **At least once:** deliveries are durable and survive restarts, and a consumer may receive the same event more than
   once. Deduplicate by `eventId`.
 - **Ordering:** deliveries are sent concurrently and may arrive out of order; use `sequence` for canonical order.
-- **No signing yet:** requests are not signed, so restrict subscribers to test networks.
+- **Signing:** for a subscription with a secret, each attempt also carries `X-Signature-Timestamp` (unix seconds, the
+  time of the attempt) and `X-Signature: sha256=<hex>`, the HMAC-SHA256 under the secret of
+  `"{X-Signature-Timestamp}.{raw body}"`. A retry is signed again with a new timestamp; its body is byte-identical.
+  Subscriptions without a secret are unsigned, so use them on test networks only.
+
+To verify a signature, recompute the HMAC over the raw body *as received*, not over a re-serialization, compare in
+constant time, and reject timestamps far from your clock (e.g. more than 5 minutes) to stop replays:
+
+```python
+import hashlib, hmac, time
+
+def verify(secret: bytes, headers, raw_body: bytes, tolerance=300) -> bool:
+    timestamp = headers["X-Signature-Timestamp"]
+    expected = "sha256=" + hmac.new(secret, timestamp.encode() + b"." + raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, headers["X-Signature"]) and abs(time.time() - int(timestamp)) <= tolerance
+```
 
 ### `GET /api/webhooks`
 
