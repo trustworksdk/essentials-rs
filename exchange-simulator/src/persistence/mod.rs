@@ -17,6 +17,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/004_instrument_enabled.sql"),
     include_str!("../../migrations/005_participant_settlement.sql"),
     include_str!("../../migrations/006_virtual_clock.sql"),
+    include_str!("../../migrations/007_settlement.sql"),
 ];
 
 /// Opens (creating if needed) the database at `path`, applies connection pragmas and runs pending migrations.
@@ -102,11 +103,13 @@ mod tests {
         assert_eq!(
             tables,
             [
+                "consumer_offsets",
                 "events",
                 "executions",
                 "instruments",
                 "orders",
                 "participants",
+                "settlement_instructions",
                 "virtual_clock",
                 "webhook_deliveries",
                 "webhook_subscriptions"

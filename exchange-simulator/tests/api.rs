@@ -14,7 +14,7 @@ async fn health_reports_ok_with_schema_version() {
         app.get("/health").await,
         (
             StatusCode::OK,
-            json!({ "status": "ok", "schemaVersion": 6 })
+            json!({ "status": "ok", "schemaVersion": 7 })
         )
     );
 }

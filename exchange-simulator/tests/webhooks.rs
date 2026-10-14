@@ -386,7 +386,7 @@ async fn webhook_registration_is_validated_and_listed() {
         json!({ "url": "not a url", "eventTypes": ["TradeExecuted"] }),
         json!({ "url": "ftp://consumer", "eventTypes": ["TradeExecuted"] }),
         json!({ "url": "http://consumer", "eventTypes": [] }),
-        json!({ "url": "http://consumer", "eventTypes": ["SettlementCompleted"] }),
+        json!({ "url": "http://consumer", "eventTypes": ["TradeSettledSomehow"] }),
     ] {
         assert_eq!(
             app.post("/api/webhooks", bad.clone()).await.0,

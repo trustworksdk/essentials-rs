@@ -6,8 +6,8 @@ use super::{InstrumentId, ParticipantId};
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("unknown {kind} {value:?}")]
 pub struct ParseEnumError {
-    kind: &'static str,
-    value: String,
+    pub(crate) kind: &'static str,
+    pub(crate) value: String,
 }
 
 /// Declares a fieldless enum with its stable database/wire spelling in both directions, including serde.
@@ -24,11 +24,11 @@ macro_rules! wire_enum {
         }
 
         impl std::str::FromStr for $name {
-            type Err = ParseEnumError;
+            type Err = $crate::domain::ParseEnumError;
             fn from_str(s: &str) -> Result<Self, Self::Err> {
                 match s {
                     $($text => Ok(Self::$variant),)+
-                    _ => Err(ParseEnumError { kind: $kind, value: s.to_string() }),
+                    _ => Err($crate::domain::ParseEnumError { kind: $kind, value: s.to_string() }),
                 }
             }
         }
@@ -53,6 +53,8 @@ macro_rules! wire_enum {
         }
     };
 }
+
+pub(crate) use wire_enum;
 
 wire_enum!(Side, "side" { Buy => "BUY", Sell => "SELL" });
 wire_enum!(OrderType, "order type" { Limit => "LIMIT", Market => "MARKET" });

@@ -13,8 +13,10 @@ use crate::engine::{BookUpdate, IdGenerator};
 /// Version of the payload schemas below. Bump on breaking payload changes.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// The component that produced the event. Settlement simulation will add its own source.
+/// The component that produced the event: the exchange (trading events)...
 pub const EXCHANGE_SOURCE: &str = "exchange";
+/// ...or the optional settlement simulator (simulated lifecycle events).
+pub const SETTLEMENT_SOURCE: &str = "settlement-simulator";
 
 pub const ORDER_ACCEPTED: &str = "OrderAccepted";
 pub const ORDER_REJECTED: &str = "OrderRejected";
@@ -23,14 +25,29 @@ pub const ORDER_FILLED: &str = "OrderFilled";
 pub const ORDER_CANCELLED: &str = "OrderCancelled";
 pub const TRADE_EXECUTED: &str = "TradeExecuted";
 
-/// Every event type the exchange emits, for validating subscriptions.
-pub const EVENT_TYPES: [&str; 6] = [
+pub const SETTLEMENT_PENDING: &str = "SettlementPending";
+pub const SETTLEMENT_COMPLETED: &str = "SettlementCompleted";
+pub const SETTLEMENT_FAILED: &str = "SettlementFailed";
+pub const SETTLEMENT_REJECTED: &str = "SettlementRejected";
+pub const SETTLEMENT_DELAYED: &str = "SettlementDelayed";
+pub const SETTLEMENT_CORRECTED: &str = "SettlementCorrected";
+pub const SETTLEMENT_CANCELLED: &str = "SettlementCancelled";
+
+/// Every event type the service emits, for validating subscriptions.
+pub const EVENT_TYPES: &[&str] = &[
     ORDER_ACCEPTED,
     ORDER_REJECTED,
     ORDER_PARTIALLY_FILLED,
     ORDER_FILLED,
     ORDER_CANCELLED,
     TRADE_EXECUTED,
+    SETTLEMENT_PENDING,
+    SETTLEMENT_COMPLETED,
+    SETTLEMENT_FAILED,
+    SETTLEMENT_REJECTED,
+    SETTLEMENT_DELAYED,
+    SETTLEMENT_CORRECTED,
+    SETTLEMENT_CANCELLED,
 ];
 
 /// Why an order was cancelled, carried in `OrderCancelled` payloads.

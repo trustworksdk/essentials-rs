@@ -169,6 +169,25 @@ Event types and payloads (`schemaVersion` 1):
 | `OrderPartiallyFilled` / `OrderFilled` | order | order after the fill; for a resting order also `executionId` |
 | `OrderCancelled` | order | order with `cancelReason`: `REQUESTED` or `MARKET_REMAINDER` |
 
+Settlement lifecycle events come from the optional settlement simulator (`source: "settlement-simulator"`). Their
+aggregate and correlation ID is the `executionId`, and their `occurredAt` is the scheduled instant: the trade time at
+intake, otherwise 00:00 UTC of the relevant date. Every one carries:
+- `executionId` and `tradeSequence`, the `TradeExecuted` event's `sequence`
+- `instrumentId`, `buyerId`, `sellerId`, `quantity`, `priceTicks`, `currency`
+- `settlementAmount` (decimal string) and `amountMinor`
+- `tradeDate` and `intendedSettlementDate`
+- `status` and `attempt`
+
+| Event | Extra payload | Status after |
+|---|---|---|
+| `SettlementPending` | `settlementDays` | `PENDING` (due at 00:00 UTC on the intended settlement date, T+N business days) |
+| `SettlementRejected` | `reason`: `SIMULATED_REJECTION` or `AMOUNT_OUT_OF_RANGE` | `REJECTED` |
+| `SettlementDelayed` | `previousIntendedSettlementDate`, `delayBusinessDays` | `DELAYED` (due on the new date) |
+| `SettlementCompleted` | `settledAt` | `SETTLED` |
+| `SettlementFailed` | `reason`: `SIMULATED_FAILURE` | `FAILED` |
+| `SettlementCancelled` | `reason`: `SIMULATED_CANCELLATION` | `CANCELLED` |
+| `SettlementCorrected` | `reason`: `SIMULATED_CORRECTION`, `previousSettlementAmount`, `previousAmountMinor` (the amount moves by one tick per unit) | `CORRECTED` |
+
 Order payloads carry `orderId`, `clientOrderId`, `instrumentId`, `participantId`, `side`, `type`, `priceTicks`, `price`,
 `quantity`, `remainingQuantity`, `filledQuantity`, `status` and `sequence`. Within one command, events come in this
 order: `OrderAccepted`, then for each fill `TradeExecuted` followed by the resting order's fill event, then the

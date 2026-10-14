@@ -156,7 +156,7 @@ webhooks, and keeps simulator-originated and externally reported outcomes explic
 | # | Step | Size | Delivers |
 |---|---|---|---|
 | 2.1 ✅ | Virtual clock and test-control API | M | A `VirtualClock` implementing `Clock` (set, advance, freeze), selected by config. Test-control routes under `/test/…`: `GET/POST /test/clock` (now, advance by, set to). They are mounted only when `test_control.enabled=true` (default false), on the same port. Every timestamp the service uses goes through the clock: order timestamps, `occurredAt`, delivery due times. Milestone 3 needs this too. |
-| 2.2 | Settlement domain, migration, event contracts | M | `SettlementInstruction` (execution ID, intended settlement date, status, attempt, outcome history). Statuses `PENDING → SETTLED \| FAILED \| REJECTED`, plus `DELAYED`, `CORRECTED`, `CANCELLED`. A business-day T+N calculator that skips weekends (D2: no holiday calendars for now). Events: `SettlementPending`, `SettlementCompleted`, `SettlementFailed`, `SettlementRejected`, `SettlementDelayed`, `SettlementCorrected`, `SettlementCancelled`, with schemas documented the way `TradeExecuted` is. The pure state machine and its tests come first, as matching did. |
+| 2.2 ✅ | Settlement domain, migration, event contracts | M | `SettlementInstruction` (execution ID, intended settlement date, status, attempt, outcome history). Statuses `PENDING → SETTLED \| FAILED \| REJECTED`, plus `DELAYED`, `CORRECTED`, `CANCELLED`. A business-day T+N calculator that skips weekends (D2: no holiday calendars for now). Events: `SettlementPending`, `SettlementCompleted`, `SettlementFailed`, `SettlementRejected`, `SettlementDelayed`, `SettlementCorrected`, `SettlementCancelled`, with schemas documented the way `TradeExecuted` is. The pure state machine and its tests come first, as matching did. |
 | 2.3 | Settlement driver and configuration | M | `settlement.mode: external \| simulated \| both` (`external` = today's behaviour). Settings: `settlement_days`, outcome probabilities, delay distribution, seed. The driver consumes trades, creates instructions, and fires due transitions when the virtual or real clock passes them. It restarts from the stored cursor and pending instructions. |
 | 2.4 | Combined mode and inbound external outcomes | S–M | Agreed (D1). `POST /api/settlements/{executionId}/outcomes` stores an external outcome (`source: external`) beside the simulated lifecycle. `GET /api/settlements/{executionId}` shows both streams side by side. |
 | 2.5 | Tests and acceptance | M | Deterministic: the same seed and the same clock moves give identical lifecycles across restarts. T+2 across a weekend. Failure, delay and correction scenarios. In combined mode, an external consumer and the simulator act on the same trade without conflict. Extend the `e2e` test to cover a simulated settlement driven by clock moves. |
@@ -194,6 +194,49 @@ duplicates the outcome.
 - **Mutation checks**, each made a test fail: deliveries due on simulated time; claims on simulated time (which first
   survived; arrival times were then recorded and the retry gap asserted); the stored clock not restored; clock
   changes not persisted; `set` allowed backwards.
+
+**2.2 — settlement domain, migration, event contracts ✅ (2026-10-14).**
+- **Delivered:**
+  - `settlement` module:
+    - `calendar::add_business_days`: Mon–Fri; a weekend trade counts from Monday.
+    - `SettlementStatus`: the seven statuses, as a wire enum (`wire_enum!` is now shared inside the crate).
+    - `Instruction`, and `SettlementPolicy` (seed, `settlement_days`, five probabilities, `max_delay_days`,
+      `max_delays`, `correction_days`) with validation.
+    - `TradeFacts::from_event`: reads a canonical `TradeExecuted`.
+    - `format_amount`, and `draw`: a SplitMix64 hash of (seed, trade sequence, attempt, purpose) giving [0, 1).
+  - `SettlementSimulator` is a pure plan-then-apply state machine, like `OrderBook`:
+    - It holds open instructions in a queue ordered by (due at, trade sequence).
+    - `plan(trades, now)` takes in new trades past the cursor, then runs every due transition in global time order,
+      so one instruction may move several times in a single step.
+    - The plan carries the new trade cursor.
+  - Seven event types (`SettlementPending`, `…Completed`, `…Failed`, `…Rejected`, `…Delayed`, `…Corrected`,
+    `…Cancelled`) with `source: "settlement-simulator"`, documented in the README. `EVENT_TYPES` is now a slice, so
+    webhooks can subscribe to them.
+  - Migration `007_settlement.sql`: `settlement_instructions` (with a due index), `consumer_offsets`, and an index on
+    `events(aggregate_id)`.
+- **Semantics (decided here; nothing needed the user):**
+  - Due times are 00:00 UTC on the intended settlement date; T+0 is due at the trade itself.
+  - Event `occurredAt` is the scheduled instant, so the same clock moves give the same timestamps whatever the tick
+    timing.
+  - One draw at each due date decides the outcome, with cancel, fail and delay as cumulative thresholds; settle is
+    the rest.
+  - Delays are 1..=`max_delay_days` business days, at most `max_delays` times; after that the instruction must
+    resolve.
+  - Corrections are scheduled at settlement, `correction_days` business days later, and move the amount by one tick
+    per unit (a simulated price correction).
+  - An amount that does not fit `i64` minor units is rejected (`AMOUNT_OUT_OF_RANGE`).
+- **Tests:**
+  - `tests/settlement.rs` (12):
+    - T+2 pending then settled, with scheduled stamps; cursor skipping.
+    - Every outcome; delay dates and the cap; a delay across a weekend; correction; T+0; amount overflow.
+    - The same outcomes whether time moves in one jump or in five-hour steps, and different ones for another seed.
+    - A simulator restored from storage continues identically.
+    - Outcome rates within 2 % of their probabilities over 5,000 trades.
+    - Planning does not mutate, and events come in global time order.
+  - Unit tests for the calendar, the draws (uniform within 1 %, sensitive to every input), amounts and policy
+    validation.
+- **Mutation checks**, each made a test fail: weekends counted as business days; transitions processed a day early;
+  delays uncapped; wall-clock stamps; cancel and fail thresholds mixed up; `apply` losing the queue.
 
 ## Milestone 3 — scenarios and fault injection
 

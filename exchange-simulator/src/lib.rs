@@ -11,4 +11,5 @@ pub mod engine;
 pub mod events;
 pub mod metrics;
 pub mod persistence;
+pub mod settlement;
 pub mod webhooks;
