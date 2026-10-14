@@ -1,0 +1,10 @@
+# Build context is the workspace root; keep it to the sources cargo needs.
+**/target
+.git
+.devcontainer
+.codegraph
+.claude
+**/*.db
+**/*.db-wal
+**/*.db-shm
+exchange-simulator/data

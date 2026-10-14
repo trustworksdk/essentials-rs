@@ -1,0 +1,12 @@
+# Built-in defaults, compiled into the binary. Override with a file named by EXCHANGE_CONFIG and/or environment
+# variables prefixed EXCHANGE__ with `__` between levels, e.g. EXCHANGE__SERVER__BIND=0.0.0.0:9000.
+server:
+  bind: "127.0.0.1:8080"
+database:
+  path: "data/exchange.db"
+  busy_timeout_ms: 5000
+logging:
+  # Used when RUST_LOG is unset.
+  filter: "info"
+  # "pretty" or "json".
+  format: "pretty"

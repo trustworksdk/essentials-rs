@@ -4,6 +4,7 @@
 resolver = "3"
 members = [
     "durable-queues-rs",
+    "exchange-simulator",
 ]
 
 [workspace.package]
