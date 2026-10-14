@@ -28,6 +28,8 @@ struct Harness {
     book: OrderBook,
     ids: SequentialIds,
     sequence: u64,
+    /// Participants' settlement details, as the exchange would look them up.
+    settlement: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl Harness {
@@ -36,6 +38,7 @@ impl Harness {
             book: OrderBook::new(acme()),
             ids: SequentialIds(1_000_000),
             sequence: 0,
+            settlement: Default::default(),
         }
     }
 
@@ -75,7 +78,15 @@ impl Harness {
                 },
             )
             .unwrap();
-        let events = events::for_update(Command::Submit, &update, &acme(), now, &mut self.ids);
+        let settlement = |id: &ParticipantId| self.settlement.get(&id.0).cloned();
+        let events = events::for_update(
+            Command::Submit,
+            &update,
+            &acme(),
+            &settlement,
+            now,
+            &mut self.ids,
+        );
         (update, events)
     }
 }
@@ -139,6 +150,8 @@ fn acceptance_trade_produces_trade_and_fill_events() {
             "sellOrderId": sell.order.id,
             "buyerId": "B",
             "sellerId": "A",
+            "buyerSettlement": null,
+            "sellerSettlement": null,
             "priceTicks": 10025,
             "price": "100.25",
             "quantity": 150,
@@ -225,7 +238,33 @@ fn cancel_is_reported_with_its_reason() {
     let mut h = Harness::new();
     let (placed, _) = h.submit("A", Side::Sell, Some(10000), 10);
     let update = h.book.cancel(placed.order.id).unwrap();
-    let events = events::for_update(Command::Cancel, &update, &acme(), Utc::now(), &mut h.ids);
+    let events = events::for_update(
+        Command::Cancel,
+        &update,
+        &acme(),
+        &|_| None,
+        Utc::now(),
+        &mut h.ids,
+    );
     assert_eq!(types(&events), ["OrderCancelled"]);
     assert_eq!(events[0].payload["cancelReason"], "REQUESTED");
+}
+
+#[test]
+fn trade_carries_both_parties_settlement_details() {
+    let mut h = Harness::new();
+    let seller = json!({ "account": "DK-SELL-001", "bic": "DABADKKK" });
+    h.settlement.insert("A".into(), seller.clone());
+    h.submit("A", Side::Sell, Some(10025), 10);
+    let (_, events) = h.submit("B", Side::Buy, Some(10025), 10);
+    let trade = events
+        .iter()
+        .find(|e| e.event_type == "TradeExecuted")
+        .unwrap();
+    assert_eq!(trade.payload["sellerSettlement"], seller);
+    assert_eq!(
+        trade.payload["buyerSettlement"],
+        serde_json::Value::Null,
+        "B has none"
+    );
 }

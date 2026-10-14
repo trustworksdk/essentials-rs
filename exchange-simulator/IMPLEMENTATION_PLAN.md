@@ -23,7 +23,7 @@ Sizes: **S** is under a step of Milestone 1, **M** about one, **L** two or more.
 |---|---|---|---|
 | 1.1 | Commit the containerized acceptance test; push `exchange-simulator-m1`; open a PR to `main` | S | |
 | 1.2 ✅ | Investigate the 57–180 ms commit spikes | S | **Done 2026-10-14.** The cause is the disk, not SQLite. `bench checkpoint` replaces SQLite's auto-checkpoint with an identical observed one: checkpoint commits peak at 8.1 ms, and every commit over 10 ms is an ordinary one. Raw fsync on the same VM disk stalls for 141–950 ms on its own. Checkpoints still cost about 10 % of durable time and most of the p99, so 4.3 is re-scoped. Turning auto-checkpointing off halves throughput. Results: `bench/results/2026-10-14-checkpoint.md`. |
-| 1.3 | Backlog from plan §3/§5 that Milestone 1 skipped (1.3a ✅, 1.3b ✅, 1.3c ✅) | M | Instrument `enabled` flag (a disabled instrument rejects orders); participant settlement metadata (free-form JSON, carried into `TradeExecuted`); HMAC-SHA256 webhook signing (`X-Signature`, a per-subscription secret); an optional serialized-delivery flag per subscription (one in-flight delivery per subscription, in `sequence` order). All four are needed soon (D5), so they come before Milestone 2; split into 1.3a signing, 1.3b ordered delivery, 1.3c instrument `enabled`, 1.3d participant metadata. Each 1.3 item adds a migration to the schema, starting with `002`, so Milestone 2's settlement migration takes the next free number. |
+| 1.3 | Backlog from plan §3/§5 that Milestone 1 skipped ✅ (1.3a–d) | M | Instrument `enabled` flag (a disabled instrument rejects orders); participant settlement metadata (free-form JSON, carried into `TradeExecuted`); HMAC-SHA256 webhook signing (`X-Signature`, a per-subscription secret); an optional serialized-delivery flag per subscription (one in-flight delivery per subscription, in `sequence` order). All four are needed soon (D5), so they come before Milestone 2; split into 1.3a signing, 1.3b ordered delivery, 1.3c instrument `enabled`, 1.3d participant metadata. Each 1.3 item adds a migration to the schema, starting with `002`, so Milestone 2's settlement migration takes the next free number. |
 
 ### Progress
 
@@ -108,6 +108,31 @@ Sizes: **S** is under a step of Milestone 1, **M** about one, **L** two or more.
   - Resting orders are kept, not cancelled, on a halt.
   - Toggling emits no event; an `InstrumentStatusChanged` event type would be a contract addition, left for later.
 - The schema test now names its columns, so later migrations do not break it. `/health` `schemaVersion` is now 4.
+
+**1.3d — participant settlement details ✅ (2026-10-14).**
+- **Delivered:**
+  - Migration `005_participant_settlement.sql` adds `participants.settlement`. It is nullable, and the database
+    checks that it is a JSON *object* (`json_valid` and `json_type = 'object'`). `Participant` gets a `settlement`
+    field.
+  - `POST /api/participants` accepts it and echoes it back; the coordinator also checks that it is an object of at
+    most 4 KiB.
+  - The coordinator keeps participants' details in memory (loaded at startup) and passes a lookup to
+    `events::for_update`. `TradeExecuted` therefore carries `buyerSettlement` and `sellerSettlement` as of execution
+    time, `null` when absent, with no database read on the hot path.
+  - New payload fields are additive, so the event `schemaVersion` stays 1.
+- **Tests:**
+  - Payload with and without details.
+  - Details durable across restart and present in `TradeExecuted` before and after it.
+  - A non-object or oversized value rejected and not stored.
+  - The database refuses a non-object.
+  - API registration echo, `400` for a string, array or number, and the replayed trade event carrying the details.
+- **Mutation checks**, each made a test fail: buyer and seller details swapped; not persisted; dropped on recovery;
+  the object check skipped; the size check skipped.
+- **Decisions:**
+  - Details are a snapshot taken at registration. There is no update endpoint yet; the plan's API table has none, and
+    changing them would need to settle whether past trades are affected (they are not: events are immutable).
+  - Still no `GET /api/participants`.
+- `ExchangeError::InvalidParticipant` now carries a reason. `/health` `schemaVersion` is now 5.
 
 ## Milestone 2 — settlement simulation
 

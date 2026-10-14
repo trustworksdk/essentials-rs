@@ -15,6 +15,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/002_webhook_signing.sql"),
     include_str!("../../migrations/003_ordered_delivery.sql"),
     include_str!("../../migrations/004_instrument_enabled.sql"),
+    include_str!("../../migrations/005_participant_settlement.sql"),
 ];
 
 /// Opens (creating if needed) the database at `path`, applies connection pragmas and runs pending migrations.
@@ -116,7 +117,7 @@ mod tests {
         let conn = memory();
         conn.execute_batch(
             "INSERT INTO instruments (id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size) VALUES ('ACME', 'ACME', 'XCSE', NULL, NULL, 'DKK', 2, 1, 1);
-             INSERT INTO participants VALUES ('A', 'Participant A');",
+             INSERT INTO participants (id, name) VALUES ('A', 'Participant A');",
         )
         .unwrap();
         let insert_order = |id: &str,
@@ -158,6 +159,19 @@ mod tests {
             [],
         )
         .expect("same symbol on another market");
+        assert!(
+            conn.execute(
+                "INSERT INTO participants (id, name, settlement) VALUES ('B', 'B', '[1]')",
+                []
+            )
+            .is_err(),
+            "settlement must be a JSON object"
+        );
+        conn.execute(
+            "INSERT INTO participants (id, name, settlement) VALUES ('C', 'C', '{\"bic\": \"X\"}')",
+            [],
+        )
+        .expect("a JSON object is accepted");
     }
 
     #[test]

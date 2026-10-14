@@ -38,4 +38,7 @@ impl std::fmt::Display for ParticipantId {
 pub struct Participant {
     pub id: ParticipantId,
     pub name: String,
+    /// Free-form settlement details (a JSON object, e.g. account, BIC, custodian), copied into every
+    /// `TradeExecuted` the participant is party to.
+    pub settlement: Option<serde_json::Value>,
 }

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +13,9 @@ use crate::domain::{
 use crate::events::{self, Command};
 use crate::persistence::Store;
 use crate::webhooks::{DeliveryJob, DeliveryResult, NewSubscription, Subscription};
+
+/// Upper bound on a participant's settlement details, serialized.
+pub const MAX_SETTLEMENT_BYTES: usize = 4096;
 
 /// A request to place an order; the exchange assigns its ID and sequence.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,8 +62,8 @@ pub enum ExchangeError {
     },
     #[error("client order ID must be 1 to 64 characters")]
     InvalidClientOrderId,
-    #[error("participant ID and name must not be blank")]
-    InvalidParticipant,
+    #[error("invalid participant: {0}")]
+    InvalidParticipant(String),
     #[error("invalid webhook subscription: {0}")]
     InvalidWebhook(String),
     #[error(transparent)]
@@ -89,7 +92,8 @@ pub struct ExchangeOptions {
 pub struct Exchange {
     store: Store,
     books: HashMap<InstrumentId, OrderBook>,
-    participants: HashSet<ParticipantId>,
+    /// Registered participants and their settlement details.
+    participants: HashMap<ParticipantId, Option<serde_json::Value>>,
     last_sequence: u64,
     identifier_policy: IdentifierPolicy,
     ids: Box<dyn IdGenerator + Send>,
@@ -114,7 +118,11 @@ impl Exchange {
                 .ok_or_else(|| ExchangeError::UnknownInstrument(order.instrument_id.clone()))?;
             book.restore(order)?;
         }
-        let participants = store.participants()?.into_iter().map(|p| p.id).collect();
+        let participants = store
+            .participants()?
+            .into_iter()
+            .map(|p| (p.id, p.settlement))
+            .collect();
         let last_sequence = store.max_sequence()?;
         let subscriptions = store.subscriptions()?;
         let released = store.release_claims(options.clock.now())?;
@@ -177,13 +185,28 @@ impl Exchange {
 
     pub fn register_participant(&mut self, participant: Participant) -> Result<(), ExchangeError> {
         if participant.id.0.trim().is_empty() || participant.name.trim().is_empty() {
-            return Err(ExchangeError::InvalidParticipant);
+            return Err(ExchangeError::InvalidParticipant(
+                "ID and name must not be blank".into(),
+            ));
         }
-        if self.participants.contains(&participant.id) {
+        if let Some(settlement) = &participant.settlement {
+            if !settlement.is_object() {
+                return Err(ExchangeError::InvalidParticipant(
+                    "settlement must be a JSON object".into(),
+                ));
+            }
+            if settlement.to_string().len() > MAX_SETTLEMENT_BYTES {
+                return Err(ExchangeError::InvalidParticipant(format!(
+                    "settlement must be at most {MAX_SETTLEMENT_BYTES} bytes of JSON"
+                )));
+            }
+        }
+        if self.participants.contains_key(&participant.id) {
             return Err(ExchangeError::DuplicateParticipant(participant.id));
         }
         self.store.insert_participant(&participant)?;
-        self.participants.insert(participant.id);
+        self.participants
+            .insert(participant.id, participant.settlement);
         Ok(())
     }
 
@@ -195,7 +218,7 @@ impl Exchange {
             .books
             .get(&command.instrument_id)
             .ok_or_else(|| ExchangeError::UnknownInstrument(command.instrument_id.clone()))?;
-        if !self.participants.contains(&command.participant_id) {
+        if !self.participants.contains_key(&command.participant_id) {
             return Err(ExchangeError::UnknownParticipant(command.participant_id));
         }
         if let Some(client_order_id) = &command.client_order_id {
@@ -360,7 +383,16 @@ impl Exchange {
         now: DateTime<Utc>,
     ) -> Result<SubmitOutcome, ExchangeError> {
         let instrument = self.books[&update.order.instrument_id].instrument();
-        let new_events = events::for_update(command, &update, instrument, now, self.ids.as_mut());
+        let participants = &self.participants;
+        let settlement = |id: &ParticipantId| participants.get(id).cloned().flatten();
+        let new_events = events::for_update(
+            command,
+            &update,
+            instrument,
+            &settlement,
+            now,
+            self.ids.as_mut(),
+        );
         let started = std::time::Instant::now();
         self.store.commit(
             &update,

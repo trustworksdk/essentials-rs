@@ -91,7 +91,10 @@ The flag survives restarts. Switching it emits no event (there is no instrument-
 
 ### `POST /api/participants`
 
-`{ "id": "participant-a", "name": "Participant A" }` → `201`.
+`{ "id": "participant-a", "name": "Participant A", "settlement": { "account": "DK-0001", "bic": "DABADKKK" } }` → `201`
+with the participant. `settlement` is optional free-form JSON: an object of at most 4 KiB, for example account, BIC
+or custodian. It is copied into every `TradeExecuted` the participant is party to, as `buyerSettlement` or
+`sellerSettlement`. It cannot be changed after registration yet.
 
 ### `POST /api/orders`
 
@@ -159,7 +162,7 @@ Event types and payloads (`schemaVersion` 1):
 |---|---|---|
 | `OrderAccepted` | order | order as accepted (status `OPEN`, nothing filled) |
 | `OrderRejected` | order | order with `rejectReason` |
-| `TradeExecuted` | execution | `executionId`, `instrumentId`, `instrument` {`id`, `symbol`, `mic`, `isin`, `cusip`, `currency`}, `buyOrderId`, `sellOrderId`, `buyerId`, `sellerId`, `priceTicks`, `price`, `quantity`, `currency`, `currencyScale`, `tickSizeMinor`, `executedAt` |
+| `TradeExecuted` | execution | `executionId`, `instrumentId`, `instrument` {`id`, `symbol`, `mic`, `isin`, `cusip`, `currency`}, `buyOrderId`, `sellOrderId`, `buyerId`, `sellerId`, `buyerSettlement`, `sellerSettlement` (each party's settlement details at execution time, or `null`), `priceTicks`, `price`, `quantity`, `currency`, `currencyScale`, `tickSizeMinor`, `executedAt` |
 | `OrderPartiallyFilled` / `OrderFilled` | order | order after the fill; for a resting order also `executionId` |
 | `OrderCancelled` | order | order with `cancelReason`: `REQUESTED` or `MARKET_REMAINDER` |
 

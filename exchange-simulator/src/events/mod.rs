@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::domain::{Execution, Instrument, Order, OrderStatus, OrderType};
+use crate::domain::{Execution, Instrument, Order, OrderStatus, OrderType, ParticipantId};
 use crate::engine::{BookUpdate, IdGenerator};
 
 /// Version of the payload schemas below. Bump on breaking payload changes.
@@ -84,6 +84,7 @@ pub fn for_update(
     command: Command,
     update: &BookUpdate,
     instrument: &Instrument,
+    settlement: &dyn Fn(&ParticipantId) -> Option<Value>,
     now: DateTime<Utc>,
     ids: &mut dyn IdGenerator,
 ) -> Vec<NewEvent> {
@@ -128,7 +129,7 @@ pub fn for_update(
         push(
             TRADE_EXECUTED,
             execution.id.to_string(),
-            trade_payload(execution, instrument),
+            trade_payload(execution, instrument, settlement),
         );
         push(
             fill_event(maker),
@@ -191,9 +192,13 @@ fn order_payload(
     payload
 }
 
-/// `TradeExecuted` payload: everything a settlement consumer needs, including an identifier snapshot of the
-/// instrument as it was at execution time.
-fn trade_payload(execution: &Execution, instrument: &Instrument) -> Value {
+/// `TradeExecuted` payload: everything a settlement consumer needs, including snapshots, as of execution time, of
+/// the instrument's identifiers and of both parties' settlement details (`null` when a party has none).
+fn trade_payload(
+    execution: &Execution,
+    instrument: &Instrument,
+    settlement: &dyn Fn(&ParticipantId) -> Option<Value>,
+) -> Value {
     json!({
         "executionId": execution.id,
         "instrumentId": execution.instrument_id,
@@ -209,6 +214,8 @@ fn trade_payload(execution: &Execution, instrument: &Instrument) -> Value {
         "sellOrderId": execution.sell_order_id,
         "buyerId": execution.buyer_id,
         "sellerId": execution.seller_id,
+        "buyerSettlement": settlement(&execution.buyer_id),
+        "sellerSettlement": settlement(&execution.seller_id),
         "priceTicks": execution.price_ticks,
         "price": instrument.ticks_to_price(execution.price_ticks),
         "quantity": execution.quantity,

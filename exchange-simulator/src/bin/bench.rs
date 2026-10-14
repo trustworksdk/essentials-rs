@@ -300,6 +300,7 @@ fn durable_exchange(dir: &std::path::Path, subscribed: bool) -> Exchange {
     for p in 0..PARTICIPANTS {
         exchange
             .register_participant(Participant {
+                settlement: None,
                 id: ParticipantId(format!("P{p:02}")),
                 name: format!("P{p}"),
             })

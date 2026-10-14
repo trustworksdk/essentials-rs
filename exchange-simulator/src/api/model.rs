@@ -112,6 +112,9 @@ pub struct InstrumentQuery {
 pub struct ParticipantBody {
     pub id: ParticipantId,
     pub name: String,
+    /// Optional settlement details: a JSON object of at most 4 KiB, copied into `TradeExecuted`.
+    #[serde(default)]
+    pub settlement: Option<serde_json::Value>,
 }
 
 impl From<ParticipantBody> for Participant {
@@ -119,6 +122,7 @@ impl From<ParticipantBody> for Participant {
         Self {
             id: b.id,
             name: b.name,
+            settlement: b.settlement,
         }
     }
 }
@@ -128,6 +132,7 @@ impl From<Participant> for ParticipantBody {
         Self {
             id: p.id,
             name: p.name,
+            settlement: p.settlement,
         }
     }
 }

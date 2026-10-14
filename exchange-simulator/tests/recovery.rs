@@ -70,6 +70,7 @@ fn participant(id: &str) -> Participant {
     Participant {
         id: ParticipantId(id.into()),
         name: format!("Participant {id}"),
+        settlement: None,
     }
 }
 
@@ -358,9 +359,10 @@ fn commands_for_unknown_instruments_or_participants_are_refused() {
     assert!(matches!(
         exchange.register_participant(Participant {
             id: ParticipantId(" ".into()),
-            name: "x".into()
+            name: "x".into(),
+            settlement: None,
         }),
-        Err(ExchangeError::InvalidParticipant)
+        Err(ExchangeError::InvalidParticipant(_))
     ));
 }
 
@@ -984,5 +986,58 @@ fn disabling_an_instrument_is_durable_and_rejections_are_recorded() {
     assert!(
         !halted_book.instrument().enabled,
         "registered disabled, still disabled after restart"
+    );
+}
+
+#[test]
+fn participant_settlement_details_are_durable_and_reach_trade_events() {
+    let db = TempDb::new();
+    let mut exchange = setup(&db);
+    let details = serde_json::json!({ "account": "DK-0001", "bic": "DABADKKK", "custodian": "VP Securities" });
+    exchange
+        .register_participant(Participant {
+            settlement: Some(details.clone()),
+            ..participant("S")
+        })
+        .unwrap();
+    processed(exchange.submit(order("S", Side::Sell, Some(10025), 20)));
+    processed(exchange.submit(order("B", Side::Buy, Some(10025), 10)));
+
+    for bad in [
+        serde_json::json!(["not", "an", "object"]),
+        serde_json::json!({ "blob": "x".repeat(5000) }),
+    ] {
+        assert!(matches!(
+            exchange.register_participant(Participant {
+                settlement: Some(bad),
+                ..participant("X")
+            }),
+            Err(ExchangeError::InvalidParticipant(_))
+        ));
+    }
+    drop(exchange);
+
+    let mut restarted = open(&db.path(), IdentifierPolicy::Strict);
+    processed(restarted.submit(order("C", Side::Buy, Some(10025), 10)));
+    let trades = restarted
+        .store()
+        .events(0, 100, Some("TradeExecuted"))
+        .unwrap();
+    assert_eq!(trades.len(), 2);
+    for trade in &trades {
+        assert_eq!(
+            trade.payload["sellerSettlement"], details,
+            "before and after the restart"
+        );
+        assert_eq!(trade.payload["buyerSettlement"], serde_json::Value::Null);
+    }
+    let stored = restarted.store().participants().unwrap();
+    assert_eq!(
+        stored.iter().find(|p| p.id.0 == "S").unwrap().settlement,
+        Some(details)
+    );
+    assert!(
+        stored.iter().all(|p| p.id.0 != "X"),
+        "rejected registrations are not stored"
     );
 }

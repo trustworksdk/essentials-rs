@@ -82,7 +82,7 @@ impl From<ExchangeError> for ApiError {
             }
             E::ClientOrderIdConflict { .. } => (StatusCode::CONFLICT, "client_order_id_conflict"),
             E::InvalidClientOrderId
-            | E::InvalidParticipant
+            | E::InvalidParticipant(_)
             | E::InvalidWebhook(_)
             | E::Instrument(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             E::Book(BookError::Invalid(_)) => (StatusCode::BAD_REQUEST, "invalid_order"),

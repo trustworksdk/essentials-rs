@@ -14,7 +14,7 @@ async fn health_reports_ok_with_schema_version() {
         app.get("/health").await,
         (
             StatusCode::OK,
-            json!({ "status": "ok", "schemaVersion": 4 })
+            json!({ "status": "ok", "schemaVersion": 5 })
         )
     );
 }
@@ -538,5 +538,45 @@ async fn instruments_can_be_halted_and_resumed() {
         (status, &created["enabled"]),
         (StatusCode::CREATED, &json!(false))
     );
+    app.stop().await;
+}
+
+#[tokio::test]
+async fn participant_settlement_details_appear_in_trade_events() {
+    let mut app = TestApp::start().await;
+    app.seed().await;
+    let details = json!({ "account": "SE-42", "bic": "ESSESESS" });
+    let (status, created) = app
+        .post(
+            "/api/participants",
+            json!({ "id": "S", "name": "Seller AB", "settlement": details }),
+        )
+        .await;
+    assert_eq!(
+        (status, &created["settlement"]),
+        (StatusCode::CREATED, &details)
+    );
+    let (status, plain) = app
+        .post("/api/participants", json!({ "id": "P", "name": "Plain" }))
+        .await;
+    assert_eq!(
+        (status, &plain["settlement"]),
+        (StatusCode::CREATED, &Value::Null)
+    );
+    for bad in [json!("text"), json!([1, 2]), json!(42)] {
+        let (status, body) = app
+            .post(
+                "/api/participants",
+                json!({ "id": "Z", "name": "Z", "settlement": bad }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    app.order("S", "SELL", Some(10025), 10).await;
+    app.order("P", "BUY", Some(10025), 10).await;
+    let (_, trades) = app.get("/api/events?eventType=TradeExecuted").await;
+    assert_eq!(trades[0]["payload"]["sellerSettlement"], details);
+    assert_eq!(trades[0]["payload"]["buyerSettlement"], Value::Null);
     app.stop().await;
 }

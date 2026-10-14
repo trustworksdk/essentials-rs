@@ -147,18 +147,29 @@ impl Store {
 
     pub fn insert_participant(&self, participant: &Participant) -> rusqlite::Result<()> {
         self.conn
-            .prepare_cached("INSERT INTO participants (id, name) VALUES (?1, ?2)")?
-            .execute(params![participant.id.0, participant.name])
+            .prepare_cached("INSERT INTO participants (id, name, settlement) VALUES (?1, ?2, ?3)")?
+            .execute(params![
+                participant.id.0,
+                participant.name,
+                participant.settlement.as_ref().map(|s| s.to_string()),
+            ])
             .map(drop)
     }
 
     pub fn participants(&self) -> rusqlite::Result<Vec<Participant>> {
         self.conn
-            .prepare_cached("SELECT id, name FROM participants ORDER BY id")?
+            .prepare_cached("SELECT id, name, settlement FROM participants ORDER BY id")?
             .query_map([], |row| {
+                let settlement: Option<String> = row.get(2)?;
                 Ok(Participant {
                     id: ParticipantId(row.get(0)?),
                     name: row.get(1)?,
+                    settlement: settlement
+                        .map(|text| serde_json::from_str(&text))
+                        .transpose()
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(e))
+                        })?,
                 })
             })?
             .collect()
