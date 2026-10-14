@@ -6,6 +6,7 @@ use uuid::Uuid;
 use crate::domain::{Execution, Instrument, InstrumentId, Order, Participant, ParticipantId};
 use crate::engine::BookUpdate;
 use crate::events::{self, EventEnvelope, NewEvent};
+use crate::settlement::{Instruction, SettlementStatus, Transition};
 use crate::webhooks::{DeliveryJob, DeliveryOutcome, DeliveryResult, Subscription};
 
 /// Repository over the single writer connection. Every state change a matching step produces is written by
@@ -438,6 +439,111 @@ impl Store {
             .map(drop)
     }
 
+    /// Settlement instructions with a transition still to come, for resuming the simulator.
+    pub fn open_settlements(&self) -> rusqlite::Result<Vec<Instruction>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {INSTRUCTION_COLUMNS} FROM settlement_instructions WHERE due_at IS NOT NULL
+                 ORDER BY due_at, trade_sequence"
+            ))?
+            .query_map([], instruction_row)?
+            .collect()
+    }
+
+    pub fn settlement(&self, execution_id: Uuid) -> rusqlite::Result<Option<Instruction>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {INSTRUCTION_COLUMNS} FROM settlement_instructions WHERE execution_id = ?1"
+            ))?
+            .query_row([execution_id.to_string()], instruction_row)
+            .optional()
+    }
+
+    /// Settlement instructions, optionally of one status, in trade order.
+    pub fn settlements(
+        &self,
+        status: Option<SettlementStatus>,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<Instruction>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {INSTRUCTION_COLUMNS} FROM settlement_instructions
+                 WHERE ?1 IS NULL OR status = ?1 ORDER BY trade_sequence LIMIT ?2"
+            ))?
+            .query_map(
+                params![status.map(SettlementStatus::as_str), limit],
+                instruction_row,
+            )?
+            .collect()
+    }
+
+    /// The last event sequence a consumer (e.g. the settlement simulator) has taken in; 0 if none.
+    pub fn consumer_offset(&self, consumer: &str) -> rusqlite::Result<u64> {
+        self.conn
+            .query_row(
+                "SELECT last_sequence FROM consumer_offsets WHERE consumer = ?1",
+                [consumer],
+                |row| from_sql(row, 0),
+            )
+            .optional()
+            .map(Option::unwrap_or_default)
+    }
+
+    /// Writes a settlement step atomically: every instruction's new state, the lifecycle events with their outbox
+    /// rows, and the consumer's new offset.
+    pub fn commit_settlement(
+        &mut self,
+        transitions: &[Transition],
+        consumer: &str,
+        cursor: u64,
+        outbox: Outbox<'_>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut upsert = tx.prepare_cached(&format!(
+                "INSERT INTO settlement_instructions ({INSTRUCTION_COLUMNS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                 ON CONFLICT (execution_id) DO UPDATE SET
+                   intended_settlement_date = excluded.intended_settlement_date, status = excluded.status,
+                   attempts = excluded.attempts, delays = excluded.delays, due_at = excluded.due_at,
+                   settled_at = excluded.settled_at, amount_minor = excluded.amount_minor,
+                   updated_at = excluded.updated_at"
+            ))?;
+            for transition in transitions {
+                let i = &transition.instruction;
+                upsert.execute(params![
+                    i.execution_id.to_string(),
+                    to_sql(i.trade_sequence),
+                    i.instrument_id.0,
+                    i.buyer_id.0,
+                    i.seller_id.0,
+                    to_sql(i.quantity),
+                    i.price_ticks,
+                    i.currency,
+                    i.currency_scale,
+                    to_sql(i.tick_size_minor),
+                    i.amount_minor,
+                    i.trade_date.to_string(),
+                    i.intended_settlement_date.to_string(),
+                    i.status.as_str(),
+                    i.attempts,
+                    i.delays,
+                    i.due_at.map(timestamp),
+                    i.settled_at.map(timestamp),
+                    timestamp(i.updated_at),
+                ])?;
+            }
+            tx.execute(
+                "INSERT INTO consumer_offsets (consumer, last_sequence) VALUES (?1, ?2)
+                 ON CONFLICT (consumer) DO UPDATE SET last_sequence = excluded.last_sequence",
+                params![consumer, to_sql(cursor)],
+            )?;
+            let events: Vec<NewEvent> = transitions.iter().map(|t| t.event.clone()).collect();
+            write_events(&tx, &events, outbox)?;
+        }
+        tx.commit()
+    }
+
     /// Number of webhook deliveries per status.
     pub fn delivery_counts(&self) -> rusqlite::Result<Vec<(String, u64)>> {
         self.conn
@@ -536,6 +642,44 @@ pub(crate) fn write_events(
         }
     }
     Ok(())
+}
+
+const INSTRUCTION_COLUMNS: &str = "execution_id, trade_sequence, instrument_id, buyer_id, seller_id, quantity, \
+    price_ticks, currency, currency_scale, tick_size_minor, amount_minor, trade_date, intended_settlement_date, status, \
+    attempts, delays, due_at, settled_at, updated_at";
+
+fn instruction_row(row: &Row<'_>) -> rusqlite::Result<Instruction> {
+    let date = |index: usize| -> rusqlite::Result<chrono::NaiveDate> { parsed(row, index) };
+    let optional_time = |index: usize| -> rusqlite::Result<Option<DateTime<Utc>>> {
+        let text: Option<String> = row.get(index)?;
+        text.map(|t| {
+            t.parse().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e))
+            })
+        })
+        .transpose()
+    };
+    Ok(Instruction {
+        execution_id: parsed(row, 0)?,
+        trade_sequence: from_sql(row, 1)?,
+        instrument_id: InstrumentId(row.get(2)?),
+        buyer_id: ParticipantId(row.get(3)?),
+        seller_id: ParticipantId(row.get(4)?),
+        quantity: from_sql(row, 5)?,
+        price_ticks: row.get(6)?,
+        currency: row.get(7)?,
+        currency_scale: row.get(8)?,
+        tick_size_minor: from_sql(row, 9)?,
+        amount_minor: row.get(10)?,
+        trade_date: date(11)?,
+        intended_settlement_date: date(12)?,
+        status: parsed(row, 13)?,
+        attempts: row.get(14)?,
+        delays: row.get(15)?,
+        due_at: optional_time(16)?,
+        settled_at: optional_time(17)?,
+        updated_at: parsed(row, 18)?,
+    })
 }
 
 const EVENT_COLUMNS: &str = "e.event_id, e.sequence, e.event_type, e.schema_version, e.source, e.simulation_id, \

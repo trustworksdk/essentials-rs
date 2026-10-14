@@ -13,7 +13,11 @@ use crate::domain::{
 };
 use crate::events::{self, Command};
 use crate::persistence::{Outbox, Store};
+use crate::settlement::{SettlementPolicy, SettlementSimulator, TradeFacts};
 use crate::webhooks::{DeliveryJob, DeliveryResult, NewSubscription, Subscription};
+
+/// The settlement simulator's name in `consumer_offsets`.
+pub const SETTLEMENT_CONSUMER: &str = "settlement-simulator";
 
 /// Upper bound on a participant's settlement details, serialized.
 pub const MAX_SETTLEMENT_BYTES: usize = 4096;
@@ -71,6 +75,8 @@ pub enum ExchangeError {
     ClockNotVirtual,
     #[error(transparent)]
     Clock(#[from] ClockError),
+    #[error("settlement simulation: {0}")]
+    Settlement(String),
     #[error(transparent)]
     Instrument(#[from] InstrumentError),
     #[error(transparent)]
@@ -92,6 +98,8 @@ pub struct ExchangeOptions {
     pub simulation_id: Option<String>,
     /// Notified after a commit that created webhook deliveries, so the delivery worker need not wait for its poll.
     pub delivery_signal: Option<Arc<tokio::sync::Notify>>,
+    /// Runs the settlement simulator with this policy (settlement mode `simulated` or `both`).
+    pub settlement: Option<SettlementPolicy>,
 }
 
 impl Default for ExchangeOptions {
@@ -103,6 +111,7 @@ impl Default for ExchangeOptions {
             virtual_clock: None,
             simulation_id: None,
             delivery_signal: None,
+            settlement: None,
         }
     }
 }
@@ -138,6 +147,7 @@ pub struct Exchange {
     ids: Box<dyn IdGenerator + Send>,
     clock: Box<dyn Clock + Send>,
     virtual_clock: Option<VirtualClock>,
+    settlement: Option<SettlementSimulator>,
     subscriptions: Vec<Subscription>,
     simulation_id: Option<String>,
     delivery_signal: Option<Arc<tokio::sync::Notify>>,
@@ -166,6 +176,18 @@ impl Exchange {
         let last_sequence = store.max_sequence()?;
         let subscriptions = store.subscriptions()?;
         let released = store.release_claims(wall_now())?;
+        let settlement = match options.settlement {
+            Some(policy) => {
+                policy.validate().map_err(ExchangeError::Settlement)?;
+                let cursor = store.consumer_offset(SETTLEMENT_CONSUMER)?;
+                Some(SettlementSimulator::new(
+                    policy,
+                    store.open_settlements()?,
+                    cursor,
+                ))
+            }
+            None => None,
+        };
         let mut clock = options.clock;
         if let Some(virtual_clock) = &options.virtual_clock {
             // Simulated time continues where it was; it never jumps back to the configured start.
@@ -197,6 +219,7 @@ impl Exchange {
             ids: options.ids,
             clock,
             virtual_clock: options.virtual_clock,
+            settlement,
             subscriptions,
             simulation_id: options.simulation_id,
             delivery_signal: options.delivery_signal,
@@ -433,6 +456,68 @@ impl Exchange {
         Ok(self.store.record_deliveries(results, now)?)
     }
 
+    /// One settlement simulator step: takes in `TradeExecuted` events past the stored cursor (in pages), then runs
+    /// every lifecycle transition due by now. Each page is committed (instructions, events, outbox, cursor) before it
+    /// is applied. Returns the number of transitions; 0 when the simulator is off.
+    pub fn settlement_tick(&mut self) -> Result<usize, ExchangeError> {
+        const PAGE: u32 = 500;
+        let mut total = 0;
+        loop {
+            let Some(simulator) = &self.settlement else {
+                return Ok(0);
+            };
+            let page = self
+                .store
+                .events(simulator.cursor(), PAGE, Some(events::TRADE_EXECUTED))?;
+            let trades = page
+                .iter()
+                .map(TradeFacts::from_event)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ExchangeError::Settlement)?;
+            let now = self.now();
+            let plan = simulator.plan(&trades, now, self.ids.as_mut());
+            if plan.transitions.is_empty() && plan.cursor == simulator.cursor() {
+                return Ok(total);
+            }
+            let outbox = Outbox {
+                subscriptions: &self.subscriptions,
+                simulation_id: self.simulation_id.as_deref(),
+                ids: self.ids.as_mut(),
+                due: wall_now(),
+            };
+            self.store.commit_settlement(
+                &plan.transitions,
+                SETTLEMENT_CONSUMER,
+                plan.cursor,
+                outbox,
+            )?;
+            for transition in &plan.transitions {
+                ::metrics::counter!(crate::metrics::EVENTS, "event_type" => transition.event.event_type)
+                    .increment(1);
+            }
+            let delivers = plan.transitions.iter().any(|t| {
+                self.subscriptions
+                    .iter()
+                    .any(|s| s.wants(t.event.event_type))
+            });
+            let simulator = self.settlement.as_mut().expect("checked above");
+            simulator.apply(&plan);
+            ::metrics::gauge!(crate::metrics::SETTLEMENT_OPEN).set(simulator.open() as f64);
+            total += plan.transitions.len();
+            if delivers && let Some(signal) = &self.delivery_signal {
+                signal.notify_one();
+            }
+            if page.len() < PAGE as usize {
+                return Ok(total);
+            }
+        }
+    }
+
+    /// Whether the settlement simulator runs.
+    pub fn simulates_settlement(&self) -> bool {
+        self.settlement.is_some()
+    }
+
     /// The clock the exchange uses for domain time.
     pub fn clock_state(&self) -> ClockState {
         ClockState {
@@ -459,6 +544,8 @@ impl Exchange {
         }
         self.store
             .save_virtual_clock(clock.now(), clock.is_running())?;
+        // Whatever became due by the new time happens before the caller hears back.
+        self.settlement_tick()?;
         Ok(self.clock_state())
     }
 

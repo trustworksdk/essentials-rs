@@ -43,6 +43,7 @@ enum Request {
     RegisterWebhook(NewSubscription, Reply<Subscription>),
     SetInstrumentEnabled(InstrumentId, bool, Reply<Instrument>),
     ClockState(oneshot::Sender<ClockState>),
+    SettlementTick(Reply<usize>),
     ChangeClock(ClockChange, Reply<ClockState>),
     ClaimDeliveries(u32, std::time::Duration, Reply<Vec<DeliveryJob>>),
     RecordDeliveries(Vec<DeliveryResult>, Reply<()>),
@@ -101,6 +102,11 @@ impl Dispatcher {
         let (reply, response) = oneshot::channel();
         self.enqueue(Request::Snapshot(instrument_id, reply))?;
         response.await.map_err(|_| DispatchError::Stopped)
+    }
+
+    /// Runs one settlement simulator step; resolves with the number of transitions.
+    pub async fn settlement_tick(&self) -> Result<usize, DispatchError> {
+        self.call(Request::SettlementTick).await
     }
 
     pub async fn clock_state(&self) -> Result<ClockState, DispatchError> {
@@ -232,6 +238,9 @@ fn handle(exchange: &mut Exchange, request: Request) -> (&'static str, &'static 
                 (update, instrument)
             });
             ("cancel", answer(reply, result))
+        }
+        Request::SettlementTick(reply) => {
+            ("settlement_tick", answer(reply, exchange.settlement_tick()))
         }
         Request::ClockState(reply) => {
             let _ = reply.send(exchange.clock_state());

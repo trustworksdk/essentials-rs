@@ -157,7 +157,7 @@ webhooks, and keeps simulator-originated and externally reported outcomes explic
 |---|---|---|---|
 | 2.1 ✅ | Virtual clock and test-control API | M | A `VirtualClock` implementing `Clock` (set, advance, freeze), selected by config. Test-control routes under `/test/…`: `GET/POST /test/clock` (now, advance by, set to). They are mounted only when `test_control.enabled=true` (default false), on the same port. Every timestamp the service uses goes through the clock: order timestamps, `occurredAt`, delivery due times. Milestone 3 needs this too. |
 | 2.2 ✅ | Settlement domain, migration, event contracts | M | `SettlementInstruction` (execution ID, intended settlement date, status, attempt, outcome history). Statuses `PENDING → SETTLED \| FAILED \| REJECTED`, plus `DELAYED`, `CORRECTED`, `CANCELLED`. A business-day T+N calculator that skips weekends (D2: no holiday calendars for now). Events: `SettlementPending`, `SettlementCompleted`, `SettlementFailed`, `SettlementRejected`, `SettlementDelayed`, `SettlementCorrected`, `SettlementCancelled`, with schemas documented the way `TradeExecuted` is. The pure state machine and its tests come first, as matching did. |
-| 2.3 | Settlement driver and configuration | M | `settlement.mode: external \| simulated \| both` (`external` = today's behaviour). Settings: `settlement_days`, outcome probabilities, delay distribution, seed. The driver consumes trades, creates instructions, and fires due transitions when the virtual or real clock passes them. It restarts from the stored cursor and pending instructions. |
+| 2.3 ✅ | Settlement driver and configuration | M | `settlement.mode: external \| simulated \| both` (`external` = today's behaviour). Settings: `settlement_days`, outcome probabilities, delay distribution, seed. The driver consumes trades, creates instructions, and fires due transitions when the virtual or real clock passes them. It restarts from the stored cursor and pending instructions. |
 | 2.4 | Combined mode and inbound external outcomes | S–M | Agreed (D1). `POST /api/settlements/{executionId}/outcomes` stores an external outcome (`source: external`) beside the simulated lifecycle. `GET /api/settlements/{executionId}` shows both streams side by side. |
 | 2.5 | Tests and acceptance | M | Deterministic: the same seed and the same clock moves give identical lifecycles across restarts. T+2 across a weekend. Failure, delay and correction scenarios. In combined mode, an external consumer and the simulator act on the same trade without conflict. Extend the `e2e` test to cover a simulated settlement driven by clock moves. |
 
@@ -237,6 +237,41 @@ duplicates the outcome.
     validation.
 - **Mutation checks**, each made a test fail: weekends counted as business days; transitions processed a day early;
   delays uncapped; wall-clock stamps; cancel and fail thresholds mixed up; `apply` losing the queue.
+
+**2.3 — settlement driver and configuration ✅ (2026-10-14).**
+- **Delivered:**
+  - A `settlement:` config section: `mode` (`external` default, `simulated`, `both`), `tick_interval_ms`, and the
+    policy fields. `SettlementConfig::simulator_policy()` is `Some` only for `simulated` and `both`. An invalid
+    policy stops startup.
+  - The simulator lives on the exchange thread (`Exchange.settlement`), so there is still one SQLite writer. It is
+    restored from `open_settlements()` and the `consumer_offsets` cursor.
+  - `Exchange::settlement_tick()` reads `TradeExecuted` events past the cursor in pages of 500, plans, and commits
+    via `Store::commit_settlement` (instruction upserts, events, outbox rows and cursor in one transaction) before
+    applying. It wakes the delivery worker and updates `settlement_open_instructions`.
+  - `change_clock` runs a tick before it replies, so `POST /test/clock/advance` returns with every transition due by
+    the new time already done.
+  - `App` runs a settlement ticker task every `tick_interval_ms` that shares the delivery worker's shutdown signal.
+    `App::shutdown` stops all background tasks before draining the exchange thread.
+- **Tests:**
+  - `tests/settlement_flow.rs` (6):
+    - T+2 is processed by the clock change itself, with scheduled stamps, source and correlation.
+    - A restart mid-lifecycle neither re-takes trades nor loses delayed instructions; everything resolves exactly
+      once.
+    - External mode simulates nothing.
+    - Webhook subscribers receive `SettlementPending` and `SettlementCompleted`.
+    - Two fresh runs with the same seed, orders and clock moves give identical lifecycles, covering at least four
+      kinds of outcome.
+    - An invalid policy stops startup.
+  - `tests/recovery.rs`: a failed settlement commit leaves no events and no cursor change; the retry takes the trade
+    in exactly once.
+  - The new flow suite was repeated three times without failure.
+- **Mutation checks**, each made a test fail: no tick on a clock change; the cursor not persisted; open instructions
+  not restored; event source ignored by the writer; the plan not applied after commit.
+- **Decisions:**
+  - Intake starts from the beginning of the event log, so enabling simulation on an existing database settles past
+    trades too, with past dates and immediately.
+  - Ticks are periodic and run after clock changes, not after every trade, which keeps the trading hot path free of
+    settlement writes.
 
 ## Milestone 3 — scenarios and fault injection
 

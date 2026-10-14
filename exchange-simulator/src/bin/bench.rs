@@ -9,7 +9,7 @@ use chrono::Utc;
 use exchange_simulator::app::App;
 use exchange_simulator::config::{
     ClockConfig, ClockMode, Config, DatabaseConfig, EventsConfig, ExchangeConfig, LogFormat,
-    LoggingConfig, ServerConfig, TestControlConfig, WebhooksConfig,
+    LoggingConfig, ServerConfig, SettlementConfig, TestControlConfig, WebhooksConfig,
 };
 use exchange_simulator::domain::{
     IdentifierPolicy, Instrument, InstrumentId, Order, OrderStatus, OrderType, Participant,
@@ -455,6 +455,7 @@ async fn bench_http(options: &Options, report: &mut Report, with_webhook: bool) 
             start: None,
             running: false,
         },
+        settlement: SettlementConfig::default(),
         test_control: TestControlConfig::default(),
         logging: LoggingConfig {
             filter: "warn".into(),

@@ -28,6 +28,9 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `webhooks.request_timeout_ms` | `5000` | Per request; a timeout is a failed attempt |
 | `webhooks.max_attempts` | `10` | Attempts in total; then the delivery is dead-lettered (`DEAD`) |
 | `webhooks.initial_backoff_ms` / `max_backoff_ms` | `500` / `300000` | Exponential backoff between attempts, with jitter |
+| `settlement.mode` | `external` | `external`, `simulated` or `both` (see Settlement) |
+| `settlement.tick_interval_ms` | `250` | How often the simulator takes in trades and fires due transitions |
+| `settlement.seed`, `settlement_days`, `*_probability`, `max_delay_days`, `max_delays`, `correction_days` | `1`, `2`, fail 0.02, delay 0.05, others 0, `3`, `2`, `1` | Simulation policy (see Settlement) |
 | `clock.mode` | `system` | `virtual` gives a controllable clock for domain time (see Test control) |
 | `clock.start` / `clock.running` | unset / `false` | Virtual clock only: first reading (default: real time at first start); start running instead of frozen |
 | `test_control.enabled` | `false` | Mounts `/test/...`. Never enable outside test deployments |
@@ -247,6 +250,34 @@ Prometheus text format, with these series:
   `exchange_events_total{event_type}`.
 - **Webhooks:** `webhook_delivery_attempts_total{outcome}`, `webhook_delivery_duration_seconds`, and the outbox
   backlog `webhook_outbox_deliveries{status}`, read from SQLite at scrape time.
+
+## Settlement
+
+`settlement.mode` decides who owns settlement outcomes:
+- **`external`** (default): an external service settles trades from the `TradeExecuted` webhook. Nothing is
+  simulated.
+- **`simulated`**: the built-in simulator creates one instruction per execution and emits `Settlement*` lifecycle
+  events with `source: "settlement-simulator"`.
+- **`both`**: the simulator runs, and external outcomes may be reported back. They are kept apart, never merged.
+
+**How the simulator works:**
+- **Intake:** it reads `TradeExecuted` from the event log by sequence, from the beginning of the log, with its
+  position stored. Matching never waits for it, and it picks up where it left off after a restart.
+- **Lifecycle:** an instruction is `PENDING` until 00:00 UTC on its intended settlement date: T+`settlement_days`
+  business days, Monday to Friday, with no holiday calendars. On that date one draw decides the outcome:
+  - `CANCELLED`, `FAILED`, or `DELAYED` by 1..=`max_delay_days` business days (at most `max_delays` times),
+    according to `cancel_probability`, `fail_probability` and `delay_probability`
+  - otherwise `SETTLED`
+
+  `reject_probability` rejects at intake. `correct_probability` issues a `SettlementCorrected` `correction_days`
+  business days after settlement.
+- **Reproducibility:** every draw is a hash of (`seed`, the trade's event sequence, the attempt, the decision). The
+  same trades in the same order with the same seed and clock moves give the same lifecycle, independent of tick
+  timing and restarts.
+- **Timing:** it runs on the exchange clock. With `clock.mode: virtual`, nothing settles until simulated time reaches
+  the date, and `POST /test/clock/advance` returns only after everything due by the new time has happened.
+- **Durability:** instruction changes, their events, webhook deliveries and the simulator's position commit in one
+  transaction.
 
 ## Test control
 

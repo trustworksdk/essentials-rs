@@ -16,13 +16,14 @@ use crate::engine::{Dispatcher, Exchange, ExchangeOptions, SystemClock, UuidV7Id
 use crate::persistence::{self, Store};
 use crate::webhooks::DeliveryWorker;
 
-/// A started service. Serve [`App::router`]; once serving ends, call [`App::shutdown`] so the delivery worker stops
-/// and the exchange thread finishes the commands it already accepted. Must be started inside a Tokio runtime.
+/// A started service. Serve [`App::router`]; once serving ends, call [`App::shutdown`] so the background tasks
+/// (webhook delivery, settlement ticks) stop and the exchange thread finishes the commands it already accepted.
+/// Must be started inside a Tokio runtime.
 pub struct App {
     pub router: Router,
     exchange_thread: JoinHandle<()>,
-    delivery_worker: tokio::task::JoinHandle<()>,
-    stop_delivery: watch::Sender<bool>,
+    background: Vec<tokio::task::JoinHandle<()>>,
+    stop: watch::Sender<bool>,
 }
 
 impl App {
@@ -46,6 +47,7 @@ impl App {
                 }),
                 simulation_id: config.events.simulation_id.clone(),
                 delivery_signal: Some(delivery_signal.clone()),
+                settlement: config.settlement.simulator_policy(),
             },
         )
         .context("recovering order books")?;
@@ -68,13 +70,22 @@ impl App {
         let (dispatcher, exchange_thread) =
             Dispatcher::spawn(exchange, config.exchange.command_queue_capacity)
                 .context("starting exchange thread")?;
-        let (stop_delivery, stopped) = watch::channel(false);
-        let delivery_worker = DeliveryWorker::spawn(
+        let (stop, stopped) = watch::channel(false);
+        let mut background = vec![DeliveryWorker::spawn(
             dispatcher.clone(),
             delivery_signal,
             config.webhooks.worker(),
-            stopped,
-        );
+            stopped.clone(),
+        )];
+        if config.settlement.simulator_policy().is_some() {
+            let interval = Duration::from_millis(config.settlement.tick_interval_ms.max(1));
+            background.push(spawn_settlement_ticker(
+                dispatcher.clone(),
+                interval,
+                stopped,
+            ));
+            tracing::info!(mode = ?config.settlement.mode, "settlement simulator running");
+        }
         let state = AppState::new(dispatcher, Store::new(reader), crate::metrics::install());
         let mut router = api::router(state.clone());
         if config.test_control.enabled {
@@ -86,17 +97,19 @@ impl App {
         Ok(Self {
             router,
             exchange_thread,
-            delivery_worker,
-            stop_delivery,
+            background,
+            stop,
         })
     }
 
     /// Stops the delivery worker (after its current batch), drops the router (the last command senders) and waits for
     /// the exchange thread to drain its queue.
     pub async fn shutdown(self) {
-        let _ = self.stop_delivery.send(true);
-        if let Err(error) = self.delivery_worker.await {
-            tracing::error!(%error, "webhook delivery worker failed");
+        let _ = self.stop.send(true);
+        for task in self.background {
+            if let Err(error) = task.await {
+                tracing::error!(%error, "background task failed");
+            }
         }
         drop(self.router);
         let thread = self.exchange_thread;
@@ -107,4 +120,29 @@ impl App {
             tracing::error!("exchange thread panicked");
         }
     }
+}
+
+/// Runs a settlement step every `interval` until `stop` turns true or the exchange stops. A full command queue just
+/// skips a beat.
+fn spawn_settlement_ticker(
+    dispatcher: crate::engine::Dispatcher,
+    interval: Duration,
+    mut stop: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = stop.changed() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+            if *stop.borrow() {
+                break;
+            }
+            match dispatcher.settlement_tick().await {
+                Ok(_) | Err(crate::engine::DispatchError::Overloaded) => {}
+                Err(crate::engine::DispatchError::Stopped) => break,
+                Err(error) => tracing::error!(%error, "settlement step failed; retrying next tick"),
+            }
+        }
+    })
 }

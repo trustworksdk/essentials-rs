@@ -21,6 +21,23 @@ webhooks:
   max_attempts: 10
   initial_backoff_ms: 500
   max_backoff_ms: 300000
+settlement:
+  # "external": no simulation; an external service owns settlement. "simulated": the built-in simulator creates a
+  # settlement instruction per trade and emits Settlement* lifecycle events. "both": simulator plus externally
+  # reported outcomes, kept apart.
+  mode: "external"
+  # How often the simulator takes in new trades and fires due transitions (each clock change also does).
+  tick_interval_ms: 250
+  seed: 1
+  settlement_days: 2
+  reject_probability: 0.0
+  cancel_probability: 0.0
+  fail_probability: 0.02
+  delay_probability: 0.05
+  correct_probability: 0.0
+  max_delay_days: 3
+  max_delays: 2
+  correction_days: 1
 clock:
   # "system": domain time is real time. "virtual": a controllable clock for simulations and tests. It starts at
   # `start` (default: the real time at first startup), frozen unless `running: true`, and resumes from its last

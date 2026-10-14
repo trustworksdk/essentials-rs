@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::time::Duration;
 
 use crate::domain::IdentifierPolicy;
+use crate::settlement::SettlementPolicy;
 use crate::webhooks::{RetryPolicy, WorkerConfig};
 
 const DEFAULTS: &str = include_str!("../config/default.yaml");
@@ -19,6 +20,7 @@ pub struct Config {
     #[serde(default)]
     pub events: EventsConfig,
     pub webhooks: WebhooksConfig,
+    pub settlement: SettlementConfig,
     pub clock: ClockConfig,
     pub test_control: TestControlConfig,
     pub database: DatabaseConfig,
@@ -36,6 +38,79 @@ pub struct ExchangeConfig {
     pub identifier_policy: IdentifierPolicy,
     /// Bound of the exchange command queue; a full queue rejects requests with 503.
     pub command_queue_capacity: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SettlementConfig {
+    pub mode: SettlementMode,
+    pub tick_interval_ms: u64,
+    pub seed: u64,
+    pub settlement_days: u32,
+    pub reject_probability: f64,
+    pub cancel_probability: f64,
+    pub fail_probability: f64,
+    pub delay_probability: f64,
+    pub correct_probability: f64,
+    pub max_delay_days: u32,
+    pub max_delays: u32,
+    pub correction_days: u32,
+}
+
+impl Default for SettlementConfig {
+    /// External mode with the shipped simulation defaults.
+    fn default() -> Self {
+        let policy = SettlementPolicy {
+            fail_probability: 0.02,
+            delay_probability: 0.05,
+            ..SettlementPolicy::default()
+        };
+        Self {
+            mode: SettlementMode::External,
+            tick_interval_ms: 250,
+            seed: policy.seed,
+            settlement_days: policy.settlement_days,
+            reject_probability: policy.reject_probability,
+            cancel_probability: policy.cancel_probability,
+            fail_probability: policy.fail_probability,
+            delay_probability: policy.delay_probability,
+            correct_probability: policy.correct_probability,
+            max_delay_days: policy.max_delay_days,
+            max_delays: policy.max_delays,
+            correction_days: policy.correction_days,
+        }
+    }
+}
+
+impl SettlementConfig {
+    /// The simulator's policy, when this mode runs the simulator.
+    pub fn simulator_policy(&self) -> Option<SettlementPolicy> {
+        matches!(self.mode, SettlementMode::Simulated | SettlementMode::Both).then(|| {
+            SettlementPolicy {
+                seed: self.seed,
+                settlement_days: self.settlement_days,
+                reject_probability: self.reject_probability,
+                cancel_probability: self.cancel_probability,
+                fail_probability: self.fail_probability,
+                delay_probability: self.delay_probability,
+                correct_probability: self.correct_probability,
+                max_delay_days: self.max_delay_days,
+                max_delays: self.max_delays,
+                correction_days: self.correction_days,
+            }
+        })
+    }
+}
+
+/// Who owns settlement outcomes.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SettlementMode {
+    /// No simulation: an external service settles trades (and may report outcomes back).
+    External,
+    /// The built-in simulator only.
+    Simulated,
+    /// The simulator and externally reported outcomes, side by side.
+    Both,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -150,6 +225,31 @@ mod tests {
         assert_eq!(config.events.simulation_id, None);
         assert_eq!(config.webhooks.worker().retry.max_attempts, 10);
         assert_eq!(config.clock.mode, ClockMode::System);
+        assert_eq!(config.settlement.mode, SettlementMode::External);
+        assert_eq!(config.settlement.simulator_policy(), None);
+        let simulated = SettlementConfig {
+            mode: SettlementMode::Both,
+            ..config.settlement.clone()
+        };
+        let policy = simulated.simulator_policy().unwrap();
+        assert_eq!((policy.settlement_days, policy.fail_probability), (2, 0.02));
+        assert_eq!(policy.validate(), Ok(()));
+        let defaults = SettlementConfig::default();
+        assert_eq!(
+            (
+                defaults.mode,
+                defaults.fail_probability,
+                defaults.delay_probability,
+                defaults.tick_interval_ms
+            ),
+            (
+                config.settlement.mode,
+                config.settlement.fail_probability,
+                config.settlement.delay_probability,
+                250
+            ),
+            "Default matches config/default.yaml"
+        );
         assert!(!config.test_control.enabled);
     }
 }

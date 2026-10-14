@@ -88,7 +88,7 @@ impl From<ExchangeError> for ApiError {
             E::Book(BookError::Invalid(_)) => (StatusCode::BAD_REQUEST, "invalid_order"),
             E::ClockNotVirtual => (StatusCode::CONFLICT, "clock_not_virtual"),
             E::Clock(_) => (StatusCode::CONFLICT, "clock_backwards"),
-            E::Book(_) | E::Storage(_) => return Self::internal(error),
+            E::Book(_) | E::Storage(_) | E::Settlement(_) => return Self::internal(error),
         };
         Self::new(status, code, error.to_string())
     }

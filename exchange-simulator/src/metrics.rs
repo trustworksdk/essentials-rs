@@ -27,6 +27,8 @@ pub const EVENTS: &str = "exchange_events_total";
 pub const WEBHOOK_ATTEMPTS: &str = "webhook_delivery_attempts_total";
 /// Duration of one webhook HTTP attempt.
 pub const WEBHOOK_DURATION: &str = "webhook_delivery_duration_seconds";
+/// Settlement instructions with a transition still to come.
+pub const SETTLEMENT_OPEN: &str = "settlement_open_instructions";
 /// Outbox rows by status (`PENDING`, `IN_FLIGHT`, `DELIVERED`, `DEAD`), read from SQLite at scrape time.
 pub const OUTBOX: &str = "webhook_outbox_deliveries";
 
@@ -88,4 +90,8 @@ fn describe() {
         "Webhook HTTP attempt duration"
     );
     describe_gauge!(OUTBOX, "Webhook deliveries by status");
+    describe_gauge!(
+        SETTLEMENT_OPEN,
+        "Settlement instructions with a transition still to come"
+    );
 }

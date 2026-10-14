@@ -1034,3 +1034,73 @@ fn participant_settlement_details_are_durable_and_reach_trade_events() {
         "rejected registrations are not stored"
     );
 }
+
+#[test]
+fn a_failed_settlement_commit_changes_nothing() {
+    use exchange_simulator::clock::VirtualClock;
+    use exchange_simulator::engine::ClockChange;
+    use exchange_simulator::settlement::SettlementPolicy;
+
+    let db = TempDb::new();
+    let start = "2030-01-07T09:00:00Z".parse().unwrap();
+    let mut exchange = Exchange::recover(
+        Store::new(persistence::open(db.path(), Duration::from_secs(5)).unwrap()),
+        ExchangeOptions {
+            virtual_clock: Some(VirtualClock::new(start, false)),
+            settlement: Some(SettlementPolicy::default()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    exchange.register_instrument(acme()).unwrap();
+    for id in ["A", "B"] {
+        exchange.register_participant(participant(id)).unwrap();
+    }
+    processed(exchange.submit(order("A", Side::Sell, Some(10025), 200)));
+    processed(exchange.submit(order("B", Side::Buy, Some(10025), 150)));
+    exchange
+        .store()
+        .connection()
+        .execute_batch("CREATE TEMP TRIGGER fail BEFORE INSERT ON settlement_instructions BEGIN SELECT RAISE(ABORT, 'no'); END;")
+        .unwrap();
+    assert!(matches!(
+        exchange.settlement_tick(),
+        Err(ExchangeError::Storage(_))
+    ));
+    assert_eq!(
+        count(
+            &exchange,
+            "SELECT COUNT(*) FROM events WHERE source = 'settlement-simulator'"
+        ),
+        0
+    );
+    assert_eq!(
+        count(&exchange, "SELECT COUNT(*) FROM consumer_offsets"),
+        0,
+        "the cursor did not move"
+    );
+
+    exchange
+        .store()
+        .connection()
+        .execute_batch("DROP TRIGGER fail")
+        .unwrap();
+    assert_eq!(
+        exchange.settlement_tick().unwrap(),
+        1,
+        "the trade is taken in on retry"
+    );
+    assert_eq!(exchange.settlement_tick().unwrap(), 0, "and only once");
+    exchange
+        .change_clock(ClockChange::Advance(chrono::Duration::days(2)))
+        .unwrap();
+    let types: Vec<String> = exchange
+        .store()
+        .events(0, 100, None)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.source == "settlement-simulator")
+        .map(|e| e.event_type)
+        .collect();
+    assert_eq!(types, ["SettlementPending", "SettlementCompleted"]);
+}
