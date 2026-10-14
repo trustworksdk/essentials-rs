@@ -8,16 +8,15 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use exchange_simulator::app::App;
 use exchange_simulator::config::{
-    Config, DatabaseConfig, EventsConfig, ExchangeConfig, LogFormat, LoggingConfig, ServerConfig,
-    WebhooksConfig,
+    ClockConfig, ClockMode, Config, DatabaseConfig, EventsConfig, ExchangeConfig, LogFormat,
+    LoggingConfig, ServerConfig, TestControlConfig, WebhooksConfig,
 };
 use exchange_simulator::domain::{
     IdentifierPolicy, Instrument, InstrumentId, Order, OrderStatus, OrderType, Participant,
     ParticipantId, Side,
 };
 use exchange_simulator::engine::{
-    Exchange, ExchangeOptions, MatchContext, OrderBook, SequentialIds, SubmitOrder, SystemClock,
-    UuidV7Ids,
+    Exchange, ExchangeOptions, MatchContext, OrderBook, SequentialIds, SubmitOrder,
 };
 use exchange_simulator::events::EVENT_TYPES;
 use exchange_simulator::persistence::{self, Store};
@@ -285,17 +284,7 @@ fn bench_durable(options: &Options, report: &mut Report, subscribed: bool) {
 fn durable_exchange(dir: &std::path::Path, subscribed: bool) -> Exchange {
     let path = dir.join("exchange.db");
     let conn = persistence::open(&path, Duration::from_secs(5)).unwrap();
-    let mut exchange = Exchange::recover(
-        Store::new(conn),
-        ExchangeOptions {
-            identifier_policy: IdentifierPolicy::Strict,
-            ids: Box::new(UuidV7Ids),
-            clock: Box::new(SystemClock),
-            simulation_id: None,
-            delivery_signal: None,
-        },
-    )
-    .unwrap();
+    let mut exchange = Exchange::recover(Store::new(conn), ExchangeOptions::default()).unwrap();
     exchange.register_instrument(acme()).unwrap();
     for p in 0..PARTICIPANTS {
         exchange
@@ -461,6 +450,12 @@ async fn bench_http(options: &Options, report: &mut Report, with_webhook: bool) 
             path: dir.join("exchange.db").to_string_lossy().into_owned(),
             busy_timeout_ms: 5000,
         },
+        clock: ClockConfig {
+            mode: ClockMode::System,
+            start: None,
+            running: false,
+        },
+        test_control: TestControlConfig::default(),
         logging: LoggingConfig {
             filter: "warn".into(),
             format: LogFormat::Pretty,

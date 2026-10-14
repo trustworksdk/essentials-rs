@@ -6,12 +6,13 @@ use chrono::{DateTime, SubsecRound, Utc};
 use uuid::Uuid;
 
 use super::{BookError, BookUpdate, Clock, IdGenerator, MatchContext, OrderBook};
+use crate::clock::{ClockError, SystemClock, VirtualClock};
 use crate::domain::{
     IdentifierPolicy, Instrument, InstrumentError, InstrumentId, Order, OrderStatus, OrderType,
     Participant, ParticipantId, Side,
 };
 use crate::events::{self, Command};
-use crate::persistence::Store;
+use crate::persistence::{Outbox, Store};
 use crate::webhooks::{DeliveryJob, DeliveryResult, NewSubscription, Subscription};
 
 /// Upper bound on a participant's settlement details, serialized.
@@ -66,6 +67,10 @@ pub enum ExchangeError {
     InvalidParticipant(String),
     #[error("invalid webhook subscription: {0}")]
     InvalidWebhook(String),
+    #[error("the exchange uses the system clock; configure clock.mode = virtual to control time")]
+    ClockNotVirtual,
+    #[error(transparent)]
+    Clock(#[from] ClockError),
     #[error(transparent)]
     Instrument(#[from] InstrumentError),
     #[error(transparent)]
@@ -74,15 +79,49 @@ pub enum ExchangeError {
     Storage(#[from] rusqlite::Error),
 }
 
-/// Construction-time dependencies of an [`Exchange`].
+/// Construction-time dependencies of an [`Exchange`]. `Default` gives strict identifiers, UUIDv7 IDs and the
+/// system clock.
 pub struct ExchangeOptions {
     pub identifier_policy: IdentifierPolicy,
     pub ids: Box<dyn IdGenerator + Send>,
+    /// Domain time (orders, executions, events). Ignored when `virtual_clock` is set.
     pub clock: Box<dyn Clock + Send>,
+    /// A controllable clock for domain time. Its state is persisted, and recovery resumes from the stored reading.
+    pub virtual_clock: Option<VirtualClock>,
     /// Stamped on every event as `simulationId`.
     pub simulation_id: Option<String>,
     /// Notified after a commit that created webhook deliveries, so the delivery worker need not wait for its poll.
     pub delivery_signal: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl Default for ExchangeOptions {
+    fn default() -> Self {
+        Self {
+            identifier_policy: IdentifierPolicy::Strict,
+            ids: Box::new(super::UuidV7Ids),
+            clock: Box::new(SystemClock),
+            virtual_clock: None,
+            simulation_id: None,
+            delivery_signal: None,
+        }
+    }
+}
+
+/// How the exchange tells time, for the test-control API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClockState {
+    pub virtual_clock: bool,
+    pub running: bool,
+    pub now: DateTime<Utc>,
+}
+
+/// A change to the virtual clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClockChange {
+    Advance(chrono::Duration),
+    Set(DateTime<Utc>),
+    Freeze,
+    Resume,
 }
 
 /// The persistence coordinator: owns the order books and the single SQLite writer, and serializes every command.
@@ -98,6 +137,7 @@ pub struct Exchange {
     identifier_policy: IdentifierPolicy,
     ids: Box<dyn IdGenerator + Send>,
     clock: Box<dyn Clock + Send>,
+    virtual_clock: Option<VirtualClock>,
     subscriptions: Vec<Subscription>,
     simulation_id: Option<String>,
     delivery_signal: Option<Arc<tokio::sync::Notify>>,
@@ -125,7 +165,23 @@ impl Exchange {
             .collect();
         let last_sequence = store.max_sequence()?;
         let subscriptions = store.subscriptions()?;
-        let released = store.release_claims(options.clock.now())?;
+        let released = store.release_claims(wall_now())?;
+        let mut clock = options.clock;
+        if let Some(virtual_clock) = &options.virtual_clock {
+            // Simulated time continues where it was; it never jumps back to the configured start.
+            if let Some((stored, running)) = store.virtual_clock()? {
+                if stored > virtual_clock.now() {
+                    virtual_clock.set(stored)?;
+                }
+                if running {
+                    virtual_clock.resume()
+                } else {
+                    virtual_clock.freeze()
+                }
+            }
+            store.save_virtual_clock(virtual_clock.now(), virtual_clock.is_running())?;
+            clock = Box::new(virtual_clock.clone());
+        }
         if released > 0 {
             tracing::info!(
                 released,
@@ -139,7 +195,8 @@ impl Exchange {
             last_sequence,
             identifier_policy: options.identifier_policy,
             ids: options.ids,
-            clock: options.clock,
+            clock,
+            virtual_clock: options.virtual_clock,
             subscriptions,
             simulation_id: options.simulation_id,
             delivery_signal: options.delivery_signal,
@@ -366,14 +423,43 @@ impl Exchange {
         limit: u32,
         lease: Duration,
     ) -> Result<Vec<DeliveryJob>, ExchangeError> {
-        let now = self.now();
+        let now = wall_now();
         let lease_until = now + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
         Ok(self.store.claim_deliveries(now, lease_until, limit)?)
     }
 
     pub fn record_deliveries(&mut self, results: &[DeliveryResult]) -> Result<(), ExchangeError> {
-        let now = self.now();
+        let now = wall_now();
         Ok(self.store.record_deliveries(results, now)?)
+    }
+
+    /// The clock the exchange uses for domain time.
+    pub fn clock_state(&self) -> ClockState {
+        ClockState {
+            virtual_clock: self.virtual_clock.is_some(),
+            running: self
+                .virtual_clock
+                .as_ref()
+                .is_none_or(VirtualClock::is_running),
+            now: self.now(),
+        }
+    }
+
+    /// Changes the virtual clock and persists its new state. It never moves backwards.
+    pub fn change_clock(&mut self, change: ClockChange) -> Result<ClockState, ExchangeError> {
+        let clock = self
+            .virtual_clock
+            .as_ref()
+            .ok_or(ExchangeError::ClockNotVirtual)?;
+        match change {
+            ClockChange::Advance(by) => clock.advance(by)?,
+            ClockChange::Set(to) => clock.set(to)?,
+            ClockChange::Freeze => clock.freeze(),
+            ClockChange::Resume => clock.resume(),
+        }
+        self.store
+            .save_virtual_clock(clock.now(), clock.is_running())?;
+        Ok(self.clock_state())
     }
 
     fn commit_and_apply(
@@ -394,14 +480,13 @@ impl Exchange {
             self.ids.as_mut(),
         );
         let started = std::time::Instant::now();
-        self.store.commit(
-            &update,
-            &new_events,
-            &self.subscriptions,
-            self.simulation_id.as_deref(),
-            self.ids.as_mut(),
-            now,
-        )?;
+        let outbox = Outbox {
+            subscriptions: &self.subscriptions,
+            simulation_id: self.simulation_id.as_deref(),
+            ids: self.ids.as_mut(),
+            due: wall_now(),
+        };
+        self.store.commit(&update, &new_events, outbox, now)?;
         ::metrics::histogram!(crate::metrics::COMMIT_DURATION).record(started.elapsed());
         record_committed(command, &update, &new_events);
         let book = self
@@ -424,6 +509,11 @@ impl Exchange {
     fn now(&self) -> DateTime<Utc> {
         self.clock.now().trunc_subsecs(6)
     }
+}
+
+/// Real time, at the precision the database stores, for webhook delivery scheduling.
+fn wall_now() -> DateTime<Utc> {
+    Utc::now().trunc_subsecs(6)
 }
 
 fn record_committed(command: Command, update: &BookUpdate, new_events: &[events::NewEvent]) {

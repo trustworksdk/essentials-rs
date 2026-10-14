@@ -23,6 +23,8 @@ struct Received {
     headers: HeaderMap,
     /// The status this receiver answered with.
     status: u16,
+    /// When the request arrived.
+    at: std::time::Instant,
 }
 
 #[derive(Clone, Default)]
@@ -99,6 +101,7 @@ async fn receive(
         raw: raw.to_vec(),
         headers,
         status: 0,
+        at: std::time::Instant::now(),
     });
     let status = state
         .script
@@ -670,6 +673,63 @@ async fn an_ordered_subscription_receives_events_one_at_a_time_in_sequence_order
         attempted.len(),
         expected.len() + 2,
         "the second event was retried twice, blocking the rest"
+    );
+    app.stop().await;
+}
+
+#[tokio::test]
+async fn webhook_delivery_runs_on_real_time_whatever_the_simulated_clock_does() {
+    let mut app = TestApp::start_with(|c| {
+        c.clock.mode = exchange_simulator::config::ClockMode::Virtual;
+        c.clock.start = Some("2100-01-01T00:00:00Z".parse().unwrap());
+        c.webhooks.initial_backoff_ms = 300;
+        c.webhooks.max_backoff_ms = 300;
+    })
+    .await;
+    app.seed().await;
+    let receiver = Receiver::start().await;
+    receiver.slow(Duration::from_millis(100));
+    receiver.respond(&[500], 200);
+    subscribe(&app, &receiver.url, &["TradeExecuted"]).await;
+    trade(&app).await;
+
+    // The first attempt is in flight (the receiver takes 100 ms); jump simulated time a month ahead meanwhile.
+    eventually("first attempt", || !receiver.received().is_empty()).await;
+    let (status, _) = app.post("/test/clock/advance", json!({ "days": 30 })).await;
+    assert_eq!(status, StatusCode::OK);
+    eventually("delivered after one retry", || {
+        app.count("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'DELIVERED'") == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        receiver.received().len(),
+        2,
+        "one failure, one success: the clock jump caused no extra attempt"
+    );
+    let attempts = receiver.received();
+    let gap = attempts[1].at - attempts[0].at;
+    assert!(
+        gap >= Duration::from_millis(150),
+        "the retry waited its real-time backoff (≥ half of 300 ms), not simulated time: {gap:?}"
+    );
+    let delivered_at: String = app
+        .db()
+        .query_row("SELECT delivered_at FROM webhook_deliveries", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(
+        delivered_at.starts_with(&chrono::Utc::now().format("%Y-").to_string()),
+        "{delivered_at} is real time"
+    );
+    let occurred = receiver.received()[0].body["occurredAt"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        occurred.starts_with("2100-01-01"),
+        "{occurred}: the event itself carries simulated time"
     );
     app.stop().await;
 }

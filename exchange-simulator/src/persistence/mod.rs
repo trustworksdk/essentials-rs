@@ -2,7 +2,7 @@
 
 mod store;
 
-pub use store::{ExecutionFilter, InstrumentFilter, OrderRecord, Store};
+pub use store::{ExecutionFilter, InstrumentFilter, OrderRecord, Outbox, Store};
 
 use std::path::Path;
 use std::time::Duration;
@@ -16,6 +16,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/003_ordered_delivery.sql"),
     include_str!("../../migrations/004_instrument_enabled.sql"),
     include_str!("../../migrations/005_participant_settlement.sql"),
+    include_str!("../../migrations/006_virtual_clock.sql"),
 ];
 
 /// Opens (creating if needed) the database at `path`, applies connection pragmas and runs pending migrations.
@@ -106,6 +107,7 @@ mod tests {
                 "instruments",
                 "orders",
                 "participants",
+                "virtual_clock",
                 "webhook_deliveries",
                 "webhook_subscriptions"
             ]

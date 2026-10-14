@@ -3,6 +3,7 @@
 
 mod error;
 mod model;
+pub mod test_control;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

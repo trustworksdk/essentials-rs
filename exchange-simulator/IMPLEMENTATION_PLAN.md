@@ -155,7 +155,7 @@ webhooks, and keeps simulator-originated and externally reported outcomes explic
 
 | # | Step | Size | Delivers |
 |---|---|---|---|
-| 2.1 | Virtual clock and test-control API | M | A `VirtualClock` implementing `Clock` (set, advance, freeze), selected by config. Test-control routes under `/test/…`: `GET/POST /test/clock` (now, advance by, set to). They are mounted only when `test_control.enabled=true` (default false), on the same port. Every timestamp the service uses goes through the clock: order timestamps, `occurredAt`, delivery due times. Milestone 3 needs this too. |
+| 2.1 ✅ | Virtual clock and test-control API | M | A `VirtualClock` implementing `Clock` (set, advance, freeze), selected by config. Test-control routes under `/test/…`: `GET/POST /test/clock` (now, advance by, set to). They are mounted only when `test_control.enabled=true` (default false), on the same port. Every timestamp the service uses goes through the clock: order timestamps, `occurredAt`, delivery due times. Milestone 3 needs this too. |
 | 2.2 | Settlement domain, migration, event contracts | M | `SettlementInstruction` (execution ID, intended settlement date, status, attempt, outcome history). Statuses `PENDING → SETTLED \| FAILED \| REJECTED`, plus `DELAYED`, `CORRECTED`, `CANCELLED`. A business-day T+N calculator that skips weekends (D2: no holiday calendars for now). Events: `SettlementPending`, `SettlementCompleted`, `SettlementFailed`, `SettlementRejected`, `SettlementDelayed`, `SettlementCorrected`, `SettlementCancelled`, with schemas documented the way `TradeExecuted` is. The pure state machine and its tests come first, as matching did. |
 | 2.3 | Settlement driver and configuration | M | `settlement.mode: external \| simulated \| both` (`external` = today's behaviour). Settings: `settlement_days`, outcome probabilities, delay distribution, seed. The driver consumes trades, creates instructions, and fires due transitions when the virtual or real clock passes them. It restarts from the stored cursor and pending instructions. |
 | 2.4 | Combined mode and inbound external outcomes | S–M | Agreed (D1). `POST /api/settlements/{executionId}/outcomes` stores an external outcome (`source: external`) beside the simulated lifecycle. `GET /api/settlements/{executionId}` shows both streams side by side. |
@@ -165,6 +165,35 @@ webhooks, and keeps simulator-originated and externally reported outcomes explic
 once and `SettlementCompleted` (or the seeded failure) exactly when the clock reaches T+2. Webhooks carry
 `source: "settlement-simulator"` and the execution ID as correlation ID. A restart in the middle neither changes nor
 duplicates the outcome.
+
+### Milestone 2 progress
+
+**2.1 — virtual clock and test-control API ✅ (2026-10-14).**
+- **Delivered:**
+  - `clock` module: `Clock`, `SystemClock`, `FixedClock` (moved from `engine`), and `VirtualClock`. It can be set,
+    advanced, frozen or resumed; it never moves backwards; clones share its state.
+  - Config `clock.mode: system | virtual` (plus `start` and `running`), and `test_control.enabled` (default false).
+  - Migration `006_virtual_clock.sql` stores the clock's reading and running flag. Each change is persisted through
+    the writer thread, and recovery resumes from the stored reading, never jumping back to the configured start.
+  - Routes `GET /test/clock` and `POST /test/clock/{advance,set,freeze,resume}`, merged into the router only when
+    test control is enabled. Errors: `409 clock_not_virtual`, `409 clock_backwards`, `400` for bad input.
+- **Refactors:**
+  - `ExchangeOptions` gained `Default`.
+  - Event and outbox writing is now `store::write_events(tx, events, Outbox)`, reusable by settlement.
+  - `NewEvent` carries its `source`.
+- **Deviation from this plan's 2.1 text ("every timestamp goes through the clock"):** webhook delivery scheduling
+  (`next_attempt_at`, leases, `delivered_at`, claim release at startup) uses **real time**. Only domain timestamps
+  use the configured clock. Under simulated time, retries would either fire at once (due dates in the "past") or
+  never (frozen clock), and a clock jump would expire in-flight leases and duplicate deliveries.
+- **Tests:**
+  - `VirtualClock` unit tests.
+  - `tests/clock.rs` (5): virtual time stamps orders, trades and events; forward-only, freeze and resume; restart
+    resumes; the system clock refuses changes; the routes are absent when disabled.
+  - Webhooks: with simulated time in 2100 and a 30-day jump mid-delivery, the retry still waits its real-time
+    backoff and nothing is delivered twice.
+- **Mutation checks**, each made a test fail: deliveries due on simulated time; claims on simulated time (which first
+  survived; arrival times were then recorded and the retry gap asserted); the stored clock not restored; clock
+  changes not persisted; `set` allowed backwards.
 
 ## Milestone 3 — scenarios and fault injection
 

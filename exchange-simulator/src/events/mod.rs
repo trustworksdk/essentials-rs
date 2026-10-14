@@ -42,6 +42,8 @@ pub const CANCEL_REQUESTED: &str = "REQUESTED";
 pub struct NewEvent {
     pub event_id: Uuid,
     pub event_type: &'static str,
+    /// The component that produced it: [`EXCHANGE_SOURCE`] for trading events.
+    pub source: &'static str,
     pub aggregate_id: String,
     pub correlation_id: Option<String>,
     pub occurred_at: DateTime<Utc>,
@@ -95,6 +97,7 @@ pub fn for_update(
         events.push(NewEvent {
             event_id: ids.next_id(),
             event_type,
+            source: EXCHANGE_SOURCE,
             aggregate_id,
             correlation_id: correlation_id.clone(),
             occurred_at: now,

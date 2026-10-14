@@ -10,7 +10,8 @@ use axum::Router;
 use tokio::sync::{Notify, watch};
 
 use crate::api::{self, AppState};
-use crate::config::Config;
+use crate::clock::VirtualClock;
+use crate::config::{ClockMode, Config};
 use crate::engine::{Dispatcher, Exchange, ExchangeOptions, SystemClock, UuidV7Ids};
 use crate::persistence::{self, Store};
 use crate::webhooks::DeliveryWorker;
@@ -37,6 +38,12 @@ impl App {
                 identifier_policy: config.exchange.identifier_policy,
                 ids: Box::new(UuidV7Ids),
                 clock: Box::new(SystemClock),
+                virtual_clock: (config.clock.mode == ClockMode::Virtual).then(|| {
+                    VirtualClock::new(
+                        config.clock.start.unwrap_or_else(chrono::Utc::now),
+                        config.clock.running,
+                    )
+                }),
                 simulation_id: config.events.simulation_id.clone(),
                 delivery_signal: Some(delivery_signal.clone()),
             },
@@ -68,11 +75,14 @@ impl App {
             config.webhooks.worker(),
             stopped,
         );
-        let router = api::router(AppState::new(
-            dispatcher,
-            Store::new(reader),
-            crate::metrics::install(),
-        ));
+        let state = AppState::new(dispatcher, Store::new(reader), crate::metrics::install());
+        let mut router = api::router(state.clone());
+        if config.test_control.enabled {
+            tracing::warn!(
+                "test-control API enabled under /test; never expose this outside test deployments"
+            );
+            router = router.merge(api::test_control::router(state));
+        }
         Ok(Self {
             router,
             exchange_thread,

@@ -10,8 +10,7 @@ use exchange_simulator::domain::{
     ParticipantId, Side,
 };
 use exchange_simulator::engine::{
-    BookUpdate, Exchange, ExchangeError, ExchangeOptions, SubmitOrder, SubmitOutcome, SystemClock,
-    UuidV7Ids,
+    BookUpdate, Exchange, ExchangeError, ExchangeOptions, SubmitOrder, SubmitOutcome,
 };
 use exchange_simulator::persistence::{self, InstrumentFilter, Store};
 use exchange_simulator::webhooks::NewSubscription;
@@ -42,10 +41,7 @@ fn open(path: &Path, policy: IdentifierPolicy) -> Exchange {
         Store::new(conn),
         ExchangeOptions {
             identifier_policy: policy,
-            ids: Box::new(UuidV7Ids),
-            clock: Box::new(SystemClock),
-            simulation_id: None,
-            delivery_signal: None,
+            ..Default::default()
         },
     )
     .unwrap()
@@ -626,11 +622,8 @@ fn events_and_webhook_deliveries_commit_or_roll_back_with_the_trade() {
     let mut exchange = Exchange::recover(
         Store::new(conn),
         ExchangeOptions {
-            identifier_policy: IdentifierPolicy::Strict,
-            ids: Box::new(UuidV7Ids),
-            clock: Box::new(SystemClock),
             simulation_id: Some("sim-7".into()),
-            delivery_signal: None,
+            ..Default::default()
         },
     )
     .unwrap();

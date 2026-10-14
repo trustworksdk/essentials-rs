@@ -19,6 +19,8 @@ pub struct Config {
     #[serde(default)]
     pub events: EventsConfig,
     pub webhooks: WebhooksConfig,
+    pub clock: ClockConfig,
+    pub test_control: TestControlConfig,
     pub database: DatabaseConfig,
     pub logging: LoggingConfig,
 }
@@ -34,6 +36,29 @@ pub struct ExchangeConfig {
     pub identifier_policy: IdentifierPolicy,
     /// Bound of the exchange command queue; a full queue rejects requests with 503.
     pub command_queue_capacity: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ClockConfig {
+    pub mode: ClockMode,
+    /// Virtual clock only: the first reading. Default: the real time at first startup.
+    #[serde(default)]
+    pub start: Option<chrono::DateTime<chrono::Utc>>,
+    /// Virtual clock only: start running with real time instead of frozen.
+    #[serde(default)]
+    pub running: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClockMode {
+    System,
+    Virtual,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct TestControlConfig {
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -124,5 +149,7 @@ mod tests {
         assert_eq!(config.exchange.identifier_policy, IdentifierPolicy::Strict);
         assert_eq!(config.events.simulation_id, None);
         assert_eq!(config.webhooks.worker().retry.max_attempts, 10);
+        assert_eq!(config.clock.mode, ClockMode::System);
+        assert!(!config.test_control.enabled);
     }
 }

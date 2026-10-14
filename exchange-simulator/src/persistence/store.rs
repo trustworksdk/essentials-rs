@@ -215,14 +215,13 @@ impl Store {
 
     /// Writes a planned book update atomically: the subject order (inserted, or updated if it exists), every resting
     /// order it traded with, its executions, its events, and a pending delivery of each event to every subscription
-    /// that wants it (the outbox). Nothing is written if any statement fails.
+    /// that wants it (the outbox). Order rows are stamped `now` (domain time). Nothing is written if any statement
+    /// fails.
     pub fn commit(
         &mut self,
         update: &BookUpdate,
         new_events: &[NewEvent],
-        subscriptions: &[Subscription],
-        simulation_id: Option<&str>,
-        ids: &mut dyn crate::engine::IdGenerator,
+        outbox: Outbox<'_>,
         now: DateTime<Utc>,
     ) -> rusqlite::Result<()> {
         let now = timestamp(now);
@@ -269,37 +268,7 @@ impl Store {
                     timestamp(execution.executed_at),
                 ])?;
             }
-            let mut insert_event = tx.prepare_cached(
-                "INSERT INTO events (event_id, event_type, schema_version, source, simulation_id, aggregate_id,
-                                     correlation_id, payload, occurred_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            )?;
-            let mut insert_delivery = tx.prepare_cached(
-                "INSERT INTO webhook_deliveries (id, subscription_id, event_sequence, status, attempts, next_attempt_at)
-                 VALUES (?1, ?2, ?3, 'PENDING', 0, ?4)",
-            )?;
-            for event in new_events {
-                insert_event.execute(params![
-                    event.event_id.to_string(),
-                    event.event_type,
-                    events::SCHEMA_VERSION,
-                    events::EXCHANGE_SOURCE,
-                    simulation_id,
-                    event.aggregate_id,
-                    event.correlation_id,
-                    event.payload.to_string(),
-                    timestamp(event.occurred_at),
-                ])?;
-                let sequence = tx.last_insert_rowid();
-                for subscription in subscriptions.iter().filter(|s| s.wants(event.event_type)) {
-                    insert_delivery.execute(params![
-                        ids.next_id().to_string(),
-                        subscription.id.to_string(),
-                        sequence,
-                        now
-                    ])?;
-                }
-            }
+            write_events(&tx, new_events, outbox)?;
         }
         tx.commit()
     }
@@ -448,6 +417,27 @@ impl Store {
         tx.commit()
     }
 
+    /// The stored virtual clock reading and whether it was running, if a virtual clock was ever used.
+    pub fn virtual_clock(&self) -> rusqlite::Result<Option<(DateTime<Utc>, bool)>> {
+        self.conn
+            .query_row(
+                "SELECT now, running FROM virtual_clock WHERE id = 1",
+                [],
+                |row| Ok((parsed(row, 0)?, row.get(1)?)),
+            )
+            .optional()
+    }
+
+    pub fn save_virtual_clock(&self, now: DateTime<Utc>, running: bool) -> rusqlite::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO virtual_clock (id, now, running) VALUES (1, ?1, ?2)
+                 ON CONFLICT (id) DO UPDATE SET now = excluded.now, running = excluded.running",
+                params![timestamp(now), running],
+            )
+            .map(drop)
+    }
+
     /// Number of webhook deliveries per status.
     pub fn delivery_counts(&self) -> rusqlite::Result<Vec<(String, u64)>> {
         self.conn
@@ -491,6 +481,61 @@ where
     let text: String = row.get(index)?;
     text.parse()
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e)))
+}
+
+/// Where a transaction's events go out: the subscriptions to queue deliveries for, the run's simulation ID, the ID
+/// source for delivery rows, and the real time at which the deliveries become due.
+pub struct Outbox<'a> {
+    pub subscriptions: &'a [Subscription],
+    pub simulation_id: Option<&'a str>,
+    pub ids: &'a mut dyn crate::engine::IdGenerator,
+    pub due: DateTime<Utc>,
+}
+
+/// Appends events to the canonical log and queues one pending delivery per event and interested subscription, inside
+/// the caller's transaction.
+pub(crate) fn write_events(
+    tx: &rusqlite::Transaction<'_>,
+    new_events: &[NewEvent],
+    outbox: Outbox<'_>,
+) -> rusqlite::Result<()> {
+    let due = timestamp(outbox.due);
+    let mut insert_event = tx.prepare_cached(
+        "INSERT INTO events (event_id, event_type, schema_version, source, simulation_id, aggregate_id,
+                             correlation_id, payload, occurred_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    let mut insert_delivery = tx.prepare_cached(
+        "INSERT INTO webhook_deliveries (id, subscription_id, event_sequence, status, attempts, next_attempt_at)
+         VALUES (?1, ?2, ?3, 'PENDING', 0, ?4)",
+    )?;
+    for event in new_events {
+        insert_event.execute(params![
+            event.event_id.to_string(),
+            event.event_type,
+            events::SCHEMA_VERSION,
+            event.source,
+            outbox.simulation_id,
+            event.aggregate_id,
+            event.correlation_id,
+            event.payload.to_string(),
+            timestamp(event.occurred_at),
+        ])?;
+        let sequence = tx.last_insert_rowid();
+        for subscription in outbox
+            .subscriptions
+            .iter()
+            .filter(|s| s.wants(event.event_type))
+        {
+            insert_delivery.execute(params![
+                outbox.ids.next_id().to_string(),
+                subscription.id.to_string(),
+                sequence,
+                due
+            ])?;
+        }
+    }
+    Ok(())
 }
 
 const EVENT_COLUMNS: &str = "e.event_id, e.sequence, e.event_type, e.schema_version, e.source, e.simulation_id, \

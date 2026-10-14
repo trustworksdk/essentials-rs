@@ -3,7 +3,9 @@ use std::thread::JoinHandle;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use super::{BookUpdate, Exchange, ExchangeError, Level, SubmitOrder, SubmitOutcome};
+use super::{
+    BookUpdate, ClockChange, ClockState, Exchange, ExchangeError, Level, SubmitOrder, SubmitOutcome,
+};
 use crate::domain::{Instrument, InstrumentId, Participant, Side};
 use crate::webhooks::{DeliveryJob, DeliveryResult, NewSubscription, Subscription};
 
@@ -40,6 +42,8 @@ enum Request {
     Snapshot(InstrumentId, oneshot::Sender<Option<BookSnapshot>>),
     RegisterWebhook(NewSubscription, Reply<Subscription>),
     SetInstrumentEnabled(InstrumentId, bool, Reply<Instrument>),
+    ClockState(oneshot::Sender<ClockState>),
+    ChangeClock(ClockChange, Reply<ClockState>),
     ClaimDeliveries(u32, std::time::Duration, Reply<Vec<DeliveryJob>>),
     RecordDeliveries(Vec<DeliveryResult>, Reply<()>),
 }
@@ -97,6 +101,16 @@ impl Dispatcher {
         let (reply, response) = oneshot::channel();
         self.enqueue(Request::Snapshot(instrument_id, reply))?;
         response.await.map_err(|_| DispatchError::Stopped)
+    }
+
+    pub async fn clock_state(&self) -> Result<ClockState, DispatchError> {
+        let (reply, response) = oneshot::channel();
+        self.enqueue(Request::ClockState(reply))?;
+        response.await.map_err(|_| DispatchError::Stopped)
+    }
+
+    pub async fn change_clock(&self, change: ClockChange) -> Result<ClockState, DispatchError> {
+        self.call(|reply| Request::ChangeClock(change, reply)).await
     }
 
     pub async fn set_instrument_enabled(
@@ -218,6 +232,13 @@ fn handle(exchange: &mut Exchange, request: Request) -> (&'static str, &'static 
                 (update, instrument)
             });
             ("cancel", answer(reply, result))
+        }
+        Request::ClockState(reply) => {
+            let _ = reply.send(exchange.clock_state());
+            ("clock_state", "ok")
+        }
+        Request::ChangeClock(change, reply) => {
+            ("change_clock", answer(reply, exchange.change_clock(change)))
         }
         Request::SetInstrumentEnabled(id, enabled, reply) => (
             "set_instrument_enabled",

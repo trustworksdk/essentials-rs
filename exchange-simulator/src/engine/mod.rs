@@ -7,9 +7,12 @@ mod book;
 mod dispatcher;
 mod exchange;
 
+pub use crate::clock::{Clock, FixedClock, SystemClock};
 pub use book::{BookError, BookUpdate, InvalidOrder, Level, OrderBook, RejectReason};
 pub use dispatcher::{BookSnapshot, DispatchError, Dispatcher};
-pub use exchange::{Exchange, ExchangeError, ExchangeOptions, SubmitOrder, SubmitOutcome};
+pub use exchange::{
+    ClockChange, ClockState, Exchange, ExchangeError, ExchangeOptions, SubmitOrder, SubmitOutcome,
+};
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -37,30 +40,6 @@ impl IdGenerator for SequentialIds {
     fn next_id(&mut self) -> Uuid {
         self.0 += 1;
         Uuid::from_u128(self.0)
-    }
-}
-
-/// Wall-clock source, injectable for reproducible tests and, later, a virtual clock.
-pub trait Clock {
-    fn now(&self) -> DateTime<Utc>;
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&self) -> DateTime<Utc> {
-        Utc::now()
-    }
-}
-
-/// A clock stuck at one instant.
-#[derive(Clone, Copy, Debug)]
-pub struct FixedClock(pub DateTime<Utc>);
-
-impl Clock for FixedClock {
-    fn now(&self) -> DateTime<Utc> {
-        self.0
     }
 }
 

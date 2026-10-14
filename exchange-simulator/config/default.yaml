@@ -21,6 +21,14 @@ webhooks:
   max_attempts: 10
   initial_backoff_ms: 500
   max_backoff_ms: 300000
+clock:
+  # "system": domain time is real time. "virtual": a controllable clock for simulations and tests. It starts at
+  # `start` (default: the real time at first startup), frozen unless `running: true`, and resumes from its last
+  # reading after a restart. Webhook delivery scheduling always uses real time.
+  mode: "system"
+test_control:
+  # Mounts /test/... (virtual clock controls). Never enable outside test deployments.
+  enabled: false
 database:
   path: "data/exchange.db"
   busy_timeout_ms: 5000

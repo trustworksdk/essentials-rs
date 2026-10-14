@@ -28,6 +28,9 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `webhooks.request_timeout_ms` | `5000` | Per request; a timeout is a failed attempt |
 | `webhooks.max_attempts` | `10` | Attempts in total; then the delivery is dead-lettered (`DEAD`) |
 | `webhooks.initial_backoff_ms` / `max_backoff_ms` | `500` / `300000` | Exponential backoff between attempts, with jitter |
+| `clock.mode` | `system` | `virtual` gives a controllable clock for domain time (see Test control) |
+| `clock.start` / `clock.running` | unset / `false` | Virtual clock only: first reading (default: real time at first start); start running instead of frozen |
+| `test_control.enabled` | `false` | Mounts `/test/...`. Never enable outside test deployments |
 | `database.path` | `data/exchange.db` | SQLite file (WAL mode) |
 | `database.busy_timeout_ms` | `5000` | SQLite busy timeout |
 | `logging.filter` / `logging.format` | `info` / `pretty` | Used when `RUST_LOG` is unset; `json` for structured logs |
@@ -225,6 +228,25 @@ Prometheus text format, with these series:
   `exchange_events_total{event_type}`.
 - **Webhooks:** `webhook_delivery_attempts_total{outcome}`, `webhook_delivery_duration_seconds`, and the outbox
   backlog `webhook_outbox_deliveries{status}`, read from SQLite at scrape time.
+
+## Test control
+
+With `test_control.enabled: true`, routes under `/test` control simulated time. They return `404` otherwise.
+
+| Method | Path | Body | Effect |
+|---|---|---|---|
+| GET | `/test/clock` | – | `{ "mode": "virtual"\|"system", "running", "now" }` |
+| POST | `/test/clock/advance` | `{ "days", "hours", "minutes", "seconds" }` (any, summed, > 0) | Move forward |
+| POST | `/test/clock/set` | `{ "to": "2030-01-07T09:00:00Z" }` | Move to an instant; earlier than now is `409 clock_backwards` |
+| POST | `/test/clock/freeze` / `/test/clock/resume` | – | Stop the clock, or let it run with real time |
+
+The `/test/clock` routes change the clock only with `clock.mode: virtual`; with the system clock they return
+`409 clock_not_virtual`.
+- **What the virtual clock stamps:** domain time: order `createdAt`/`updatedAt`, `executedAt`, event `occurredAt`,
+  and (later) settlement dates.
+- **It never moves backwards.** Its state is stored, so a restart resumes simulated time where it was.
+- **Webhook delivery stays on real time** (retry backoff, leases, `delivered_at`), so jumping the clock forward
+  neither stalls nor duplicates deliveries.
 
 ## Testing
 
