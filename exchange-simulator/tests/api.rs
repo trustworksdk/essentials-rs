@@ -10,12 +10,24 @@ use uuid::Uuid;
 #[tokio::test]
 async fn health_reports_ok_with_schema_version() {
     let app = TestApp::start().await;
+    let migrations = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|e| e == "sql")
+        })
+        .count();
     assert_eq!(
         app.get("/health").await,
         (
             StatusCode::OK,
-            json!({ "status": "ok", "schemaVersion": 7 })
-        )
+            json!({ "status": "ok", "schemaVersion": migrations })
+        ),
+        "every migration in migrations/ is applied"
     );
 }
 

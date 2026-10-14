@@ -11,7 +11,7 @@ use tokio::sync::{Notify, watch};
 
 use crate::api::{self, AppState};
 use crate::clock::VirtualClock;
-use crate::config::{ClockMode, Config};
+use crate::config::{ClockMode, Config, SettlementMode};
 use crate::engine::{Dispatcher, Exchange, ExchangeOptions, SystemClock, UuidV7Ids};
 use crate::persistence::{self, Store};
 use crate::webhooks::DeliveryWorker;
@@ -48,6 +48,7 @@ impl App {
                 simulation_id: config.events.simulation_id.clone(),
                 delivery_signal: Some(delivery_signal.clone()),
                 settlement: config.settlement.simulator_policy(),
+                external_outcomes: config.settlement.mode != SettlementMode::Simulated,
             },
         )
         .context("recovering order books")?;

@@ -87,6 +87,10 @@ impl From<ExchangeError> for ApiError {
             | E::Instrument(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             E::Book(BookError::Invalid(_)) => (StatusCode::BAD_REQUEST, "invalid_order"),
             E::ClockNotVirtual => (StatusCode::CONFLICT, "clock_not_virtual"),
+            E::ExternalOutcomesDisabled => (StatusCode::CONFLICT, "external_outcomes_disabled"),
+            E::UnknownExecution(_) => (StatusCode::NOT_FOUND, "not_found"),
+            E::InvalidReport(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
+            E::ReportConflict { .. } => (StatusCode::CONFLICT, "report_conflict"),
             E::Clock(_) => (StatusCode::CONFLICT, "clock_backwards"),
             E::Book(_) | E::Storage(_) | E::Settlement(_) => return Self::internal(error),
         };

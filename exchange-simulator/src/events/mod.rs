@@ -15,8 +15,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 /// The component that produced the event: the exchange (trading events)...
 pub const EXCHANGE_SOURCE: &str = "exchange";
-/// ...or the optional settlement simulator (simulated lifecycle events).
+/// ...or the optional settlement simulator (simulated lifecycle events)...
 pub const SETTLEMENT_SOURCE: &str = "settlement-simulator";
+/// ...or an external settlement service reporting outcomes back.
+pub const EXTERNAL_SOURCE: &str = "external";
 
 pub const ORDER_ACCEPTED: &str = "OrderAccepted";
 pub const ORDER_REJECTED: &str = "OrderRejected";
@@ -32,6 +34,8 @@ pub const SETTLEMENT_REJECTED: &str = "SettlementRejected";
 pub const SETTLEMENT_DELAYED: &str = "SettlementDelayed";
 pub const SETTLEMENT_CORRECTED: &str = "SettlementCorrected";
 pub const SETTLEMENT_CANCELLED: &str = "SettlementCancelled";
+/// An outcome reported by an external settlement service (`source: "external"`).
+pub const SETTLEMENT_OUTCOME_REPORTED: &str = "SettlementOutcomeReported";
 
 /// Every event type the service emits, for validating subscriptions.
 pub const EVENT_TYPES: &[&str] = &[
@@ -48,6 +52,7 @@ pub const EVENT_TYPES: &[&str] = &[
     SETTLEMENT_DELAYED,
     SETTLEMENT_CORRECTED,
     SETTLEMENT_CANCELLED,
+    SETTLEMENT_OUTCOME_REPORTED,
 ];
 
 /// Why an order was cancelled, carried in `OrderCancelled` payloads.

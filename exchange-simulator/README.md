@@ -189,6 +189,7 @@ intake, otherwise 00:00 UTC of the relevant date. Every one carries:
 | `SettlementCompleted` | `settledAt` | `SETTLED` |
 | `SettlementFailed` | `reason`: `SIMULATED_FAILURE` | `FAILED` |
 | `SettlementCancelled` | `reason`: `SIMULATED_CANCELLATION` | `CANCELLED` |
+| `SettlementOutcomeReported` | `source: "external"`: `reportId`, `status`, `reference`, `reason`, `details`, `receivedAt` (not a lifecycle step of the simulator) | – |
 | `SettlementCorrected` | `reason`: `SIMULATED_CORRECTION`, `previousSettlementAmount`, `previousAmountMinor` (the amount moves by one tick per unit) | `CORRECTED` |
 
 Order payloads carry `orderId`, `clientOrderId`, `instrumentId`, `participantId`, `side`, `type`, `priceTicks`, `price`,
@@ -278,6 +279,39 @@ Prometheus text format, with these series:
   the date, and `POST /test/clock/advance` returns only after everything due by the new time has happened.
 - **Durability:** instruction changes, their events, webhook deliveries and the simulator's position commit in one
   transaction.
+
+### `POST /api/settlements/{executionId}/outcomes`
+
+An external settlement service reports an outcome, accepted in `external` and `both` modes; in `simulated` mode it
+returns `409 external_outcomes_disabled`. The body:
+
+```json
+{ "status": "SETTLED", "reference": "csd-12345", "reason": null,
+  "occurredAt": "2030-01-09T10:00:00Z", "details": { "csd": "VP Securities" } }
+```
+
+- **Fields:** `status` is one of the settlement statuses (`PENDING`, `DELAYED`, `SETTLED`, `FAILED`, `REJECTED`,
+  `CANCELLED`, `CORRECTED`). `reference` (1–128 characters), `reason`, `occurredAt` (default: time of receipt) and
+  `details` (a JSON object, at most 4 KiB) are optional.
+- **Response:** `201` with the stored report (`reportId`, `receivedAt` on the exchange clock), and it publishes a
+  `SettlementOutcomeReported` event with `source: "external"`.
+- **Idempotent by `reference`:** the same reference with the same outcome returns the stored report with `200` and
+  `"duplicate": true`. With a different outcome it returns `409 report_conflict`.
+- **No ordering rules:** the service is the authority for its own reports, so the simulator imposes no state order on
+  them.
+- **Never merged:** a report never changes a simulated instruction, and a simulated outcome never changes a report.
+- **Errors:** `404` for an unknown execution.
+
+### `GET /api/settlements/{executionId}`
+
+Everything known about one execution's settlement, side by side:
+- `simulated`: the instruction, or `null` if the simulator is off
+- `simulatedEvents`: its lifecycle events
+- `external`: the reports in order of receipt
+
+### `GET /api/settlements?status=&limit=`
+
+Simulated instructions in trade order, optionally of one status. `limit` is 1–1000, default 100.
 
 ## Test control
 

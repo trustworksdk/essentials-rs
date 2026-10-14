@@ -3,6 +3,7 @@
 
 mod error;
 mod model;
+pub mod settlements;
 pub mod test_control;
 
 use std::collections::HashMap;
@@ -80,7 +81,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/trades", get(list_trades))
         .route("/api/events", get(list_events))
         .route("/api/webhooks", post(register_webhook).get(list_webhooks))
-        .with_state(state)
+        .with_state(state.clone())
+        .merge(settlements::router(state))
 }
 
 /// Liveness and readiness: the process is up and the database answers.

@@ -158,7 +158,7 @@ webhooks, and keeps simulator-originated and externally reported outcomes explic
 | 2.1 ✅ | Virtual clock and test-control API | M | A `VirtualClock` implementing `Clock` (set, advance, freeze), selected by config. Test-control routes under `/test/…`: `GET/POST /test/clock` (now, advance by, set to). They are mounted only when `test_control.enabled=true` (default false), on the same port. Every timestamp the service uses goes through the clock: order timestamps, `occurredAt`, delivery due times. Milestone 3 needs this too. |
 | 2.2 ✅ | Settlement domain, migration, event contracts | M | `SettlementInstruction` (execution ID, intended settlement date, status, attempt, outcome history). Statuses `PENDING → SETTLED \| FAILED \| REJECTED`, plus `DELAYED`, `CORRECTED`, `CANCELLED`. A business-day T+N calculator that skips weekends (D2: no holiday calendars for now). Events: `SettlementPending`, `SettlementCompleted`, `SettlementFailed`, `SettlementRejected`, `SettlementDelayed`, `SettlementCorrected`, `SettlementCancelled`, with schemas documented the way `TradeExecuted` is. The pure state machine and its tests come first, as matching did. |
 | 2.3 ✅ | Settlement driver and configuration | M | `settlement.mode: external \| simulated \| both` (`external` = today's behaviour). Settings: `settlement_days`, outcome probabilities, delay distribution, seed. The driver consumes trades, creates instructions, and fires due transitions when the virtual or real clock passes them. It restarts from the stored cursor and pending instructions. |
-| 2.4 | Combined mode and inbound external outcomes | S–M | Agreed (D1). `POST /api/settlements/{executionId}/outcomes` stores an external outcome (`source: external`) beside the simulated lifecycle. `GET /api/settlements/{executionId}` shows both streams side by side. |
+| 2.4 ✅ | Combined mode and inbound external outcomes | S–M | Agreed (D1). `POST /api/settlements/{executionId}/outcomes` stores an external outcome (`source: external`) beside the simulated lifecycle. `GET /api/settlements/{executionId}` shows both streams side by side. |
 | 2.5 | Tests and acceptance | M | Deterministic: the same seed and the same clock moves give identical lifecycles across restarts. T+2 across a weekend. Failure, delay and correction scenarios. In combined mode, an external consumer and the simulator act on the same trade without conflict. Extend the `e2e` test to cover a simulated settlement driven by clock moves. |
 
 **Acceptance:** with mode `both`, the seed fixed and the virtual clock frozen, one trade gives `SettlementPending` at
@@ -272,6 +272,40 @@ duplicates the outcome.
     trades too, with past dates and immediately.
   - Ticks are periodic and run after clock changes, not after every trade, which keeps the trading hot path free of
     settlement writes.
+
+**2.4 — combined mode and inbound external outcomes ✅ (2026-10-14).**
+- **Delivered:**
+  - Migration `008_settlement_reports.sql` adds `settlement_reports`: a status CHECK, a unique
+    `(execution_id, reference)`, and `details` as a JSON object.
+  - `Exchange::report_settlement(NewReport)`:
+    - It is accepted only when `external_outcomes` is set (modes `external` and `both`).
+    - It validates the reference length and that `details` is an object of at most 4 KiB, and that the execution
+      exists.
+    - It is idempotent by reference: `NewReport::repeats` compares `occurredAt` only when the retry gives one.
+    - It commits the report and a `SettlementOutcomeReported` event (`source: "external"`, aggregate and correlation
+      = execution ID) in one transaction.
+  - Routes: `POST /api/settlements/{id}/outcomes` (`201`, or `200` with `duplicate`); `GET /api/settlements/{id}`
+    (`simulated`, `simulatedEvents`, `external` side by side); `GET /api/settlements?status=&limit=`.
+  - `Store::events_for(aggregate, source)` uses the aggregate index from 007.
+- **Tests:**
+  - `tests/settlement_reports.rs` (5):
+    - In `both` mode, an external `SETTLED` and a simulated `FAILED` stay apart: neither overwrites the other, the
+      external report emits no `SettlementCompleted`, and the simulated history holds no external events.
+    - Idempotency: a repeat, a repeat with the same `occurredAt`, a conflicting status or time, reports without a
+      reference; restart survival.
+    - `simulated` mode refuses reports with `409`.
+    - Validation: unknown execution, bad status, missing status, non-object details, reference length, unknown
+      fields, bad UUID.
+    - Listing by status.
+  - The `/health` test now derives the expected schema version from the files in `migrations/`, so it no longer
+    needs editing per migration.
+- **Mutation checks**, each made a test fail: the mode check removed; `occurredAt` ignored in idempotency; a
+  duplicate answered `201`; the external source mislabelled; the simulated history not filtered by source.
+- **Decisions:**
+  - External reports get their own event type rather than reusing `Settlement*` types with another source, so a
+    subscriber to `SettlementCompleted` only ever sees the simulator's verdict.
+  - No state ordering is imposed on external reports.
+  - In `external` mode reports are accepted too: there they are the only lifecycle record.
 
 ## Milestone 3 — scenarios and fault injection
 

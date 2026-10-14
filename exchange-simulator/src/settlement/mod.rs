@@ -128,6 +128,47 @@ impl SettlementPolicy {
     }
 }
 
+/// A settlement outcome reported by an external service. It is stored and published as is, beside (never merged
+/// into) any simulated instruction for the same execution.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalReport {
+    pub id: Uuid,
+    pub execution_id: Uuid,
+    pub status: SettlementStatus,
+    /// The reporter's own identifier; a repeated reference with the same content is the same report.
+    pub reference: Option<String>,
+    pub reason: Option<String>,
+    /// Free-form JSON object.
+    pub details: Option<serde_json::Value>,
+    /// When the reporter says it happened; defaults to the time of receipt.
+    pub occurred_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+}
+
+/// An incoming external report, before it is stored.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewReport {
+    pub execution_id: Uuid,
+    pub status: SettlementStatus,
+    pub reference: Option<String>,
+    pub reason: Option<String>,
+    pub details: Option<serde_json::Value>,
+    pub occurred_at: Option<DateTime<Utc>>,
+}
+
+impl NewReport {
+    /// Whether this is a retry of `existing`: the same outcome, and the same `occurred_at` if this one gives one
+    /// (a retry that leaves it out would otherwise get a fresh receipt time).
+    pub fn repeats(&self, existing: &ExternalReport) -> bool {
+        self.execution_id == existing.execution_id
+            && self.status == existing.status
+            && self.reference == existing.reference
+            && self.reason == existing.reason
+            && self.details == existing.details
+            && self.occurred_at.is_none_or(|at| at == existing.occurred_at)
+    }
+}
+
 /// What the simulator needs from a `TradeExecuted` event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TradeFacts {

@@ -18,6 +18,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/005_participant_settlement.sql"),
     include_str!("../../migrations/006_virtual_clock.sql"),
     include_str!("../../migrations/007_settlement.sql"),
+    include_str!("../../migrations/008_settlement_reports.sql"),
 ];
 
 /// Opens (creating if needed) the database at `path`, applies connection pragmas and runs pending migrations.
@@ -110,6 +111,7 @@ mod tests {
                 "orders",
                 "participants",
                 "settlement_instructions",
+                "settlement_reports",
                 "virtual_clock",
                 "webhook_deliveries",
                 "webhook_subscriptions"

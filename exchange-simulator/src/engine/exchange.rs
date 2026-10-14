@@ -13,7 +13,9 @@ use crate::domain::{
 };
 use crate::events::{self, Command};
 use crate::persistence::{Outbox, Store};
-use crate::settlement::{SettlementPolicy, SettlementSimulator, TradeFacts};
+use crate::settlement::{
+    ExternalReport, NewReport, SettlementPolicy, SettlementSimulator, TradeFacts,
+};
 use crate::webhooks::{DeliveryJob, DeliveryResult, NewSubscription, Subscription};
 
 /// The settlement simulator's name in `consumer_offsets`.
@@ -77,6 +79,19 @@ pub enum ExchangeError {
     Clock(#[from] ClockError),
     #[error("settlement simulation: {0}")]
     Settlement(String),
+    #[error("settlement mode is simulated; externally reported outcomes are not accepted")]
+    ExternalOutcomesDisabled,
+    #[error("unknown execution {0}")]
+    UnknownExecution(Uuid),
+    #[error("invalid settlement report: {0}")]
+    InvalidReport(String),
+    #[error(
+        "reference {reference} was already reported for execution {execution_id} with a different outcome"
+    )]
+    ReportConflict {
+        execution_id: Uuid,
+        reference: String,
+    },
     #[error(transparent)]
     Instrument(#[from] InstrumentError),
     #[error(transparent)]
@@ -100,6 +115,8 @@ pub struct ExchangeOptions {
     pub delivery_signal: Option<Arc<tokio::sync::Notify>>,
     /// Runs the settlement simulator with this policy (settlement mode `simulated` or `both`).
     pub settlement: Option<SettlementPolicy>,
+    /// Accepts settlement outcomes reported by an external service (settlement mode `external` or `both`).
+    pub external_outcomes: bool,
 }
 
 impl Default for ExchangeOptions {
@@ -112,6 +129,7 @@ impl Default for ExchangeOptions {
             simulation_id: None,
             delivery_signal: None,
             settlement: None,
+            external_outcomes: true,
         }
     }
 }
@@ -148,6 +166,7 @@ pub struct Exchange {
     clock: Box<dyn Clock + Send>,
     virtual_clock: Option<VirtualClock>,
     settlement: Option<SettlementSimulator>,
+    external_outcomes: bool,
     subscriptions: Vec<Subscription>,
     simulation_id: Option<String>,
     delivery_signal: Option<Arc<tokio::sync::Notify>>,
@@ -220,6 +239,7 @@ impl Exchange {
             clock,
             virtual_clock: options.virtual_clock,
             settlement,
+            external_outcomes: options.external_outcomes,
             subscriptions,
             simulation_id: options.simulation_id,
             delivery_signal: options.delivery_signal,
@@ -511,6 +531,91 @@ impl Exchange {
                 return Ok(total);
             }
         }
+    }
+
+    /// Stores a settlement outcome reported by an external service and publishes `SettlementOutcomeReported`
+    /// (`source: "external"`). It never touches a simulated instruction. A repeated `reference` with the same outcome
+    /// returns the stored report with `true`; with a different outcome it fails.
+    pub fn report_settlement(
+        &mut self,
+        report: NewReport,
+    ) -> Result<(ExternalReport, bool), ExchangeError> {
+        if !self.external_outcomes {
+            return Err(ExchangeError::ExternalOutcomesDisabled);
+        }
+        if let Some(reference) = &report.reference
+            && !(1..=128).contains(&reference.chars().count())
+        {
+            return Err(ExchangeError::InvalidReport(
+                "reference must be 1 to 128 characters".into(),
+            ));
+        }
+        if let Some(details) = &report.details
+            && (!details.is_object() || details.to_string().len() > MAX_SETTLEMENT_BYTES)
+        {
+            return Err(ExchangeError::InvalidReport(format!(
+                "details must be a JSON object of at most {MAX_SETTLEMENT_BYTES} bytes"
+            )));
+        }
+        if !self.store.execution_exists(report.execution_id)? {
+            return Err(ExchangeError::UnknownExecution(report.execution_id));
+        }
+        if let Some(reference) = &report.reference
+            && let Some(existing) = self
+                .store
+                .report_by_reference(report.execution_id, reference)?
+        {
+            return if report.repeats(&existing) {
+                Ok((existing, true))
+            } else {
+                Err(ExchangeError::ReportConflict {
+                    execution_id: report.execution_id,
+                    reference: reference.clone(),
+                })
+            };
+        }
+        let received_at = self.now();
+        let stored = ExternalReport {
+            id: self.ids.next_id(),
+            execution_id: report.execution_id,
+            status: report.status,
+            reference: report.reference,
+            reason: report.reason,
+            details: report.details,
+            occurred_at: report.occurred_at.unwrap_or(received_at),
+            received_at,
+        };
+        let event = events::NewEvent {
+            event_id: self.ids.next_id(),
+            event_type: events::SETTLEMENT_OUTCOME_REPORTED,
+            source: events::EXTERNAL_SOURCE,
+            aggregate_id: stored.execution_id.to_string(),
+            correlation_id: Some(stored.execution_id.to_string()),
+            occurred_at: stored.occurred_at,
+            payload: serde_json::json!({
+                "reportId": stored.id,
+                "executionId": stored.execution_id,
+                "status": stored.status,
+                "reference": stored.reference,
+                "reason": stored.reason,
+                "details": stored.details,
+                "receivedAt": stored.received_at,
+            }),
+        };
+        let outbox = Outbox {
+            subscriptions: &self.subscriptions,
+            simulation_id: self.simulation_id.as_deref(),
+            ids: self.ids.as_mut(),
+            due: wall_now(),
+        };
+        self.store.commit_report(&stored, &event, outbox)?;
+        ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type).increment(1);
+        if self.subscriptions.iter().any(|s| s.wants(event.event_type))
+            && let Some(signal) = &self.delivery_signal
+        {
+            signal.notify_one();
+        }
+        Ok((stored, false))
     }
 
     /// Whether the settlement simulator runs.

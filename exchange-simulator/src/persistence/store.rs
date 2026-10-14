@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::domain::{Execution, Instrument, InstrumentId, Order, Participant, ParticipantId};
 use crate::engine::BookUpdate;
 use crate::events::{self, EventEnvelope, NewEvent};
-use crate::settlement::{Instruction, SettlementStatus, Transition};
+use crate::settlement::{ExternalReport, Instruction, SettlementStatus, Transition};
 use crate::webhooks::{DeliveryJob, DeliveryOutcome, DeliveryResult, Subscription};
 
 /// Repository over the single writer connection. Every state change a matching step produces is written by
@@ -544,6 +544,75 @@ impl Store {
         tx.commit()
     }
 
+    pub fn execution_exists(&self, id: Uuid) -> rusqlite::Result<bool> {
+        self.conn
+            .prepare_cached("SELECT 1 FROM executions WHERE id = ?1")?
+            .exists([id.to_string()])
+    }
+
+    pub fn report_by_reference(
+        &self,
+        execution_id: Uuid,
+        reference: &str,
+    ) -> rusqlite::Result<Option<ExternalReport>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {REPORT_COLUMNS} FROM settlement_reports WHERE execution_id = ?1 AND reference = ?2"
+            ))?
+            .query_row(params![execution_id.to_string(), reference], report_row)
+            .optional()
+    }
+
+    /// External reports for an execution, in order of receipt.
+    pub fn reports(&self, execution_id: Uuid) -> rusqlite::Result<Vec<ExternalReport>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {REPORT_COLUMNS} FROM settlement_reports WHERE execution_id = ?1 ORDER BY received_at, rowid"
+            ))?
+            .query_map([execution_id.to_string()], report_row)?
+            .collect()
+    }
+
+    /// Stores an external report and publishes its event, atomically.
+    pub fn commit_report(
+        &mut self,
+        report: &ExternalReport,
+        event: &NewEvent,
+        outbox: Outbox<'_>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.prepare_cached(&format!(
+            "INSERT INTO settlement_reports ({REPORT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        ))?
+        .execute(params![
+            report.id.to_string(),
+            report.execution_id.to_string(),
+            report.status.as_str(),
+            report.reference,
+            report.reason,
+            report.details.as_ref().map(|d| d.to_string()),
+            timestamp(report.occurred_at),
+            timestamp(report.received_at),
+        ])?;
+        write_events(&tx, std::slice::from_ref(event), outbox)?;
+        tx.commit()
+    }
+
+    /// Events about one aggregate (e.g. an execution's settlement lifecycle), optionally from one source.
+    pub fn events_for(
+        &self,
+        aggregate_id: &str,
+        source: Option<&str>,
+    ) -> rusqlite::Result<Vec<EventEnvelope>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {EVENT_COLUMNS} FROM events e
+                 WHERE e.aggregate_id = ?1 AND (?2 IS NULL OR e.source = ?2) ORDER BY e.sequence"
+            ))?
+            .query_map(params![aggregate_id, source], |row| event_row(row, 0))?
+            .collect()
+    }
+
     /// Number of webhook deliveries per status.
     pub fn delivery_counts(&self) -> rusqlite::Result<Vec<(String, u64)>> {
         self.conn
@@ -642,6 +711,26 @@ pub(crate) fn write_events(
         }
     }
     Ok(())
+}
+
+const REPORT_COLUMNS: &str =
+    "id, execution_id, status, reference, reason, details, occurred_at, received_at";
+
+fn report_row(row: &Row<'_>) -> rusqlite::Result<ExternalReport> {
+    let details: Option<String> = row.get(5)?;
+    Ok(ExternalReport {
+        id: parsed(row, 0)?,
+        execution_id: parsed(row, 1)?,
+        status: parsed(row, 2)?,
+        reference: row.get(3)?,
+        reason: row.get(4)?,
+        details: details
+            .map(|text| serde_json::from_str(&text))
+            .transpose()
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(e)))?,
+        occurred_at: parsed(row, 6)?,
+        received_at: parsed(row, 7)?,
+    })
 }
 
 const INSTRUCTION_COLUMNS: &str = "execution_id, trade_sequence, instrument_id, buyer_id, seller_id, quantity, \

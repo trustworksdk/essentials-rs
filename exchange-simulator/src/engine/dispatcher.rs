@@ -7,6 +7,7 @@ use super::{
     BookUpdate, ClockChange, ClockState, Exchange, ExchangeError, Level, SubmitOrder, SubmitOutcome,
 };
 use crate::domain::{Instrument, InstrumentId, Participant, Side};
+use crate::settlement::{ExternalReport, NewReport};
 use crate::webhooks::{DeliveryJob, DeliveryResult, NewSubscription, Subscription};
 
 #[derive(Debug, thiserror::Error)]
@@ -44,6 +45,7 @@ enum Request {
     SetInstrumentEnabled(InstrumentId, bool, Reply<Instrument>),
     ClockState(oneshot::Sender<ClockState>),
     SettlementTick(Reply<usize>),
+    ReportSettlement(NewReport, Reply<(ExternalReport, bool)>),
     ChangeClock(ClockChange, Reply<ClockState>),
     ClaimDeliveries(u32, std::time::Duration, Reply<Vec<DeliveryJob>>),
     RecordDeliveries(Vec<DeliveryResult>, Reply<()>),
@@ -107,6 +109,15 @@ impl Dispatcher {
     /// Runs one settlement simulator step; resolves with the number of transitions.
     pub async fn settlement_tick(&self) -> Result<usize, DispatchError> {
         self.call(Request::SettlementTick).await
+    }
+
+    /// Stores an externally reported settlement outcome; `true` when it repeats a stored report.
+    pub async fn report_settlement(
+        &self,
+        report: NewReport,
+    ) -> Result<(ExternalReport, bool), DispatchError> {
+        self.call(|reply| Request::ReportSettlement(report, reply))
+            .await
     }
 
     pub async fn clock_state(&self) -> Result<ClockState, DispatchError> {
@@ -242,6 +253,10 @@ fn handle(exchange: &mut Exchange, request: Request) -> (&'static str, &'static 
         Request::SettlementTick(reply) => {
             ("settlement_tick", answer(reply, exchange.settlement_tick()))
         }
+        Request::ReportSettlement(report, reply) => (
+            "report_settlement",
+            answer(reply, exchange.report_settlement(report)),
+        ),
         Request::ClockState(reply) => {
             let _ = reply.send(exchange.clock_state());
             ("clock_state", "ok")
