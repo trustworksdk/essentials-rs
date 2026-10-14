@@ -2,12 +2,18 @@
   "worktree": {
     "baseRef": "head"
   },
+  "enabledPlugins": {
+    "typescript-lsp@claude-plugins-official": true,
+    "pyright-lsp@claude-plugins-official": true,
+    "rust-analyzer-lsp@claude-plugins-official": true
+  },
   "extraKnownMarketplaces": {
     "trustworks-plugins": {
       "source": {
         "source": "directory",
         "path": "/opt/claude-seed/marketplaces/trustworks-plugins"
-      }
+      },
+      "autoUpdate": true
     }
   }
 }
