@@ -361,3 +361,34 @@ Steps refer to "First implementation sequence" above.
 - `lastSequence` in a book snapshot is the exchange-wide sequence at snapshot time. A book's own high-water mark would read lower after a restart, because only resting orders are restored. The HTTP restart test caught that.
 - Instrument sharding is not done: one exchange thread serves all instruments. The plan schedules sharded workers in Milestone 4.
 - `GET /api/trades` returns the oldest trades first with a `limit`. It has no cursor yet; ordered replay is `/api/events` (step 5).
+
+### Step 5 — events, transactional outbox, webhooks ✅ done (2026-10-14)
+
+**Delivered**
+- `events`: the envelope (`eventId`, `sequence`, `eventType`, `schemaVersion` 1, `source` `"exchange"`, `simulationId` from `events.simulation_id`, `aggregateId`, `correlationId`, `occurredAt`, `payload`) and the six initial event types. `events::for_update` derives a command's events in a fixed order: `OrderAccepted`, then per fill `TradeExecuted` plus the resting order's `OrderPartiallyFilled`/`OrderFilled`, then the incoming order's fill event, then `OrderCancelled` (`MARKET_REMAINDER`). A cancel gives `OrderCancelled` (`REQUESTED`), a self-trade gives `OrderRejected`. `TradeExecuted` carries the instrument identifier snapshot, settlement fields (currency, scale, tick size) and a decimal `price`.
+- Outbox: `Store::commit` writes events and one `PENDING` `webhook_deliveries` row per matching subscription in the same transaction as the orders and executions.
+- Webhooks:
+  - `POST/GET /api/webhooks`: the URL must be http(s), and event types must be known and non-empty.
+  - `DeliveryWorker` (Tokio task) claims due deliveries through the exchange thread, so there is still one SQLite writer. It POSTs the envelope with `X-Event-Id`, `X-Event-Type`, `X-Event-Sequence`, `X-Subscription-Id` and `X-Delivery-Attempt` headers, with bounded concurrency, and records the outcomes in one batch.
+  - 2xx counts as delivered. Anything else retries with exponential backoff and equal jitter until `max_attempts`, then `DEAD`.
+  - A claim is a lease, sized from timeout × batch / concurrency + 30 s; startup releases all claims. A result for a claim that was meanwhile re-claimed and finished is ignored.
+  - Commits that create deliveries wake the worker at once; retries are picked up by the poll (`webhooks.poll_interval_ms`).
+- `GET /api/events?after=&limit=&eventType=`: cursor replay by sequence, via the read connection.
+- `App::shutdown` stops the worker (after its batch), then drains the exchange thread.
+- Tests:
+  - `tests/events.rs` (6): event order and payloads per scenario.
+  - `tests/recovery.rs` (+2): a failure inserting a delivery row rolls back the trade, events and orders; claims are leases and late results do not overwrite.
+  - `tests/webhooks.rs` (6, in-process HTTP receiver): delivery with a stable `eventId` that equals the replayed event; per-subscription filtering; two failures then success, with no new trades; dead-lettering; resume after restart from a claim left `IN_FLIGHT`; replay paging, stable across restart; registration validation.
+  - `tests/mockserver.rs` (1, Testcontainers `mockserver/mockserver:5.15.0`): acceptance steps 3 and 8–10 with a consumer that answers 500, 500, then 202. Three identical deliveries, one execution, the book restored after restart, no re-delivery.
+- Mutation checks, each made a test fail: attempts not counted; claims not released at startup; subscription filter ignored; any status treated as delivered; lease ignored; a late result overwrites; the `TradeExecuted` type wrong; one attempt too many.
+
+**Decisions**
+- Delivery bookkeeping goes through the exchange thread rather than a second SQLite writer. The cost is extra commands on the matching queue (two per batch); the gain is no writer contention. When the queue is full, results are retried briefly, then left to lease expiry (at-least-once).
+- A subscription receives only events committed after it registered; `/api/events` is the way to backfill.
+- Deliveries for one subscription run concurrently, so they can arrive out of order. Serialized per-subscription delivery (plan §5, "where ordering matters") is not built.
+- HMAC signing (plan §5, optional) is not built; subscribers belong on test networks only, as the "open implementation choices" above say.
+- `config/default.yaml` uses `events: {}`. A section holding only comments parses as null and failed startup; the config unit test caught it.
+
+**Remaining for Milestone 1** (step 6 and the definition of done)
+- Prometheus `/metrics` and a benchmark harness: durable throughput measured separately from in-memory throughput.
+- A Docker-based end-to-end run of the full acceptance test: the simulator *container* plus MockServer on one compose network, covering the container restart. Today MockServer runs in a container and the simulator in-process.

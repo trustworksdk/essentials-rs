@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app.router.clone())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    tokio::task::spawn_blocking(move || app.shutdown()).await?;
+    app.shutdown().await;
     tracing::info!("shut down");
     Ok(())
 }

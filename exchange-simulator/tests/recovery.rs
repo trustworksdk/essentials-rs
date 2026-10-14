@@ -43,6 +43,8 @@ fn open(path: &Path, policy: IdentifierPolicy) -> Exchange {
             identifier_policy: policy,
             ids: Box::new(UuidV7Ids),
             clock: Box::new(SystemClock),
+            simulation_id: None,
+            delivery_signal: None,
         },
     )
     .unwrap()
@@ -603,4 +605,186 @@ fn restarting_at_any_point_gives_the_same_trades_as_running_straight_through() {
             "seed {seed}: the script trades"
         );
     }
+}
+
+#[test]
+fn events_and_webhook_deliveries_commit_or_roll_back_with_the_trade() {
+    let db = TempDb::new();
+    let conn = persistence::open(db.path(), Duration::from_secs(5)).unwrap();
+    let mut exchange = Exchange::recover(
+        Store::new(conn),
+        ExchangeOptions {
+            identifier_policy: IdentifierPolicy::Strict,
+            ids: Box::new(UuidV7Ids),
+            clock: Box::new(SystemClock),
+            simulation_id: Some("sim-7".into()),
+            delivery_signal: None,
+        },
+    )
+    .unwrap();
+    exchange.register_instrument(acme()).unwrap();
+    for id in ["A", "B"] {
+        exchange.register_participant(participant(id)).unwrap();
+    }
+    let trades = exchange
+        .register_webhook(
+            "http://localhost:1/trades".into(),
+            vec!["TradeExecuted".into()],
+        )
+        .unwrap();
+    let all = exchange
+        .register_webhook(
+            "http://localhost:1/all".into(),
+            [
+                "OrderAccepted",
+                "TradeExecuted",
+                "OrderFilled",
+                "OrderPartiallyFilled",
+            ]
+            .map(String::from)
+            .to_vec(),
+        )
+        .unwrap();
+
+    processed(exchange.submit(order("A", Side::Sell, Some(10025), 200)));
+    exchange
+        .store()
+        .connection()
+        .execute_batch(
+            "CREATE TEMP TRIGGER fail BEFORE INSERT ON webhook_deliveries
+             WHEN (SELECT event_type FROM events WHERE sequence = NEW.event_sequence) = 'TradeExecuted'
+             BEGIN SELECT RAISE(ABORT, 'outbox full'); END;",
+        )
+        .unwrap();
+    assert!(matches!(
+        exchange.submit(order("B", Side::Buy, Some(10025), 150)),
+        Err(ExchangeError::Storage(_))
+    ));
+    assert_eq!(count(&exchange, "SELECT COUNT(*) FROM executions"), 0);
+    assert_eq!(count(&exchange, "SELECT COUNT(*) FROM orders"), 1);
+    assert_eq!(
+        count(&exchange, "SELECT COUNT(*) FROM events"),
+        1,
+        "only the first order's OrderAccepted"
+    );
+    assert_eq!(
+        count(&exchange, "SELECT COUNT(*) FROM webhook_deliveries"),
+        1
+    );
+
+    exchange
+        .store()
+        .connection()
+        .execute_batch("DROP TRIGGER fail")
+        .unwrap();
+    processed(exchange.submit(order("B", Side::Buy, Some(10025), 150)));
+    let events = exchange.store().events(0, 100, None).unwrap();
+    let types: Vec<_> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(
+        types,
+        [
+            "OrderAccepted",
+            "OrderAccepted",
+            "TradeExecuted",
+            "OrderPartiallyFilled",
+            "OrderFilled"
+        ]
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| e.simulation_id.as_deref() == Some("sim-7") && e.source == "exchange")
+    );
+    assert!(events.windows(2).all(|w| w[0].sequence < w[1].sequence));
+    let deliveries = |subscription: Uuid| {
+        count(
+            &exchange,
+            &format!(
+                "SELECT COUNT(*) FROM webhook_deliveries WHERE subscription_id = '{subscription}' AND status = 'PENDING'"
+            ),
+        )
+    };
+    assert_eq!(deliveries(trades.id), 1);
+    assert_eq!(deliveries(all.id), 5);
+
+    assert!(matches!(
+        exchange.register_webhook("ftp://x".into(), vec!["TradeExecuted".into()]),
+        Err(ExchangeError::InvalidWebhook(_))
+    ));
+    assert!(matches!(
+        exchange.register_webhook("http://x".into(), vec![]),
+        Err(ExchangeError::InvalidWebhook(_))
+    ));
+    assert!(matches!(
+        exchange.register_webhook("http://x".into(), vec!["Trade".into()]),
+        Err(ExchangeError::InvalidWebhook(_))
+    ));
+}
+
+#[test]
+fn a_delivery_claim_is_a_lease_and_late_results_do_not_overwrite() {
+    use chrono::{TimeZone, Utc};
+    use exchange_simulator::webhooks::{DeliveryOutcome, DeliveryResult};
+
+    let db = TempDb::new();
+    let mut exchange = setup(&db);
+    exchange
+        .register_webhook(
+            "http://localhost:1/hook".into(),
+            vec!["OrderAccepted".into()],
+        )
+        .unwrap();
+    processed(exchange.submit(order("A", Side::Sell, Some(10025), 200)));
+    drop(exchange);
+
+    let mut store = Store::new(persistence::open(db.path(), Duration::from_secs(5)).unwrap());
+    let at = |second: u32| Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, second).unwrap();
+    let first = store.claim_deliveries(at(0), at(10), 10).unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        (first[0].attempts, first[0].event.event_type.as_str()),
+        (0, "OrderAccepted")
+    );
+    assert!(
+        store
+            .claim_deliveries(at(5), at(15), 10)
+            .unwrap()
+            .is_empty(),
+        "leased"
+    );
+
+    let second = store.claim_deliveries(at(11), at(20), 10).unwrap();
+    assert_eq!(second.len(), 1, "an expired lease is claimable again");
+    assert_eq!(second[0].event, first[0].event);
+
+    let delivered = DeliveryResult {
+        delivery_id: second[0].delivery_id,
+        outcome: DeliveryOutcome::Delivered,
+    };
+    store.record_deliveries(&[delivered], at(12)).unwrap();
+    let late = DeliveryResult {
+        delivery_id: first[0].delivery_id,
+        outcome: DeliveryOutcome::Retry {
+            at: at(30),
+            error: "timeout".into(),
+        },
+    };
+    store.record_deliveries(&[late], at(13)).unwrap();
+    let (status, attempts): (String, i64) = store
+        .connection()
+        .query_row("SELECT status, attempts FROM webhook_deliveries", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(
+        (status.as_str(), attempts),
+        ("DELIVERED", 1),
+        "the late result for the old claim was ignored"
+    );
+    assert!(
+        store
+            .claim_deliveries(at(50), at(55), 10)
+            .unwrap()
+            .is_empty()
+    );
 }

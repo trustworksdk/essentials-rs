@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 use crate::domain::{Execution, Instrument, InstrumentId, Order, Participant, ParticipantId};
 use crate::engine::BookUpdate;
+use crate::events::{self, EventEnvelope, NewEvent};
+use crate::webhooks::{DeliveryJob, DeliveryOutcome, DeliveryResult, Subscription};
 
 /// Repository over the single writer connection. Every state change a matching step produces is written by
 /// [`Store::commit`] in one transaction.
@@ -190,8 +192,17 @@ impl Store {
     }
 
     /// Writes a planned book update atomically: the subject order (inserted, or updated if it exists), every resting
-    /// order it traded with, and its executions. Nothing is written if any statement fails.
-    pub fn commit(&mut self, update: &BookUpdate, now: DateTime<Utc>) -> rusqlite::Result<()> {
+    /// order it traded with, its executions, its events, and a pending delivery of each event to every subscription
+    /// that wants it (the outbox). Nothing is written if any statement fails.
+    pub fn commit(
+        &mut self,
+        update: &BookUpdate,
+        new_events: &[NewEvent],
+        subscriptions: &[Subscription],
+        simulation_id: Option<&str>,
+        ids: &mut dyn crate::engine::IdGenerator,
+        now: DateTime<Utc>,
+    ) -> rusqlite::Result<()> {
         let now = timestamp(now);
         let tx = self.conn.transaction()?;
         {
@@ -236,8 +247,181 @@ impl Store {
                     timestamp(execution.executed_at),
                 ])?;
             }
+            let mut insert_event = tx.prepare_cached(
+                "INSERT INTO events (event_id, event_type, schema_version, source, simulation_id, aggregate_id,
+                                     correlation_id, payload, occurred_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            let mut insert_delivery = tx.prepare_cached(
+                "INSERT INTO webhook_deliveries (id, subscription_id, event_sequence, status, attempts, next_attempt_at)
+                 VALUES (?1, ?2, ?3, 'PENDING', 0, ?4)",
+            )?;
+            for event in new_events {
+                insert_event.execute(params![
+                    event.event_id.to_string(),
+                    event.event_type,
+                    events::SCHEMA_VERSION,
+                    events::EXCHANGE_SOURCE,
+                    simulation_id,
+                    event.aggregate_id,
+                    event.correlation_id,
+                    event.payload.to_string(),
+                    timestamp(event.occurred_at),
+                ])?;
+                let sequence = tx.last_insert_rowid();
+                for subscription in subscriptions.iter().filter(|s| s.wants(event.event_type)) {
+                    insert_delivery.execute(params![
+                        ids.next_id().to_string(),
+                        subscription.id.to_string(),
+                        sequence,
+                        now
+                    ])?;
+                }
+            }
         }
         tx.commit()
+    }
+
+    /// Canonical events with `sequence > after`, in sequence order, optionally of one type.
+    pub fn events(
+        &self,
+        after: u64,
+        limit: u32,
+        event_type: Option<&str>,
+    ) -> rusqlite::Result<Vec<EventEnvelope>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {EVENT_COLUMNS} FROM events e
+                 WHERE e.sequence > ?1 AND (?2 IS NULL OR e.event_type = ?2)
+                 ORDER BY e.sequence LIMIT ?3"
+            ))?
+            .query_map(params![to_sql(after), event_type, limit], |row| {
+                event_row(row, 0)
+            })?
+            .collect()
+    }
+
+    pub fn insert_subscription(&self, subscription: &Subscription) -> rusqlite::Result<()> {
+        let event_types =
+            serde_json::to_string(&subscription.event_types).expect("strings serialize");
+        self.conn
+            .prepare_cached(
+                "INSERT INTO webhook_subscriptions (id, url, enabled, event_types, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .execute(params![
+                subscription.id.to_string(),
+                subscription.url,
+                subscription.enabled,
+                event_types,
+                timestamp(subscription.created_at)
+            ])
+            .map(drop)
+    }
+
+    pub fn subscriptions(&self) -> rusqlite::Result<Vec<Subscription>> {
+        self.conn
+            .prepare_cached(
+                "SELECT id, url, enabled, event_types, created_at FROM webhook_subscriptions ORDER BY created_at, id",
+            )?
+            .query_map([], |row| {
+                let event_types: String = row.get(3)?;
+                Ok(Subscription {
+                    id: parsed(row, 0)?,
+                    url: row.get(1)?,
+                    enabled: row.get(2)?,
+                    event_types: serde_json::from_str(&event_types).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(e))
+                    })?,
+                    created_at: parsed(row, 4)?,
+                })
+            })?
+            .collect()
+    }
+
+    /// Claims up to `limit` deliveries that are due at `now` (pending, or in flight with an expired lease), oldest
+    /// due first, and leases them until `lease_until`.
+    pub fn claim_deliveries(
+        &mut self,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<DeliveryJob>> {
+        let tx = self.conn.transaction()?;
+        let jobs = {
+            let mut select = tx.prepare_cached(&format!(
+                "SELECT d.id, d.subscription_id, s.url, d.attempts, {EVENT_COLUMNS}
+                 FROM webhook_deliveries d
+                 JOIN webhook_subscriptions s ON s.id = d.subscription_id
+                 JOIN events e ON e.sequence = d.event_sequence
+                 WHERE d.status IN ('PENDING', 'IN_FLIGHT') AND d.next_attempt_at <= ?1
+                 ORDER BY d.next_attempt_at, d.event_sequence
+                 LIMIT ?2"
+            ))?;
+            let jobs = select
+                .query_map(params![timestamp(now), limit], |row| {
+                    Ok(DeliveryJob {
+                        delivery_id: parsed(row, 0)?,
+                        subscription_id: parsed(row, 1)?,
+                        url: row.get(2)?,
+                        attempts: row.get(3)?,
+                        event: event_row(row, 4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut lease = tx.prepare_cached(
+                "UPDATE webhook_deliveries SET status = 'IN_FLIGHT', next_attempt_at = ?2 WHERE id = ?1",
+            )?;
+            for job in &jobs {
+                lease.execute(params![job.delivery_id.to_string(), timestamp(lease_until)])?;
+            }
+            jobs
+        };
+        tx.commit()?;
+        Ok(jobs)
+    }
+
+    /// Records attempt outcomes. Each counts as one attempt. Only in-flight deliveries are updated, so a late result
+    /// for a delivery that was meanwhile re-claimed and finished does not overwrite it.
+    pub fn record_deliveries(
+        &mut self,
+        results: &[DeliveryResult],
+        now: DateTime<Utc>,
+    ) -> rusqlite::Result<()> {
+        let now = timestamp(now);
+        let tx = self.conn.transaction()?;
+        {
+            let mut update = tx.prepare_cached(
+                "UPDATE webhook_deliveries
+                 SET status = ?2, attempts = attempts + 1, next_attempt_at = ?3, last_error = ?4, delivered_at = ?5
+                 WHERE id = ?1 AND status = 'IN_FLIGHT'",
+            )?;
+            for result in results {
+                let (status, next, error, delivered) = match &result.outcome {
+                    DeliveryOutcome::Delivered => ("DELIVERED", None, None, Some(now.clone())),
+                    DeliveryOutcome::Retry { at, error } => {
+                        ("PENDING", Some(timestamp(*at)), Some(error.as_str()), None)
+                    }
+                    DeliveryOutcome::Dead { error } => ("DEAD", None, Some(error.as_str()), None),
+                };
+                update.execute(params![
+                    result.delivery_id.to_string(),
+                    status,
+                    next,
+                    error,
+                    delivered
+                ])?;
+            }
+        }
+        tx.commit()
+    }
+
+    /// Makes every in-flight delivery due now. Used at startup, when no claim can still be in progress.
+    pub fn release_claims(&self, now: DateTime<Utc>) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE webhook_deliveries SET status = 'PENDING', next_attempt_at = ?1 WHERE status = 'IN_FLIGHT'",
+            [timestamp(now)],
+        )
     }
 }
 
@@ -265,6 +449,28 @@ where
     let text: String = row.get(index)?;
     text.parse()
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e)))
+}
+
+const EVENT_COLUMNS: &str = "e.event_id, e.sequence, e.event_type, e.schema_version, e.source, e.simulation_id, \
+                             e.aggregate_id, e.correlation_id, e.occurred_at, e.payload";
+
+/// Reads the [`EVENT_COLUMNS`] starting at column `at`.
+fn event_row(row: &Row<'_>, at: usize) -> rusqlite::Result<EventEnvelope> {
+    let payload: String = row.get(at + 9)?;
+    Ok(EventEnvelope {
+        event_id: parsed(row, at)?,
+        sequence: from_sql(row, at + 1)?,
+        event_type: row.get(at + 2)?,
+        schema_version: row.get(at + 3)?,
+        source: row.get(at + 4)?,
+        simulation_id: row.get(at + 5)?,
+        aggregate_id: row.get(at + 6)?,
+        correlation_id: row.get(at + 7)?,
+        occurred_at: parsed(row, at + 8)?,
+        payload: serde_json::from_str(&payload).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(at + 9, Type::Text, Box::new(e))
+        })?,
+    })
 }
 
 fn instrument_row(row: &Row<'_>) -> rusqlite::Result<Instrument> {

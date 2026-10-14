@@ -1,7 +1,7 @@
 # exchange-simulator
 
 A lightweight stock exchange for integration and performance testing. It does real price-time matching over integer
-ticks and keeps SQLite as the authoritative store. Durable trade webhooks are planned. Design:
+ticks, keeps SQLite as the authoritative store, and delivers canonical events through durable, retried webhooks. Design:
 [`rust_exchange_simulator_plan.md`](rust_exchange_simulator_plan.md) and
 [`milestone_1_domain_schema_events.md`](milestone_1_domain_schema_events.md), whose "Implementation progress" section
 tracks what is built.
@@ -22,6 +22,12 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `server.bind` | `127.0.0.1:8080` | Listen address (`0.0.0.0:8080` in the image) |
 | `exchange.identifier_policy` | `strict` | `strict` checks MIC/ISIN/CUSIP check digits; `permissive` checks lengths only |
 | `exchange.command_queue_capacity` | `10000` | Commands waiting for the exchange thread; when full, requests get `503 overloaded` |
+| `events.simulation_id` | unset | Stamped on every event as `simulationId` |
+| `webhooks.poll_interval_ms` | `250` | How often due deliveries (retries) are looked for; new events are sent at once |
+| `webhooks.batch_size` / `concurrency` | `100` / `16` | Deliveries claimed per round / concurrent requests |
+| `webhooks.request_timeout_ms` | `5000` | Per request; a timeout is a failed attempt |
+| `webhooks.max_attempts` | `10` | Attempts in total; then the delivery is dead-lettered (`DEAD`) |
+| `webhooks.initial_backoff_ms` / `max_backoff_ms` | `500` / `300000` | Exponential backoff between attempts, with jitter |
 | `database.path` | `data/exchange.db` | SQLite file (WAL mode) |
 | `database.busy_timeout_ms` | `5000` | SQLite busy timeout |
 | `logging.filter` / `logging.format` | `info` / `pretty` | Used when `RUST_LOG` is unset; `json` for structured logs |
@@ -36,8 +42,9 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
   part).
 - **Self-trade:** an incoming order that would trade against its own participant's resting order is rejected whole.
   It is recorded with status `REJECTED` and `rejectReason: "SELF_TRADE"`.
-- **Durability:** a successful response means the order, any resting orders it traded with, and its executions are
-  committed in one SQLite transaction. Books are rebuilt from SQLite on startup.
+- **Durability:** a successful response means the order, any resting orders it traded with, its executions, its events
+  and their pending webhook deliveries are committed in one SQLite transaction. Books are rebuilt from SQLite on
+  startup.
 - **Sequence:** every accepted or rejected order gets the next exchange-wide `sequence`, which is its time priority.
   Malformed requests get no sequence.
 
@@ -121,4 +128,51 @@ order. `limit` is 1–1000 (default 100). `Trade`: `executionId`, `instrumentId`
 
 `{"status": "ok", "schemaVersion": 1}`, or `503` if the database does not answer.
 
-Not yet available: `GET /api/events` and `/api/webhooks` (step 5), `GET /metrics` (step 6).
+### `GET /api/events?after=&limit=&eventType=`
+
+Canonical events with `sequence > after` (default 0), in sequence order. `limit` is 1–1000 (default 100). To replay
+everything, pass the last `sequence` you received as `after` until the result is empty. Envelope:
+
+```json
+{ "eventId": "0199…", "sequence": 3, "eventType": "TradeExecuted", "schemaVersion": 1, "source": "exchange",
+  "simulationId": null, "aggregateId": "<executionId>", "correlationId": "<incoming orderId>",
+  "occurredAt": "2026-10-14T12:00:00.000000Z", "payload": { … } }
+```
+
+Event types and payloads (`schemaVersion` 1):
+
+| Event | Aggregate | Payload |
+|---|---|---|
+| `OrderAccepted` | order | order as accepted (status `OPEN`, nothing filled) |
+| `OrderRejected` | order | order with `rejectReason` |
+| `TradeExecuted` | execution | `executionId`, `instrumentId`, `instrument` {`id`, `symbol`, `mic`, `isin`, `cusip`, `currency`}, `buyOrderId`, `sellOrderId`, `buyerId`, `sellerId`, `priceTicks`, `price`, `quantity`, `currency`, `currencyScale`, `tickSizeMinor`, `executedAt` |
+| `OrderPartiallyFilled` / `OrderFilled` | order | order after the fill; for a resting order also `executionId` |
+| `OrderCancelled` | order | order with `cancelReason`: `REQUESTED` or `MARKET_REMAINDER` |
+
+Order payloads carry `orderId`, `clientOrderId`, `instrumentId`, `participantId`, `side`, `type`, `priceTicks`, `price`,
+`quantity`, `remainingQuantity`, `filledQuantity`, `status` and `sequence`. Within one command, events come in this
+order: `OrderAccepted`, then for each fill `TradeExecuted` followed by the resting order's fill event, then the
+incoming order's fill event, then `OrderCancelled` for a market remainder. A command's events all share
+`correlationId`, the incoming (or cancelled) order's ID.
+
+### `POST /api/webhooks`
+
+`{ "url": "http://consumer:8080/trades", "eventTypes": ["TradeExecuted"] }` → `201`
+`{ "id", "url", "eventTypes", "enabled", "createdAt" }`. The URL must be `http` or `https`, and the event types must
+be ones listed above. A subscription receives events committed after it was registered; replay earlier events with
+`/api/events`.
+
+Delivery is a `POST` of the event envelope with headers `X-Event-Id`, `X-Event-Type`, `X-Event-Sequence`,
+`X-Subscription-Id` and `X-Delivery-Attempt`.
+- **Retries:** any 2xx response counts as delivered. Anything else, including a timeout or a connection error, is
+  retried with exponential backoff and jitter, up to `webhooks.max_attempts`; then the delivery is marked `DEAD`.
+- **At least once:** deliveries are durable and survive restarts, and a consumer may receive the same event more than
+  once. Deduplicate by `eventId`.
+- **Ordering:** deliveries are sent concurrently and may arrive out of order; use `sequence` for canonical order.
+- **No signing yet:** requests are not signed, so restrict subscribers to test networks.
+
+### `GET /api/webhooks`
+
+Lists the subscriptions.
+
+Not yet available: `GET /metrics` (step 6).

@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, SubsecRound, Utc};
 use uuid::Uuid;
@@ -8,7 +10,9 @@ use crate::domain::{
     IdentifierPolicy, Instrument, InstrumentError, InstrumentId, Order, OrderStatus, OrderType,
     Participant, ParticipantId, Side,
 };
+use crate::events::{self, Command};
 use crate::persistence::Store;
+use crate::webhooks::{DeliveryJob, DeliveryResult, Subscription};
 
 /// A request to place an order; the exchange assigns its ID and sequence.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +61,8 @@ pub enum ExchangeError {
     InvalidClientOrderId,
     #[error("participant ID and name must not be blank")]
     InvalidParticipant,
+    #[error("invalid webhook subscription: {0}")]
+    InvalidWebhook(String),
     #[error(transparent)]
     Instrument(#[from] InstrumentError),
     #[error(transparent)]
@@ -70,6 +76,10 @@ pub struct ExchangeOptions {
     pub identifier_policy: IdentifierPolicy,
     pub ids: Box<dyn IdGenerator + Send>,
     pub clock: Box<dyn Clock + Send>,
+    /// Stamped on every event as `simulationId`.
+    pub simulation_id: Option<String>,
+    /// Notified after a commit that created webhook deliveries, so the delivery worker need not wait for its poll.
+    pub delivery_signal: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// The persistence coordinator: owns the order books and the single SQLite writer, and serializes every command.
@@ -84,10 +94,14 @@ pub struct Exchange {
     identifier_policy: IdentifierPolicy,
     ids: Box<dyn IdGenerator + Send>,
     clock: Box<dyn Clock + Send>,
+    subscriptions: Vec<Subscription>,
+    simulation_id: Option<String>,
+    delivery_signal: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Exchange {
-    /// Loads instruments and participants and rebuilds every book from the active orders, in acceptance sequence.
+    /// Loads instruments, participants and webhook subscriptions, rebuilds every book from the active orders in
+    /// acceptance sequence, and releases webhook delivery claims left by a previous process.
     pub fn recover(store: Store, options: ExchangeOptions) -> Result<Self, ExchangeError> {
         let mut books: HashMap<_, _> = store
             .instruments(&Default::default())?
@@ -102,6 +116,14 @@ impl Exchange {
         }
         let participants = store.participants()?.into_iter().map(|p| p.id).collect();
         let last_sequence = store.max_sequence()?;
+        let subscriptions = store.subscriptions()?;
+        let released = store.release_claims(options.clock.now())?;
+        if released > 0 {
+            tracing::info!(
+                released,
+                "released webhook deliveries claimed before restart"
+            );
+        }
         Ok(Self {
             store,
             books,
@@ -110,6 +132,9 @@ impl Exchange {
             identifier_policy: options.identifier_policy,
             ids: options.ids,
             clock: options.clock,
+            subscriptions,
+            simulation_id: options.simulation_id,
+            delivery_signal: options.delivery_signal,
         })
     }
 
@@ -198,7 +223,7 @@ impl Exchange {
                 ids: self.ids.as_mut(),
             },
         )?;
-        self.commit_and_apply(update, now)
+        self.commit_and_apply(Command::Submit, update, now)
     }
 
     /// Cancels the remaining quantity of an active order.
@@ -218,7 +243,7 @@ impl Exchange {
         };
         let update = book.plan_cancel(order_id)?;
         let now = self.now();
-        match self.commit_and_apply(update, now)? {
+        match self.commit_and_apply(Command::Cancel, update, now)? {
             SubmitOutcome::Processed(update) => Ok(update),
             SubmitOutcome::Duplicate(_) => {
                 unreachable!("commit_and_apply only reports processed updates")
@@ -239,12 +264,80 @@ impl Exchange {
         self.last_sequence
     }
 
+    /// Registers a webhook endpoint for the given event types. It receives events committed from now on; earlier
+    /// events can be replayed from the events API.
+    pub fn register_webhook(
+        &mut self,
+        url: String,
+        event_types: Vec<String>,
+    ) -> Result<Subscription, ExchangeError> {
+        let parsed = reqwest::Url::parse(&url)
+            .map_err(|e| ExchangeError::InvalidWebhook(format!("url: {e}")))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(ExchangeError::InvalidWebhook(
+                "url must be http or https".into(),
+            ));
+        }
+        if event_types.is_empty() {
+            return Err(ExchangeError::InvalidWebhook(
+                "eventTypes must not be empty".into(),
+            ));
+        }
+        if let Some(unknown) = event_types
+            .iter()
+            .find(|t| !events::EVENT_TYPES.contains(&t.as_str()))
+        {
+            return Err(ExchangeError::InvalidWebhook(format!(
+                "unknown event type {unknown}"
+            )));
+        }
+        let mut event_types = event_types;
+        event_types.sort();
+        event_types.dedup();
+        let subscription = Subscription {
+            id: self.ids.next_id(),
+            url,
+            event_types,
+            enabled: true,
+            created_at: self.now(),
+        };
+        self.store.insert_subscription(&subscription)?;
+        self.subscriptions.push(subscription.clone());
+        Ok(subscription)
+    }
+
+    /// Claims up to `limit` due webhook deliveries, leased for `lease`.
+    pub fn claim_deliveries(
+        &mut self,
+        limit: u32,
+        lease: Duration,
+    ) -> Result<Vec<DeliveryJob>, ExchangeError> {
+        let now = self.now();
+        let lease_until = now + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
+        Ok(self.store.claim_deliveries(now, lease_until, limit)?)
+    }
+
+    pub fn record_deliveries(&mut self, results: &[DeliveryResult]) -> Result<(), ExchangeError> {
+        let now = self.now();
+        Ok(self.store.record_deliveries(results, now)?)
+    }
+
     fn commit_and_apply(
         &mut self,
+        command: Command,
         update: BookUpdate,
         now: DateTime<Utc>,
     ) -> Result<SubmitOutcome, ExchangeError> {
-        self.store.commit(&update, now)?;
+        let instrument = self.books[&update.order.instrument_id].instrument();
+        let new_events = events::for_update(command, &update, instrument, now, self.ids.as_mut());
+        self.store.commit(
+            &update,
+            &new_events,
+            &self.subscriptions,
+            self.simulation_id.as_deref(),
+            self.ids.as_mut(),
+            now,
+        )?;
         let book = self
             .books
             .get_mut(&update.order.instrument_id)
@@ -252,6 +345,12 @@ impl Exchange {
         book.apply(&update)
             .expect("nothing else touched the book between plan and apply");
         self.last_sequence = self.last_sequence.max(update.order.sequence);
+        let delivers = new_events
+            .iter()
+            .any(|e| self.subscriptions.iter().any(|s| s.wants(e.event_type)));
+        if delivers && let Some(signal) = &self.delivery_signal {
+            signal.notify_one();
+        }
         Ok(SubmitOutcome::Processed(update))
     }
 

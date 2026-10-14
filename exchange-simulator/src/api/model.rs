@@ -309,3 +309,20 @@ impl From<BookSnapshot> for BookView {
         }
     }
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EventQuery {
+    /// Return events with a sequence greater than this; default 0 (from the beginning).
+    pub after: Option<u64>,
+    /// 1 to 1000; default 100.
+    pub limit: Option<u32>,
+    pub event_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebhookRequest {
+    pub url: String,
+    pub event_types: Vec<String>,
+}

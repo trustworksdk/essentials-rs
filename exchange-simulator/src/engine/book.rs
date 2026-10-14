@@ -64,7 +64,7 @@ pub struct BookUpdate {
     base_version: u64,
     /// The order the command was about (the incoming order, or the cancelled one), in its resulting state.
     pub order: Order,
-    /// Resting orders that traded, in match order, in their resulting state.
+    /// Resting orders that traded, in their resulting state: one per execution, in the same (match) order.
     pub fills: Vec<Order>,
     /// Executions in match order; empty unless the incoming order traded.
     pub executions: Vec<Execution>,

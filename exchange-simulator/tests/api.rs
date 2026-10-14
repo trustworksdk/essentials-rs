@@ -1,152 +1,15 @@
 //! The REST API end to end over the real router, exchange thread and a SQLite file.
 
-use std::path::PathBuf;
+mod common;
 
-use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
-use exchange_simulator::app::App;
-use exchange_simulator::config::{
-    Config, DatabaseConfig, ExchangeConfig, LogFormat, LoggingConfig, ServerConfig,
-};
-use exchange_simulator::domain::IdentifierPolicy;
-use http_body_util::BodyExt;
+use axum::http::StatusCode;
+use common::{TestApp, acme};
 use serde_json::{Value, json};
-use tower::ServiceExt;
 use uuid::Uuid;
-
-struct TestApp {
-    app: Option<App>,
-    dir: PathBuf,
-}
-
-impl TestApp {
-    fn start() -> Self {
-        let dir = std::env::temp_dir().join(format!("exchange-sim-api-{}", Uuid::now_v7()));
-        let mut test = Self { app: None, dir };
-        test.restart();
-        test
-    }
-
-    fn config(&self) -> Config {
-        Config {
-            server: ServerConfig {
-                bind: "127.0.0.1:0".into(),
-            },
-            exchange: ExchangeConfig {
-                identifier_policy: IdentifierPolicy::Strict,
-                command_queue_capacity: 1024,
-            },
-            database: DatabaseConfig {
-                path: self.dir.join("exchange.db").to_string_lossy().into_owned(),
-                busy_timeout_ms: 5000,
-            },
-            logging: LoggingConfig {
-                filter: "warn".into(),
-                format: LogFormat::Pretty,
-            },
-        }
-    }
-
-    /// Stops the service (draining the exchange thread) and starts a new one on the same database.
-    fn restart(&mut self) {
-        if let Some(app) = self.app.take() {
-            app.shutdown();
-        }
-        self.app = Some(App::start(&self.config()).unwrap());
-    }
-
-    async fn call(&self, method: Method, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
-        let request = Request::builder().method(method).uri(uri);
-        let request = match body {
-            Some(body) => request
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string())),
-            None => request.body(Body::empty()),
-        }
-        .unwrap();
-        let response = self
-            .app
-            .as_ref()
-            .unwrap()
-            .router
-            .clone()
-            .oneshot(request)
-            .await
-            .unwrap();
-        let status = response.status();
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let body = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap()
-        };
-        (status, body)
-    }
-
-    async fn get(&self, uri: &str) -> (StatusCode, Value) {
-        self.call(Method::GET, uri, None).await
-    }
-
-    async fn post(&self, uri: &str, body: Value) -> (StatusCode, Value) {
-        self.call(Method::POST, uri, Some(body)).await
-    }
-
-    async fn delete(&self, uri: &str) -> (StatusCode, Value) {
-        self.call(Method::DELETE, uri, None).await
-    }
-
-    /// ACME (DKK, scale 2, tick 1) and participants A to D.
-    async fn seed(&self) {
-        let (status, body) = self.post("/api/instruments", acme()).await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        for id in ["A", "B", "C", "D"] {
-            let (status, _) = self
-                .post(
-                    "/api/participants",
-                    json!({ "id": id, "name": format!("Participant {id}") }),
-                )
-                .await;
-            assert_eq!(status, StatusCode::CREATED);
-        }
-    }
-
-    async fn order(
-        &self,
-        participant: &str,
-        side: &str,
-        price_ticks: Option<i64>,
-        quantity: u64,
-    ) -> (StatusCode, Value) {
-        let order_type = if price_ticks.is_some() {
-            "LIMIT"
-        } else {
-            "MARKET"
-        };
-        self.post(
-            "/api/orders",
-            json!({ "instrumentId": "ACME", "participantId": participant, "side": side, "type": order_type,
-                    "priceTicks": price_ticks, "quantity": quantity }),
-        )
-        .await
-    }
-}
-
-impl Drop for TestApp {
-    fn drop(&mut self) {
-        if let Some(app) = self.app.take() {
-            app.shutdown();
-        }
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-fn acme() -> Value {
-    json!({ "id": "ACME", "symbol": "ACME", "mic": "XCSE", "currency": "DKK", "currencyScale": 2, "tickSizeMinor": 1 })
-}
 
 #[tokio::test]
 async fn health_reports_ok_with_schema_version() {
-    let app = TestApp::start();
+    let app = TestApp::start().await;
     assert_eq!(
         app.get("/health").await,
         (
@@ -158,7 +21,7 @@ async fn health_reports_ok_with_schema_version() {
 
 #[tokio::test]
 async fn milestone_acceptance_over_http_including_restart() {
-    let mut app = TestApp::start();
+    let mut app = TestApp::start().await;
     app.seed().await;
 
     let (status, sell) = app.order("A", "SELL", Some(10025), 200).await;
@@ -211,7 +74,7 @@ async fn milestone_acceptance_over_http_including_restart() {
     assert_eq!(trades.as_array().unwrap().len(), 1);
     assert_eq!(trades[0]["executionId"], execution["executionId"]);
 
-    app.restart();
+    app.restart().await;
     assert_eq!(
         app.get("/api/orderbooks/ACME").await,
         (StatusCode::OK, expected_book),
@@ -226,7 +89,7 @@ async fn milestone_acceptance_over_http_including_restart() {
 
 #[tokio::test]
 async fn order_requests_are_validated() {
-    let app = TestApp::start();
+    let app = TestApp::start().await;
     app.seed().await;
     let error = |(status, body): (StatusCode, Value)| {
         (
@@ -281,7 +144,7 @@ async fn order_requests_are_validated() {
 
 #[tokio::test]
 async fn exchange_outcomes_market_self_trade_and_client_order_ids() {
-    let app = TestApp::start();
+    let app = TestApp::start().await;
     app.seed().await;
     app.order("A", "SELL", Some(10000), 10).await;
 
@@ -334,7 +197,7 @@ async fn exchange_outcomes_market_self_trade_and_client_order_ids() {
 
 #[tokio::test]
 async fn cancel_and_order_lookup_errors() {
-    let app = TestApp::start();
+    let app = TestApp::start().await;
     app.seed().await;
     let (_, placed) = app.order("A", "BUY", Some(9900), 10).await;
     let id = placed["order"]["orderId"].as_str().unwrap().to_string();
@@ -379,7 +242,7 @@ async fn cancel_and_order_lookup_errors() {
 
 #[tokio::test]
 async fn instruments_and_participants_registration_and_lookup() {
-    let app = TestApp::start();
+    let app = TestApp::start().await;
     app.seed().await;
     let listing = |id: &str, mic: &str, isin: Option<&str>, cusip: Option<&str>| {
         json!({ "id": id, "symbol": "ACME", "mic": mic, "isin": isin, "cusip": cusip, "currency": "USD",
@@ -467,7 +330,7 @@ async fn instruments_and_participants_registration_and_lookup() {
 
 #[tokio::test]
 async fn trades_can_be_filtered() {
-    let app = TestApp::start();
+    let app = TestApp::start().await;
     app.seed().await;
     let (_, sell) = app.order("A", "SELL", Some(10000), 30).await;
     app.order("B", "BUY", Some(10000), 10).await;
@@ -513,7 +376,7 @@ async fn trades_can_be_filtered() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_submissions_are_serialized_without_loss() {
-    let app = std::sync::Arc::new(TestApp::start());
+    let app = std::sync::Arc::new(TestApp::start().await);
     app.seed().await;
     let tasks: Vec<_> = (0..200)
         .map(|i| {

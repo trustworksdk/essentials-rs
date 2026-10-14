@@ -1,21 +1,27 @@
-//! Assembles the service from configuration: database, recovered exchange, exchange thread and HTTP router.
+//! Assembles the service from configuration: database, recovered exchange, exchange thread, webhook delivery worker
+//! and HTTP router.
 
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Context;
 use axum::Router;
+use tokio::sync::{Notify, watch};
 
 use crate::api::{self, AppState};
 use crate::config::Config;
 use crate::engine::{Dispatcher, Exchange, ExchangeOptions, SystemClock, UuidV7Ids};
 use crate::persistence::{self, Store};
+use crate::webhooks::DeliveryWorker;
 
-/// A started service. Serve [`App::router`]; once serving ends, drop the router and call [`App::shutdown`] so the
-/// exchange thread finishes the commands it already accepted.
+/// A started service. Serve [`App::router`]; once serving ends, call [`App::shutdown`] so the delivery worker stops
+/// and the exchange thread finishes the commands it already accepted. Must be started inside a Tokio runtime.
 pub struct App {
     pub router: Router,
     exchange_thread: JoinHandle<()>,
+    delivery_worker: tokio::task::JoinHandle<()>,
+    stop_delivery: watch::Sender<bool>,
 }
 
 impl App {
@@ -24,12 +30,15 @@ impl App {
         let path = &config.database.path;
         let writer = persistence::open(path, busy_timeout)
             .with_context(|| format!("opening database {path}"))?;
+        let delivery_signal = Arc::new(Notify::new());
         let exchange = Exchange::recover(
             Store::new(writer),
             ExchangeOptions {
                 identifier_policy: config.exchange.identifier_policy,
                 ids: Box::new(UuidV7Ids),
                 clock: Box::new(SystemClock),
+                simulation_id: config.events.simulation_id.clone(),
+                delivery_signal: Some(delivery_signal.clone()),
             },
         )
         .context("recovering order books")?;
@@ -52,17 +61,35 @@ impl App {
         let (dispatcher, exchange_thread) =
             Dispatcher::spawn(exchange, config.exchange.command_queue_capacity)
                 .context("starting exchange thread")?;
+        let (stop_delivery, stopped) = watch::channel(false);
+        let delivery_worker = DeliveryWorker::spawn(
+            dispatcher.clone(),
+            delivery_signal,
+            config.webhooks.worker(),
+            stopped,
+        );
         let router = api::router(AppState::new(dispatcher, Store::new(reader)));
         Ok(Self {
             router,
             exchange_thread,
+            delivery_worker,
+            stop_delivery,
         })
     }
 
-    /// Drops the router (the last command senders) and waits for the exchange thread to drain its queue.
-    pub fn shutdown(self) {
+    /// Stops the delivery worker (after its current batch), drops the router (the last command senders) and waits for
+    /// the exchange thread to drain its queue.
+    pub async fn shutdown(self) {
+        let _ = self.stop_delivery.send(true);
+        if let Err(error) = self.delivery_worker.await {
+            tracing::error!(%error, "webhook delivery worker failed");
+        }
         drop(self.router);
-        if self.exchange_thread.join().is_err() {
+        let thread = self.exchange_thread;
+        if !matches!(
+            tokio::task::spawn_blocking(move || thread.join()).await,
+            Ok(Ok(()))
+        ) {
             tracing::error!("exchange thread panicked");
         }
     }

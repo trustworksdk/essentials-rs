@@ -20,7 +20,9 @@ pub use model::*;
 
 use crate::domain::{Instrument, InstrumentId, Participant};
 use crate::engine::{Dispatcher, SubmitOutcome};
+use crate::events::EventEnvelope;
 use crate::persistence::{ExecutionFilter, InstrumentFilter, Store};
+use crate::webhooks::Subscription;
 
 /// Shared handler state.
 #[derive(Clone)]
@@ -67,6 +69,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/orders/{id}", get(get_order).delete(cancel_order))
         .route("/api/orderbooks/{instrument_id}", get(order_book))
         .route("/api/trades", get(list_trades))
+        .route("/api/events", get(list_events))
+        .route("/api/webhooks", post(register_webhook).get(list_webhooks))
         .with_state(state)
 }
 
@@ -236,4 +240,38 @@ async fn list_trades(
             .map(|e| TradeView::new(e, &instruments[&e.instrument_id]))
             .collect(),
     ))
+}
+
+/// Cursor-based replay of canonical events: those with `sequence > after`, in sequence order.
+async fn list_events(
+    State(state): State<AppState>,
+    query: Result<Query<EventQuery>, QueryRejection>,
+) -> Result<Json<Vec<EventEnvelope>>, ApiError> {
+    let Query(q) = query?;
+    let limit = q.limit.unwrap_or(100);
+    if !(1..=1000).contains(&limit) {
+        return Err(ApiError::bad_request("limit must be between 1 and 1000"));
+    }
+    let after = q.after.unwrap_or(0);
+    Ok(Json(
+        state
+            .read(move |store| store.events(after, limit, q.event_type.as_deref()))
+            .await?,
+    ))
+}
+
+async fn register_webhook(
+    State(state): State<AppState>,
+    body: Result<Json<WebhookRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<Subscription>), ApiError> {
+    let Json(body) = body?;
+    let subscription = state
+        .dispatcher
+        .register_webhook(body.url, body.event_types)
+        .await?;
+    Ok((StatusCode::CREATED, Json(subscription)))
+}
+
+async fn list_webhooks(State(state): State<AppState>) -> Result<Json<Vec<Subscription>>, ApiError> {
+    Ok(Json(state.read(|store| store.subscriptions()).await?))
 }

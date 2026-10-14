@@ -81,9 +81,10 @@ impl From<ExchangeError> for ApiError {
                 (StatusCode::CONFLICT, "already_exists")
             }
             E::ClientOrderIdConflict { .. } => (StatusCode::CONFLICT, "client_order_id_conflict"),
-            E::InvalidClientOrderId | E::InvalidParticipant | E::Instrument(_) => {
-                (StatusCode::BAD_REQUEST, "invalid_request")
-            }
+            E::InvalidClientOrderId
+            | E::InvalidParticipant
+            | E::InvalidWebhook(_)
+            | E::Instrument(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             E::Book(BookError::Invalid(_)) => (StatusCode::BAD_REQUEST, "invalid_order"),
             E::Book(_) | E::Storage(_) => return Self::internal(error),
         };

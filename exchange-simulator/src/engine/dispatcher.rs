@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use super::{BookUpdate, Exchange, ExchangeError, Level, SubmitOrder, SubmitOutcome};
 use crate::domain::{Instrument, InstrumentId, Participant, Side};
+use crate::webhooks::{DeliveryJob, DeliveryResult, Subscription};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
@@ -37,6 +38,9 @@ enum Request {
     Submit(SubmitOrder, Reply<(SubmitOutcome, Instrument)>),
     Cancel(Uuid, Reply<(BookUpdate, Instrument)>),
     Snapshot(InstrumentId, oneshot::Sender<Option<BookSnapshot>>),
+    RegisterWebhook(String, Vec<String>, Reply<Subscription>),
+    ClaimDeliveries(u32, std::time::Duration, Reply<Vec<DeliveryJob>>),
+    RecordDeliveries(Vec<DeliveryResult>, Reply<()>),
 }
 
 /// Async handle to the single exchange thread. Commands are queued on a bounded channel and executed one at a time
@@ -94,6 +98,33 @@ impl Dispatcher {
         response.await.map_err(|_| DispatchError::Stopped)
     }
 
+    pub async fn register_webhook(
+        &self,
+        url: String,
+        event_types: Vec<String>,
+    ) -> Result<Subscription, DispatchError> {
+        self.call(|reply| Request::RegisterWebhook(url, event_types, reply))
+            .await
+    }
+
+    /// Claims up to `limit` due webhook deliveries, leased for `lease`.
+    pub async fn claim_deliveries(
+        &self,
+        limit: u32,
+        lease: std::time::Duration,
+    ) -> Result<Vec<DeliveryJob>, DispatchError> {
+        self.call(|reply| Request::ClaimDeliveries(limit, lease, reply))
+            .await
+    }
+
+    pub async fn record_deliveries(
+        &self,
+        results: Vec<DeliveryResult>,
+    ) -> Result<(), DispatchError> {
+        self.call(|reply| Request::RecordDeliveries(results, reply))
+            .await
+    }
+
     async fn call<T>(&self, request: impl FnOnce(Reply<T>) -> Request) -> Result<T, DispatchError> {
         let (reply, response) = oneshot::channel();
         self.enqueue(request(reply))?;
@@ -144,6 +175,15 @@ fn run(mut exchange: Exchange, mut rx: mpsc::Receiver<Request>) {
                     (update, instrument)
                 });
                 let _ = reply.send(result);
+            }
+            Request::RegisterWebhook(url, event_types, reply) => {
+                let _ = reply.send(exchange.register_webhook(url, event_types));
+            }
+            Request::ClaimDeliveries(limit, lease, reply) => {
+                let _ = reply.send(exchange.claim_deliveries(limit, lease));
+            }
+            Request::RecordDeliveries(results, reply) => {
+                let _ = reply.send(exchange.record_deliveries(&results));
             }
             Request::Snapshot(instrument_id, reply) => {
                 let _ = reply.send(exchange.book(&instrument_id).map(|book| BookSnapshot {

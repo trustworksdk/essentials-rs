@@ -1,0 +1,220 @@
+//! Canonical event contracts. Events are derived from a committed book update, written in the same transaction as the
+//! orders and executions they describe, and never change afterwards. The global `sequence` assigned by SQLite is the
+//! replay cursor.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::domain::{Execution, Instrument, Order, OrderStatus, OrderType};
+use crate::engine::{BookUpdate, IdGenerator};
+
+/// Version of the payload schemas below. Bump on breaking payload changes.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// The component that produced the event. Settlement simulation will add its own source.
+pub const EXCHANGE_SOURCE: &str = "exchange";
+
+pub const ORDER_ACCEPTED: &str = "OrderAccepted";
+pub const ORDER_REJECTED: &str = "OrderRejected";
+pub const ORDER_PARTIALLY_FILLED: &str = "OrderPartiallyFilled";
+pub const ORDER_FILLED: &str = "OrderFilled";
+pub const ORDER_CANCELLED: &str = "OrderCancelled";
+pub const TRADE_EXECUTED: &str = "TradeExecuted";
+
+/// Every event type the exchange emits, for validating subscriptions.
+pub const EVENT_TYPES: [&str; 6] = [
+    ORDER_ACCEPTED,
+    ORDER_REJECTED,
+    ORDER_PARTIALLY_FILLED,
+    ORDER_FILLED,
+    ORDER_CANCELLED,
+    TRADE_EXECUTED,
+];
+
+/// Why an order was cancelled, carried in `OrderCancelled` payloads.
+pub const CANCEL_MARKET_REMAINDER: &str = "MARKET_REMAINDER";
+pub const CANCEL_REQUESTED: &str = "REQUESTED";
+
+/// An event before storage has assigned its sequence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewEvent {
+    pub event_id: Uuid,
+    pub event_type: &'static str,
+    pub aggregate_id: String,
+    pub correlation_id: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+    pub payload: Value,
+}
+
+/// The canonical envelope, as stored and as delivered to webhooks and the replay API.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventEnvelope {
+    pub event_id: Uuid,
+    pub sequence: u64,
+    pub event_type: String,
+    pub schema_version: u32,
+    pub source: String,
+    pub simulation_id: Option<String>,
+    pub aggregate_id: String,
+    pub correlation_id: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+    pub payload: Value,
+}
+
+/// Whether a command was a new order or a cancellation, which decides how a `CANCELLED` result is explained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    Submit,
+    Cancel,
+}
+
+/// The events a committed update produces, in this order:
+///
+/// - submit, rejected: `OrderRejected`
+/// - submit: `OrderAccepted`, then for each execution `TradeExecuted` followed by the resting order's
+///   `OrderPartiallyFilled`/`OrderFilled`, then the incoming order's own fill event if it traded, then `OrderCancelled`
+///   if a market remainder was cancelled
+/// - cancel: `OrderCancelled`
+///
+/// Every event carries the subject order's ID as correlation ID.
+pub fn for_update(
+    command: Command,
+    update: &BookUpdate,
+    instrument: &Instrument,
+    now: DateTime<Utc>,
+    ids: &mut dyn IdGenerator,
+) -> Vec<NewEvent> {
+    let order = &update.order;
+    let correlation_id = Some(order.id.to_string());
+    let mut events = Vec::new();
+    let mut push = |event_type: &'static str, aggregate_id: String, payload: Value| {
+        events.push(NewEvent {
+            event_id: ids.next_id(),
+            event_type,
+            aggregate_id,
+            correlation_id: correlation_id.clone(),
+            occurred_at: now,
+            payload,
+        });
+    };
+
+    if command == Command::Cancel {
+        push(
+            ORDER_CANCELLED,
+            order.id.to_string(),
+            order_payload(order, instrument, Some(CANCEL_REQUESTED), None),
+        );
+        return events;
+    }
+    if let Some(reason) = update.rejection {
+        let mut payload = order_payload(order, instrument, None, None);
+        payload["rejectReason"] = json!(reason.code());
+        push(ORDER_REJECTED, order.id.to_string(), payload);
+        return events;
+    }
+
+    let mut accepted = order.clone();
+    accepted.remaining_quantity = accepted.quantity;
+    accepted.status = OrderStatus::Open;
+    push(
+        ORDER_ACCEPTED,
+        order.id.to_string(),
+        order_payload(&accepted, instrument, None, None),
+    );
+    for (execution, maker) in update.executions.iter().zip(&update.fills) {
+        push(
+            TRADE_EXECUTED,
+            execution.id.to_string(),
+            trade_payload(execution, instrument),
+        );
+        push(
+            fill_event(maker),
+            maker.id.to_string(),
+            order_payload(maker, instrument, None, Some(execution.id)),
+        );
+    }
+    if order.filled_quantity() > 0 {
+        push(
+            fill_event(order),
+            order.id.to_string(),
+            order_payload(order, instrument, None, None),
+        );
+    }
+    if order.status == OrderStatus::Cancelled && order.order_type == OrderType::Market {
+        push(
+            ORDER_CANCELLED,
+            order.id.to_string(),
+            order_payload(order, instrument, Some(CANCEL_MARKET_REMAINDER), None),
+        );
+    }
+    events
+}
+
+fn fill_event(order: &Order) -> &'static str {
+    if order.remaining_quantity == 0 {
+        ORDER_FILLED
+    } else {
+        ORDER_PARTIALLY_FILLED
+    }
+}
+
+fn order_payload(
+    order: &Order,
+    instrument: &Instrument,
+    cancel_reason: Option<&str>,
+    execution_id: Option<Uuid>,
+) -> Value {
+    let mut payload = json!({
+        "orderId": order.id,
+        "clientOrderId": order.client_order_id,
+        "instrumentId": order.instrument_id,
+        "participantId": order.participant_id,
+        "side": order.side,
+        "type": order.order_type,
+        "priceTicks": order.limit_price_ticks,
+        "price": order.limit_price_ticks.map(|t| instrument.ticks_to_price(t)),
+        "quantity": order.quantity,
+        "remainingQuantity": order.remaining_quantity,
+        "filledQuantity": order.filled_quantity(),
+        "status": order.status,
+        "sequence": order.sequence,
+    });
+    if let Some(reason) = cancel_reason {
+        payload["cancelReason"] = json!(reason);
+    }
+    if let Some(execution_id) = execution_id {
+        payload["executionId"] = json!(execution_id);
+    }
+    payload
+}
+
+/// `TradeExecuted` payload: everything a settlement consumer needs, including an identifier snapshot of the
+/// instrument as it was at execution time.
+fn trade_payload(execution: &Execution, instrument: &Instrument) -> Value {
+    json!({
+        "executionId": execution.id,
+        "instrumentId": execution.instrument_id,
+        "instrument": {
+            "id": instrument.id,
+            "symbol": instrument.symbol,
+            "mic": instrument.mic,
+            "isin": instrument.isin,
+            "cusip": instrument.cusip,
+            "currency": instrument.currency,
+        },
+        "buyOrderId": execution.buy_order_id,
+        "sellOrderId": execution.sell_order_id,
+        "buyerId": execution.buyer_id,
+        "sellerId": execution.seller_id,
+        "priceTicks": execution.price_ticks,
+        "price": instrument.ticks_to_price(execution.price_ticks),
+        "quantity": execution.quantity,
+        "currency": instrument.currency,
+        "currencyScale": instrument.currency_scale,
+        "tickSizeMinor": instrument.tick_size_minor,
+        "executedAt": execution.executed_at,
+    })
+}

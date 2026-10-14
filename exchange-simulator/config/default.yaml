@@ -8,6 +8,19 @@ exchange:
   identifier_policy: "strict"
   # Commands waiting for the exchange thread. When full, requests fail fast with 503 instead of queueing unbounded.
   command_queue_capacity: 10000
+# events.simulation_id: optional simulation run ID stamped on every event as simulationId, e.g.
+# EXCHANGE__EVENTS__SIMULATION_ID=run-1. Unset by default.
+events: {}
+webhooks:
+  # Look for due deliveries this often when no new event signalled them (this is when retries are picked up).
+  poll_interval_ms: 250
+  batch_size: 100
+  concurrency: 16
+  request_timeout_ms: 5000
+  # Attempts in total, the first included; then the delivery is dead-lettered (status DEAD).
+  max_attempts: 10
+  initial_backoff_ms: 500
+  max_backoff_ms: 300000
 database:
   path: "data/exchange.db"
   busy_timeout_ms: 5000
