@@ -339,10 +339,12 @@ cargo test -p exchange-simulator                          # unit, integration an
 cargo test -p exchange-simulator --features e2e --test e2e   # the acceptance test in containers (builds the image)
 ```
 
-`tests/e2e.rs` runs the Milestone 1 acceptance scenario against the real image, with MockServer as the settlement
-consumer on one Docker network. It covers registration, the 200/150 trade, the webhook with a stable event ID, a
-`docker restart` that restores the book without repeating events, and a consumer outage whose retries create no
-trades.
+`tests/e2e.rs` runs both acceptance scenarios against the real image, with MockServer on one Docker network:
+- **Milestone 1:** registration, the 200/150 trade, the webhook with a stable event ID, a `docker restart` that
+  restores the book without repeating events, and a consumer outage whose retries create no trades.
+- **Milestone 2:** combined settlement mode on a virtual clock. `SettlementPending` reaches MockServer, the trade
+  survives a `docker restart` mid-lifecycle, a clock advance to T+2 settles it exactly once, and an external report
+  is published apart from the simulator's events.
 
 ## Benchmarks
 

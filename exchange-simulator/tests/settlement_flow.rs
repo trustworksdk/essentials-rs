@@ -315,3 +315,208 @@ async fn an_invalid_settlement_policy_stops_startup() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+async fn set_clock(app: &TestApp, to: &str) {
+    let (status, body) = app.post("/test/clock/set", json!({ "to": to })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn settlement_happens_exactly_when_the_clock_reaches_the_date_and_skips_weekends() {
+    // Thursday 2030-01-10: T+2 is Monday 2030-01-14.
+    let mut app = TestApp::start_with(simulated(|c| {
+        c.clock.start = Some("2030-01-10T15:00:00Z".parse().unwrap())
+    }))
+    .await;
+    app.seed().await;
+    trade(&app).await;
+    let pending = wait_for(&app, "SettlementPending", 1).await;
+    assert_eq!(
+        pending[0]["payload"]["intendedSettlementDate"],
+        "2030-01-14"
+    );
+
+    set_clock(&app, "2030-01-12T12:00:00Z").await; // Saturday
+    set_clock(&app, "2030-01-13T23:59:59Z").await; // one second before Monday
+    assert!(
+        events(&app, "SettlementCompleted").await.is_empty(),
+        "nothing settles over the weekend"
+    );
+    set_clock(&app, "2030-01-14T00:00:00Z").await;
+    let completed = events(&app, "SettlementCompleted").await;
+    assert_eq!(
+        completed.len(),
+        1,
+        "exactly at 00:00 UTC on the settlement date"
+    );
+    assert_eq!(completed[0]["occurredAt"], "2030-01-14T00:00:00Z");
+    app.stop().await;
+}
+
+#[tokio::test]
+async fn a_settled_trade_is_corrected_on_the_configured_day() {
+    let mut app = TestApp::start_with(simulated(|c| {
+        c.settlement.correct_probability = 1.0;
+        c.settlement.correction_days = 2;
+    }))
+    .await;
+    app.seed().await;
+    trade(&app).await;
+    wait_for(&app, "SettlementPending", 1).await;
+    advance(&app, 2).await; // Wednesday: settled
+    assert_eq!(events(&app, "SettlementCompleted").await.len(), 1);
+    advance(&app, 1).await; // Thursday: not yet
+    assert!(events(&app, "SettlementCorrected").await.is_empty());
+    advance(&app, 1).await; // Friday 2030-01-11: ISD + 2 business days
+    let corrected = events(&app, "SettlementCorrected").await;
+    assert_eq!(corrected.len(), 1);
+    assert_eq!(corrected[0]["occurredAt"], "2030-01-11T00:00:00Z");
+    let payload = &corrected[0]["payload"];
+    assert_eq!(payload["previousSettlementAmount"], "15037.50");
+    assert!(
+        payload["settlementAmount"] == "15036.00" || payload["settlementAmount"] == "15039.00",
+        "{payload}"
+    );
+    app.stop().await;
+}
+
+#[tokio::test]
+async fn a_restart_in_the_middle_does_not_change_the_outcome() {
+    let policy = |c: &mut Config| {
+        c.settlement.seed = 77;
+        c.settlement.fail_probability = 0.2;
+        c.settlement.delay_probability = 0.4;
+        c.settlement.correct_probability = 0.3;
+    };
+    let script = |restart: bool| async move {
+        let mut app = TestApp::start_with(simulated(policy)).await;
+        app.seed().await;
+        for i in 0..8 {
+            app.order("A", "SELL", Some(10_000 + i), 10).await;
+            app.order("B", "BUY", Some(10_000 + i), 10).await;
+        }
+        wait_for(&app, "SettlementPending", 8).await;
+        advance(&app, 2).await;
+        if restart {
+            app.restart().await;
+        }
+        advance(&app, 3).await;
+        if restart {
+            app.restart().await;
+        }
+        advance(&app, 10).await;
+        let result = lifecycle(&app).await;
+        app.stop().await;
+        result
+    };
+    let straight = script(false).await;
+    let restarted = script(true).await;
+    assert_eq!(straight, restarted);
+    assert!(
+        straight.len() > 16,
+        "the script goes past pending and settled: {}",
+        straight.len()
+    );
+}
+
+#[tokio::test]
+async fn an_external_consumer_and_the_simulator_act_on_the_same_trade() {
+    let mut app =
+        TestApp::start_with(simulated(|c| c.settlement.mode = SettlementMode::Both)).await;
+    app.seed().await;
+    // Serve the exchange on a real port, so the consumer can call back the way an external service would.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let exchange_url = format!("http://{}", listener.local_addr().unwrap());
+    let router = app.router();
+    // The extra server holds a router (and so a handle to the exchange thread); it must stop before the app can.
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    // The consumer settles every trade it hears about and reports SETTLED back with its own reference.
+    let reported = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = reported.clone();
+    let base = exchange_url.clone();
+    let consumer = axum::Router::new().route(
+        "/trades",
+        axum::routing::post(move |axum::Json(event): axum::Json<Value>| {
+            let (base, counter) = (base.clone(), counter.clone());
+            async move {
+                let execution = event["payload"]["executionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let response = reqwest::Client::new()
+                    .post(format!("{base}/api/settlements/{execution}/outcomes"))
+                    .json(
+                        &json!({ "status": "SETTLED", "reference": format!("ext-{execution}"),
+                                   "details": { "via": "consumer" } }),
+                    )
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(response.status().is_success());
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                StatusCode::OK
+            }
+        }),
+    );
+    let consumer_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let consumer_url = format!("http://{}/trades", consumer_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(consumer_listener, consumer).await.unwrap() });
+    let (status, _) = app
+        .post(
+            "/api/webhooks",
+            json!({ "url": consumer_url, "eventTypes": ["TradeExecuted"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let execution = trade(&app).await;
+    let id = execution["executionId"].as_str().unwrap();
+    for _ in 0..300 {
+        if reported.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        reported.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the consumer reported back"
+    );
+    wait_for(&app, "SettlementPending", 1).await;
+    advance(&app, 2).await;
+
+    let detail = app.get(&format!("/api/settlements/{id}")).await.1;
+    assert_eq!(detail["simulated"]["status"], "SETTLED");
+    assert_eq!(detail["external"][0]["status"], "SETTLED");
+    assert_eq!(detail["external"][0]["reference"], format!("ext-{id}"));
+    let sources: std::collections::BTreeSet<_> = app
+        .get("/api/events?limit=1000")
+        .await
+        .1
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["aggregateId"] == id || e["correlationId"] == id)
+        .map(|e| {
+            format!(
+                "{}:{}",
+                e["source"].as_str().unwrap(),
+                e["eventType"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(
+        sources.into_iter().collect::<Vec<_>>(),
+        [
+            "exchange:TradeExecuted",
+            "external:SettlementOutcomeReported",
+            "settlement-simulator:SettlementCompleted",
+            "settlement-simulator:SettlementPending",
+        ],
+        "each source speaks for itself"
+    );
+    server.abort();
+    let _ = server.await;
+    app.stop().await;
+}

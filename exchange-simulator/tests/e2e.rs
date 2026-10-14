@@ -1,6 +1,9 @@
 //! The Milestone 1 acceptance test, fully containerized: the service image built from `Dockerfile` and MockServer as
 //! the settlement consumer on one private Docker network, a fresh database volume, and a real container restart.
 //!
+//! A second test runs the Milestone 2 settlement acceptance the same way: combined settlement mode on a virtual
+//! clock, lifecycle events and an external report delivered to MockServer, and a restart mid-lifecycle.
+//!
 //! Needs Docker. Run with `cargo test -p exchange-simulator --features e2e --test e2e`.
 
 use std::process::Stdio;
@@ -15,8 +18,14 @@ const IMAGE: &str = "exchange-simulator";
 const TAG: &str = "e2e";
 const HOOK_PATH: &str = "/settlement/trades";
 
-/// Builds the service image from the workspace root, as compose.yaml does; BuildKit's cache makes reruns quick.
+/// Builds the service image from the workspace root, as compose.yaml does, once per test run; BuildKit's cache
+/// makes reruns quick.
 fn build_image() {
+    static BUILD: std::sync::Once = std::sync::Once::new();
+    BUILD.call_once(build_image_now);
+}
+
+fn build_image_now() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
     let status = std::process::Command::new("docker")
         .args([
@@ -100,28 +109,38 @@ impl MockServer {
 
     /// Answers `POST HOOK_PATH` with `status`, replacing earlier expectations.
     async fn respond(&self, http: &Http, status: u16) {
+        self.respond_on(http, HOOK_PATH, status).await;
+    }
+
+    /// Answers `POST path` with `status`, replacing earlier expectations for that path.
+    async fn respond_on(&self, http: &Http, path: &str, status: u16) {
         http.put(
             format!("{}/mockserver/clear?type=EXPECTATIONS", self.base().await),
-            json!({ "path": HOOK_PATH }),
+            json!({ "path": path }),
         )
         .await;
         http.put(
             format!("{}/mockserver/expectation", self.base().await),
-            json!({ "httpRequest": { "method": "POST", "path": HOOK_PATH }, "httpResponse": { "statusCode": status },
+            json!({ "httpRequest": { "method": "POST", "path": path }, "httpResponse": { "statusCode": status },
                     "times": { "unlimited": true } }),
         )
         .await;
     }
 
-    /// Bodies of the webhook requests received so far, oldest first.
+    /// Bodies of the webhook requests received on `HOOK_PATH` so far, oldest first.
     async fn received(&self, http: &Http) -> Vec<Value> {
+        self.received_on(http, HOOK_PATH).await
+    }
+
+    /// Bodies of the requests received on `path` so far, oldest first.
+    async fn received_on(&self, http: &Http, path: &str) -> Vec<Value> {
         let requests = http
             .put(
                 format!(
                     "{}/mockserver/retrieve?type=REQUESTS&format=JSON",
                     self.base().await
                 ),
-                json!({ "path": HOOK_PATH }),
+                json!({ "path": path }),
             )
             .await;
         requests
@@ -369,5 +388,184 @@ async fn milestone_1_acceptance_in_containers() {
     assert_eq!(
         http.get(format!("{api}/api/orderbooks/ACME")).await["asks"],
         json!([])
+    );
+}
+
+#[tokio::test]
+async fn milestone_2_settlement_in_containers() {
+    const EVENTS_PATH: &str = "/settlement/events";
+    build_image();
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let network = format!("exsim-e2e2-{suffix}");
+    let mock_host = format!("mockserver-{suffix}");
+    let http = Http {
+        client: reqwest::Client::new(),
+    };
+    let mock = MockServer {
+        container: GenericImage::new("mockserver/mockserver", "5.15.0")
+            .with_exposed_port(1080.tcp())
+            .with_wait_for(WaitFor::message_on_stdout("started on port: 1080"))
+            .with_network(&network)
+            .with_container_name(&mock_host)
+            .start()
+            .await
+            .expect("start MockServer"),
+    };
+    mock.respond_on(&http, EVENTS_PATH, 202).await;
+
+    // Combined mode, frozen virtual clock on Monday 2030-01-07 09:00 UTC, no random failures or delays.
+    let service = GenericImage::new(IMAGE, TAG)
+        .with_exposed_port(8080.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("exchange simulator listening"))
+        .with_network(&network)
+        .with_env_var("EXCHANGE__CLOCK__MODE", "virtual")
+        .with_env_var("EXCHANGE__CLOCK__START", "2030-01-07T09:00:00Z")
+        .with_env_var("EXCHANGE__TEST_CONTROL__ENABLED", "true")
+        .with_env_var("EXCHANGE__SETTLEMENT__MODE", "both")
+        .with_env_var("EXCHANGE__SETTLEMENT__TICK_INTERVAL_MS", "50")
+        .with_env_var("EXCHANGE__SETTLEMENT__FAIL_PROBABILITY", "0")
+        .with_env_var("EXCHANGE__SETTLEMENT__DELAY_PROBABILITY", "0")
+        .start()
+        .await
+        .expect("start service container");
+    let base = async || {
+        format!(
+            "http://127.0.0.1:{}",
+            service.get_host_port_ipv4(8080).await.unwrap()
+        )
+    };
+    let api = base().await;
+    http.post(
+        format!("{api}/api/instruments"),
+        json!({ "id": "ACME", "symbol": "ACME", "mic": "XCSE", "currency": "DKK", "currencyScale": 2 }),
+    )
+    .await;
+    for id in ["participant-a", "participant-b"] {
+        http.post(
+            format!("{api}/api/participants"),
+            json!({ "id": id, "name": id }),
+        )
+        .await;
+    }
+    http.post(
+        format!("{api}/api/webhooks"),
+        json!({ "url": format!("http://{mock_host}:1080{EVENTS_PATH}"),
+                "eventTypes": ["SettlementPending", "SettlementCompleted", "SettlementOutcomeReported"] }),
+    )
+    .await;
+
+    let order = |participant: &str, side: &str, quantity: u64| {
+        json!({ "instrumentId": "ACME", "participantId": participant, "side": side, "type": "LIMIT",
+                "priceTicks": 10025, "quantity": quantity })
+    };
+    http.post(
+        format!("{api}/api/orders"),
+        order("participant-a", "SELL", 200),
+    )
+    .await;
+    let buy = http
+        .post(
+            format!("{api}/api/orders"),
+            order("participant-b", "BUY", 150),
+        )
+        .await;
+    let execution_id = buy["executions"][0]["executionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // SettlementPending reaches the subscriber, attributed to the simulator and correlated to the execution.
+    let received = eventually("SettlementPending at MockServer", async || {
+        let received = mock.received_on(&http, EVENTS_PATH).await;
+        (!received.is_empty()).then_some(received)
+    })
+    .await;
+    let pending = &received[0];
+    assert_eq!(
+        (&pending["eventType"], &pending["source"]),
+        (&json!("SettlementPending"), &json!("settlement-simulator"))
+    );
+    assert_eq!(pending["correlationId"], execution_id.as_str());
+    assert_eq!(pending["payload"]["intendedSettlementDate"], "2030-01-09");
+
+    // Restart mid-lifecycle: simulated time and the pending instruction survive.
+    let status = tokio::process::Command::new("docker")
+        .args(["restart", service.id()])
+        .stdout(Stdio::null())
+        .status()
+        .await
+        .expect("run docker restart");
+    assert!(status.success());
+    let api = base().await;
+    eventually("service after restart", async || {
+        let response = http.client.get(format!("{api}/health")).send().await.ok()?;
+        response.status().is_success().then_some(())
+    })
+    .await;
+    assert_eq!(
+        http.get(format!("{api}/test/clock")).await["now"],
+        "2030-01-07T09:00:00Z"
+    );
+
+    // T+2: advancing the clock settles the trade before the call returns.
+    let advanced = http
+        .post(format!("{api}/test/clock/advance"), json!({ "days": 2 }))
+        .await;
+    assert_eq!(advanced["now"], "2030-01-09T09:00:00Z");
+    let completed = http
+        .get(format!("{api}/api/events?eventType=SettlementCompleted"))
+        .await;
+    assert_eq!(completed.as_array().unwrap().len(), 1);
+    assert_eq!(completed[0]["occurredAt"], "2030-01-09T00:00:00Z");
+    let pendings = http
+        .get(format!("{api}/api/events?eventType=SettlementPending"))
+        .await;
+    assert_eq!(
+        pendings.as_array().unwrap().len(),
+        1,
+        "the restart did not take the trade in twice"
+    );
+
+    // An external service reports its own outcome; it is published apart from the simulator's.
+    let (status, _) = http
+        .send(
+            reqwest::Method::POST,
+            format!("{api}/api/settlements/{execution_id}/outcomes"),
+            Some(json!({ "status": "SETTLED", "reference": "csd-e2e-1" })),
+        )
+        .await;
+    assert_eq!(status, 201);
+    let all = eventually("three settlement events at MockServer", async || {
+        let received = mock.received_on(&http, EVENTS_PATH).await;
+        (received.len() >= 3).then_some(received)
+    })
+    .await;
+    let seen: std::collections::BTreeSet<_> = all
+        .iter()
+        .map(|e| {
+            format!(
+                "{}:{}",
+                e["source"].as_str().unwrap(),
+                e["eventType"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        [
+            "external:SettlementOutcomeReported",
+            "settlement-simulator:SettlementCompleted",
+            "settlement-simulator:SettlementPending",
+        ]
+    );
+    let detail = http
+        .get(format!("{api}/api/settlements/{execution_id}"))
+        .await;
+    assert_eq!(
+        (
+            &detail["simulated"]["status"],
+            &detail["external"][0]["status"]
+        ),
+        (&json!("SETTLED"), &json!("SETTLED"))
     );
 }

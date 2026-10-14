@@ -159,7 +159,7 @@ webhooks, and keeps simulator-originated and externally reported outcomes explic
 | 2.2 ✅ | Settlement domain, migration, event contracts | M | `SettlementInstruction` (execution ID, intended settlement date, status, attempt, outcome history). Statuses `PENDING → SETTLED \| FAILED \| REJECTED`, plus `DELAYED`, `CORRECTED`, `CANCELLED`. A business-day T+N calculator that skips weekends (D2: no holiday calendars for now). Events: `SettlementPending`, `SettlementCompleted`, `SettlementFailed`, `SettlementRejected`, `SettlementDelayed`, `SettlementCorrected`, `SettlementCancelled`, with schemas documented the way `TradeExecuted` is. The pure state machine and its tests come first, as matching did. |
 | 2.3 ✅ | Settlement driver and configuration | M | `settlement.mode: external \| simulated \| both` (`external` = today's behaviour). Settings: `settlement_days`, outcome probabilities, delay distribution, seed. The driver consumes trades, creates instructions, and fires due transitions when the virtual or real clock passes them. It restarts from the stored cursor and pending instructions. |
 | 2.4 ✅ | Combined mode and inbound external outcomes | S–M | Agreed (D1). `POST /api/settlements/{executionId}/outcomes` stores an external outcome (`source: external`) beside the simulated lifecycle. `GET /api/settlements/{executionId}` shows both streams side by side. |
-| 2.5 | Tests and acceptance | M | Deterministic: the same seed and the same clock moves give identical lifecycles across restarts. T+2 across a weekend. Failure, delay and correction scenarios. In combined mode, an external consumer and the simulator act on the same trade without conflict. Extend the `e2e` test to cover a simulated settlement driven by clock moves. |
+| 2.5 ✅ | Tests and acceptance | M | Deterministic: the same seed and the same clock moves give identical lifecycles across restarts. T+2 across a weekend. Failure, delay and correction scenarios. In combined mode, an external consumer and the simulator act on the same trade without conflict. Extend the `e2e` test to cover a simulated settlement driven by clock moves. |
 
 **Acceptance:** with mode `both`, the seed fixed and the virtual clock frozen, one trade gives `SettlementPending` at
 once and `SettlementCompleted` (or the seeded failure) exactly when the clock reaches T+2. Webhooks carry
@@ -306,6 +306,49 @@ duplicates the outcome.
     subscriber to `SettlementCompleted` only ever sees the simulator's verdict.
   - No state ordering is imposed on external reports.
   - In `external` mode reports are accepted too: there they are the only lifecycle record.
+
+**2.5 — tests and acceptance ✅ (2026-10-14).**
+- **Delivered**, covering the parts of the 2.5 list earlier steps had not:
+  - `tests/settlement_flow.rs` (+4):
+    - Settlement happens *exactly* when the clock reaches 00:00 UTC on the date: one second before Monday nothing
+      happens, and a Thursday trade waits over the weekend.
+    - A correction lands on the configured business day with a one-tick amount change.
+    - The same script with two restarts in the middle gives the same lifecycle as without.
+    - An external consumer receives `TradeExecuted` by webhook and reports `SETTLED` back over real HTTP while the
+      simulator settles the same trade; each source's events stay its own.
+  - `tests/e2e.rs`: `milestone_2_settlement_in_containers` runs the plan's Milestone 2 acceptance on the real image
+    with MockServer:
+    - Combined mode on a frozen virtual clock.
+    - `SettlementPending` delivered with `source: "settlement-simulator"` and the execution ID as correlation ID.
+    - A `docker restart` mid-lifecycle: the clock resumes, and the trade is not taken in again.
+    - `POST /test/clock/advance` by 2 days settles it once, at `2030-01-09T00:00:00Z`.
+    - An external report is published as `external:SettlementOutcomeReported`.
+
+    The image build now runs once per test binary (`std::sync::Once`).
+- **Found:** `App::shutdown` waits for every router clone to drop, because each holds a handle to the exchange
+  thread. A test that served the router on an extra port hung on stop until it aborted that server first. `main` is
+  unaffected, since its server finishes before shutdown. The constraint is documented at the call site.
+- **Stability:** the settlement suites passed three runs in a row and the e2e suite two, with no leftover containers
+  or networks.
+
+### Milestone 2 status
+
+Steps 2.1–2.5 are done.
+- **Acceptance met** (plan: "with mode `both`, the seed fixed and the virtual clock frozen…"):
+  - One trade gives `SettlementPending` at once.
+  - `SettlementCompleted` comes exactly when the clock reaches T+2, or the seeded failure instead.
+  - Webhooks carry `source: "settlement-simulator"` and the execution ID as correlation ID.
+  - A restart in the middle neither changes nor duplicates the outcome.
+
+  All of it is checked in-process and in containers.
+- **Deviation:** delivery scheduling runs on real time (see 2.1).
+- **Open for later:**
+  - Holiday calendars (D2).
+  - An `InstrumentStatusChanged` event.
+  - Participant detail updates.
+  - Simulator intake from "now" instead of from the start of the log, if wanted.
+  - Reproducible *IDs* across runs, which Milestone 3 needs for byte-identical event logs. Today outcomes, dates and
+    timestamps are reproducible, but event and execution IDs are random UUIDv7.
 
 ## Milestone 3 — scenarios and fault injection
 
