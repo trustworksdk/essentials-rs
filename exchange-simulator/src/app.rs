@@ -68,7 +68,11 @@ impl App {
             config.webhooks.worker(),
             stopped,
         );
-        let router = api::router(AppState::new(dispatcher, Store::new(reader)));
+        let router = api::router(AppState::new(
+            dispatcher,
+            Store::new(reader),
+            crate::metrics::install(),
+        ));
         Ok(Self {
             router,
             exchange_thread,

@@ -12,6 +12,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -29,14 +30,16 @@ use crate::webhooks::Subscription;
 pub struct AppState {
     dispatcher: Dispatcher,
     reader: Arc<Mutex<Store>>,
+    metrics: PrometheusHandle,
 }
 
 impl AppState {
     /// `reader` should be a read-only connection to the database the dispatcher's exchange writes.
-    pub fn new(dispatcher: Dispatcher, reader: Store) -> Self {
+    pub fn new(dispatcher: Dispatcher, reader: Store, metrics: PrometheusHandle) -> Self {
         Self {
             dispatcher,
             reader: Arc::new(Mutex::new(reader)),
+            metrics,
         }
     }
 
@@ -60,6 +63,7 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route(
             "/api/instruments",
             post(register_instrument).get(list_instruments),
@@ -274,4 +278,25 @@ async fn register_webhook(
 
 async fn list_webhooks(State(state): State<AppState>) -> Result<Json<Vec<Subscription>>, ApiError> {
     Ok(Json(state.read(|store| store.subscriptions()).await?))
+}
+
+/// Prometheus text exposition. The outbox gauges are refreshed from SQLite on each scrape.
+async fn metrics(
+    State(state): State<AppState>,
+) -> Result<([(axum::http::HeaderName, &'static str); 1], String), ApiError> {
+    let counts = state.read(|store| store.delivery_counts()).await?;
+    for status in ["PENDING", "IN_FLIGHT", "DELIVERED", "DEAD"] {
+        let count = counts
+            .iter()
+            .find(|(s, _)| s == status)
+            .map_or(0, |(_, n)| *n);
+        ::metrics::gauge!(crate::metrics::OUTBOX, "status" => status).set(count as f64);
+    }
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        state.metrics.render(),
+    ))
 }

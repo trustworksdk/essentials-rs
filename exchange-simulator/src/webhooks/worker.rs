@@ -163,6 +163,7 @@ async fn deliver(
     job: DeliveryJob,
 ) -> DeliveryResult {
     let attempt = job.attempts + 1;
+    let started = std::time::Instant::now();
     let response = client
         .post(&job.url)
         .header("X-Event-Id", job.event.event_id.to_string())
@@ -178,6 +179,13 @@ async fn deliver(
         Ok(response) => retry.after_failure(job.attempts, format!("HTTP {}", response.status())),
         Err(error) => retry.after_failure(job.attempts, error.to_string()),
     };
+    ::metrics::histogram!(crate::metrics::WEBHOOK_DURATION).record(started.elapsed());
+    let label = match &outcome {
+        DeliveryOutcome::Delivered => "delivered",
+        DeliveryOutcome::Retry { .. } => "retry",
+        DeliveryOutcome::Dead { .. } => "dead",
+    };
+    ::metrics::counter!(crate::metrics::WEBHOOK_ATTEMPTS, "outcome" => label).increment(1);
     match &outcome {
         DeliveryOutcome::Delivered => {
             tracing::debug!(delivery = %job.delivery_id, event = %job.event.event_id, attempt, "webhook delivered");

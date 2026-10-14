@@ -363,3 +363,109 @@ async fn webhook_registration_is_validated_and_listed() {
     assert_eq!(listed, json!([created]));
     app.stop().await;
 }
+
+/// The value of a sample line `name{labels} value` (labels given exactly as rendered, or empty).
+fn sample(metrics: &str, series: &str) -> Option<f64> {
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+}
+
+#[tokio::test]
+async fn metrics_expose_commands_trades_latencies_and_the_outbox() {
+    // Counters are process-wide and other tests in this binary also trade, so assert lower bounds; this is the only
+    // test here that scrapes, so the outbox gauge reflects this test's database.
+    let mut app = TestApp::start().await;
+    app.seed().await;
+    let receiver = Receiver::start().await;
+    receiver.respond(&[500], 200);
+    subscribe(&app, &receiver.url, &["TradeExecuted"]).await;
+    trade(&app).await;
+    eventually("delivery", || {
+        app.count("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'DELIVERED'") == 1
+    })
+    .await;
+
+    let text = metrics_text(&app).await;
+    assert!(
+        sample(&text, "exchange_executions_total").unwrap() >= 1.0,
+        "{text}"
+    );
+    assert!(sample(&text, "exchange_traded_quantity_total").unwrap() >= 150.0);
+    assert!(sample(&text, r#"exchange_orders_total{status="FILLED"}"#).unwrap() >= 1.0);
+    assert!(
+        sample(
+            &text,
+            r#"exchange_commands_total{command="submit",outcome="ok"}"#
+        )
+        .unwrap()
+            >= 2.0
+    );
+    assert!(
+        sample(
+            &text,
+            r#"exchange_events_total{event_type="TradeExecuted"}"#
+        )
+        .unwrap()
+            >= 1.0
+    );
+    assert!(sample(&text, r#"webhook_delivery_attempts_total{outcome="retry"}"#).unwrap() >= 1.0);
+    assert!(
+        sample(
+            &text,
+            r#"webhook_delivery_attempts_total{outcome="delivered"}"#
+        )
+        .unwrap()
+            >= 1.0
+    );
+    assert_eq!(
+        sample(&text, r#"webhook_outbox_deliveries{status="DELIVERED"}"#),
+        Some(1.0)
+    );
+    assert_eq!(
+        sample(&text, r#"webhook_outbox_deliveries{status="PENDING"}"#),
+        Some(0.0)
+    );
+    for histogram in [
+        "exchange_match_duration_seconds_count",
+        "exchange_commit_duration_seconds_count",
+        r#"exchange_command_duration_seconds_count{command="submit"}"#,
+        "webhook_delivery_duration_seconds_count",
+    ] {
+        assert!(
+            sample(&text, histogram).unwrap_or(0.0) >= 1.0,
+            "{histogram} in {text}"
+        );
+    }
+    assert!(text.contains("# HELP exchange_commit_duration_seconds"));
+    app.stop().await;
+}
+
+async fn metrics_text(app: &TestApp) -> String {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let response = app
+        .router()
+        .oneshot(
+            axum::http::Request::get("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; version=0.0.4"
+    );
+    String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap()
+}

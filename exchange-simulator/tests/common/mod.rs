@@ -83,6 +83,10 @@ impl TestApp {
         }
     }
 
+    pub fn router(&self) -> axum::Router {
+        self.app.as_ref().expect("running").router.clone()
+    }
+
     /// A separate connection to the database, for asserting on stored state.
     pub fn db(&self) -> rusqlite::Connection {
         rusqlite::Connection::open(&self.config.database.path).unwrap()

@@ -133,69 +133,105 @@ impl Dispatcher {
 
     fn enqueue(&self, request: Request) -> Result<(), DispatchError> {
         self.tx.try_send(request).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => DispatchError::Overloaded,
+            mpsc::error::TrySendError::Full(_) => {
+                ::metrics::counter!(crate::metrics::QUEUE_REJECTIONS).increment(1);
+                DispatchError::Overloaded
+            }
             mpsc::error::TrySendError::Closed(_) => DispatchError::Stopped,
         })
     }
 }
 
 fn run(mut exchange: Exchange, mut rx: mpsc::Receiver<Request>) {
-    // A send fails only when the caller gave up waiting (e.g. the HTTP client disconnected). The command still took
-    // effect; there is no one left to tell.
+    use crate::metrics::{COMMAND_DURATION, COMMANDS, QUEUE_DEPTH};
     while let Some(request) = rx.blocking_recv() {
-        match request {
-            Request::RegisterInstrument(instrument, reply) => {
-                let _ = reply.send(
-                    exchange
-                        .register_instrument(instrument.clone())
-                        .map(|()| instrument),
-                );
-            }
-            Request::RegisterParticipant(participant, reply) => {
-                let _ = reply.send(
-                    exchange
-                        .register_participant(participant.clone())
-                        .map(|()| participant),
-                );
-            }
-            Request::Submit(order, reply) => {
-                let result = exchange.submit(order).map(|outcome| {
-                    let instrument_id = match &outcome {
-                        SubmitOutcome::Processed(update) => &update.order.instrument_id,
-                        SubmitOutcome::Duplicate(order) => &order.instrument_id,
-                    };
-                    let instrument = instrument_of(&exchange, instrument_id);
-                    (outcome, instrument)
-                });
-                let _ = reply.send(result);
-            }
-            Request::Cancel(order_id, reply) => {
-                let result = exchange.cancel(order_id).map(|update| {
-                    let instrument = instrument_of(&exchange, &update.order.instrument_id);
-                    (update, instrument)
-                });
-                let _ = reply.send(result);
-            }
-            Request::RegisterWebhook(url, event_types, reply) => {
-                let _ = reply.send(exchange.register_webhook(url, event_types));
-            }
-            Request::ClaimDeliveries(limit, lease, reply) => {
-                let _ = reply.send(exchange.claim_deliveries(limit, lease));
-            }
-            Request::RecordDeliveries(results, reply) => {
-                let _ = reply.send(exchange.record_deliveries(&results));
-            }
-            Request::Snapshot(instrument_id, reply) => {
-                let _ = reply.send(exchange.book(&instrument_id).map(|book| BookSnapshot {
-                    instrument: book.instrument().clone(),
-                    bids: book.depth(Side::Buy),
-                    asks: book.depth(Side::Sell),
-                    last_sequence: exchange.last_sequence(),
-                }));
-            }
-        }
+        ::metrics::gauge!(QUEUE_DEPTH).set(rx.len() as f64);
+        let started = std::time::Instant::now();
+        let (command, outcome) = handle(&mut exchange, request);
+        ::metrics::histogram!(COMMAND_DURATION, "command" => command).record(started.elapsed());
+        ::metrics::counter!(COMMANDS, "command" => command, "outcome" => outcome).increment(1);
     }
     tracing::info!("exchange thread stopped");
+}
+
+/// Executes one request and answers it; returns the command name and outcome for metrics.
+///
+/// A reply fails only when the caller gave up waiting (e.g. the HTTP client disconnected). The command still took
+/// effect; there is no one left to tell.
+fn handle(exchange: &mut Exchange, request: Request) -> (&'static str, &'static str) {
+    fn answer<T>(reply: Reply<T>, result: Result<T, ExchangeError>) -> &'static str {
+        let outcome = match &result {
+            Ok(_) => "ok",
+            Err(ExchangeError::Storage(_) | ExchangeError::Book(_))
+                if !is_invalid_order(&result) =>
+            {
+                "error"
+            }
+            Err(_) => "invalid",
+        };
+        let _ = reply.send(result);
+        outcome
+    }
+    fn is_invalid_order<T>(result: &Result<T, ExchangeError>) -> bool {
+        matches!(
+            result,
+            Err(ExchangeError::Book(super::BookError::Invalid(_)))
+        )
+    }
+
+    match request {
+        Request::RegisterInstrument(instrument, reply) => {
+            let result = exchange
+                .register_instrument(instrument.clone())
+                .map(|()| instrument);
+            ("register_instrument", answer(reply, result))
+        }
+        Request::RegisterParticipant(participant, reply) => {
+            let result = exchange
+                .register_participant(participant.clone())
+                .map(|()| participant);
+            ("register_participant", answer(reply, result))
+        }
+        Request::Submit(order, reply) => {
+            let result = exchange.submit(order).map(|outcome| {
+                let instrument_id = match &outcome {
+                    SubmitOutcome::Processed(update) => &update.order.instrument_id,
+                    SubmitOutcome::Duplicate(order) => &order.instrument_id,
+                };
+                let instrument = instrument_of(exchange, instrument_id);
+                (outcome, instrument)
+            });
+            ("submit", answer(reply, result))
+        }
+        Request::Cancel(order_id, reply) => {
+            let result = exchange.cancel(order_id).map(|update| {
+                let instrument = instrument_of(exchange, &update.order.instrument_id);
+                (update, instrument)
+            });
+            ("cancel", answer(reply, result))
+        }
+        Request::RegisterWebhook(url, event_types, reply) => (
+            "register_webhook",
+            answer(reply, exchange.register_webhook(url, event_types)),
+        ),
+        Request::ClaimDeliveries(limit, lease, reply) => (
+            "claim_deliveries",
+            answer(reply, exchange.claim_deliveries(limit, lease)),
+        ),
+        Request::RecordDeliveries(results, reply) => (
+            "record_deliveries",
+            answer(reply, exchange.record_deliveries(&results)),
+        ),
+        Request::Snapshot(instrument_id, reply) => {
+            let _ = reply.send(exchange.book(&instrument_id).map(|book| BookSnapshot {
+                instrument: book.instrument().clone(),
+                bids: book.depth(Side::Buy),
+                asks: book.depth(Side::Sell),
+                last_sequence: exchange.last_sequence(),
+            }));
+            ("snapshot", "ok")
+        }
+    }
 }
 
 fn instrument_of(exchange: &Exchange, id: &InstrumentId) -> Instrument {

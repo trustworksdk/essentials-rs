@@ -216,6 +216,7 @@ impl Exchange {
             sequence: self.last_sequence + 1,
             status: OrderStatus::Open,
         };
+        let started = std::time::Instant::now();
         let update = book.plan_submit(
             order,
             &mut MatchContext {
@@ -223,6 +224,7 @@ impl Exchange {
                 ids: self.ids.as_mut(),
             },
         )?;
+        ::metrics::histogram!(crate::metrics::MATCH_DURATION).record(started.elapsed());
         self.commit_and_apply(Command::Submit, update, now)
     }
 
@@ -330,6 +332,7 @@ impl Exchange {
     ) -> Result<SubmitOutcome, ExchangeError> {
         let instrument = self.books[&update.order.instrument_id].instrument();
         let new_events = events::for_update(command, &update, instrument, now, self.ids.as_mut());
+        let started = std::time::Instant::now();
         self.store.commit(
             &update,
             &new_events,
@@ -338,6 +341,8 @@ impl Exchange {
             self.ids.as_mut(),
             now,
         )?;
+        ::metrics::histogram!(crate::metrics::COMMIT_DURATION).record(started.elapsed());
+        record_committed(command, &update, &new_events);
         let book = self
             .books
             .get_mut(&update.order.instrument_id)
@@ -357,6 +362,19 @@ impl Exchange {
     /// The clock reading at the precision the database stores, so memory and storage agree.
     fn now(&self) -> DateTime<Utc> {
         self.clock.now().trunc_subsecs(6)
+    }
+}
+
+fn record_committed(command: Command, update: &BookUpdate, new_events: &[events::NewEvent]) {
+    use crate::metrics::{EVENTS, EXECUTIONS, ORDERS, TRADED_QUANTITY};
+    if command == Command::Submit {
+        ::metrics::counter!(ORDERS, "status" => update.order.status.as_str()).increment(1);
+    }
+    ::metrics::counter!(EXECUTIONS).increment(update.executions.len() as u64);
+    ::metrics::counter!(TRADED_QUANTITY)
+        .increment(update.executions.iter().map(|e| e.quantity).sum());
+    for event in new_events {
+        ::metrics::counter!(EVENTS, "event_type" => event.event_type).increment(1);
     }
 }
 

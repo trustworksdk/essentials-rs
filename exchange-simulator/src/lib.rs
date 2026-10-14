@@ -8,5 +8,6 @@ pub mod config;
 pub mod domain;
 pub mod engine;
 pub mod events;
+pub mod metrics;
 pub mod persistence;
 pub mod webhooks;

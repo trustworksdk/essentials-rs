@@ -416,6 +416,16 @@ impl Store {
         tx.commit()
     }
 
+    /// Number of webhook deliveries per status.
+    pub fn delivery_counts(&self) -> rusqlite::Result<Vec<(String, u64)>> {
+        self.conn
+            .prepare_cached(
+                "SELECT status, COUNT(*) FROM webhook_deliveries GROUP BY status ORDER BY status",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, from_sql(row, 1)?)))?
+            .collect()
+    }
+
     /// Makes every in-flight delivery due now. Used at startup, when no claim can still be in progress.
     pub fn release_claims(&self, now: DateTime<Utc>) -> rusqlite::Result<usize> {
         self.conn.execute(

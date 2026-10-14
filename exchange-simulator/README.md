@@ -175,4 +175,17 @@ Delivery is a `POST` of the event envelope with headers `X-Event-Id`, `X-Event-T
 
 Lists the subscriptions.
 
-Not yet available: `GET /metrics` (step 6).
+### `GET /metrics`
+
+Prometheus text format, with these series:
+- **Commands:** `exchange_commands_total{command,outcome}` and `exchange_command_duration_seconds{command}`.
+- **Hot path, split into stages:** `exchange_match_duration_seconds` and `exchange_commit_duration_seconds`.
+- **Queue:** `exchange_command_queue_depth` and `exchange_command_queue_rejections_total`.
+- **Results:** `exchange_orders_total{status}`, `exchange_executions_total`, `exchange_traded_quantity_total` and
+  `exchange_events_total{event_type}`.
+- **Webhooks:** `webhook_delivery_attempts_total{outcome}`, `webhook_delivery_duration_seconds`, and the outbox
+  backlog `webhook_outbox_deliveries{status}`, read from SQLite at scrape time.
+
+## Benchmarks
+
+[`bench/README.md`](bench/README.md) covers how to run the harness and the baseline results.

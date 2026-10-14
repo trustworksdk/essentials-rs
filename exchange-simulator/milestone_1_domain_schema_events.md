@@ -392,3 +392,48 @@ Steps refer to "First implementation sequence" above.
 **Remaining for Milestone 1** (step 6 and the definition of done)
 - Prometheus `/metrics` and a benchmark harness: durable throughput measured separately from in-memory throughput.
 - A Docker-based end-to-end run of the full acceptance test: the simulator *container* plus MockServer on one compose network, covering the container restart. Today MockServer runs in a container and the simulator in-process.
+
+### Step 6 — metrics and benchmark harness ✅ done (2026-10-14)
+
+**Delivered**
+- `GET /metrics` (Prometheus text format via `metrics` + `metrics-exporter-prometheus`; one process-wide recorder, `metrics::install`):
+  - command counts and latency per command type
+  - matching and SQLite commit latency, measured separately
+  - queue depth and queue rejections
+  - orders by status, executions, traded quantity, events by type
+  - webhook attempts by outcome and attempt latency
+  - outbox rows by status, read from SQLite at scrape time
+- `src/bin/bench.rs` (`cargo run --release -p exchange-simulator --bin bench -- all --dir <disk>`): one seeded workload measured at three levels:
+  - in-memory `OrderBook`
+  - durable `Exchange` on SQLite, with and without an outbox subscriber
+  - the HTTP service with 32 clients, with and without a live webhook consumer
+
+  Each report records the SQLite version and pragmas, and the measured fsync latency of the database directory. `default-run` keeps `cargo run` starting the service.
+- `bench/README.md` and `bench/results/`: baseline on the devcontainer, which is a Docker Desktop VM (aarch64, 8 CPUs):
+
+  | Scenario | Throughput |
+  |---|---|
+  | in-memory matching | 2.9 M orders/s |
+  | durable, VM disk | 5.3–5.6 k orders/s (p50 140 µs, p99 1.2 ms) |
+  | durable with outbox | 4.3–4.4 k orders/s |
+  | HTTP end to end | 4.85 k orders/s (p50 6.4 ms) |
+  | HTTP with webhook consumer | 3.7 k orders/s; every trade event delivered within the run |
+
+  On tmpfs, with no real fsync: 13–26 k/s.
+- Tests: `metrics_expose_commands_trades_latencies_and_the_outbox` (in `tests/webhooks.rs`). Mutation checks: dropping the commit histogram, or zeroing the outbox gauge, made it fail.
+
+**Findings**
+- `/tmp` in the devcontainer is tmpfs (fsync ≈ 1 µs). The first "durable" figures (26 k/s) were SQLite in RAM, which the fsync probe exposed. Durable figures must state where the database lived; the harness now reports it.
+- One SQLite writer that fsyncs every commit is the limit, roughly 500× below in-memory matching. The 1k–10k orders/s target is met at about 4–5k on this VM's disk, not at 10k. Bare-metal numbers will differ; measure before quoting.
+- Commit maxima of 57–180 ms recur on the VM disk. A likely cause is the automatic WAL checkpoint in the committing transaction; not investigated.
+- Milestone 4 levers (not built): group commit, checkpointing off the hot path, sharded matching, and the plan's non-durable fast mode.
+
+### Milestone 1 status
+
+Steps 1–6 are done. Definition of done:
+- Docker startup is reproducible.
+- The API is documented in `README.md`.
+- Correctness, restart and webhook tests pass, including MockServer.
+- The performance baseline is measured.
+
+Still open from the checklist: a **Docker-based end-to-end** run of the full acceptance test, with the simulator *container* and MockServer on one compose network, including `docker compose restart`. Every step of it is already covered by in-process tests and manual container smoke runs, but not by one automated container run.
