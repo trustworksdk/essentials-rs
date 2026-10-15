@@ -375,9 +375,9 @@ the order below deliberately puts group commit before sharding.
 | 4.1 | Latency breakdown and an open-loop load generator | M | New histograms for queue wait (enqueue → start) and acknowledgement latency (enqueue → reply). The bench gains a target-rate, open-loop mode that avoids coordinated omission, reporting achieved rate, latency at that rate, and 503 counts. |
 | 4.2 | Group commit | M–L | The writer drains up to N queued commands (or waits up to T µs) and plans them in order on the books. It commits them in one transaction and replies to each after the commit. If the commit fails, all plans are dropped and every caller gets the error; nothing is applied. Ordering and determinism are unchanged. Expected: several times today's durable throughput. |
 | 4.3 | Background checkpointing | S | Turn off automatic WAL checkpointing on the writer *only together with* a background connection that runs `PRAGMA wal_checkpoint(PASSIVE)` when the WAL passes a size threshold. Without that, the WAL grows without bound and throughput halves (1.2). Target: the roughly 10 % of durable time and the p99 now spent in checkpoint commits. The occasional > 10 ms spikes come from the disk (1.2), and this will not remove them. Measure with `bench checkpoint`. |
-| 4.4 | Explicit non-durable fast mode | S | `persistence.mode: durable \| fast`. `fast` uses `synchronous=OFF`, or in-memory with periodic snapshots per D4. `/health` and `/metrics` say which mode is running, and responses carry a header in fast mode, so nobody mistakes it for durable. |
+| 4.4 | Explicit non-durable modes | S | `persistence.mode: durable \| fast \| memory` (D4).<br>• **`fast`**: WAL with `synchronous=NORMAL`. Every commit still reaches the database file, and fsync happens only at checkpoints. All state survives a process or container restart (books, events, outbox, settlement instructions, simulator cursor, virtual clock), so settlement keeps working across restarts. Only a host or node crash, or power loss, can lose the last commits, and the database is never corrupted. (`synchronous=OFF` was rejected: it can corrupt the database on a host crash.)<br>• **`memory`**: an in-memory SQLite database for pure throughput runs. Nothing survives a restart (orders, trades, pending settlements, undelivered webhooks), so settlement works only while the process runs.<br>`/health` and `/metrics` report the mode, and responses carry a header in non-durable modes. The README documents the trade-offs, including that durability in Kubernetes also needs a persistent volume (`emptyDir` loses everything when the pod is rescheduled, even in `durable` mode). |
 | 4.5 | Instrument-sharded matching (only if 4.1 shows matching as a bottleneck) | M | Matching workers per instrument shard in front of the single writer. Today's data says matching is not the limit, so this is a measure-first step. |
-| 4.6 | Benchmark on the target hardware and load report | M | Run on agreed hardware (D4). Report durable vs fast, with and without outbox and webhooks, across instrument counts. Compare against the 1k–10k target with numbers and their environment, as `bench/README.md` does today. |
+| 4.6 | Containerized benchmark and load report | M | There is no single target machine (D4): deployments are mostly Docker Compose or Kubernetes, and their hardware varies. So the benchmark runs as containers: the service image plus a load-generator container, with explicit CPU and memory limits and a named storage backing (volume or storage class). It ships as a compose profile and as a Kubernetes Job manifest. Each report records its environment: limits, storage, measured fsync latency, and node type where known. It compares `durable`, `fast` and `memory`, with and without outbox and webhooks, across instrument counts. Figures against the 1k–10k target are quoted per environment, never as one universal number. |
 
 ## Suggested order
 
@@ -399,9 +399,13 @@ Settled on 2026-10-14:
 
 Settled on 2026-10-15:
 - **D3 — scenario runner surface:** both, a CLI and an API (step 3.1).
+- **D4 (rest) — benchmark environment and fast mode:**
+  - There is no fixed hardware: the service mostly runs in Docker Compose or Kubernetes, so the benchmark is
+    containerized and reports per environment (4.6).
+  - Fast mode can skip disk syncing or run fully in memory, as long as it is documented. The plan offers both: `fast`
+    (`synchronous=NORMAL`), where settlement survives restarts, and `memory`, where everything, settlement included,
+    lasts only while the process runs (4.4).
 - **D6 — reproducible IDs:** event and execution IDs (in fact all IDs) must be stable and reproducible across runs.
   This is a new step, 3.0, the first of Milestone 3.
 
-Still open:
-- **D4 (rest):** what is the benchmark target hardware, and is "fast mode" `synchronous=OFF` or fully in-memory?
-  Needed before 4.4 and 4.6.
+Still open: none.
