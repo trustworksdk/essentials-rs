@@ -7,18 +7,86 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use std::sync::Arc;
 
 use super::{ApiError, AppState};
+use crate::config::Config;
 use crate::engine::{ClockChange, ClockState};
+use crate::persistence::DeliveryRecord;
+use crate::scenario::{Report, Scenario};
 
-pub fn router(state: AppState) -> Router {
+/// The test-control routes. `config` is the service's configuration, which scenario sandboxes start from.
+pub fn router(state: AppState, config: Arc<Config>) -> Router {
     Router::new()
+        .route("/test/scenarios", post(run_scenario))
+        .route("/test/deliveries", get(deliveries))
         .route("/test/clock", get(clock))
         .route("/test/clock/advance", post(advance))
         .route("/test/clock/set", post(set))
         .route("/test/clock/freeze", post(freeze))
         .route("/test/clock/resume", post(resume))
+        .layer(axum::Extension(config))
         .with_state(state)
+}
+
+/// Runs a scenario (YAML or JSON in the request body) in a fresh sandbox, independent of this service's state, and
+/// returns its report: `200` whether it passed or not (see `passed`), `400` if it cannot be parsed.
+async fn run_scenario(
+    axum::Extension(config): axum::Extension<Arc<Config>>,
+    body: String,
+) -> Result<Json<Report>, ApiError> {
+    let scenario = Scenario::parse(&body).map_err(|error| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_scenario",
+            error,
+        )
+    })?;
+    let report = crate::scenario::run(&scenario, &config)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(report))
+}
+
+/// A webhook delivery: which event goes to which subscription, and how far it got.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryView {
+    pub delivery_id: Uuid,
+    pub subscription_id: Uuid,
+    pub url: String,
+    pub event_sequence: u64,
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub status: String,
+    pub attempts: u64,
+    pub last_error: Option<String>,
+}
+
+impl From<DeliveryRecord> for DeliveryView {
+    fn from(d: DeliveryRecord) -> Self {
+        Self {
+            delivery_id: d.delivery_id,
+            subscription_id: d.subscription_id,
+            url: d.url,
+            event_sequence: d.event_sequence,
+            event_id: d.event_id,
+            event_type: d.event_type,
+            status: d.status,
+            attempts: d.attempts,
+            last_error: d.last_error,
+        }
+    }
+}
+
+/// Every webhook delivery, in event order. Delivery runs on real time, so statuses move without clock changes.
+async fn deliveries(State(state): State<AppState>) -> Result<Json<Vec<DeliveryView>>, ApiError> {
+    let deliveries = state.read(|store| store.deliveries()).await?;
+    Ok(Json(
+        deliveries.into_iter().map(DeliveryView::from).collect(),
+    ))
 }
 
 #[derive(Debug, Serialize)]

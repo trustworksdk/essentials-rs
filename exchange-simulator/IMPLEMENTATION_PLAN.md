@@ -358,7 +358,7 @@ random markets; and faults injected into *delivered copies* of events, never int
 | # | Step | Size | Delivers |
 |---|---|---|---|
 | 3.0 ✅ | Reproducible IDs (D6) | M | Config `ids: { mode: random \| deterministic, seed }`, default `random`. In `deterministic` mode every ID is a UUIDv8 built from a keyed hash of `(seed, kind, natural key)`. The keys already follow from the command order: order → its sequence; execution → (taker order sequence, fill index); event → its event sequence (the single writer knows the next one, and checks it against SQLite after insert); webhook delivery → (subscription, event sequence); subscription → its ordinal; external report → (execution, ordinal). No extra counters are stored, so a restart continues identically. Acceptance: the same commands, seed and clock moves give a byte-identical `/api/events` log and identical API responses (only real-time delivery fields differ), including with restarts in between. |
-| 3.1 | Scenario DSL and runner | L | YAML: `seed`, `instruments`, `participants`, `subscriptions`, then `steps:` (`order`, `cancel`, `advance_clock`, `expect` on order state, trades, events, book, deliveries). It runs against an in-process service with a virtual clock and deterministic IDs. Per D3, both a CLI (`exchange-simulator scenario run file.yaml`, exit code = verdict) and `POST /test/scenarios` (test control only; returns the verdict and each failed expectation). Both use one runner. Example scenarios go in `scenarios/`. |
+| 3.1 ✅ | Scenario DSL and runner | L | YAML: `seed`, `instruments`, `participants`, `subscriptions`, then `steps:` (`order`, `cancel`, `advance_clock`, `expect` on order state, trades, events, book, deliveries). It runs against an in-process service with a virtual clock and deterministic IDs. Per D3, both a CLI (`exchange-simulator scenario run file.yaml`, exit code = verdict) and `POST /test/scenarios` (test control only; returns the verdict and each failed expectation). Both use one runner. Example scenarios go in `scenarios/`. |
 | 3.2 | Random market generator | M | Seeded distributions from plan §6: arrival rate, buy probability, market-order and cancellation probabilities, and price and size distributions per instrument. It generalizes the `bench` workload. Reproducibility comes from the seed plus deterministic sequencing: one generator feeds commands in order, under the virtual clock. |
 | 3.3 | Delivery fault policies | M | Per-subscription policy, configured under `/test/…` or in a scenario: missing fields, explicit nulls, invalid values (a JSON-path list or a random choice by probability), duplicates, delays, out-of-order (hold and release). Faults apply to the outgoing copy only. A new `webhook_attempts` table records each attempt with the mutation applied, so a test can assert on what was actually sent. |
 | 3.4 | Reset and replay controls | S | `POST /test/reset` clears all state (test mode only). `POST /test/webhooks/{id}/redeliver?after=` re-enqueues deliveries from a sequence. Dead letters can be listed and retried. |
@@ -403,6 +403,64 @@ random markets; and faults injected into *delivered copies* of events, never int
   - In simulated modes, the trade transaction grows by one instruction row and one event per execution. The
     benchmark runs in `external` mode, so its numbers are unaffected.
   - Hash-derived IDs are not time-ordered. Nothing relies on ID order: lists order by sequence or rowid.
+
+**3.1 — scenario DSL and runner ✅ (2026-10-15).**
+- **Delivered:**
+  - `scenario` module: `Scenario::parse` (YAML via `serde-saphyr`; JSON works too), a containment matcher, and one
+    runner, `scenario::run(&Scenario, &Config) -> Report`.
+  - Setup: `seed`, `start`, `settlement` (any policy field), `instruments`, `participants`, `webhooks` (the plan's
+    `subscriptions`), all as API request bodies.
+  - Steps: `order`, `cancel`, `advance_clock`, `set_clock`, `report_settlement`, `set_instrument`, and `expect` on an
+    order, a book, a settlement, or a filter over trades, events or deliveries, with `count`. Command steps can check
+    their own response (`status`, `matches`).
+  - References: `as: name` names an order, `name#i` is its `i`-th execution.
+  - Every step runs even after a failure. The report lists each step with its failures; step 0 is the setup.
+  - **Sandbox:** each run starts a fresh in-process `App` from the service's configuration, with a temporary
+    database, a frozen virtual clock at `start`, deterministic IDs from `seed`, test control on and
+    `simulationId` = the scenario name. Commands go through the router (`tower::oneshot`), so a scenario exercises
+    the real API. The sandbox is removed afterwards.
+  - **CLI:** `exchange-simulator scenario run <file>... [--json]`. Exit 0 if all pass, 1 if any fails, 2 for an
+    unreadable or invalid file. `serve` (or no arguments) runs the service as before.
+  - **API:** `POST /test/scenarios` (test control only): `200` with the report, `400 invalid_scenario` with the
+    parse error and its line.
+  - **`GET /test/deliveries`:** every webhook delivery, with its URL, event, status and attempts. It backs the
+    `deliveries` expectation and is there for tests generally.
+  - Examples in `scenarios/`: the Milestone 1 acceptance trade, T+2 settlement over a weekend with an external report,
+    and trading rules (self-trade, market remainder, idempotent client order IDs, cancels, a halt).
+  - A README section on scenarios.
+- **Tests:**
+  - Unit tests: parsing (the documented example; errors with location, unknown steps, typos, wrong expectation
+    targets) and the matcher (paths, arrays, numbers by value).
+  - `tests/scenarios.rs` (6):
+    - Every example passes.
+    - A deliberately wrong scenario reports exactly the expected failures per step, and the steps after them run.
+    - The same scenario gives an identical report and the deterministic event ID twice.
+    - The CLI's exit codes and its `--json` output.
+    - The API gives the same report as the CLI runner, leaves the live service's state untouched, answers `400` to
+      a bad scenario, and `404` with test control off.
+    - Deliveries against a real local consumer: `DELIVERED` on the first attempt, `DEAD` after five for a failing
+      one, and a failing `wait_ms: 100` expectation reported as such. The consumer got the deterministic event ID.
+  - The suite was repeated five times without failure.
+- **Mutation checks**, each made a test fail: random IDs in the sandbox; no wait on deliveries; missing fields
+  ignored by the matcher; stopping at the first failure; CLI exit 0 on failure; the sandbox on the base database
+  path; no default `instrumentId`.
+- **Decisions:**
+  - **`deliveries` expectations wait** (`wait_ms`, default 5000). Delivery runs on real time (2.1), so it is the
+    only state that changes without a command. Every other expectation is checked once. `wait_ms` anywhere else is a
+    parse error.
+  - **Sandboxes, not the live service.** `POST /test/scenarios` never touches the running service's state, so it
+    is safe to call against a shared test deployment, and API and CLI give identical reports. Running a scenario
+    *against* the live state could come later with reset (3.4).
+  - **The API answers `200` for a failed scenario.** The verdict is `passed` in the body; `4xx` is reserved for a
+    scenario that cannot be read.
+  - Matching is containment: named fields must be equal, others are ignored, arrays match element by element and in
+    full length. Numbers compare by value.
+  - `http-body-util` and `tower` moved from dev-dependencies to dependencies, since the runner drives the router
+    in-process.
+- **Deviations:**
+  - The plan names the setup list `subscriptions`; the file uses `webhooks`, after the API resource.
+  - Besides the plan's steps there are also `set_clock`, `report_settlement` and `set_instrument`, so the
+    Milestone 2 behaviour can be scripted too.
 
 ## Milestone 4 — performance
 

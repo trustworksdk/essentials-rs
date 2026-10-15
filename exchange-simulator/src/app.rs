@@ -93,7 +93,7 @@ impl App {
             tracing::warn!(
                 "test-control API enabled under /test; never expose this outside test deployments"
             );
-            router = router.merge(api::test_control::router(state));
+            router = router.merge(api::test_control::router(state, Arc::new(config.clone())));
         }
         Ok(Self {
             router,

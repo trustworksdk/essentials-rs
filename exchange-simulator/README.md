@@ -336,7 +336,8 @@ not on a background tick.
 
 ## Test control
 
-With `test_control.enabled: true`, routes under `/test` control simulated time. They return `404` otherwise.
+With `test_control.enabled: true`, routes under `/test` control simulated time, show webhook deliveries and run
+scenarios. They return `404` otherwise.
 
 | Method | Path | Body | Effect |
 |---|---|---|---|
@@ -344,6 +345,8 @@ With `test_control.enabled: true`, routes under `/test` control simulated time. 
 | POST | `/test/clock/advance` | `{ "days", "hours", "minutes", "seconds" }` (any, summed, > 0) | Move forward |
 | POST | `/test/clock/set` | `{ "to": "2030-01-07T09:00:00Z" }` | Move to an instant; earlier than now is `409 clock_backwards` |
 | POST | `/test/clock/freeze` / `/test/clock/resume` | – | Stop the clock, or let it run with real time |
+| GET | `/test/deliveries` | – | Every webhook delivery in event order: `deliveryId`, `subscriptionId`, `url`, `eventSequence`, `eventId`, `eventType`, `status`, `attempts`, `lastError` |
+| POST | `/test/scenarios` | A scenario, YAML or JSON | Runs it in a sandbox (see Scenarios); `200` with the report, `400 invalid_scenario` if it does not parse |
 
 The `/test/clock` routes change the clock only with `clock.mode: virtual`; with the system clock they return
 `409 clock_not_virtual`.
@@ -352,6 +355,61 @@ The `/test/clock` routes change the clock only with `clock.mode: virtual`; with 
 - **It never moves backwards.** Its state is stored, so a restart resumes simulated time where it was.
 - **Webhook delivery stays on real time** (retry backoff, leases, `delivered_at`), so jumping the clock forward
   neither stalls nor duplicates deliveries.
+
+## Scenarios
+
+A scenario is a YAML file: setup (instruments, participants, webhooks), then ordered steps: commands, clock moves and
+expectations. It runs against a fresh in-process service of its own, with a temporary database, a frozen virtual
+clock, deterministic IDs from its `seed` and test control on. The same file therefore gives the same events, IDs and
+verdict every time. Examples are in [`scenarios/`](scenarios/).
+
+```sh
+cargo run -p exchange-simulator -- scenario run exchange-simulator/scenarios/*.yaml   # exit 0 pass, 1 fail, 2 bad file
+cargo run -p exchange-simulator -- scenario run --json some.yaml                      # reports as a JSON array
+curl -X POST --data-binary @some.yaml localhost:8080/test/scenarios                   # the same runner, over HTTP
+```
+
+The sandbox starts from the service's configuration (webhook timings, identifier policy). The scenario sets the
+clock, the IDs and, under `settlement:`, any settlement policy fields; `simulationId` is the scenario's name. The
+live service's own state is never touched.
+
+```yaml
+name: partial fill
+seed: 7                          # deterministic IDs, and the settlement seed unless settlement.seed is set
+start: 2030-01-07T09:00:00Z      # the virtual clock's first reading (this is the default)
+settlement: { mode: both, fail_probability: 0 }
+instruments:  [ { id: ACME, symbol: ACME, currency: DKK, currencyScale: 2 } ]   # request bodies, as for POST
+participants: [ { id: A, name: Seller }, { id: B, name: Buyer } ]
+webhooks:     [ { url: "http://consumer:8080/hook", eventTypes: [TradeExecuted] } ]
+steps:
+  - order: { as: sell, participantId: A, side: SELL, type: LIMIT, priceTicks: 10025, quantity: 200 }
+  - order: { as: buy, participantId: B, side: BUY, type: LIMIT, priceTicks: 10025, quantity: 150,
+             expect: { status: 201, matches: { order: { status: FILLED } } } }
+  - expect: { order: sell, matches: { status: PARTIALLY_FILLED, remainingQuantity: 50 } }
+  - advance_clock: { days: 2 }
+  - expect: { settlement: "buy#0", matches: { simulated: { status: SETTLED } } }
+  - expect: { events: { eventType: SettlementCompleted }, count: 1 }
+  - expect: { deliveries: { eventType: TradeExecuted, status: DELIVERED }, count: 1, wait_ms: 2000 }
+```
+
+| Step | Does |
+|---|---|
+| `order: { as?, expect?, ...body }` | `POST /api/orders`. `instrumentId` may be left out when there is one instrument |
+| `cancel: { order, expect? }` | `DELETE /api/orders/{id}` |
+| `advance_clock: { days, hours, minutes, seconds }` / `set_clock: { to }` | Move the virtual clock |
+| `report_settlement: { execution, expect?, ...body }` | `POST /api/settlements/{executionId}/outcomes` |
+| `set_instrument: { instrument, enabled, expect? }` | `PATCH /api/instruments/{id}` |
+| `expect: { order \| book \| settlement: ref, matches }` | `GET` the one resource; it must contain `matches` |
+| `expect: { trades \| events \| deliveries: filter, count? }` | The items containing `filter`: exactly `count`, or at least one |
+
+- **References:** `as: name` names an order. Later steps use `name` for its order ID and `name#i` for the ID of the
+  `i`-th execution in its submit response. Literal UUIDs work too.
+- **Command checks:** `expect: { status, matches }` checks the command's own response. Without it, any 2xx passes.
+- **Matching is containment:** every field named must be present and equal; fields left out are ignored. Arrays must
+  have the same length and match element by element.
+- **Deliveries run on real time.** So a `deliveries` expectation is retried until it holds or `wait_ms` has passed
+  (default 5000). Every other expectation is checked once, since the state depends only on the commands and the clock.
+- **Reports:** every step runs, even after a failure, so one run shows every problem. Step 0 is the setup.
 
 ## Testing
 

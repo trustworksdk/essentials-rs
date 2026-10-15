@@ -1,0 +1,471 @@
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Method, Request};
+use http_body_util::BodyExt;
+use serde::Serialize;
+use serde_json::{Value, json};
+use tower::ServiceExt;
+use uuid::Uuid;
+
+use super::matcher::{contains, mismatches};
+use super::{Expectation, ResponseCheck, Scenario, Step};
+use crate::app::App;
+use crate::config::{ClockConfig, ClockMode, Config, IdMode, IdsConfig};
+
+/// How long a `deliveries` expectation waits by default for webhook delivery, which runs on real time.
+const DEFAULT_DELIVERY_WAIT_MS: u64 = 5000;
+const DELIVERY_POLL: Duration = Duration::from_millis(20);
+
+/// The outcome of a scenario run. Every step runs, even after a failure, so one run shows every problem.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Report {
+    pub name: String,
+    pub passed: bool,
+    /// Index 0 is the setup (instruments, participants, webhooks); steps count from 1.
+    pub steps: Vec<StepReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StepReport {
+    pub index: usize,
+    pub step: String,
+    pub passed: bool,
+    pub failures: Vec<String>,
+}
+
+impl Report {
+    /// A human-readable rendering: one line per step, failures indented below.
+    pub fn render(&self) -> String {
+        let verdict = if self.passed { "PASSED" } else { "FAILED" };
+        let mut out = format!("Scenario \"{}\": {verdict}\n", self.name);
+        for step in &self.steps {
+            let mark = if step.passed { "ok  " } else { "FAIL" };
+            out.push_str(&format!("  {mark} {:>3} {}\n", step.index, step.step));
+            for failure in &step.failures {
+                out.push_str(&format!("           {failure}\n"));
+            }
+        }
+        out
+    }
+}
+
+/// Runs a scenario against a fresh sandboxed service built from `base`: its own temporary database, a frozen virtual
+/// clock at the scenario's start, deterministic IDs from its seed, test control on, and its settlement settings. The
+/// sandbox is removed afterwards. Errors are reserved for a sandbox that cannot start; scenario failures are in the
+/// report.
+pub async fn run(scenario: &Scenario, base: &Config) -> anyhow::Result<Report> {
+    let dir = std::env::temp_dir().join(format!("exchange-scenario-{}", Uuid::now_v7()));
+    let config = sandbox_config(scenario, base, &dir);
+    let app = App::start(&config)?;
+    let mut runner = Runner {
+        router: app.router.clone(),
+        refs: HashMap::new(),
+        instruments: Vec::new(),
+    };
+    let mut steps = vec![runner.setup(scenario).await];
+    for (i, step) in scenario.steps.iter().enumerate() {
+        let (description, failures) = runner.step(step).await;
+        steps.push(StepReport {
+            index: i + 1,
+            step: description,
+            passed: failures.is_empty(),
+            failures,
+        });
+    }
+    // The runner's router holds a handle to the exchange thread; it must go before the app can shut down.
+    drop(runner);
+    app.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(Report {
+        name: scenario.name.clone(),
+        passed: steps.iter().all(|s| s.passed),
+        steps,
+    })
+}
+
+fn sandbox_config(scenario: &Scenario, base: &Config, dir: &std::path::Path) -> Config {
+    let mut config = base.clone();
+    config.database.path = dir.join("exchange.db").to_string_lossy().into_owned();
+    config.clock = ClockConfig {
+        mode: ClockMode::Virtual,
+        start: Some(scenario.start),
+        running: false,
+    };
+    config.ids = IdsConfig {
+        mode: IdMode::Deterministic,
+        seed: scenario.seed,
+    };
+    config.test_control.enabled = true;
+    config.events.simulation_id = Some(scenario.name.clone());
+    let s = &mut config.settlement;
+    s.seed = scenario.seed;
+    if let Some(section) = &scenario.settlement {
+        macro_rules! apply {
+            ($($field:ident),*) => { $(if let Some(value) = section.$field { s.$field = value; })* };
+        }
+        apply!(
+            mode,
+            seed,
+            settlement_days,
+            reject_probability,
+            cancel_probability,
+            fail_probability,
+            delay_probability,
+            correct_probability,
+            max_delay_days,
+            max_delays,
+            correction_days
+        );
+    }
+    config
+}
+
+struct Runner {
+    router: Router,
+    /// Named orders: their submit responses.
+    refs: HashMap<String, Value>,
+    instruments: Vec<String>,
+}
+
+impl Runner {
+    async fn call(
+        &self,
+        method: Method,
+        uri: &str,
+        body: Option<Value>,
+    ) -> Result<(u16, Value), String> {
+        let request = Request::builder().method(method).uri(uri);
+        let request = match body {
+            Some(body) => request
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string())),
+            None => request.body(Body::empty()),
+        }
+        .map_err(|e| e.to_string())?;
+        let response = self
+            .router
+            .clone()
+            .oneshot(request)
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status().as_u16();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| e.to_string())?
+            .to_bytes();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        Ok((status, body))
+    }
+
+    async fn setup(&mut self, scenario: &Scenario) -> StepReport {
+        let mut failures = Vec::new();
+        let groups = [
+            ("instrument", "/api/instruments", &scenario.instruments),
+            ("participant", "/api/participants", &scenario.participants),
+            ("webhook", "/api/webhooks", &scenario.webhooks),
+        ];
+        for (kind, uri, bodies) in groups {
+            for body in bodies {
+                match self.call(Method::POST, uri, Some(body.clone())).await {
+                    Ok((status, _)) if (200..300).contains(&status) => {
+                        if kind == "instrument"
+                            && let Some(id) = body["id"].as_str()
+                        {
+                            self.instruments.push(id.to_string());
+                        }
+                    }
+                    Ok((status, response)) => {
+                        failures.push(format!("{kind} {body}: HTTP {status} {response}"))
+                    }
+                    Err(error) => failures.push(format!("{kind} {body}: {error}")),
+                }
+            }
+        }
+        StepReport {
+            index: 0,
+            step: "setup".into(),
+            passed: failures.is_empty(),
+            failures,
+        }
+    }
+
+    /// Runs one step; returns its description and failures.
+    async fn step(&mut self, step: &Step) -> (String, Vec<String>) {
+        match step {
+            Step::Order(order) => {
+                let mut body = order.body.clone();
+                if !body.contains_key("instrumentId")
+                    && let [only] = self.instruments.as_slice()
+                {
+                    body.insert("instrumentId".into(), json!(only));
+                }
+                let text = |key: &str| {
+                    body.get(key)
+                        .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
+                };
+                let price = text("priceTicks").unwrap_or_else(|| "MARKET".into());
+                let description = format!(
+                    "order{} {} {} {}@{price}",
+                    order
+                        .name
+                        .as_ref()
+                        .map(|n| format!(" {n}:"))
+                        .unwrap_or_default(),
+                    text("participantId").unwrap_or_default(),
+                    text("side").unwrap_or_default(),
+                    text("quantity").unwrap_or_default(),
+                );
+                let response = self
+                    .call(Method::POST, "/api/orders", Some(Value::Object(body)))
+                    .await;
+                if let (Some(name), Ok((status, body))) = (&order.name, &response)
+                    && (200..300).contains(status)
+                {
+                    self.refs.insert(name.clone(), body.clone());
+                }
+                (description, check_response(response, order.expect.as_ref()))
+            }
+            Step::Cancel(cancel) => {
+                let description = format!("cancel {}", cancel.order);
+                match self.order_id(&cancel.order) {
+                    Ok(id) => {
+                        let response = self
+                            .call(Method::DELETE, &format!("/api/orders/{id}"), None)
+                            .await;
+                        (
+                            description,
+                            check_response(response, cancel.expect.as_ref()),
+                        )
+                    }
+                    Err(failure) => (description, vec![failure]),
+                }
+            }
+            Step::AdvanceClock(advance) => {
+                let body = serde_json::to_value(advance).expect("serializable");
+                let description = format!("advance_clock {body}");
+                let response = self
+                    .call(Method::POST, "/test/clock/advance", Some(body))
+                    .await;
+                (description, check_response(response, None))
+            }
+            Step::SetClock(set) => {
+                let description = format!(
+                    "set_clock {}",
+                    set.to.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                );
+                let response = self
+                    .call(
+                        Method::POST,
+                        "/test/clock/set",
+                        Some(json!({ "to": set.to })),
+                    )
+                    .await;
+                (description, check_response(response, None))
+            }
+            Step::ReportSettlement(report) => {
+                let description = format!("report_settlement {}", report.execution);
+                match self.execution_id(&report.execution) {
+                    Ok(id) => {
+                        let uri = format!("/api/settlements/{id}/outcomes");
+                        let response = self
+                            .call(Method::POST, &uri, Some(Value::Object(report.body.clone())))
+                            .await;
+                        (
+                            description,
+                            check_response(response, report.expect.as_ref()),
+                        )
+                    }
+                    Err(failure) => (description, vec![failure]),
+                }
+            }
+            Step::SetInstrument(set) => {
+                let description =
+                    format!("set_instrument {} enabled={}", set.instrument, set.enabled);
+                let uri = format!("/api/instruments/{}", set.instrument);
+                let response = self
+                    .call(Method::PATCH, &uri, Some(json!({ "enabled": set.enabled })))
+                    .await;
+                (description, check_response(response, set.expect.as_ref()))
+            }
+            Step::Expect(expectation) => self.expect(expectation).await,
+        }
+    }
+
+    async fn expect(&self, e: &Expectation) -> (String, Vec<String>) {
+        if let Some(order) = &e.order {
+            let description = format!("expect order {order}");
+            return match self.order_id(order) {
+                Ok(id) => (
+                    description,
+                    self.check_single(&format!("/api/orders/{id}"), e.matches.as_ref())
+                        .await,
+                ),
+                Err(failure) => (description, vec![failure]),
+            };
+        }
+        if let Some(instrument) = &e.book {
+            let description = format!("expect book {instrument}");
+            let failures = self
+                .check_single(&format!("/api/orderbooks/{instrument}"), e.matches.as_ref())
+                .await;
+            return (description, failures);
+        }
+        if let Some(execution) = &e.settlement {
+            let description = format!("expect settlement {execution}");
+            return match self.execution_id(execution) {
+                Ok(id) => (
+                    description,
+                    self.check_single(&format!("/api/settlements/{id}"), e.matches.as_ref())
+                        .await,
+                ),
+                Err(failure) => (description, vec![failure]),
+            };
+        }
+        let (kind, filter, uri, paged, wait) = match (&e.trades, &e.events, &e.deliveries) {
+            (Some(filter), _, _) => ("trades", filter, "/api/trades?limit=1000", false, 0),
+            (_, Some(filter), _) => ("events", filter, "/api/events?limit=1000", true, 0),
+            (_, _, Some(filter)) => (
+                "deliveries",
+                filter,
+                "/test/deliveries",
+                false,
+                e.wait_ms.unwrap_or(DEFAULT_DELIVERY_WAIT_MS),
+            ),
+            _ => unreachable!("Scenario::parse checks that an expectation has a target"),
+        };
+        let description = format!("expect {kind} {filter}");
+        let deadline = Instant::now() + Duration::from_millis(wait);
+        loop {
+            let failure = match self.collect(uri, paged).await {
+                Ok(items) => {
+                    let found = items.iter().filter(|item| contains(filter, item)).count();
+                    match e.count {
+                        Some(count) if count != found => {
+                            Some(format!("expected {count} matching {kind}, found {found}"))
+                        }
+                        None if found == 0 => {
+                            Some(format!("expected at least one matching {kind}, found none"))
+                        }
+                        _ => None,
+                    }
+                }
+                Err(failure) => Some(failure),
+            };
+            match failure {
+                Some(_) if Instant::now() < deadline => tokio::time::sleep(DELIVERY_POLL).await,
+                Some(failure) => {
+                    let waited = if wait > 0 {
+                        format!(" after waiting {wait} ms")
+                    } else {
+                        String::new()
+                    };
+                    return (description, vec![format!("{failure}{waited}")]);
+                }
+                None => return (description, Vec::new()),
+            }
+        }
+    }
+
+    /// GETs one resource and checks it contains `matches`.
+    async fn check_single(&self, uri: &str, matches: Option<&Value>) -> Vec<String> {
+        match self.call(Method::GET, uri, None).await {
+            Ok((200, actual)) => matches
+                .map(|expected| mismatches(expected, &actual))
+                .unwrap_or_default(),
+            Ok((status, body)) => vec![format!("GET {uri}: HTTP {status} {body}")],
+            Err(error) => vec![format!("GET {uri}: {error}")],
+        }
+    }
+
+    /// Every item of a list endpoint; events are paged through by sequence.
+    async fn collect(&self, uri: &str, paged: bool) -> Result<Vec<Value>, String> {
+        let mut items = Vec::new();
+        let mut after = 0;
+        loop {
+            let page_uri = if paged {
+                format!("{uri}&after={after}")
+            } else {
+                uri.to_string()
+            };
+            let page = match self.call(Method::GET, &page_uri, None).await? {
+                (200, Value::Array(page)) => page,
+                (status, body) => return Err(format!("GET {page_uri}: HTTP {status} {body}")),
+            };
+            let full = page.len() == 1000;
+            if let Some(last) = page.last() {
+                after = last["sequence"].as_u64().unwrap_or(after);
+            }
+            items.extend(page);
+            if !paged || !full {
+                return Ok(items);
+            }
+        }
+    }
+
+    /// A named order's ID, or a literal order ID.
+    fn order_id(&self, reference: &str) -> Result<String, String> {
+        if let Some(response) = self.refs.get(reference) {
+            return response["order"]["orderId"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("{reference} has no order ID"));
+        }
+        Uuid::parse_str(reference)
+            .map(|id| id.to_string())
+            .map_err(|_| format!("unknown order reference {reference} (name orders with `as:`)"))
+    }
+
+    /// `order#i`: the `i`-th execution of a named order; otherwise a literal execution ID.
+    fn execution_id(&self, reference: &str) -> Result<String, String> {
+        if let Some((name, index)) = reference.split_once('#') {
+            let response = self
+                .refs
+                .get(name)
+                .ok_or_else(|| format!("unknown order reference {name}"))?;
+            let index: usize = index
+                .parse()
+                .map_err(|_| format!("bad execution index in {reference}"))?;
+            return response["executions"][index]["executionId"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("{name} has no execution {index}"));
+        }
+        Uuid::parse_str(reference)
+            .map(|id| id.to_string())
+            .map_err(|_| format!("unknown execution reference {reference} (use order#index)"))
+    }
+}
+
+/// Checks a command's response: the expected status (default: any 2xx) and the contained fields.
+fn check_response(
+    response: Result<(u16, Value), String>,
+    check: Option<&ResponseCheck>,
+) -> Vec<String> {
+    let (status, body) = match response {
+        Ok(response) => response,
+        Err(error) => return vec![error],
+    };
+    let mut failures = Vec::new();
+    match check.and_then(|c| c.status) {
+        Some(expected) if expected != status => {
+            failures.push(format!("expected HTTP {expected}, got {status}: {body}"))
+        }
+        None if !(200..300).contains(&status) => failures.push(format!("HTTP {status}: {body}")),
+        _ => {}
+    }
+    if let Some(expected) = check.and_then(|c| c.matches.as_ref()) {
+        failures.extend(mismatches(expected, &body));
+    }
+    failures
+}

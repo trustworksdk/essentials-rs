@@ -36,6 +36,21 @@ pub struct ExecutionFilter {
     pub limit: u32,
 }
 
+/// A webhook delivery as test control shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeliveryRecord {
+    pub delivery_id: Uuid,
+    pub subscription_id: Uuid,
+    pub url: String,
+    pub event_sequence: u64,
+    pub event_id: Uuid,
+    pub event_type: String,
+    /// `PENDING`, `IN_FLIGHT`, `DELIVERED` or `DEAD`.
+    pub status: String,
+    pub attempts: u64,
+    pub last_error: Option<String>,
+}
+
 /// An order with the timestamps stored alongside it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderRecord {
@@ -603,6 +618,33 @@ impl Store {
                 "SELECT status, COUNT(*) FROM webhook_deliveries GROUP BY status ORDER BY status",
             )?
             .query_map([], |row| Ok((row.get(0)?, from_sql(row, 1)?)))?
+            .collect()
+    }
+
+    /// Every webhook delivery with its subscription URL and event, in event order, then subscription.
+    pub fn deliveries(&self) -> rusqlite::Result<Vec<DeliveryRecord>> {
+        self.conn
+            .prepare_cached(
+                "SELECT d.id, d.subscription_id, s.url, d.event_sequence, e.event_id, e.event_type, d.status,
+                        d.attempts, d.last_error
+                 FROM webhook_deliveries d
+                 JOIN webhook_subscriptions s ON s.id = d.subscription_id
+                 JOIN events e ON e.sequence = d.event_sequence
+                 ORDER BY d.event_sequence, s.created_at, s.id",
+            )?
+            .query_map([], |row| {
+                Ok(DeliveryRecord {
+                    delivery_id: parsed(row, 0)?,
+                    subscription_id: parsed(row, 1)?,
+                    url: row.get(2)?,
+                    event_sequence: from_sql(row, 3)?,
+                    event_id: parsed(row, 4)?,
+                    event_type: row.get(5)?,
+                    status: row.get(6)?,
+                    attempts: from_sql(row, 7)?,
+                    last_error: row.get(8)?,
+                })
+            })?
             .collect()
     }
 

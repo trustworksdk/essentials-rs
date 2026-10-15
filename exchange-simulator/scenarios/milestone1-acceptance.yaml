@@ -1,0 +1,22 @@
+name: Milestone 1 acceptance trade
+description: >
+  A sell of 200 at 100.25 and a buy of 150 trade once; 50 stay on the book. The trade, its events and the resting
+  order are as specified, with the same IDs on every run.
+seed: 1
+instruments:
+  - { id: ACME, symbol: ACME, mic: XCSE, currency: DKK, currencyScale: 2, tickSizeMinor: 1 }
+participants:
+  - { id: participant-a, name: Participant A }
+  - { id: participant-b, name: Participant B }
+steps:
+  - order: { as: sell, participantId: participant-a, side: SELL, type: LIMIT, priceTicks: 10025, quantity: 200,
+             expect: { status: 201, matches: { order: { status: OPEN, price: "100.25" }, executions: [] } } }
+  - order: { as: buy, participantId: participant-b, side: BUY, type: LIMIT, priceTicks: 10025, quantity: 150,
+             expect: { matches: { order: { status: FILLED },
+                                  executions: [ { quantity: 150, price: "100.25", buyerId: participant-b,
+                                                  sellerId: participant-a } ] } } }
+  - expect: { order: sell, matches: { status: PARTIALLY_FILLED, remainingQuantity: 50, filledQuantity: 150 } }
+  - expect: { book: ACME, matches: { bids: [], asks: [ { priceTicks: 10025, quantity: 50, orders: 1 } ] } }
+  - expect: { trades: {}, count: 1 }
+  - expect: { events: { eventType: TradeExecuted, payload: { quantity: 150, price: "100.25" } }, count: 1 }
+  - expect: { events: { eventType: OrderAccepted }, count: 2 }

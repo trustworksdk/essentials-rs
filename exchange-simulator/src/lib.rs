@@ -12,5 +12,6 @@ pub mod events;
 pub mod ids;
 pub mod metrics;
 pub mod persistence;
+pub mod scenario;
 pub mod settlement;
 pub mod webhooks;

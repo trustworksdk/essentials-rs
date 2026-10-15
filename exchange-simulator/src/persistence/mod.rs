@@ -2,7 +2,9 @@
 
 mod store;
 
-pub use store::{ExecutionFilter, InstrumentFilter, OrderRecord, Outbox, SettlementWrite, Store};
+pub use store::{
+    DeliveryRecord, ExecutionFilter, InstrumentFilter, OrderRecord, Outbox, SettlementWrite, Store,
+};
 
 use std::path::Path;
 use std::time::Duration;

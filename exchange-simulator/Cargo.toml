@@ -15,23 +15,24 @@ config = { version = "0.15.27", default-features = false, features = ["yaml"] }
 fastrand = "2.5.0"
 futures-util = "0.3.34"
 hmac = "0.13.0"
+http-body-util = "0.1.5"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 rusqlite = { version = "0.39.0", features = ["bundled", "hooks"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = "2.0.0"
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 thiserror = "2.0.21"
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.28.0", features = ["v7", "v8", "serde"] }
 
 [dev-dependencies]
-http-body-util = "0.1.5"
 testcontainers-modules = "0.15.0"
-tower = { version = "0.5.3", features = ["util"] }
 
 [features]
 # The containerized acceptance test (tests/e2e.rs): builds the service image and runs it with MockServer on a Docker
