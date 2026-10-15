@@ -3,7 +3,8 @@
 mod store;
 
 pub use store::{
-    DeliveryRecord, ExecutionFilter, InstrumentFilter, OrderRecord, Outbox, SettlementWrite, Store,
+    AttemptRow, DeliveryRecord, ExecutionFilter, InstrumentFilter, OrderRecord, Outbox,
+    SettlementWrite, Store,
 };
 
 use std::path::Path;
@@ -21,6 +22,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/006_virtual_clock.sql"),
     include_str!("../../migrations/007_settlement.sql"),
     include_str!("../../migrations/008_settlement_reports.sql"),
+    include_str!("../../migrations/009_delivery_faults.sql"),
 ];
 
 /// Opens (creating if needed) the database at `path`, applies connection pragmas and runs pending migrations.
@@ -115,6 +117,7 @@ mod tests {
                 "settlement_instructions",
                 "settlement_reports",
                 "virtual_clock",
+                "webhook_attempts",
                 "webhook_deliveries",
                 "webhook_subscriptions"
             ]

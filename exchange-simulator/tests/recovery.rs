@@ -764,6 +764,7 @@ fn a_delivery_claim_is_a_lease_and_late_results_do_not_overwrite() {
     let delivered = DeliveryResult {
         delivery_id: second[0].delivery_id,
         outcome: DeliveryOutcome::Delivered,
+        sent: Vec::new(),
     };
     store.record_deliveries(&[delivered], at(12)).unwrap();
     let late = DeliveryResult {
@@ -772,6 +773,7 @@ fn a_delivery_claim_is_a_lease_and_late_results_do_not_overwrite() {
             at: at(30),
             error: "timeout".into(),
         },
+        sent: Vec::new(),
     };
     store.record_deliveries(&[late], at(13)).unwrap();
     let (status, attempts): (String, i64) = store
@@ -829,6 +831,7 @@ fn an_ordered_subscription_has_one_delivery_in_flight_in_sequence_order() {
                     &[DeliveryResult {
                         delivery_id: job.delivery_id,
                         outcome,
+                        sent: Vec::new(),
                     }],
                     at,
                 )

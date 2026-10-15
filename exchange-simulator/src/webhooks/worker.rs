@@ -5,7 +5,7 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use tokio::sync::{Notify, watch};
 
-use super::{DeliveryJob, DeliveryOutcome, DeliveryResult, signing};
+use super::{AttemptRecord, DeliveryJob, DeliveryOutcome, DeliveryResult, signing};
 use crate::engine::{DispatchError, Dispatcher};
 
 /// Exponential backoff with jitter, and the attempt budget before a delivery is dead-lettered.
@@ -162,8 +162,103 @@ async fn deliver(
 ) -> DeliveryResult {
     let attempt = job.attempts + 1;
     let started = std::time::Instant::now();
-    // Serialized once: these exact bytes are signed and sent.
-    let body = serde_json::to_vec(&job.event).expect("envelopes serialize");
+    let plan = job
+        .faults
+        .as_ref()
+        .map(|policy| {
+            let event = serde_json::to_value(&job.event).expect("envelopes serialize");
+            policy.plan(job.delivery_id, attempt, job.held, &event)
+        })
+        .unwrap_or_default();
+    if let Some(hold) = plan.hold {
+        let now = Utc::now();
+        let at = now + chrono::Duration::from_std(hold).unwrap_or(chrono::Duration::MAX);
+        ::metrics::counter!(crate::metrics::WEBHOOK_ATTEMPTS, "outcome" => "held").increment(1);
+        tracing::debug!(delivery = %job.delivery_id, until = %at, "webhook held back by an out-of-order fault");
+        return DeliveryResult {
+            delivery_id: job.delivery_id,
+            outcome: DeliveryOutcome::Held { at },
+            sent: vec![AttemptRecord {
+                attempt,
+                held: true,
+                faults: plan.applied,
+                body: None,
+                http_status: None,
+                error: None,
+                at: now,
+            }],
+        };
+    }
+    if let Some(delay) = plan.delay {
+        tokio::time::sleep(delay).await;
+    }
+    // Serialized once: these exact bytes are signed and sent (twice for a duplicate).
+    let body = match &plan.body {
+        Some(damaged) => damaged.clone(),
+        None => serde_json::to_vec(&job.event).expect("envelopes serialize"),
+    };
+    let recorded_body = plan
+        .body
+        .as_ref()
+        .map(|b| String::from_utf8_lossy(b).into_owned());
+    let mut sent = Vec::new();
+    let mut outcome = None;
+    for _ in 0..if plan.duplicate { 2 } else { 1 } {
+        let at = Utc::now();
+        let (http_status, error) = match send(client, &job, attempt, &body).await {
+            Ok(status) if status.is_success() => (Some(status.as_u16()), None),
+            Ok(status) => (Some(status.as_u16()), Some(format!("HTTP {status}"))),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        // The first request decides; a duplicate only shows the consumer the same event again.
+        outcome.get_or_insert_with(|| match &error {
+            None => DeliveryOutcome::Delivered,
+            Some(error) => retry.after_failure(job.attempts, error.clone()),
+        });
+        sent.push(AttemptRecord {
+            attempt,
+            held: false,
+            faults: plan.applied.clone(),
+            body: recorded_body.clone(),
+            http_status,
+            error,
+            at,
+        });
+    }
+    let outcome = outcome.expect("at least one request");
+    ::metrics::histogram!(crate::metrics::WEBHOOK_DURATION).record(started.elapsed());
+    let label = match &outcome {
+        DeliveryOutcome::Delivered => "delivered",
+        DeliveryOutcome::Retry { .. } => "retry",
+        DeliveryOutcome::Dead { .. } => "dead",
+        DeliveryOutcome::Held { .. } => "held",
+    };
+    ::metrics::counter!(crate::metrics::WEBHOOK_ATTEMPTS, "outcome" => label).increment(1);
+    match &outcome {
+        DeliveryOutcome::Delivered | DeliveryOutcome::Held { .. } => {
+            tracing::debug!(delivery = %job.delivery_id, event = %job.event.event_id, attempt, "webhook delivered");
+        }
+        DeliveryOutcome::Retry { error, at } => {
+            tracing::info!(delivery = %job.delivery_id, url = %job.url, attempt, %error, retry_at = %at, "webhook failed");
+        }
+        DeliveryOutcome::Dead { error } => {
+            tracing::warn!(delivery = %job.delivery_id, url = %job.url, attempt, %error, "webhook dead-lettered");
+        }
+    }
+    DeliveryResult {
+        delivery_id: job.delivery_id,
+        outcome,
+        sent,
+    }
+}
+
+/// One POST of `body` for the job, signed when the subscription has a secret.
+async fn send(
+    client: &reqwest::Client,
+    job: &DeliveryJob,
+    attempt: u32,
+    body: &[u8],
+) -> Result<reqwest::StatusCode, reqwest::Error> {
     let mut request = client
         .post(&job.url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -178,37 +273,10 @@ async fn deliver(
             .header(signing::TIMESTAMP_HEADER, timestamp.to_string())
             .header(
                 signing::SIGNATURE_HEADER,
-                signing::sign(secret, timestamp, &body),
+                signing::sign(secret, timestamp, body),
             );
     }
-    let response = request.body(body).send().await;
-    let outcome = match response {
-        Ok(response) if response.status().is_success() => DeliveryOutcome::Delivered,
-        Ok(response) => retry.after_failure(job.attempts, format!("HTTP {}", response.status())),
-        Err(error) => retry.after_failure(job.attempts, error.to_string()),
-    };
-    ::metrics::histogram!(crate::metrics::WEBHOOK_DURATION).record(started.elapsed());
-    let label = match &outcome {
-        DeliveryOutcome::Delivered => "delivered",
-        DeliveryOutcome::Retry { .. } => "retry",
-        DeliveryOutcome::Dead { .. } => "dead",
-    };
-    ::metrics::counter!(crate::metrics::WEBHOOK_ATTEMPTS, "outcome" => label).increment(1);
-    match &outcome {
-        DeliveryOutcome::Delivered => {
-            tracing::debug!(delivery = %job.delivery_id, event = %job.event.event_id, attempt, "webhook delivered");
-        }
-        DeliveryOutcome::Retry { error, at } => {
-            tracing::info!(delivery = %job.delivery_id, url = %job.url, attempt, %error, retry_at = %at, "webhook failed");
-        }
-        DeliveryOutcome::Dead { error } => {
-            tracing::warn!(delivery = %job.delivery_id, url = %job.url, attempt, %error, "webhook dead-lettered");
-        }
-    }
-    DeliveryResult {
-        delivery_id: job.delivery_id,
-        outcome,
-    }
+    Ok(request.body(body.to_vec()).send().await?.status())
 }
 
 #[cfg(test)]

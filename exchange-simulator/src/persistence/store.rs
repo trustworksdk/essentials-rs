@@ -8,7 +8,7 @@ use crate::engine::BookUpdate;
 use crate::events::{self, EventEnvelope, NewEvent};
 use crate::ids::IdScheme;
 use crate::settlement::{ExternalReport, Instruction, SettlementStatus};
-use crate::webhooks::{DeliveryJob, DeliveryOutcome, DeliveryResult, Subscription};
+use crate::webhooks::{DeliveryJob, DeliveryOutcome, DeliveryResult, FaultPolicy, Subscription};
 
 /// Repository over the single writer connection. Every state change a matching step produces is written by
 /// [`Store::commit`] in one transaction.
@@ -34,6 +34,25 @@ pub struct ExecutionFilter {
     /// Matches executions where the order is the buy or the sell order.
     pub order_id: Option<Uuid>,
     pub limit: u32,
+}
+
+/// A recorded webhook attempt with its delivery's subscription and event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttemptRow {
+    pub id: u64,
+    pub delivery_id: Uuid,
+    pub subscription_id: Uuid,
+    pub url: String,
+    pub event_sequence: u64,
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub attempt: u32,
+    pub held: bool,
+    pub faults: Vec<String>,
+    pub body: Option<String>,
+    pub http_status: Option<u16>,
+    pub error: Option<String>,
+    pub at: DateTime<Utc>,
 }
 
 /// A webhook delivery as test control shows it.
@@ -336,7 +355,7 @@ impl Store {
     pub fn subscriptions(&self) -> rusqlite::Result<Vec<Subscription>> {
         self.conn
             .prepare_cached(
-                "SELECT id, url, enabled, event_types, created_at, secret, ordered
+                "SELECT id, url, enabled, event_types, created_at, secret, ordered, fault_policy
                  FROM webhook_subscriptions ORDER BY created_at, id",
             )?
             .query_map([], |row| {
@@ -351,6 +370,54 @@ impl Store {
                     created_at: parsed(row, 4)?,
                     secret: row.get(5)?,
                     ordered: row.get(6)?,
+                    faults: json_column(row, 7)?,
+                })
+            })?
+            .collect()
+    }
+
+    /// Sets or clears a subscription's fault policy; false when there is no such subscription.
+    pub fn set_fault_policy(
+        &self,
+        subscription_id: Uuid,
+        policy: Option<&FaultPolicy>,
+    ) -> rusqlite::Result<bool> {
+        let policy = policy.map(|p| serde_json::to_string(p).expect("policies serialize"));
+        self.conn
+            .prepare_cached("UPDATE webhook_subscriptions SET fault_policy = ?2 WHERE id = ?1")?
+            .execute(params![subscription_id.to_string(), policy])
+            .map(|n| n == 1)
+    }
+
+    /// Recorded webhook attempts, oldest first, optionally for one subscription.
+    pub fn attempts(&self, subscription_id: Option<Uuid>) -> rusqlite::Result<Vec<AttemptRow>> {
+        self.conn
+            .prepare_cached(
+                "SELECT a.id, a.delivery_id, d.subscription_id, s.url, d.event_sequence, e.event_id, e.event_type,
+                        a.attempt, a.outcome, a.faults, a.body, a.http_status, a.error, a.at
+                 FROM webhook_attempts a
+                 JOIN webhook_deliveries d ON d.id = a.delivery_id
+                 JOIN webhook_subscriptions s ON s.id = d.subscription_id
+                 JOIN events e ON e.sequence = d.event_sequence
+                 WHERE ?1 IS NULL OR d.subscription_id = ?1
+                 ORDER BY a.id",
+            )?
+            .query_map(params![subscription_id.map(|id| id.to_string())], |row| {
+                Ok(AttemptRow {
+                    id: from_sql(row, 0)?,
+                    delivery_id: parsed(row, 1)?,
+                    subscription_id: parsed(row, 2)?,
+                    url: row.get(3)?,
+                    event_sequence: from_sql(row, 4)?,
+                    event_id: parsed(row, 5)?,
+                    event_type: row.get(6)?,
+                    attempt: row.get(7)?,
+                    held: row.get::<_, String>(8)? == "HELD",
+                    faults: json_column(row, 9)?.unwrap_or_default(),
+                    body: row.get(10)?,
+                    http_status: row.get(11)?,
+                    error: row.get(12)?,
+                    at: parsed(row, 13)?,
                 })
             })?
             .collect()
@@ -368,7 +435,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         let jobs = {
             let mut select = tx.prepare_cached(&format!(
-                "SELECT d.id, d.subscription_id, s.url, d.attempts, {EVENT_COLUMNS}, s.secret
+                "SELECT d.id, d.subscription_id, s.url, d.attempts, {EVENT_COLUMNS}, s.secret, s.fault_policy, d.held
                  FROM webhook_deliveries d
                  JOIN webhook_subscriptions s ON s.id = d.subscription_id
                  JOIN events e ON e.sequence = d.event_sequence
@@ -388,6 +455,8 @@ impl Store {
                         attempts: row.get(3)?,
                         event: event_row(row, 4)?,
                         secret: row.get(14)?,
+                        faults: json_column(row, 15)?,
+                        held: row.get(16)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -403,8 +472,9 @@ impl Store {
         Ok(jobs)
     }
 
-    /// Records attempt outcomes. Each counts as one attempt. Only in-flight deliveries are updated, so a late result
-    /// for a delivery that was meanwhile re-claimed and finished does not overwrite it.
+    /// Records attempt outcomes. Each counts as one attempt, except a hold. Only in-flight deliveries are updated, so a
+    /// late result for a delivery that was meanwhile re-claimed and finished does not overwrite it. What was sent is
+    /// recorded in `webhook_attempts` either way: it happened.
     pub fn record_deliveries(
         &mut self,
         results: &[DeliveryResult],
@@ -418,6 +488,14 @@ impl Store {
                  SET status = ?2, attempts = attempts + 1, next_attempt_at = ?3, last_error = ?4, delivered_at = ?5
                  WHERE id = ?1 AND status = 'IN_FLIGHT'",
             )?;
+            let mut hold = tx.prepare_cached(
+                "UPDATE webhook_deliveries SET status = 'PENDING', next_attempt_at = ?2, held = 1
+                 WHERE id = ?1 AND status = 'IN_FLIGHT'",
+            )?;
+            let mut attempt = tx.prepare_cached(
+                "INSERT INTO webhook_attempts (delivery_id, attempt, outcome, faults, body, http_status, error, at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
             for result in results {
                 let (status, next, error, delivered) = match &result.outcome {
                     DeliveryOutcome::Delivered => ("DELIVERED", None, None, Some(now.clone())),
@@ -425,14 +503,31 @@ impl Store {
                         ("PENDING", Some(timestamp(*at)), Some(error.as_str()), None)
                     }
                     DeliveryOutcome::Dead { error } => ("DEAD", None, Some(error.as_str()), None),
+                    DeliveryOutcome::Held { .. } => ("PENDING", None, None, None),
                 };
-                update.execute(params![
-                    result.delivery_id.to_string(),
-                    status,
-                    next,
-                    error,
-                    delivered
-                ])?;
+                if let DeliveryOutcome::Held { at } = &result.outcome {
+                    hold.execute(params![result.delivery_id.to_string(), timestamp(*at)])?;
+                } else {
+                    update.execute(params![
+                        result.delivery_id.to_string(),
+                        status,
+                        next,
+                        error,
+                        delivered
+                    ])?;
+                }
+                for sent in &result.sent {
+                    attempt.execute(params![
+                        result.delivery_id.to_string(),
+                        sent.attempt,
+                        if sent.held { "HELD" } else { "SENT" },
+                        serde_json::to_string(&sent.faults).expect("strings serialize"),
+                        sent.body,
+                        sent.http_status,
+                        sent.error,
+                        timestamp(sent.at),
+                    ])?;
+                }
             }
         }
         tx.commit()
@@ -665,6 +760,19 @@ pub(crate) fn timestamp(at: DateTime<Utc>) -> String {
 /// Domain quantities and sequences are `u64` but validated to fit SQLite's signed 64-bit integers.
 fn to_sql(value: u64) -> i64 {
     i64::try_from(value).expect("domain integers are validated to fit i64")
+}
+
+/// A nullable JSON text column.
+fn json_column<T: serde::de::DeserializeOwned>(
+    row: &Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<T>> {
+    let Some(text) = row.get::<_, Option<String>>(index)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e)))
 }
 
 fn from_sql(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {

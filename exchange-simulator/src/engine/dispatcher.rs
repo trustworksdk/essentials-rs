@@ -8,7 +8,7 @@ use super::{
 };
 use crate::domain::{Instrument, InstrumentId, Participant, Side};
 use crate::settlement::{ExternalReport, NewReport};
-use crate::webhooks::{DeliveryJob, DeliveryResult, NewSubscription, Subscription};
+use crate::webhooks::{DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
@@ -42,6 +42,7 @@ enum Request {
     Cancel(Uuid, Reply<(BookUpdate, Instrument)>),
     Snapshot(InstrumentId, oneshot::Sender<Option<BookSnapshot>>),
     RegisterWebhook(NewSubscription, Reply<Subscription>),
+    SetWebhookFaults(Uuid, Option<FaultPolicy>, Reply<Subscription>),
     SetInstrumentEnabled(InstrumentId, bool, Reply<Instrument>),
     ClockState(oneshot::Sender<ClockState>),
     SettlementTick(Reply<usize>),
@@ -144,6 +145,15 @@ impl Dispatcher {
         request: NewSubscription,
     ) -> Result<Subscription, DispatchError> {
         self.call(|reply| Request::RegisterWebhook(request, reply))
+            .await
+    }
+
+    pub async fn set_webhook_faults(
+        &self,
+        subscription_id: Uuid,
+        policy: Option<FaultPolicy>,
+    ) -> Result<Subscription, DispatchError> {
+        self.call(|reply| Request::SetWebhookFaults(subscription_id, policy, reply))
             .await
     }
 
@@ -271,6 +281,10 @@ fn handle(exchange: &mut Exchange, request: Request) -> (&'static str, &'static 
         Request::RegisterWebhook(request, reply) => (
             "register_webhook",
             answer(reply, exchange.register_webhook(request)),
+        ),
+        Request::SetWebhookFaults(id, policy, reply) => (
+            "set_webhook_faults",
+            answer(reply, exchange.set_webhook_faults(id, policy)),
         ),
         Request::ClaimDeliveries(limit, lease, reply) => (
             "claim_deliveries",

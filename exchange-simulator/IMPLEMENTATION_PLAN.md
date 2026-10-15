@@ -360,7 +360,7 @@ random markets; and faults injected into *delivered copies* of events, never int
 | 3.0 ✅ | Reproducible IDs (D6) | M | Config `ids: { mode: random \| deterministic, seed }`, default `random`. In `deterministic` mode every ID is a UUIDv8 built from a keyed hash of `(seed, kind, natural key)`. The keys already follow from the command order: order → its sequence; execution → (taker order sequence, fill index); event → its event sequence (the single writer knows the next one, and checks it against SQLite after insert); webhook delivery → (subscription, event sequence); subscription → its ordinal; external report → (execution, ordinal). No extra counters are stored, so a restart continues identically. Acceptance: the same commands, seed and clock moves give a byte-identical `/api/events` log and identical API responses (only real-time delivery fields differ), including with restarts in between. |
 | 3.1 ✅ | Scenario DSL and runner | L | YAML: `seed`, `instruments`, `participants`, `subscriptions`, then `steps:` (`order`, `cancel`, `advance_clock`, `expect` on order state, trades, events, book, deliveries). It runs against an in-process service with a virtual clock and deterministic IDs. Per D3, both a CLI (`exchange-simulator scenario run file.yaml`, exit code = verdict) and `POST /test/scenarios` (test control only; returns the verdict and each failed expectation). Both use one runner. Example scenarios go in `scenarios/`. |
 | 3.2 ✅ | Random market generator | M | Seeded distributions from plan §6: arrival rate, buy probability, market-order and cancellation probabilities, and price and size distributions per instrument. It generalizes the `bench` workload. Reproducibility comes from the seed plus deterministic sequencing: one generator feeds commands in order, under the virtual clock. |
-| 3.3 | Delivery fault policies | M | Per-subscription policy, configured under `/test/…` or in a scenario: missing fields, explicit nulls, invalid values (a JSON-path list or a random choice by probability), duplicates, delays, out-of-order (hold and release). Faults apply to the outgoing copy only. A new `webhook_attempts` table records each attempt with the mutation applied, so a test can assert on what was actually sent. |
+| 3.3 ✅ | Delivery fault policies | M | Per-subscription policy, configured under `/test/…` or in a scenario: missing fields, explicit nulls, invalid values (a JSON-path list or a random choice by probability), duplicates, delays, out-of-order (hold and release). Faults apply to the outgoing copy only. A new `webhook_attempts` table records each attempt with the mutation applied, so a test can assert on what was actually sent. |
 | 3.4 | Reset and replay controls | S | `POST /test/reset` clears all state (test mode only). `POST /test/webhooks/{id}/redeliver?after=` re-enqueues deliveries from a sequence. Dead letters can be listed and retried. |
 | 3.5 | Tests and acceptance | M | A scenario suite in CI: the same file and seed give byte-identical event logs over two runs. Each fault type is visible at the receiver and absent from `/api/events`. Reset gives a clean state. |
 
@@ -521,6 +521,88 @@ random markets; and faults injected into *delivered copies* of events, never int
     `POST /test/scenarios`. A market against the live service waits for reset (3.4), if it is wanted at all.
 - **Deviation:** the plan's example config has `instruments: 100` as a count. Here instruments are listed (each
   needs its registration and distributions), so many instruments mean a long list.
+
+**3.3 — delivery fault policies ✅ (2026-10-15).**
+- **Delivered:**
+  - `webhooks::faults`: `FaultPolicy` with `missing`, `nulls` and `invalid` (listed JSON paths, or one random leaf
+    field), `duplicateProbability`, `delay` and `outOfOrder`, each with a probability. `validate` errors name the
+    field. `plan()` turns a policy into a `FaultPlan` for one attempt.
+  - **Reproducible decisions.** Each is drawn from SplitMix64 seeded by SHA-256(policy seed, delivery ID, attempt).
+    With deterministic IDs the same deliveries get the same faults on every run and across restarts. Every draw is
+    always made, so adding one fault leaves the others' decisions unchanged.
+  - **Worker:**
+    - a hold returns a new `DeliveryOutcome::Held { at }`;
+    - a delay sleeps in the request's slot;
+    - the damaged body (or the canonical one) is serialized once, signed and sent, and sent twice for a duplicate;
+    - the first response decides the outcome;
+    - headers stay canonical.
+  - **Migration 009:**
+    - `webhook_subscriptions.fault_policy` (JSON) holds the policy;
+    - `webhook_deliveries.held` marks a delivery as held once, so it is never held again;
+    - the new `webhook_attempts` table has one row per request sent (a duplicate adds one) and one per hold, with
+      the attempt number, outcome (`SENT`/`HELD`), faults applied, the body when a fault changed it, HTTP status,
+      error and time.
+  - **A hold uses no attempt.** It sets the delivery back to `PENDING` with `next_attempt_at` = now + `holdMs`, so
+    later events are claimed and overtake it. Rows are written in `record_deliveries`, in the same transaction as the
+    outcome.
+  - **Test control:**
+    - `PUT`/`DELETE /test/webhooks/{id}/faults` (through the exchange thread; `404` for an unknown subscription);
+    - `GET /test/attempts?subscriptionId=`;
+    - `GET /api/webhooks` shows a subscription's policy when it has one.
+  - **Scenarios:**
+    - a `faults` key on webhook entries;
+    - a `set_faults: { url, faults }` step (`null` clears);
+    - an `attempts` expectation, which waits like `deliveries`;
+    - `all: true` on list expectations: every item matches, and there is at least one. It is used to wait for the
+      outbox to drain.
+  - A README section on fault injection.
+- **Tests:**
+  - `faults` unit tests (5):
+    - Listed paths are removed, nulled or made invalid, and missing paths are skipped.
+    - Decisions are reproducible per delivery and attempt, change with the seed and on a retry, and fire at the
+      configured rates.
+    - A random field fault removes exactly one leaf.
+    - A hold sends nothing and happens once.
+    - Adding a fault does not change the others.
+    - Invalid policies name the field.
+  - `tests/faults.rs` (6), against a real receiver:
+    - **Field faults:** the received body is exactly the configured damage, while `/api/events` keeps the canonical
+      event. The signature covers the damaged bytes, and `/test/attempts` records the faults and the same body.
+    - **Duplicates and delays:** two identical requests as one attempt, at least 300 ms late, with no body stored.
+      The delivery is `DELIVERED` after 1 attempt.
+    - **Holds:** a held trade is overtaken by a later one, and the hold uses no attempt.
+    - **Restarts:** the policy survives a restart, and a held delivery is not held again after one.
+    - **Validation:** invalid policies, unknown fields, `outOfOrder` on an ordered subscription, an unknown
+      subscription, and test control off are all refused.
+    - **Reproducibility:** a scenario with a random market and random faults, run twice, sends byte-identical copies,
+      damage and duplicates included.
+  - `tests/scenarios.rs` (+1): `all` fails on an empty list and on a partial match.
+  - The fault, scenario and webhook suites were repeated five times without failure.
+- **Mutation checks**, each made a test fail:
+  - the canonical body sent instead of the damaged one;
+  - the hold not remembered;
+  - a hold counted as an attempt;
+  - no duplicate;
+  - no delay;
+  - the fault generator ignoring the delivery ID;
+  - holds allowed on ordered subscriptions;
+  - the signature over the canonical body;
+  - only faulted attempts recorded;
+  - `all` passing on an empty list.
+- **Decisions:**
+  - **Faults are decided per attempt.** A retry draws anew, as a flaky network would.
+  - **Every attempt is recorded,** faults or not, but the body only when a fault changed it. That makes
+    `webhook_attempts` the record of what was sent. It costs one more row per attempt in the transaction that
+    already records the outcome; the cost on webhook throughput is not yet measured (4.1/4.6).
+  - **A duplicate is the same attempt,** with identical bytes and headers. The first response decides the outcome.
+  - **A signed subscription signs the damaged bytes.** The consumer then sees a valid signature over a faulty event,
+    which tests payload validation rather than signature checks. A forged-signature fault could come later.
+  - **A delay sleeps in place.** It holds up the worker's batch, like a slow network, so it is capped at 10 s, well
+    inside the claim lease. Holds are the way to reorder.
+  - **Holds are refused on ordered subscriptions,** since an ordered subscription by definition never reorders.
+- **Deviation:** the plan says "configured under `/test/…` or in a scenario". Both are there, but the policy lives
+  on the subscription itself rather than in a separate test-control store. That way it survives restarts and is
+  visible in `GET /api/webhooks`.
 
 ## Milestone 4 — performance
 

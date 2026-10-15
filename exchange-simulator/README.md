@@ -336,8 +336,8 @@ not on a background tick.
 
 ## Test control
 
-With `test_control.enabled: true`, routes under `/test` control simulated time, show webhook deliveries and run
-scenarios. They return `404` otherwise.
+With `test_control.enabled: true`, routes under `/test` control simulated time, show webhook deliveries and attempts,
+inject delivery faults and run scenarios. They return `404` otherwise.
 
 | Method | Path | Body | Effect |
 |---|---|---|---|
@@ -346,6 +346,8 @@ scenarios. They return `404` otherwise.
 | POST | `/test/clock/set` | `{ "to": "2030-01-07T09:00:00Z" }` | Move to an instant; earlier than now is `409 clock_backwards` |
 | POST | `/test/clock/freeze` / `/test/clock/resume` | – | Stop the clock, or let it run with real time |
 | GET | `/test/deliveries` | – | Every webhook delivery in event order: `deliveryId`, `subscriptionId`, `url`, `eventSequence`, `eventId`, `eventType`, `status`, `attempts`, `lastError` |
+| PUT / DELETE | `/test/webhooks/{id}/faults` | A fault policy / – | Set or clear the subscription's delivery faults (see Fault injection); returns the subscription |
+| GET | `/test/attempts?subscriptionId=` | – | Every request sent and every hold, oldest first: `deliveryId`, `subscriptionId`, `url`, `eventSequence`, `eventId`, `eventType`, `attempt`, `outcome` (`SENT`\|`HELD`), `faults`, `body` (only when a fault changed it), `httpStatus`, `error`, `at` |
 | POST | `/test/scenarios` | A scenario, YAML or JSON | Runs it in a sandbox (see Scenarios); `200` with the report, `400 invalid_scenario` if it does not parse |
 
 The `/test/clock` routes change the clock only with `clock.mode: virtual`; with the system clock they return
@@ -380,7 +382,8 @@ start: 2030-01-07T09:00:00Z      # the virtual clock's first reading (this is th
 settlement: { mode: both, fail_probability: 0 }
 instruments:  [ { id: ACME, symbol: ACME, currency: DKK, currencyScale: 2 } ]   # request bodies, as for POST
 participants: [ { id: A, name: Seller }, { id: B, name: Buyer } ]
-webhooks:     [ { url: "http://consumer:8080/hook", eventTypes: [TradeExecuted] } ]
+webhooks:     [ { url: "http://consumer:8080/hook", eventTypes: [TradeExecuted],
+                  faults: { duplicateProbability: 0.1 } } ]                         # optional, see Fault injection
 steps:
   - order: { as: sell, participantId: A, side: SELL, type: LIMIT, priceTicks: 10025, quantity: 200 }
   - order: { as: buy, participantId: B, side: BUY, type: LIMIT, priceTicks: 10025, quantity: 150,
@@ -399,17 +402,19 @@ steps:
 | `advance_clock: { days, hours, minutes, seconds }` / `set_clock: { to }` | Move the virtual clock |
 | `report_settlement: { execution, expect?, ...body }` | `POST /api/settlements/{executionId}/outcomes` |
 | `set_instrument: { instrument, enabled, expect? }` | `PATCH /api/instruments/{id}` |
+| `set_faults: { url, faults }` | Set the fault policy of the webhook registered for `url`; `faults: null` clears it |
 | `market: { ...random market }` | A seeded random market; see below |
 | `expect: { order \| book \| settlement: ref, matches }` | `GET` the one resource; it must contain `matches` |
-| `expect: { trades \| events \| deliveries: filter, count? }` | The items containing `filter`: exactly `count`, or at least one |
+| `expect: { trades \| events \| deliveries \| attempts: filter, count? \| all? }` | The items containing `filter`: exactly `count`, at least one, or with `all: true` every item (and at least one) |
 
 - **References:** `as: name` names an order. Later steps use `name` for its order ID and `name#i` for the ID of the
   `i`-th execution in its submit response. Literal UUIDs work too.
 - **Command checks:** `expect: { status, matches }` checks the command's own response. Without it, any 2xx passes.
 - **Matching is containment:** every field named must be present and equal; fields left out are ignored. Arrays must
   have the same length and match element by element.
-- **Deliveries run on real time.** So a `deliveries` expectation is retried until it holds or `wait_ms` has passed
-  (default 5000). Every other expectation is checked once, since the state depends only on the commands and the clock.
+- **Deliveries run on real time.** So `deliveries` and `attempts` expectations are retried until they hold or
+  `wait_ms` has passed (default 5000). `{ deliveries: { status: DELIVERED }, all: true }` waits for the outbox to
+  drain. Every other expectation is checked once, since the state depends only on the commands and the clock.
 - **Reports:** every step runs, even after a failure, so one run shows every problem. Step 0 is the setup. Each
   report ends with a fingerprint of the final event log, its event count and SHA-256. Equal fingerprints mean
   byte-identical logs.
@@ -447,6 +452,47 @@ market with the same statistics. [`scenarios/random-market.yaml`](scenarios/rand
   cancels, and the final clock reading. Any other refusal is a failure.
 
 The benchmark's workload is the same generator (see `bench/README.md`).
+
+## Fault injection
+
+With test control on, a subscription can be given a fault policy. It damages, duplicates, delays or reorders the
+copies sent to that subscription. The canonical events in `/api/events`, and every other subscription's copies, are
+never changed.
+
+```sh
+curl -X PUT localhost:8080/test/webhooks/$SUBSCRIPTION/faults -H 'content-type: application/json' -d '{
+  "seed": 7,
+  "missing":    { "probability": 0.15 },
+  "nulls":      { "paths": ["payload.price"] },
+  "invalid":    { "paths": ["payload.quantity", "payload.executedAt"], "probability": 0.5 },
+  "duplicateProbability": 0.02,
+  "delay":      { "probability": 0.1, "ms": 500 },
+  "outOfOrder": { "probability": 0.05, "holdMs": 1000 }
+}'
+```
+
+| Fault | Effect on the copy sent |
+|---|---|
+| `missing` | Removes the listed `paths`, or one random field without `paths` |
+| `nulls` | Sets them to `null` |
+| `invalid` | Replaces them with a value of the wrong type: a string becomes `-12345`; a number, boolean, null, array or object becomes a string |
+| `duplicateProbability` | Sends the same bytes twice, as the same attempt |
+| `delay` | Waits `ms` (at most 10 000) before sending |
+| `outOfOrder` | Holds the delivery back for `holdMs` without sending it or using an attempt; later events overtake it. A delivery is held at most once. Not allowed on an `ordered` subscription |
+
+- **Paths** are dot-separated, with array indexes as numbers: `payload.price`, `payload.instrument.isin`. A path
+  that does not exist in an event is skipped.
+- **Probabilities** default to 1 for field faults, delays and holds, and to 0 for duplicates. Each fault is decided
+  per attempt, so a retry can come out differently.
+- **Reproducible:** each decision is drawn from a generator seeded by (`seed`, delivery ID, attempt). With
+  `ids.mode: deterministic` (always so in scenarios), the same deliveries get the same faults on every run, restarts
+  included.
+- **Signatures and headers:** a signed subscription's signature covers the damaged bytes, as sent. Headers
+  (`X-Event-Id`, `X-Event-Sequence`, …) stay canonical.
+- **What was sent** is in `/test/attempts`: one row per request (a duplicate adds one) and one per hold, with the
+  faults applied and, when they changed it, the exact body.
+- **Scope:** policies are stored with the subscription and survive restarts. Clear one with `DELETE`. Every attempt
+  is recorded, faults or not; the body only when a fault changed it.
 
 ## Testing
 

@@ -17,7 +17,7 @@ use crate::persistence::{Outbox, SettlementWrite, Store};
 use crate::settlement::{
     ExternalReport, NewReport, SettlementPolicy, SettlementSimulator, TradeFacts,
 };
-use crate::webhooks::{DeliveryJob, DeliveryResult, NewSubscription, Subscription};
+use crate::webhooks::{DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription};
 
 /// The settlement simulator's name in `consumer_offsets`.
 pub const SETTLEMENT_CONSUMER: &str = "settlement-simulator";
@@ -74,6 +74,8 @@ pub enum ExchangeError {
     InvalidParticipant(String),
     #[error("invalid webhook subscription: {0}")]
     InvalidWebhook(String),
+    #[error("unknown webhook subscription {0}")]
+    UnknownSubscription(Uuid),
     #[error("the exchange uses the system clock; configure clock.mode = virtual to control time")]
     ClockNotVirtual,
     #[error(transparent)]
@@ -459,10 +461,37 @@ impl Exchange {
             created_at: self.now(),
             secret,
             ordered,
+            faults: None,
         };
         self.store.insert_subscription(&subscription)?;
         self.subscriptions.push(subscription.clone());
         Ok(subscription)
+    }
+
+    /// Sets (or with `None` clears) a subscription's delivery fault policy. It applies to attempts from the next claim
+    /// on. Out-of-order holds are refused for an ordered subscription, which by definition never reorders.
+    pub fn set_webhook_faults(
+        &mut self,
+        subscription_id: Uuid,
+        policy: Option<FaultPolicy>,
+    ) -> Result<Subscription, ExchangeError> {
+        let subscription = self
+            .subscriptions
+            .iter_mut()
+            .find(|s| s.id == subscription_id)
+            .ok_or(ExchangeError::UnknownSubscription(subscription_id))?;
+        if let Some(policy) = &policy {
+            policy.validate().map_err(ExchangeError::InvalidWebhook)?;
+            if subscription.ordered && policy.out_of_order.is_some() {
+                return Err(ExchangeError::InvalidWebhook(
+                    "outOfOrder cannot apply to an ordered subscription".into(),
+                ));
+            }
+        }
+        self.store
+            .set_fault_policy(subscription_id, policy.as_ref())?;
+        subscription.faults = policy;
+        Ok(subscription.clone())
     }
 
     /// Claims up to `limit` due webhook deliveries, leased for `lease`.

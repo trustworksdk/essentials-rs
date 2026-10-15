@@ -1,27 +1,35 @@
 //! Test-control API, mounted under `/test` only when `test_control.enabled` is set. It controls simulated time and
 //! must never be exposed outside test deployments.
 
-use axum::extract::State;
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use std::sync::Arc;
 
+use super::model::SubscriptionView;
 use super::{ApiError, AppState};
 use crate::config::Config;
 use crate::engine::{ClockChange, ClockState};
-use crate::persistence::DeliveryRecord;
+use crate::persistence::{AttemptRow, DeliveryRecord};
 use crate::scenario::{Report, Scenario};
+use crate::webhooks::FaultPolicy;
 
 /// The test-control routes. `config` is the service's configuration, which scenario sandboxes start from.
 pub fn router(state: AppState, config: Arc<Config>) -> Router {
     Router::new()
         .route("/test/scenarios", post(run_scenario))
         .route("/test/deliveries", get(deliveries))
+        .route("/test/attempts", get(attempts))
+        .route(
+            "/test/webhooks/{id}/faults",
+            axum::routing::put(set_faults).delete(clear_faults),
+        )
         .route("/test/clock", get(clock))
         .route("/test/clock/advance", post(advance))
         .route("/test/clock/set", post(set))
@@ -87,6 +95,95 @@ async fn deliveries(State(state): State<AppState>) -> Result<Json<Vec<DeliveryVi
     Ok(Json(
         deliveries.into_iter().map(DeliveryView::from).collect(),
     ))
+}
+
+/// Sets a subscription's delivery fault policy (see [`crate::webhooks::faults`]); returns the subscription.
+async fn set_faults(
+    State(state): State<AppState>,
+    id: Result<Path<Uuid>, PathRejection>,
+    body: Result<Json<FaultPolicy>, JsonRejection>,
+) -> Result<Json<SubscriptionView>, ApiError> {
+    let Path(id) = id?;
+    let Json(policy) = body?;
+    let subscription = state
+        .dispatcher
+        .set_webhook_faults(id, Some(policy))
+        .await?;
+    Ok(Json(subscription.into()))
+}
+
+/// Removes a subscription's fault policy: its deliveries go out unchanged again.
+async fn clear_faults(
+    State(state): State<AppState>,
+    id: Result<Path<Uuid>, PathRejection>,
+) -> Result<Json<SubscriptionView>, ApiError> {
+    let Path(id) = id?;
+    let subscription = state.dispatcher.set_webhook_faults(id, None).await?;
+    Ok(Json(subscription.into()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttemptsQuery {
+    pub subscription_id: Option<Uuid>,
+}
+
+/// What was actually sent for a delivery: one request, a duplicate of it, or a hold.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttemptView {
+    pub id: u64,
+    pub delivery_id: Uuid,
+    pub subscription_id: Uuid,
+    pub url: String,
+    pub event_sequence: u64,
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub attempt: u32,
+    /// `SENT` or `HELD`.
+    pub outcome: &'static str,
+    pub faults: Vec<String>,
+    /// The body sent when a fault changed it; absent when the canonical envelope went out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<Value>,
+    pub http_status: Option<u16>,
+    pub error: Option<String>,
+    pub at: DateTime<Utc>,
+}
+
+impl From<AttemptRow> for AttemptView {
+    fn from(a: AttemptRow) -> Self {
+        Self {
+            id: a.id,
+            delivery_id: a.delivery_id,
+            subscription_id: a.subscription_id,
+            url: a.url,
+            event_sequence: a.event_sequence,
+            event_id: a.event_id,
+            event_type: a.event_type,
+            attempt: a.attempt,
+            outcome: if a.held { "HELD" } else { "SENT" },
+            faults: a.faults,
+            body: a
+                .body
+                .map(|b| serde_json::from_str(&b).unwrap_or(Value::String(b))),
+            http_status: a.http_status,
+            error: a.error,
+            at: a.at,
+        }
+    }
+}
+
+/// Every recorded webhook attempt, oldest first; `?subscriptionId=` narrows to one subscription.
+async fn attempts(
+    State(state): State<AppState>,
+    query: Result<Query<AttemptsQuery>, QueryRejection>,
+) -> Result<Json<Vec<AttemptView>>, ApiError> {
+    let Query(query) = query?;
+    let rows = state
+        .read(move |store| store.attempts(query.subscription_id))
+        .await?;
+    Ok(Json(rows.into_iter().map(AttemptView::from).collect()))
 }
 
 #[derive(Debug, Serialize)]

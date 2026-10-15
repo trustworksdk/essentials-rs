@@ -19,7 +19,7 @@ use crate::app::App;
 use crate::config::{ClockConfig, ClockMode, Config, IdMode, IdsConfig};
 use crate::market::{MarketAction, MarketConfig};
 
-/// How long a `deliveries` expectation waits by default for webhook delivery, which runs on real time.
+/// How long a `deliveries` or `attempts` expectation waits by default for webhook delivery, which runs on real time.
 const DEFAULT_DELIVERY_WAIT_MS: u64 = 5000;
 const DELIVERY_POLL: Duration = Duration::from_millis(20);
 /// A market step reports at most this many failures; a broken market would otherwise fail every order.
@@ -86,6 +86,7 @@ pub async fn run(scenario: &Scenario, base: &Config) -> anyhow::Result<Report> {
         router: app.router.clone(),
         refs: HashMap::new(),
         instruments: Vec::new(),
+        webhooks: HashMap::new(),
         seed: scenario.seed,
     };
     let mut steps = vec![runner.setup(scenario).await];
@@ -153,6 +154,8 @@ struct Runner {
     /// Named orders: their submit responses.
     refs: HashMap<String, Value>,
     instruments: Vec<String>,
+    /// Registered webhooks: URL → subscription ID.
+    webhooks: HashMap<String, String>,
     /// The scenario's seed: the default for market steps.
     seed: u64,
 }
@@ -202,12 +205,24 @@ impl Runner {
         ];
         for (kind, uri, bodies) in groups {
             for body in bodies {
+                // A webhook's `faults` is not part of its registration; it is set right after.
+                let mut body = body.clone();
+                let faults = body.as_object_mut().and_then(|b| b.remove("faults"));
                 match self.call(Method::POST, uri, Some(body.clone())).await {
-                    Ok((status, _)) if (200..300).contains(&status) => {
+                    Ok((status, response)) if (200..300).contains(&status) => {
                         if kind == "instrument"
                             && let Some(id) = body["id"].as_str()
                         {
                             self.instruments.push(id.to_string());
+                        }
+                        if kind == "webhook"
+                            && let (Some(url), Some(id)) =
+                                (body["url"].as_str(), response["id"].as_str())
+                        {
+                            self.webhooks.insert(url.to_string(), id.to_string());
+                            if let Some(faults) = faults {
+                                failures.extend(self.set_faults(url, Some(faults)).await);
+                            }
                         }
                     }
                     Ok((status, response)) => {
@@ -324,6 +339,14 @@ impl Runner {
                 (description, check_response(response, set.expect.as_ref()))
             }
             Step::Market(market) => self.market(market).await,
+            Step::SetFaults(set) => (
+                format!(
+                    "set_faults {} {}",
+                    set.url,
+                    set.faults.as_ref().map_or("off".into(), Value::to_string)
+                ),
+                self.set_faults(&set.url, set.faults.clone()).await,
+            ),
             Step::Expect(expectation) => self.expect(expectation).await,
         }
     }
@@ -440,6 +463,19 @@ impl Runner {
         (description, failures)
     }
 
+    /// Sets (or with `None` clears) the fault policy of the webhook registered for `url`.
+    async fn set_faults(&self, url: &str, faults: Option<Value>) -> Vec<String> {
+        let Some(id) = self.webhooks.get(url) else {
+            return vec![format!("no webhook registered for {url}")];
+        };
+        let uri = format!("/test/webhooks/{id}/faults");
+        let response = match faults {
+            Some(faults) => self.call(Method::PUT, &uri, Some(faults)).await,
+            None => self.call(Method::DELETE, &uri, None).await,
+        };
+        check_response(response, None)
+    }
+
     /// The fingerprint of the current event log.
     async fn event_log(&self) -> EventLog {
         let events = self
@@ -487,18 +523,21 @@ impl Runner {
                 Err(failure) => (description, vec![failure]),
             };
         }
-        let (kind, filter, uri, paged, wait) = match (&e.trades, &e.events, &e.deliveries) {
-            (Some(filter), _, _) => ("trades", filter, "/api/trades?limit=1000", false, 0),
-            (_, Some(filter), _) => ("events", filter, "/api/events?limit=1000", true, 0),
-            (_, _, Some(filter)) => (
-                "deliveries",
-                filter,
-                "/test/deliveries",
-                false,
-                e.wait_ms.unwrap_or(DEFAULT_DELIVERY_WAIT_MS),
-            ),
-            _ => unreachable!("Scenario::parse checks that an expectation has a target"),
-        };
+        let real_time_wait = e.wait_ms.unwrap_or(DEFAULT_DELIVERY_WAIT_MS);
+        let (kind, filter, uri, paged, wait) =
+            match (&e.trades, &e.events, &e.deliveries, &e.attempts) {
+                (Some(filter), ..) => ("trades", filter, "/api/trades?limit=1000", false, 0),
+                (_, Some(filter), ..) => ("events", filter, "/api/events?limit=1000", true, 0),
+                (_, _, Some(filter), _) => (
+                    "deliveries",
+                    filter,
+                    "/test/deliveries",
+                    false,
+                    real_time_wait,
+                ),
+                (.., Some(filter)) => ("attempts", filter, "/test/attempts", false, real_time_wait),
+                _ => unreachable!("Scenario::parse checks that an expectation has a target"),
+            };
         let description = format!("expect {kind} {filter}");
         let deadline = Instant::now() + Duration::from_millis(wait);
         loop {
@@ -506,6 +545,14 @@ impl Runner {
                 Ok(items) => {
                     let found = items.iter().filter(|item| contains(filter, item)).count();
                     match e.count {
+                        _ if e.all == Some(true) => {
+                            (found < items.len() || items.is_empty()).then(|| {
+                                format!(
+                                    "expected all {kind} to match, {found} of {} do",
+                                    items.len()
+                                )
+                            })
+                        }
                         Some(count) if count != found => {
                             Some(format!("expected {count} matching {kind}, found {found}"))
                         }

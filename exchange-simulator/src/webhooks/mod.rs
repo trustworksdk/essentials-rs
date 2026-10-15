@@ -8,9 +8,11 @@
 //! claims. Consumers must therefore deduplicate by `eventId`. Concurrent deliveries may arrive out of order; the
 //! envelope's `sequence` gives the canonical order.
 
+pub mod faults;
 pub mod signing;
 mod worker;
 
+pub use faults::FaultPolicy;
 pub use worker::{DeliveryWorker, RetryPolicy, WorkerConfig};
 
 use chrono::{DateTime, Utc};
@@ -20,7 +22,7 @@ use uuid::Uuid;
 use crate::events::EventEnvelope;
 
 /// A registered webhook endpoint and the event types it receives.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Subscription {
     pub id: Uuid,
@@ -33,6 +35,9 @@ pub struct Subscription {
     pub secret: Option<String>,
     /// Deliver strictly in event sequence order, one at a time.
     pub ordered: bool,
+    /// Faults injected into outgoing copies (test control only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub faults: Option<FaultPolicy>,
 }
 
 /// A request to register a subscription.
@@ -63,18 +68,48 @@ pub struct DeliveryJob {
     pub attempts: u32,
     /// The subscription's signing secret, if any.
     pub secret: Option<String>,
+    /// The subscription's fault policy, if any.
+    pub faults: Option<FaultPolicy>,
+    /// Whether an out-of-order fault held this delivery back before.
+    pub held: bool,
     pub event: EventEnvelope,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeliveryOutcome {
     Delivered,
-    Retry { at: DateTime<Utc>, error: String },
-    Dead { error: String },
+    Retry {
+        at: DateTime<Utc>,
+        error: String,
+    },
+    Dead {
+        error: String,
+    },
+    /// Held back by an out-of-order fault: due again at `at`, without counting an attempt.
+    Held {
+        at: DateTime<Utc>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeliveryResult {
     pub delivery_id: Uuid,
     pub outcome: DeliveryOutcome,
+    /// What happened on the wire: one entry per request sent (a duplicate adds one), or one for a hold.
+    pub sent: Vec<AttemptRecord>,
+}
+
+/// One request sent for a delivery, or one hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttemptRecord {
+    /// The delivery attempt number; a duplicate shares it.
+    pub attempt: u32,
+    pub held: bool,
+    /// The faults applied, e.g. `missing:payload.price`, `duplicate`, `delay:500ms`, `held:1000ms`.
+    pub faults: Vec<String>,
+    /// The body sent, when a fault changed it.
+    pub body: Option<String>,
+    pub http_status: Option<u16>,
+    pub error: Option<String>,
+    pub at: DateTime<Utc>,
 }

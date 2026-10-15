@@ -75,7 +75,7 @@ impl From<ExchangeError> for ApiError {
         let (status, code) = match &error {
             E::UnknownInstrument(_) => (StatusCode::UNPROCESSABLE_ENTITY, "unknown_instrument"),
             E::UnknownParticipant(_) => (StatusCode::UNPROCESSABLE_ENTITY, "unknown_participant"),
-            E::UnknownOrder(_) => (StatusCode::NOT_FOUND, "not_found"),
+            E::UnknownOrder(_) | E::UnknownSubscription(_) => (StatusCode::NOT_FOUND, "not_found"),
             E::OrderNotActive { .. } => (StatusCode::CONFLICT, "order_not_active"),
             E::DuplicateInstrument(_) | E::DuplicateListing { .. } | E::DuplicateParticipant(_) => {
                 (StatusCode::CONFLICT, "already_exists")

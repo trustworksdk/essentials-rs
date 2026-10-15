@@ -10,7 +10,7 @@ use crate::domain::{
     Side,
 };
 use crate::engine::{BookSnapshot, Level, RejectReason, SubmitOrder};
-use crate::webhooks::Subscription;
+use crate::webhooks::{FaultPolicy, Subscription};
 
 fn one() -> u64 {
     1
@@ -369,6 +369,9 @@ pub struct SubscriptionView {
     pub signed: bool,
     pub ordered: bool,
     pub created_at: DateTime<Utc>,
+    /// The delivery fault policy, when test control set one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub faults: Option<FaultPolicy>,
 }
 
 impl From<Subscription> for SubscriptionView {
@@ -381,6 +384,7 @@ impl From<Subscription> for SubscriptionView {
             signed: s.secret.is_some(),
             ordered: s.ordered,
             created_at: s.created_at,
+            faults: s.faults,
         }
     }
 }

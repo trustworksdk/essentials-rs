@@ -447,3 +447,42 @@ async fn the_event_log_fingerprint_covers_every_event() {
     assert_ne!(a.sha256, b.sha256, "only the last event differs");
     assert_eq!(a, run(at(101)).await);
 }
+
+#[tokio::test]
+async fn all_needs_every_item_and_at_least_one() {
+    let text = r#"
+name: all
+instruments: [ { id: ACME, symbol: ACME, currency: DKK, currencyScale: 2 } ]
+participants: [ { id: A, name: A }, { id: B, name: B } ]
+steps:
+  - expect: { deliveries: {}, all: true, wait_ms: 50 }
+  - order: { participantId: A, side: SELL, type: LIMIT, priceTicks: 100, quantity: 5 }
+  - order: { participantId: B, side: BUY, type: LIMIT, priceTicks: 99, quantity: 5 }
+  - expect: { events: { eventType: OrderAccepted }, all: true }
+  - expect: { events: { payload: { side: SELL } }, all: true }
+"#;
+    let report = scenario::run(&Scenario::parse(text).unwrap(), &base_config().await)
+        .await
+        .unwrap();
+    let failures: Vec<(usize, Vec<String>)> = report
+        .steps
+        .iter()
+        .filter(|s| !s.passed)
+        .map(|s| (s.index, s.failures.clone()))
+        .collect();
+    assert_eq!(
+        failures,
+        [
+            (
+                1,
+                vec!["expected all deliveries to match, 0 of 0 do after waiting 50 ms".to_string()]
+            ),
+            (
+                5,
+                vec!["expected all events to match, 1 of 2 do".to_string()]
+            )
+        ],
+        "{}",
+        report.render()
+    );
+}

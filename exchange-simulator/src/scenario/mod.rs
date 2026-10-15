@@ -102,6 +102,9 @@ pub enum Step {
     ReportSettlement(ReportStep),
     /// `PATCH /api/instruments/{instrument}`.
     SetInstrument(SetInstrument),
+    /// Sets the delivery fault policy of the webhook registered for `url` (`PUT /test/webhooks/{id}/faults`), or
+    /// clears it with `faults: null`.
+    SetFaults(SetFaults),
     /// A seeded random market ([`crate::market`]): its participants are registered if new, then its commands are
     /// sent in order, the virtual clock set to each arrival time.
     Market(MarketConfig),
@@ -164,6 +167,13 @@ pub struct ReportStep {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct SetFaults {
+    pub url: String,
+    pub faults: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetInstrument {
     pub instrument: String,
     pub enabled: bool,
@@ -171,11 +181,12 @@ pub struct SetInstrument {
 }
 
 /// A check of the current state. Exactly one target: an `order`, a `book`, a `settlement`, or a filter over `trades`,
-/// `events` or webhook `deliveries`. For single targets `matches` must be contained in the target's JSON; for lists
-/// the filter selects the matching items and `count` checks how many (default: at least one).
+/// `events`, webhook `deliveries` or webhook `attempts` (what was actually sent). For single targets `matches` must be
+/// contained in the target's JSON; for lists the filter selects the matching items and `count` checks how many
+/// (default: at least one).
 ///
-/// Webhook delivery runs on real time, not on the virtual clock, so a `deliveries` check is retried until it holds
-/// or `wait_ms` (default 5000) has passed.
+/// Webhook delivery runs on real time, not on the virtual clock, so `deliveries` and `attempts` checks are retried
+/// until they hold or `wait_ms` (default 5000) has passed.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Expectation {
@@ -185,7 +196,11 @@ pub struct Expectation {
     pub trades: Option<Value>,
     pub events: Option<Value>,
     pub deliveries: Option<Value>,
+    pub attempts: Option<Value>,
     pub count: Option<usize>,
+    /// Every item must match the filter, and there must be at least one. With `wait_ms`, e.g. "every delivery is
+    /// `DELIVERED`" waits until the outbox has drained.
+    pub all: Option<bool>,
     pub wait_ms: Option<u64>,
     pub matches: Option<Value>,
 }
@@ -208,16 +223,28 @@ impl Scenario {
                     expectation.trades.is_some(),
                     expectation.events.is_some(),
                     expectation.deliveries.is_some(),
+                    expectation.attempts.is_some(),
                 ];
                 if targets.iter().filter(|t| **t).count() != 1 {
                     return Err(format!(
-                        "step {}: expect needs exactly one of order, book, settlement, trades, events, deliveries",
+                        "step {}: expect needs exactly one of order, book, settlement, trades, events, deliveries, \
+                         attempts",
                         i + 1
                     ));
                 }
-                if expectation.wait_ms.is_some() && expectation.deliveries.is_none() {
+                if expectation.all.is_some() && expectation.count.is_some() {
                     return Err(format!(
-                        "step {}: wait_ms applies only to deliveries; everything else follows the virtual clock",
+                        "step {}: give either count or all, not both",
+                        i + 1
+                    ));
+                }
+                if expectation.wait_ms.is_some()
+                    && expectation.deliveries.is_none()
+                    && expectation.attempts.is_none()
+                {
+                    return Err(format!(
+                        "step {}: wait_ms applies only to deliveries and attempts; everything else follows the \
+                         virtual clock",
                         i + 1
                     ));
                 }
@@ -280,6 +307,16 @@ steps:
         let two_targets =
             Scenario::parse("name: x\nsteps:\n  - expect: { order: a, book: ACME }\n").unwrap_err();
         assert!(two_targets.contains("exactly one"), "{two_targets}");
+        let both =
+            Scenario::parse("name: x\nsteps:\n  - expect: { trades: {}, count: 1, all: true }\n")
+                .unwrap_err();
+        assert!(both.contains("either count or all"), "{both}");
+        assert!(
+            Scenario::parse(
+                "name: x\nsteps:\n  - expect: { attempts: {}, all: true, wait_ms: 5 }\n"
+            )
+            .is_ok()
+        );
         let bad_market = Scenario::parse(
             "name: x\nsteps:\n  - market: { orders: 1, buy_probability: 2, instruments: [ { id: A, price: { mid_ticks: 1 } } ] }\n",
         )
