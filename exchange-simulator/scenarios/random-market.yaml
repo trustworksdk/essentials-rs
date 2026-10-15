@@ -1,0 +1,28 @@
+name: Random market
+description: >
+  A seeded random market on two instruments for two simulated minutes, with cancellations and T+2 settlement. The
+  same seed gives the same orders, trades, events and IDs on every run.
+seed: 12345
+settlement: { mode: simulated, fail_probability: 0.1, delay_probability: 0 }
+instruments:
+  - { id: ACME, symbol: ACME, currency: DKK, currencyScale: 2 }
+  - { id: BETA, symbol: BETA, currency: DKK, currencyScale: 2, lotSize: 10 }
+steps:
+  - market:
+      orders: 600
+      orders_per_second: 5
+      participants: 8
+      buy_probability: 0.5
+      market_order_probability: 0.15
+      cancellation_probability: 0.1
+      instruments:
+        - { id: ACME, weight: 2, price: { mid_ticks: 10000, width_ticks: 30, skew_ticks: 5 } }
+        - { id: BETA, weight: 1, price: { mid_ticks: 2500, width_ticks: 8, distribution: normal },
+            quantity: { min: 10, max: 500, lot: 10 } }
+  - expect: { trades: { instrumentId: ACME } }
+  - expect: { trades: { instrumentId: BETA } }
+  - expect: { events: { eventType: OrderCancelled } }
+  - expect: { events: { eventType: SettlementPending } }
+  - advance_clock: { days: 7 }
+  - expect: { events: { eventType: SettlementFailed } }
+  - expect: { events: { eventType: SettlementCompleted } }

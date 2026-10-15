@@ -10,14 +10,20 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
+
 use super::matcher::{contains, mismatches};
 use super::{Expectation, ResponseCheck, Scenario, Step};
 use crate::app::App;
 use crate::config::{ClockConfig, ClockMode, Config, IdMode, IdsConfig};
+use crate::market::{MarketAction, MarketConfig};
 
 /// How long a `deliveries` expectation waits by default for webhook delivery, which runs on real time.
 const DEFAULT_DELIVERY_WAIT_MS: u64 = 5000;
 const DELIVERY_POLL: Duration = Duration::from_millis(20);
+/// A market step reports at most this many failures; a broken market would otherwise fail every order.
+const MAX_MARKET_FAILURES: usize = 10;
 
 /// The outcome of a scenario run. Every step runs, even after a failure, so one run shows every problem.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -27,6 +33,16 @@ pub struct Report {
     pub passed: bool,
     /// Index 0 is the setup (instruments, participants, webhooks); steps count from 1.
     pub steps: Vec<StepReport>,
+    /// A fingerprint of the run's final event log: equal fingerprints mean byte-identical logs.
+    pub event_log: EventLog,
+}
+
+/// The number of events and the SHA-256 of `/api/events` as JSON lines, one event per line, in sequence order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventLog {
+    pub events: usize,
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -50,6 +66,10 @@ impl Report {
                 out.push_str(&format!("           {failure}\n"));
             }
         }
+        out.push_str(&format!(
+            "  event log: {} events, sha256 {}\n",
+            self.event_log.events, self.event_log.sha256
+        ));
         out
     }
 }
@@ -66,6 +86,7 @@ pub async fn run(scenario: &Scenario, base: &Config) -> anyhow::Result<Report> {
         router: app.router.clone(),
         refs: HashMap::new(),
         instruments: Vec::new(),
+        seed: scenario.seed,
     };
     let mut steps = vec![runner.setup(scenario).await];
     for (i, step) in scenario.steps.iter().enumerate() {
@@ -77,6 +98,7 @@ pub async fn run(scenario: &Scenario, base: &Config) -> anyhow::Result<Report> {
             failures,
         });
     }
+    let event_log = runner.event_log().await;
     // The runner's router holds a handle to the exchange thread; it must go before the app can shut down.
     drop(runner);
     app.shutdown().await;
@@ -85,6 +107,7 @@ pub async fn run(scenario: &Scenario, base: &Config) -> anyhow::Result<Report> {
         name: scenario.name.clone(),
         passed: steps.iter().all(|s| s.passed),
         steps,
+        event_log,
     })
 }
 
@@ -130,6 +153,8 @@ struct Runner {
     /// Named orders: their submit responses.
     refs: HashMap<String, Value>,
     instruments: Vec<String>,
+    /// The scenario's seed: the default for market steps.
+    seed: u64,
 }
 
 impl Runner {
@@ -298,7 +323,137 @@ impl Runner {
                     .await;
                 (description, check_response(response, set.expect.as_ref()))
             }
+            Step::Market(market) => self.market(market).await,
             Step::Expect(expectation) => self.expect(expectation).await,
+        }
+    }
+
+    /// Registers the market's participants (existing ones are fine), then sends its commands in order, setting the
+    /// virtual clock to each arrival time first. Exchange rejections and cancels of orders that have meanwhile filled
+    /// are part of a market; any other refusal is a failure.
+    async fn market(&mut self, market: &MarketConfig) -> (String, Vec<String>) {
+        let mut market = market.clone();
+        let seed = *market.seed.get_or_insert(self.seed);
+        let mut failures = Vec::new();
+        let mut fail = |failure: String| {
+            if failures.len() < MAX_MARKET_FAILURES {
+                failures.push(failure);
+            } else if failures.len() == MAX_MARKET_FAILURES {
+                failures.push("… further failures not shown".into());
+            }
+        };
+        for id in market.participants.ids() {
+            let body = json!({ "id": id, "name": id });
+            match self
+                .call(Method::POST, "/api/participants", Some(body))
+                .await
+            {
+                Ok((201 | 409, _)) => {}
+                Ok((status, body)) => fail(format!("participant {id}: HTTP {status} {body}")),
+                Err(error) => fail(format!("participant {id}: {error}")),
+            }
+        }
+        let start = match self.call(Method::GET, "/test/clock", None).await {
+            Ok((200, clock)) => clock["now"]
+                .as_str()
+                .and_then(|now| now.parse::<DateTime<Utc>>().ok()),
+            _ => None,
+        };
+        let Some(start) = start else {
+            return (
+                format!("market seed {seed}"),
+                vec!["cannot read the virtual clock".into()],
+            );
+        };
+        let mut now = start;
+        let mut order_ids: Vec<Option<String>> = Vec::new();
+        let (mut accepted, mut rejected, mut executions, mut cancelled, mut refused) =
+            (0, 0, 0, 0, 0);
+        for command in market.generate() {
+            let at = start + chrono::Duration::microseconds(command.at_micros as i64);
+            if at > now {
+                match self
+                    .call(Method::POST, "/test/clock/set", Some(json!({ "to": at })))
+                    .await
+                {
+                    Ok((200, _)) => now = at,
+                    Ok((status, body)) => fail(format!("set clock to {at}: HTTP {status} {body}")),
+                    Err(error) => fail(format!("set clock to {at}: {error}")),
+                }
+            }
+            match command.action {
+                MarketAction::Submit(order) => {
+                    let body = json!({
+                        "instrumentId": order.instrument_id.0,
+                        "participantId": order.participant_id.0,
+                        "side": order.side,
+                        "type": order.order_type,
+                        "priceTicks": order.limit_price_ticks,
+                        "quantity": order.quantity,
+                    });
+                    let response = self
+                        .call(Method::POST, "/api/orders", Some(body.clone()))
+                        .await;
+                    let id = match response {
+                        Ok((201, response)) => {
+                            if response["order"]["status"] == "REJECTED" {
+                                rejected += 1;
+                            } else {
+                                accepted += 1;
+                            }
+                            executions += response["executions"].as_array().map_or(0, Vec::len);
+                            response["order"]["orderId"].as_str().map(str::to_string)
+                        }
+                        Ok((status, response)) => {
+                            fail(format!("order {body}: HTTP {status} {response}"));
+                            None
+                        }
+                        Err(error) => {
+                            fail(format!("order {body}: {error}"));
+                            None
+                        }
+                    };
+                    order_ids.push(id);
+                }
+                MarketAction::Cancel { submit_index } => {
+                    // An order that failed to submit has already been reported.
+                    let Some(Some(id)) = order_ids.get(submit_index) else {
+                        continue;
+                    };
+                    let uri = format!("/api/orders/{id}");
+                    match self.call(Method::DELETE, &uri, None).await {
+                        Ok((200, _)) => cancelled += 1,
+                        Ok((409, _)) => refused += 1,
+                        Ok((status, body)) => fail(format!("DELETE {uri}: HTTP {status} {body}")),
+                        Err(error) => fail(format!("DELETE {uri}: {error}")),
+                    }
+                }
+            }
+        }
+        let description = format!(
+            "market seed {seed}: {} orders ({rejected} rejected), {executions} executions, {} cancels \
+             ({refused} refused), until {}",
+            accepted + rejected,
+            cancelled + refused,
+            now.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+        );
+        (description, failures)
+    }
+
+    /// The fingerprint of the current event log.
+    async fn event_log(&self) -> EventLog {
+        let events = self
+            .collect("/api/events?limit=1000", true)
+            .await
+            .unwrap_or_default();
+        let mut hash = Sha256::new();
+        for event in &events {
+            hash.update(event.to_string().as_bytes());
+            hash.update(b"\n");
+        }
+        EventLog {
+            events: events.len(),
+            sha256: hash.finalize().iter().map(|b| format!("{b:02x}")).collect(),
         }
     }
 

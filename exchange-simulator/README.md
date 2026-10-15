@@ -399,6 +399,7 @@ steps:
 | `advance_clock: { days, hours, minutes, seconds }` / `set_clock: { to }` | Move the virtual clock |
 | `report_settlement: { execution, expect?, ...body }` | `POST /api/settlements/{executionId}/outcomes` |
 | `set_instrument: { instrument, enabled, expect? }` | `PATCH /api/instruments/{id}` |
+| `market: { ...random market }` | A seeded random market; see below |
 | `expect: { order \| book \| settlement: ref, matches }` | `GET` the one resource; it must contain `matches` |
 | `expect: { trades \| events \| deliveries: filter, count? }` | The items containing `filter`: exactly `count`, or at least one |
 
@@ -409,7 +410,43 @@ steps:
   have the same length and match element by element.
 - **Deliveries run on real time.** So a `deliveries` expectation is retried until it holds or `wait_ms` has passed
   (default 5000). Every other expectation is checked once, since the state depends only on the commands and the clock.
-- **Reports:** every step runs, even after a failure, so one run shows every problem. Step 0 is the setup.
+- **Reports:** every step runs, even after a failure, so one run shows every problem. Step 0 is the setup. Each
+  report ends with a fingerprint of the final event log, its event count and SHA-256. Equal fingerprints mean
+  byte-identical logs.
+
+### Random markets
+
+A `market` step generates orders and cancels from seeded distributions, then sends them in order. Before each
+command, the virtual clock is set to that command's arrival time. The command stream depends only on the
+configuration, so the same seed gives the same orders, trades, events and IDs. A different seed gives a different
+market with the same statistics. [`scenarios/random-market.yaml`](scenarios/random-market.yaml) is an example.
+
+```yaml
+- market:
+    seed: 12345                     # default: the scenario's seed
+    orders: 600                     # commands in total, submits and cancels
+    orders_per_second: 5            # Poisson arrivals in simulated time; 0 (default) puts them all at one instant
+    participants: 8                 # P01..P08, registered if new; or a list of existing participant IDs
+    buy_probability: 0.5            # default 0.5
+    market_order_probability: 0.15  # default 0
+    cancellation_probability: 0.1   # chance a command cancels an earlier limit order instead; default 0
+    instruments:                    # must be registered in the setup
+      - { id: ACME, weight: 2, price: { mid_ticks: 10000, width_ticks: 30, skew_ticks: 5 } }
+      - { id: BETA, weight: 1, price: { mid_ticks: 2500, width_ticks: 8, distribution: normal },
+          quantity: { min: 10, max: 500, lot: 10 } }
+```
+
+- **Instruments:** each gets a share of the arrivals in proportion to its `weight`.
+- **Limit prices:** buys centre on `mid_ticks - skew_ticks` and sells on `mid_ticks + skew_ticks`. A positive skew
+  builds resting liquidity; a negative one makes orders cross.
+- **Price spread:** `width_ticks` is the half-width of a `uniform` distribution (the default), or the standard
+  deviation of a `normal` one.
+- **Quantities:** uniform whole lots between `min` and `max` (default 1–100, lot 1).
+- **What counts as normal:** exchange rejections (self-trades, for example) and cancels of orders that have filled
+  meanwhile are part of a market. The step summarizes them: orders, rejections, executions, cancels and refused
+  cancels, and the final clock reading. Any other refusal is a failure.
+
+The benchmark's workload is the same generator (see `bench/README.md`).
 
 ## Testing
 

@@ -12,13 +12,16 @@ use exchange_simulator::config::{
     LogFormat, LoggingConfig, ServerConfig, SettlementConfig, TestControlConfig, WebhooksConfig,
 };
 use exchange_simulator::domain::{
-    IdentifierPolicy, Instrument, InstrumentId, Order, OrderStatus, OrderType, Participant,
-    ParticipantId, Side,
+    IdentifierPolicy, Instrument, InstrumentId, Order, OrderStatus, Participant, ParticipantId,
 };
 use exchange_simulator::engine::{
     Exchange, ExchangeOptions, IdScheme, MatchContext, OrderBook, SubmitOrder,
 };
 use exchange_simulator::events::EVENT_TYPES;
+use exchange_simulator::market::{
+    Distribution, InstrumentMarket, MarketAction, MarketConfig, Participants, PriceDistribution,
+    QuantityDistribution,
+};
 use exchange_simulator::persistence::{self, Store};
 use exchange_simulator::webhooks::NewSubscription;
 
@@ -96,45 +99,50 @@ fn acme() -> Instrument {
 
 const PARTICIPANTS: usize = 50;
 
-/// Deterministic generator (xorshift64*).
-struct Rng(u64);
-
-impl Rng {
-    fn below(&mut self, n: u64) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+/// The workload, a random market (`exchange_simulator::market`): 80 % limit orders priced uniformly within ±50 ticks
+/// of 100.00, 20 % market orders, sides even, quantities 1–100, 50 participants. Limit prices on both sides overlap,
+/// so roughly half the orders trade.
+fn market(seed: u64, n: usize) -> MarketConfig {
+    MarketConfig {
+        seed: Some(seed),
+        orders: n,
+        orders_per_second: 0.0,
+        participants: Participants::Count(PARTICIPANTS),
+        buy_probability: 0.5,
+        market_order_probability: 0.2,
+        cancellation_probability: 0.0,
+        instruments: vec![InstrumentMarket {
+            id: "ACME".into(),
+            weight: 1.0,
+            price: PriceDistribution {
+                mid_ticks: 10_000,
+                width_ticks: 50,
+                skew_ticks: 0,
+                distribution: Distribution::Uniform,
+            },
+            quantity: QuantityDistribution {
+                min: 1,
+                max: 100,
+                lot: 1,
+            },
+        }],
     }
 }
 
-/// The workload: 80 % limit orders priced uniformly within ±50 ticks of 100.00, 20 % market orders, sides even,
-/// quantities 1–100, 50 participants. Limit prices on both sides overlap, so roughly half the orders trade.
 fn workload(seed: u64, n: usize) -> Vec<SubmitOrder> {
-    let mut rng = Rng(seed.max(1));
-    (0..n)
-        .map(|_| {
-            let side = if rng.below(2) == 0 {
-                Side::Buy
-            } else {
-                Side::Sell
-            };
-            let market = rng.below(5) == 0;
-            SubmitOrder {
-                client_order_id: None,
-                instrument_id: InstrumentId("ACME".into()),
-                participant_id: ParticipantId(format!("P{:02}", rng.below(PARTICIPANTS as u64))),
-                side,
-                order_type: if market {
-                    OrderType::Market
-                } else {
-                    OrderType::Limit
-                },
-                limit_price_ticks: (!market).then(|| 9_950 + rng.below(101) as i64),
-                quantity: 1 + rng.below(100),
-            }
+    let market = market(seed, n);
+    market.validate().expect("valid workload");
+    market
+        .generate()
+        .map(|command| match command.action {
+            MarketAction::Submit(order) => order,
+            MarketAction::Cancel { .. } => unreachable!("the workload has no cancellations"),
         })
         .collect()
+}
+
+fn participant_ids() -> Vec<String> {
+    Participants::Count(PARTICIPANTS).ids()
 }
 
 #[derive(Default)]
@@ -286,12 +294,12 @@ fn durable_exchange(dir: &std::path::Path, subscribed: bool) -> Exchange {
     let conn = persistence::open(&path, Duration::from_secs(5)).unwrap();
     let mut exchange = Exchange::recover(Store::new(conn), ExchangeOptions::default()).unwrap();
     exchange.register_instrument(acme()).unwrap();
-    for p in 0..PARTICIPANTS {
+    for id in participant_ids() {
         exchange
             .register_participant(Participant {
                 settlement: None,
-                id: ParticipantId(format!("P{p:02}")),
-                name: format!("P{p}"),
+                id: ParticipantId(id.clone()),
+                name: id,
             })
             .unwrap();
     }
@@ -477,10 +485,10 @@ async fn bench_http(options: &Options, report: &mut Report, with_webhook: bool) 
         async move { assert!(request.send().await.unwrap().status().is_success()) }
     };
     post("/api/instruments", serde_json::json!({ "id": "ACME", "symbol": "ACME", "mic": "XCSE", "currency": "DKK", "currencyScale": 2 })).await;
-    for p in 0..PARTICIPANTS {
+    for id in participant_ids() {
         post(
             "/api/participants",
-            serde_json::json!({ "id": format!("P{p:02}"), "name": format!("P{p}") }),
+            serde_json::json!({ "id": id, "name": id }),
         )
         .await;
     }

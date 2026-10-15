@@ -10,6 +10,7 @@ pub mod domain;
 pub mod engine;
 pub mod events;
 pub mod ids;
+pub mod market;
 pub mod metrics;
 pub mod persistence;
 pub mod scenario;

@@ -341,3 +341,109 @@ steps:
         "the consumer got the event with its deterministic ID"
     );
 }
+
+fn random_market() -> String {
+    std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scenarios/random-market.yaml"),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_random_market_is_reproducible_from_its_seed() {
+    let config = base_config().await;
+    let text = random_market();
+    let first = scenario::run(&Scenario::parse(&text).unwrap(), &config)
+        .await
+        .unwrap();
+    let second = scenario::run(&Scenario::parse(&text).unwrap(), &config)
+        .await
+        .unwrap();
+    assert!(first.passed, "{}", first.render());
+    assert_eq!(first, second, "same report, same byte-identical event log");
+    assert!(first.event_log.events > 1000, "{:?}", first.event_log);
+
+    let other = scenario::run(
+        &Scenario::parse(&text.replace("seed: 12345", "seed: 54321")).unwrap(),
+        &config,
+    )
+    .await
+    .unwrap();
+    assert!(other.passed, "{}", other.render());
+    assert_ne!(other.event_log, first.event_log);
+    assert_ne!(other.steps[1].step, first.steps[1].step);
+
+    // Arrivals move the virtual clock: 600 commands at 5 per second end about two minutes after the 09:00 start.
+    let summary = &first.steps[1].step;
+    let until: chrono::DateTime<chrono::Utc> =
+        summary.rsplit("until ").next().unwrap().parse().unwrap();
+    let elapsed = (until
+        - "2030-01-07T09:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap())
+    .num_seconds();
+    assert!((100..140).contains(&elapsed), "{summary}");
+
+    // The market's summary agrees with the trade log: every execution it saw is one trade.
+    let executions: usize = summary
+        .split(", ")
+        .find_map(|part| part.strip_suffix(" executions"))
+        .unwrap_or_else(|| panic!("{summary}"))
+        .parse()
+        .unwrap();
+    let checked = format!(
+        "{}\n  - expect: {{ trades: {{}}, count: {executions} }}\n  - expect: {{ events: {{ eventType: TradeExecuted }}, count: {executions} }}\n",
+        text.trim_end()
+    );
+    let report = scenario::run(&Scenario::parse(&checked).unwrap(), &config)
+        .await
+        .unwrap();
+    assert!(report.passed, "{}", report.render());
+}
+
+#[tokio::test]
+async fn a_broken_market_reports_a_bounded_number_of_failures() {
+    let text = r#"
+name: unknown instrument
+steps:
+  - market: { orders: 50, instruments: [ { id: NOPE, price: { mid_ticks: 100 } } ] }
+"#;
+    let report = scenario::run(&Scenario::parse(text).unwrap(), &base_config().await)
+        .await
+        .unwrap();
+    let failures = &report.steps[1].failures;
+    assert!(!report.passed);
+    assert_eq!(failures.len(), 11, "{}", report.render());
+    assert!(
+        failures[0].contains("HTTP 422") && failures[0].contains("unknown_instrument"),
+        "{}",
+        failures[0]
+    );
+    assert_eq!(failures[10], "… further failures not shown");
+}
+
+#[tokio::test]
+async fn the_event_log_fingerprint_covers_every_event() {
+    let config = base_config().await;
+    let at = |price: u32| {
+        format!(
+            "name: fingerprint\ninstruments: [ {{ id: ACME, symbol: ACME, currency: DKK, currencyScale: 2 }} ]\n\
+             participants: [ {{ id: A, name: A }} ]\nsteps:\n\
+             - order: {{ participantId: A, side: SELL, type: LIMIT, priceTicks: 100, quantity: 1 }}\n\
+             - order: {{ participantId: A, side: SELL, type: LIMIT, priceTicks: {price}, quantity: 1 }}\n"
+        )
+    };
+    let run = |text: String| {
+        let config = config.clone();
+        async move {
+            scenario::run(&Scenario::parse(&text).unwrap(), &config)
+                .await
+                .unwrap()
+                .event_log
+        }
+    };
+    let (a, b) = (run(at(101)).await, run(at(102)).await);
+    assert_eq!(a.events, b.events);
+    assert_ne!(a.sha256, b.sha256, "only the last event differs");
+    assert_eq!(a, run(at(101)).await);
+}

@@ -24,6 +24,10 @@ equally likely, quantities 1–100, 50 participants, one instrument, seed 42. It
 events per order. Self-trades are rejected, which is why the HTTP runs end with slightly different
 execution counts: concurrent clients interleave orders differently.
 
+Since step 3.2 the workload is a random market from `exchange_simulator::market`, with this configuration (no
+arrival rate, no cancellations). Its seeded stream differs from the hand-written generator behind the 2026-10-14
+figures, but it has the same distributions and the same shape: 0.89 executions and 3.27 events per order at seed 42.
+
 **`--dir` matters.** Each report states the measured cost of a 4 KiB write plus fsync in the database directory. On
 tmpfs that cost is about 1 µs, and the "durable" rows then measure SQLite in RAM. In this devcontainer `/tmp` is tmpfs;
 `/home/vscode` is overlay on the Docker VM's disk, which is what a Docker volume uses.

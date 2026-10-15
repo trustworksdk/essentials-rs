@@ -359,7 +359,7 @@ random markets; and faults injected into *delivered copies* of events, never int
 |---|---|---|---|
 | 3.0 ✅ | Reproducible IDs (D6) | M | Config `ids: { mode: random \| deterministic, seed }`, default `random`. In `deterministic` mode every ID is a UUIDv8 built from a keyed hash of `(seed, kind, natural key)`. The keys already follow from the command order: order → its sequence; execution → (taker order sequence, fill index); event → its event sequence (the single writer knows the next one, and checks it against SQLite after insert); webhook delivery → (subscription, event sequence); subscription → its ordinal; external report → (execution, ordinal). No extra counters are stored, so a restart continues identically. Acceptance: the same commands, seed and clock moves give a byte-identical `/api/events` log and identical API responses (only real-time delivery fields differ), including with restarts in between. |
 | 3.1 ✅ | Scenario DSL and runner | L | YAML: `seed`, `instruments`, `participants`, `subscriptions`, then `steps:` (`order`, `cancel`, `advance_clock`, `expect` on order state, trades, events, book, deliveries). It runs against an in-process service with a virtual clock and deterministic IDs. Per D3, both a CLI (`exchange-simulator scenario run file.yaml`, exit code = verdict) and `POST /test/scenarios` (test control only; returns the verdict and each failed expectation). Both use one runner. Example scenarios go in `scenarios/`. |
-| 3.2 | Random market generator | M | Seeded distributions from plan §6: arrival rate, buy probability, market-order and cancellation probabilities, and price and size distributions per instrument. It generalizes the `bench` workload. Reproducibility comes from the seed plus deterministic sequencing: one generator feeds commands in order, under the virtual clock. |
+| 3.2 ✅ | Random market generator | M | Seeded distributions from plan §6: arrival rate, buy probability, market-order and cancellation probabilities, and price and size distributions per instrument. It generalizes the `bench` workload. Reproducibility comes from the seed plus deterministic sequencing: one generator feeds commands in order, under the virtual clock. |
 | 3.3 | Delivery fault policies | M | Per-subscription policy, configured under `/test/…` or in a scenario: missing fields, explicit nulls, invalid values (a JSON-path list or a random choice by probability), duplicates, delays, out-of-order (hold and release). Faults apply to the outgoing copy only. A new `webhook_attempts` table records each attempt with the mutation applied, so a test can assert on what was actually sent. |
 | 3.4 | Reset and replay controls | S | `POST /test/reset` clears all state (test mode only). `POST /test/webhooks/{id}/redeliver?after=` re-enqueues deliveries from a sequence. Dead letters can be listed and retried. |
 | 3.5 | Tests and acceptance | M | A scenario suite in CI: the same file and seed give byte-identical event logs over two runs. Each fault type is visible at the receiver and absent from `/api/events`. Reset gives a clean state. |
@@ -461,6 +461,66 @@ random markets; and faults injected into *delivered copies* of events, never int
   - The plan names the setup list `subscriptions`; the file uses `webhooks`, after the API resource.
   - Besides the plan's steps there are also `set_clock`, `report_settlement` and `set_instrument`, so the
     Milestone 2 behaviour can be scripted too.
+
+**3.2 — random market generator ✅ (2026-10-15).**
+- **Delivered:**
+  - `market` module: `MarketConfig`, which `validate`s with errors naming the field, and a pure `generate()`
+    iterator of `MarketCommand { at_micros, action: Submit | Cancel { submit_index } }`.
+  - The distributions from plan §6:
+    - Poisson arrivals in simulated time (`orders_per_second`; 0 puts every command at one instant).
+    - Buy, market-order and cancellation probabilities. A cancel picks a random earlier limit order, never one
+      twice.
+    - Participants as a count (`P01`…) or a list.
+    - Per instrument: an arrival `weight`, limit prices around `mid_ticks` with `width_ticks` and `skew_ticks`
+      (buys below the mid, sells above), `uniform` or `normal`, and quantities as uniform whole lots.
+  - **Its own RNG (SplitMix64).** It is written out in the module, so a dependency upgrade can never change a
+    recorded stream. Probabilities always draw, so changing one does not shift the rest of the stream.
+  - **Scenario `market` step.** It registers the market's participants (existing ones are fine), then sends each
+    command in order, first setting the virtual clock to its arrival time (start + offset, so no drift builds up).
+    Cancels address orders by their submit index, through the IDs returned. The seed defaults to the scenario's.
+    Exchange rejections and refused cancels of orders that have meanwhile filled are summarized, not failures; any
+    other refusal is a failure, with at most 10 reported. The step's summary (orders, rejections, executions,
+    cancels, refusals, final clock) is part of the report.
+  - **Event-log fingerprint in every scenario report:** the count and SHA-256 of `/api/events` as JSON lines.
+    Equal fingerprints mean byte-identical logs. 3.5's acceptance can use it directly.
+  - **The bench workload is now this generator,** with a configuration matching the old one. The stream differs
+    from the hand-written one, but the shape is the same (0.89 executions and 3.27 events per order against about
+    0.9 and 3.3). Noted in `bench/README.md`.
+  - `scenarios/random-market.yaml`: 600 commands on two instruments (one normal, one with lots of 10), with cancels
+    and simulated settlement with failures, then a week forward.
+  - A README section on random markets.
+- **Tests:**
+  - `market` unit tests (6):
+    - The same seed gives the same stream; another seed gives another.
+    - The stream's first three commands are pinned. The first was recomputed independently in Python.
+    - The draws follow the configured shares, bounds, lots and skew: every uniform tick is used, about 68 % of a
+      normal falls within 1σ, the mean arrival gap is 1/rate, and the gaps' coefficient of variation is about 1.
+    - Cancels name earlier limit orders, each once.
+    - No rate means one instant; named participants work.
+    - Invalid configurations name the field.
+  - `tests/scenarios.rs` (+3):
+    - The random market passes, and two runs give identical reports and event-log fingerprints. Another seed gives
+      a different market that still passes.
+    - The clock ends about two minutes in, as 600 commands at 5/s should.
+    - The summary's execution count equals the trades and `TradeExecuted` events.
+    - A market on an unknown instrument reports 10 failures plus a "further failures" line.
+    - Two logs of equal length differing only in their last event get different fingerprints.
+  - The scenario suite was repeated five times without failure.
+- **Mutation checks**, each made a test fail:
+  - generator: seed ignored; normal drawn as uniform; skew sign flipped; no cancellations; evenly spaced arrivals
+    with the same draws;
+  - runner: clock not moved; a refused cancel counted as a failure; the scenario seed not used as the default; a
+    fingerprint over the first event only.
+- **Decisions:**
+  - **The generator does not react to the exchange.** The stream depends only on the configuration, which is what
+    makes a market reproducible from its seed. A cancel can therefore name an order that has meanwhile filled, and
+    the exchange refuses it (counted as refused).
+  - **Prices move around a fixed mid.** There is no drift or random walk of the mid yet; it can be added as a price
+    option later.
+  - **No market endpoint of its own.** Markets run as scenario steps, so they come through both the CLI and
+    `POST /test/scenarios`. A market against the live service waits for reset (3.4), if it is wanted at all.
+- **Deviation:** the plan's example config has `instruments: 100` as a count. Here instruments are listed (each
+  needs its registration and distributions), so many instruments mean a long list.
 
 ## Milestone 4 — performance
 

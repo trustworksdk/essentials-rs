@@ -18,6 +18,8 @@
 //!   - advance_clock: { days: 2 }
 //!   - expect: { settlement: "buy#0", matches: { simulated: { status: SETTLED } } }
 //!   - expect: { events: { eventType: SettlementCompleted }, count: 1 }
+//!   - market: { orders: 500, orders_per_second: 10, participants: 5, cancellation_probability: 0.1,
+//!               instruments: [ { id: ACME, price: { mid_ticks: 10025, width_ticks: 10 } } ] }
 //!   - expect: { deliveries: { eventType: SettlementCompleted, status: DELIVERED }, count: 1, wait_ms: 2000 }
 //! ```
 //!
@@ -28,13 +30,14 @@ mod matcher;
 mod runner;
 
 pub use matcher::{contains, mismatches};
-pub use runner::{Report, StepReport, run};
+pub use runner::{EventLog, Report, StepReport, run};
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::config::SettlementMode;
+use crate::market::MarketConfig;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,6 +102,9 @@ pub enum Step {
     ReportSettlement(ReportStep),
     /// `PATCH /api/instruments/{instrument}`.
     SetInstrument(SetInstrument),
+    /// A seeded random market ([`crate::market`]): its participants are registered if new, then its commands are
+    /// sent in order, the virtual clock set to each arrival time.
+    Market(MarketConfig),
     /// A check of the current state.
     Expect(Expectation),
 }
@@ -189,6 +195,11 @@ impl Scenario {
     pub fn parse(text: &str) -> Result<Self, String> {
         let scenario: Self = serde_saphyr::from_str(text).map_err(|e| e.to_string())?;
         for (i, step) in scenario.steps.iter().enumerate() {
+            if let Step::Market(market) = step {
+                market
+                    .validate()
+                    .map_err(|error| format!("step {}: market: {error}", i + 1))?;
+            }
             if let Step::Expect(expectation) = step {
                 let targets = [
                     expectation.order.is_some(),
@@ -237,13 +248,14 @@ steps:
   - set_clock: { to: 2030-01-20T00:00:00Z }
   - report_settlement: { execution: "buy#0", status: SETTLED, reference: r-1 }
   - set_instrument: { instrument: ACME, enabled: false }
+  - market: { orders: 10, instruments: [ { id: ACME, price: { mid_ticks: 100 } } ] }
   - expect: { order: sell, matches: { status: CANCELLED } }
   - expect: { events: { eventType: SettlementCompleted }, count: 1 }
 "#;
         let scenario = Scenario::parse(text).unwrap();
         assert_eq!(
             (scenario.name.as_str(), scenario.seed, scenario.steps.len()),
-            ("partial fill", 7, 9)
+            ("partial fill", 7, 10)
         );
         assert_eq!(scenario.start, default_start());
         let Step::Order(order) = &scenario.steps[1] else {
@@ -268,6 +280,14 @@ steps:
         let two_targets =
             Scenario::parse("name: x\nsteps:\n  - expect: { order: a, book: ACME }\n").unwrap_err();
         assert!(two_targets.contains("exactly one"), "{two_targets}");
+        let bad_market = Scenario::parse(
+            "name: x\nsteps:\n  - market: { orders: 1, buy_probability: 2, instruments: [ { id: A, price: { mid_ticks: 1 } } ] }\n",
+        )
+        .unwrap_err();
+        assert!(
+            bad_market.contains("step 1: market: buy_probability"),
+            "{bad_market}"
+        );
         let no_target = Scenario::parse("name: x\nsteps:\n  - expect: { count: 1 }\n").unwrap_err();
         assert!(no_target.contains("step 1"), "{no_target}");
         let misplaced_wait =
