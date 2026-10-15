@@ -347,8 +347,8 @@ Steps 2.1–2.5 are done.
   - An `InstrumentStatusChanged` event.
   - Participant detail updates.
   - Simulator intake from "now" instead of from the start of the log, if wanted.
-  - Reproducible *IDs* across runs, which Milestone 3 needs for byte-identical event logs. Today outcomes, dates and
-    timestamps are reproducible, but event and execution IDs are random UUIDv7.
+  - Reproducible *IDs* across runs (now decision D6, step 3.0). Today outcomes, dates and timestamps are
+    reproducible, but event and execution IDs are random UUIDv7.
 
 ## Milestone 3 — scenarios and fault injection
 
@@ -357,7 +357,8 @@ random markets; and faults injected into *delivered copies* of events, never int
 
 | # | Step | Size | Delivers |
 |---|---|---|---|
-| 3.1 | Scenario DSL and runner | L | YAML: `seed`, `instruments`, `participants`, `subscriptions`, then `steps:` (`order`, `cancel`, `advance_clock`, `expect` on order state, trades, events, book, deliveries). It runs against an in-process service with a virtual clock. Per D3, a CLI (`exchange-simulator scenario run file.yaml`, exit code = verdict) and/or `POST /test/scenarios`. Example scenarios go in `scenarios/`. |
+| 3.0 | Reproducible IDs (D6) | M | Config `ids: { mode: random \| deterministic, seed }`, default `random`. In `deterministic` mode every ID is a UUIDv8 built from a keyed hash of `(seed, kind, natural key)`. The keys already follow from the command order: order → its sequence; execution → (taker order sequence, fill index); event → its event sequence (the single writer knows the next one, and checks it against SQLite after insert); webhook delivery → (subscription, event sequence); subscription → its ordinal; external report → (execution, ordinal). No extra counters are stored, so a restart continues identically. Acceptance: the same commands, seed and clock moves give a byte-identical `/api/events` log and identical API responses (only real-time delivery fields differ), including with restarts in between. |
+| 3.1 | Scenario DSL and runner | L | YAML: `seed`, `instruments`, `participants`, `subscriptions`, then `steps:` (`order`, `cancel`, `advance_clock`, `expect` on order state, trades, events, book, deliveries). It runs against an in-process service with a virtual clock and deterministic IDs. Per D3, both a CLI (`exchange-simulator scenario run file.yaml`, exit code = verdict) and `POST /test/scenarios` (test control only; returns the verdict and each failed expectation). Both use one runner. Example scenarios go in `scenarios/`. |
 | 3.2 | Random market generator | M | Seeded distributions from plan §6: arrival rate, buy probability, market-order and cancellation probabilities, and price and size distributions per instrument. It generalizes the `bench` workload. Reproducibility comes from the seed plus deterministic sequencing: one generator feeds commands in order, under the virtual clock. |
 | 3.3 | Delivery fault policies | M | Per-subscription policy, configured under `/test/…` or in a scenario: missing fields, explicit nulls, invalid values (a JSON-path list or a random choice by probability), duplicates, delays, out-of-order (hold and release). Faults apply to the outgoing copy only. A new `webhook_attempts` table records each attempt with the mutation applied, so a test can assert on what was actually sent. |
 | 3.4 | Reset and replay controls | S | `POST /test/reset` clears all state (test mode only). `POST /test/webhooks/{id}/redeliver?after=` re-enqueues deliveries from a sequence. Dead letters can be listed and retried. |
@@ -383,7 +384,7 @@ the order below deliberately puts group commit before sharding.
 1. Milestone 1 wrap-up: 1.1 now, then 1.2, then 1.3a–d.
 2. 2.1 virtual clock and test control. Milestones 2 and 3 both depend on it.
 3. Milestone 2, steps 2.2–2.5.
-4. Milestone 3, steps 3.1–3.5.
+4. Milestone 3, steps 3.0–3.5.
 5. Milestone 4, steps 4.1–4.6 (settlement before performance, D4).
 
 ## Decisions
@@ -396,7 +397,11 @@ Settled on 2026-10-14:
 - **D5 — Milestone 1 backlog:** all four items are needed soon: HMAC signing, ordered delivery, instrument `enabled`,
   participant settlement metadata (1.3a–d).
 
+Settled on 2026-10-15:
+- **D3 — scenario runner surface:** both, a CLI and an API (step 3.1).
+- **D6 — reproducible IDs:** event and execution IDs (in fact all IDs) must be stable and reproducible across runs.
+  This is a new step, 3.0, the first of Milestone 3.
+
 Still open:
-- **D3 — scenario runner surface:** CLI only, API only, or both? Needed before 3.1.
 - **D4 (rest):** what is the benchmark target hardware, and is "fast mode" `synchronous=OFF` or fully in-memory?
   Needed before 4.4 and 4.6.
