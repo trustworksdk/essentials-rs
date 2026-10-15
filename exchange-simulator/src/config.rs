@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::time::Duration;
 
 use crate::domain::IdentifierPolicy;
+use crate::ids::IdScheme;
 use crate::settlement::SettlementPolicy;
 use crate::webhooks::{RetryPolicy, WorkerConfig};
 
@@ -20,6 +21,7 @@ pub struct Config {
     #[serde(default)]
     pub events: EventsConfig,
     pub webhooks: WebhooksConfig,
+    pub ids: IdsConfig,
     pub settlement: SettlementConfig,
     pub clock: ClockConfig,
     pub test_control: TestControlConfig,
@@ -38,6 +40,30 @@ pub struct ExchangeConfig {
     pub identifier_policy: IdentifierPolicy,
     /// Bound of the exchange command queue; a full queue rejects requests with 503.
     pub command_queue_capacity: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct IdsConfig {
+    pub mode: IdMode,
+    #[serde(default)]
+    pub seed: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IdMode {
+    #[default]
+    Random,
+    Deterministic,
+}
+
+impl IdsConfig {
+    pub fn scheme(&self) -> IdScheme {
+        match self.mode {
+            IdMode::Random => IdScheme::Random,
+            IdMode::Deterministic => IdScheme::Deterministic { seed: self.seed },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -225,6 +251,12 @@ mod tests {
         assert_eq!(config.events.simulation_id, None);
         assert_eq!(config.webhooks.worker().retry.max_attempts, 10);
         assert_eq!(config.clock.mode, ClockMode::System);
+        assert_eq!(config.ids.scheme(), IdScheme::Random);
+        let seeded = IdsConfig {
+            mode: IdMode::Deterministic,
+            seed: 9,
+        };
+        assert_eq!(seeded.scheme(), IdScheme::Deterministic { seed: 9 });
         assert_eq!(config.settlement.mode, SettlementMode::External);
         assert_eq!(config.settlement.simulator_policy(), None);
         let simulated = SettlementConfig {

@@ -2,7 +2,6 @@
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use exchange_simulator::domain::{InstrumentId, ParticipantId};
-use exchange_simulator::engine::SequentialIds;
 use exchange_simulator::settlement::{
     SettlementPlan, SettlementPolicy, SettlementSimulator, SettlementStatus, TradeFacts,
 };
@@ -43,7 +42,7 @@ fn step(
     trades: &[TradeFacts],
     now: DateTime<Utc>,
 ) -> SettlementPlan {
-    let plan = sim.plan(trades, now, &mut SequentialIds(1 << 40));
+    let plan = sim.plan(trades, now);
     sim.apply(&plan);
     plan
 }
@@ -403,11 +402,7 @@ fn planning_changes_nothing_until_applied_and_events_come_in_time_order() {
     let trades: Vec<_> = (1..=50)
         .map(|i| trade(i, monday() + Duration::hours(i as i64)))
         .collect();
-    let plan = sim.plan(
-        &trades,
-        monday() + Duration::days(20),
-        &mut SequentialIds(0),
-    );
+    let plan = sim.plan(&trades, monday() + Duration::days(20));
     assert_eq!(
         (sim.cursor(), sim.open()),
         (0, 0),

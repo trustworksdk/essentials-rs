@@ -26,7 +26,7 @@ thiserror = "2.0.21"
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
-uuid = { version = "1.28.0", features = ["v7", "serde"] }
+uuid = { version = "1.28.0", features = ["v7", "v8", "serde"] }
 
 [dev-dependencies]
 http-body-util = "0.1.5"

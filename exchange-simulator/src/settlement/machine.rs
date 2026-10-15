@@ -6,7 +6,6 @@ use uuid::Uuid;
 
 use super::calendar::add_business_days;
 use super::{Instruction, SettlementPolicy, SettlementStatus, TradeFacts, draw, format_amount};
-use crate::engine::IdGenerator;
 use crate::events::{self, NewEvent};
 
 // Draw purposes: each decision gets its own independent stream.
@@ -83,19 +82,14 @@ impl SettlementSimulator {
     /// Plans taking in `trades` (those after the cursor, in sequence order) and then every transition due at or
     /// before `now`, in due order (ties by trade sequence). An instruction can move several times in one step, e.g.
     /// delayed and then settled when the clock jumps ahead.
-    pub fn plan(
-        &self,
-        trades: &[TradeFacts],
-        now: DateTime<Utc>,
-        ids: &mut dyn IdGenerator,
-    ) -> SettlementPlan {
+    pub fn plan(&self, trades: &[TradeFacts], now: DateTime<Utc>) -> SettlementPlan {
         let mut transitions = Vec::new();
         let mut working: HashMap<Uuid, Instruction> = HashMap::new();
         let mut queue = self.queue.clone();
         let mut cursor = self.cursor;
 
         for trade in trades.iter().filter(|t| t.sequence > self.cursor) {
-            let transition = self.intake(trade, ids);
+            let transition = self.intake(trade);
             if let Some(due) = transition.instruction.due_at {
                 queue.insert((due, trade.sequence, trade.execution_id));
             }
@@ -114,7 +108,7 @@ impl SettlementSimulator {
                 .or_else(|| self.open.get(&id))
                 .expect("queued instructions are open")
                 .clone();
-            let transition = self.evaluate(&current, ids);
+            let transition = self.evaluate(&current);
             if let Some(next) = transition.instruction.due_at {
                 queue.insert((next, sequence, id));
             }
@@ -155,7 +149,7 @@ impl SettlementSimulator {
         }
     }
 
-    fn intake(&self, trade: &TradeFacts, ids: &mut dyn IdGenerator) -> Transition {
+    fn intake(&self, trade: &TradeFacts) -> Transition {
         let policy = &self.policy;
         let trade_date = trade.executed_at.date_naive();
         let isd = add_business_days(trade_date, policy.settlement_days);
@@ -202,11 +196,11 @@ impl SettlementSimulator {
                 json!({ "settlementDays": policy.settlement_days }),
             ),
         };
-        let event = settlement_event(event_type, &instruction, trade.executed_at, extra, ids);
+        let event = settlement_event(event_type, &instruction, trade.executed_at, extra);
         Transition { instruction, event }
     }
 
-    fn evaluate(&self, current: &Instruction, ids: &mut dyn IdGenerator) -> Transition {
+    fn evaluate(&self, current: &Instruction) -> Transition {
         let policy = &self.policy;
         let at = current
             .due_at
@@ -290,7 +284,7 @@ impl SettlementSimulator {
             }
             final_status => unreachable!("{final_status} instructions have no due transition"),
         };
-        let event = settlement_event(event_type, &next, at, extra, ids);
+        let event = settlement_event(event_type, &next, at, extra);
         Transition {
             instruction: next,
             event,
@@ -305,14 +299,13 @@ fn start_of(date: NaiveDate) -> DateTime<Utc> {
         .and_utc()
 }
 
-/// A settlement lifecycle event: the instruction's state after the transition plus `extra` fields. Aggregate and
+/// A settlement lifecycle event (unstamped: the writer assigns sequence and ID): the instruction's state after the transition plus `extra` fields. Aggregate and
 /// correlation ID are the execution ID.
 fn settlement_event(
     event_type: &'static str,
     instruction: &Instruction,
     at: DateTime<Utc>,
     extra: Value,
-    ids: &mut dyn IdGenerator,
 ) -> NewEvent {
     let mut payload = json!({
         "executionId": instruction.execution_id,
@@ -334,7 +327,8 @@ fn settlement_event(
         payload.extend(extra);
     }
     NewEvent {
-        event_id: ids.next_id(),
+        event_id: Uuid::nil(),
+        sequence: 0,
         event_type,
         source: events::SETTLEMENT_SOURCE,
         aggregate_id: instruction.execution_id.to_string(),

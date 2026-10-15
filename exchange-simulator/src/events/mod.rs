@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::domain::{Execution, Instrument, Order, OrderStatus, OrderType, ParticipantId};
-use crate::engine::{BookUpdate, IdGenerator};
+use crate::engine::BookUpdate;
 
 /// Version of the payload schemas below. Bump on breaking payload changes.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -62,7 +62,10 @@ pub const CANCEL_REQUESTED: &str = "REQUESTED";
 /// An event before storage has assigned its sequence.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewEvent {
+    /// Assigned with `sequence` by the writer just before commit ([`NewEvent::stamp`]); nil until then.
     pub event_id: Uuid,
+    /// The event's position in the canonical log; 0 until stamped.
+    pub sequence: u64,
     pub event_type: &'static str,
     /// The component that produced it: [`EXCHANGE_SOURCE`] for trading events.
     pub source: &'static str,
@@ -70,6 +73,20 @@ pub struct NewEvent {
     pub correlation_id: Option<String>,
     pub occurred_at: DateTime<Utc>,
     pub payload: Value,
+}
+
+impl NewEvent {
+    /// Gives each event its place in the log, starting at `first`, and the ID derived from it. Returns the sequence
+    /// after the last one.
+    pub fn stamp(events: &mut [NewEvent], first: u64, ids: crate::ids::IdScheme) -> u64 {
+        let mut sequence = first;
+        for event in events {
+            event.sequence = sequence;
+            event.event_id = ids.event(sequence);
+            sequence += 1;
+        }
+        sequence
+    }
 }
 
 /// The canonical envelope, as stored and as delivered to webhooks and the replay API.
@@ -103,21 +120,22 @@ pub enum Command {
 ///   if a market remainder was cancelled
 /// - cancel: `OrderCancelled`
 ///
-/// Every event carries the subject order's ID as correlation ID.
+/// Every event carries the subject order's ID as correlation ID. Events come back unstamped: the writer assigns their
+/// sequences and IDs.
 pub fn for_update(
     command: Command,
     update: &BookUpdate,
     instrument: &Instrument,
     settlement: &dyn Fn(&ParticipantId) -> Option<Value>,
     now: DateTime<Utc>,
-    ids: &mut dyn IdGenerator,
 ) -> Vec<NewEvent> {
     let order = &update.order;
     let correlation_id = Some(order.id.to_string());
     let mut events = Vec::new();
     let mut push = |event_type: &'static str, aggregate_id: String, payload: Value| {
         events.push(NewEvent {
-            event_id: ids.next_id(),
+            event_id: Uuid::nil(),
+            sequence: 0,
             event_type,
             source: EXCHANGE_SOURCE,
             aggregate_id,

@@ -1036,7 +1036,7 @@ fn participant_settlement_details_are_durable_and_reach_trade_events() {
 }
 
 #[test]
-fn a_failed_settlement_commit_changes_nothing() {
+fn a_failed_settlement_write_changes_nothing() {
     use exchange_simulator::clock::VirtualClock;
     use exchange_simulator::engine::ClockChange;
     use exchange_simulator::settlement::SettlementPolicy;
@@ -1056,44 +1056,59 @@ fn a_failed_settlement_commit_changes_nothing() {
     for id in ["A", "B"] {
         exchange.register_participant(participant(id)).unwrap();
     }
-    processed(exchange.submit(order("A", Side::Sell, Some(10025), 200)));
-    processed(exchange.submit(order("B", Side::Buy, Some(10025), 150)));
-    exchange
-        .store()
-        .connection()
-        .execute_batch("CREATE TEMP TRIGGER fail BEFORE INSERT ON settlement_instructions BEGIN SELECT RAISE(ABORT, 'no'); END;")
-        .unwrap();
+    let sell = processed(exchange.submit(order("A", Side::Sell, Some(10025), 200)));
+    let fail = "CREATE TEMP TRIGGER fail BEFORE INSERT ON settlement_instructions BEGIN SELECT RAISE(ABORT, 'no'); END;";
+    let settlement_events = "SELECT COUNT(*) FROM events WHERE source = 'settlement-simulator'";
+
+    // Intake happens in the trade's own transaction: if it cannot be written, the trade is not either.
+    exchange.store().connection().execute_batch(fail).unwrap();
     assert!(matches!(
-        exchange.settlement_tick(),
+        exchange.submit(order("B", Side::Buy, Some(10025), 150)),
         Err(ExchangeError::Storage(_))
     ));
-    assert_eq!(
-        count(
-            &exchange,
-            "SELECT COUNT(*) FROM events WHERE source = 'settlement-simulator'"
-        ),
-        0
-    );
+    assert_eq!(count(&exchange, "SELECT COUNT(*) FROM executions"), 0);
+    assert_eq!(count(&exchange, settlement_events), 0);
     assert_eq!(
         count(&exchange, "SELECT COUNT(*) FROM consumer_offsets"),
         0,
         "the cursor did not move"
     );
-
+    assert_eq!(
+        exchange
+            .book(&acme().id)
+            .unwrap()
+            .order(sell.order.id)
+            .unwrap()
+            .remaining_quantity,
+        200
+    );
     exchange
         .store()
         .connection()
         .execute_batch("DROP TRIGGER fail")
         .unwrap();
+    let trade = processed(exchange.submit(order("B", Side::Buy, Some(10025), 150)));
+    assert_eq!(trade.executions.len(), 1);
     assert_eq!(
-        exchange.settlement_tick().unwrap(),
+        count(&exchange, settlement_events),
         1,
-        "the trade is taken in on retry"
+        "SettlementPending with the trade"
     );
-    assert_eq!(exchange.settlement_tick().unwrap(), 0, "and only once");
+
+    // Due transitions on a tick: a failed write leaves them due, and the retry runs them once.
+    exchange.store().connection().execute_batch(fail).unwrap();
+    assert!(matches!(
+        exchange.change_clock(ClockChange::Advance(chrono::Duration::days(2))),
+        Err(ExchangeError::Storage(_))
+    ));
+    assert_eq!(count(&exchange, settlement_events), 1);
     exchange
-        .change_clock(ClockChange::Advance(chrono::Duration::days(2)))
+        .store()
+        .connection()
+        .execute_batch("DROP TRIGGER fail")
         .unwrap();
+    assert_eq!(exchange.settlement_tick().unwrap(), 1);
+    assert_eq!(exchange.settlement_tick().unwrap(), 0, "and only once");
     let types: Vec<String> = exchange
         .store()
         .events(0, 100, None)
@@ -1103,4 +1118,16 @@ fn a_failed_settlement_commit_changes_nothing() {
         .map(|e| e.event_type)
         .collect();
     assert_eq!(types, ["SettlementPending", "SettlementCompleted"]);
+    let sequences: Vec<u64> = exchange
+        .store()
+        .events(0, 100, None)
+        .unwrap()
+        .iter()
+        .map(|e| e.sequence)
+        .collect();
+    assert_eq!(
+        sequences,
+        (1..=sequences.len() as u64).collect::<Vec<_>>(),
+        "no gaps from the failed writes"
+    );
 }

@@ -21,6 +21,12 @@ webhooks:
   max_attempts: 10
   initial_backoff_ms: 500
   max_backoff_ms: 300000
+ids:
+  # "random": UUIDv7, different every run. "deterministic": every ID (orders, executions, events, deliveries,
+  # subscriptions, reports) is derived from `seed` and the order of commands, so the same commands give the same IDs
+  # run after run. Use it for reproducible tests and scenarios.
+  mode: "random"
+  seed: 0
 settlement:
   # "external": no simulation; an external service owns settlement. "simulated": the built-in simulator creates a
   # settlement instruction per trade and emits Settlement* lifecycle events. "both": simulator plus externally

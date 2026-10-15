@@ -14,37 +14,13 @@ pub use exchange::{
     ClockChange, ClockState, Exchange, ExchangeError, ExchangeOptions, SubmitOrder, SubmitOutcome,
 };
 
+pub use crate::ids::IdScheme;
+
 use chrono::{DateTime, Utc};
-use uuid::Uuid;
 
-/// Source of execution IDs, injectable so tests and seeded scenarios are reproducible.
-pub trait IdGenerator {
-    fn next_id(&mut self) -> Uuid;
-}
-
-/// Time-ordered random UUIDs (v7) for production use.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct UuidV7Ids;
-
-impl IdGenerator for UuidV7Ids {
-    fn next_id(&mut self) -> Uuid {
-        Uuid::now_v7()
-    }
-}
-
-/// Deterministic IDs `00000000-0000-0000-0000-000000000001`, `...02`, ... for tests and replayable scenarios.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SequentialIds(pub u128);
-
-impl IdGenerator for SequentialIds {
-    fn next_id(&mut self) -> Uuid {
-        self.0 += 1;
-        Uuid::from_u128(self.0)
-    }
-}
-
-/// Inputs a matching step needs from outside the book: the clock reading and an ID source.
-pub struct MatchContext<'a> {
+/// Inputs a matching step needs from outside the book: the clock reading and the ID scheme.
+#[derive(Clone, Copy, Debug)]
+pub struct MatchContext {
     pub now: DateTime<Utc>,
-    pub ids: &'a mut dyn IdGenerator,
+    pub ids: IdScheme,
 }

@@ -8,15 +8,15 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use exchange_simulator::app::App;
 use exchange_simulator::config::{
-    ClockConfig, ClockMode, Config, DatabaseConfig, EventsConfig, ExchangeConfig, LogFormat,
-    LoggingConfig, ServerConfig, SettlementConfig, TestControlConfig, WebhooksConfig,
+    ClockConfig, ClockMode, Config, DatabaseConfig, EventsConfig, ExchangeConfig, IdsConfig,
+    LogFormat, LoggingConfig, ServerConfig, SettlementConfig, TestControlConfig, WebhooksConfig,
 };
 use exchange_simulator::domain::{
     IdentifierPolicy, Instrument, InstrumentId, Order, OrderStatus, OrderType, Participant,
     ParticipantId, Side,
 };
 use exchange_simulator::engine::{
-    Exchange, ExchangeOptions, MatchContext, OrderBook, SequentialIds, SubmitOrder,
+    Exchange, ExchangeOptions, IdScheme, MatchContext, OrderBook, SubmitOrder,
 };
 use exchange_simulator::events::EVENT_TYPES;
 use exchange_simulator::persistence::{self, Store};
@@ -200,7 +200,7 @@ fn temp_dir(base: &std::path::Path, label: &str) -> std::path::PathBuf {
 /// Pure matching on one book: no I/O, no events, no sequencing beyond the book's own.
 fn bench_matching(options: &Options, report: &mut Report) {
     let commands = workload(options.seed, options.matching_orders);
-    let mut ids = SequentialIds(1 << 64);
+    let ids = IdScheme::Deterministic { seed: 0 };
     let orders: Vec<Order> = commands
         .into_iter()
         .enumerate()
@@ -224,7 +224,7 @@ fn bench_matching(options: &Options, report: &mut Report) {
     let started = Instant::now();
     for order in orders {
         let update = book
-            .submit(order, &mut MatchContext { now, ids: &mut ids })
+            .submit(order, &mut MatchContext { now, ids })
             .expect("valid order");
         executions += update.executions.len();
     }
@@ -455,6 +455,7 @@ async fn bench_http(options: &Options, report: &mut Report, with_webhook: bool) 
             start: None,
             running: false,
         },
+        ids: IdsConfig::default(),
         settlement: SettlementConfig::default(),
         test_control: TestControlConfig::default(),
         logging: LoggingConfig {

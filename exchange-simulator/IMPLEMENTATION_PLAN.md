@@ -357,12 +357,52 @@ random markets; and faults injected into *delivered copies* of events, never int
 
 | # | Step | Size | Delivers |
 |---|---|---|---|
-| 3.0 | Reproducible IDs (D6) | M | Config `ids: { mode: random \| deterministic, seed }`, default `random`. In `deterministic` mode every ID is a UUIDv8 built from a keyed hash of `(seed, kind, natural key)`. The keys already follow from the command order: order → its sequence; execution → (taker order sequence, fill index); event → its event sequence (the single writer knows the next one, and checks it against SQLite after insert); webhook delivery → (subscription, event sequence); subscription → its ordinal; external report → (execution, ordinal). No extra counters are stored, so a restart continues identically. Acceptance: the same commands, seed and clock moves give a byte-identical `/api/events` log and identical API responses (only real-time delivery fields differ), including with restarts in between. |
+| 3.0 ✅ | Reproducible IDs (D6) | M | Config `ids: { mode: random \| deterministic, seed }`, default `random`. In `deterministic` mode every ID is a UUIDv8 built from a keyed hash of `(seed, kind, natural key)`. The keys already follow from the command order: order → its sequence; execution → (taker order sequence, fill index); event → its event sequence (the single writer knows the next one, and checks it against SQLite after insert); webhook delivery → (subscription, event sequence); subscription → its ordinal; external report → (execution, ordinal). No extra counters are stored, so a restart continues identically. Acceptance: the same commands, seed and clock moves give a byte-identical `/api/events` log and identical API responses (only real-time delivery fields differ), including with restarts in between. |
 | 3.1 | Scenario DSL and runner | L | YAML: `seed`, `instruments`, `participants`, `subscriptions`, then `steps:` (`order`, `cancel`, `advance_clock`, `expect` on order state, trades, events, book, deliveries). It runs against an in-process service with a virtual clock and deterministic IDs. Per D3, both a CLI (`exchange-simulator scenario run file.yaml`, exit code = verdict) and `POST /test/scenarios` (test control only; returns the verdict and each failed expectation). Both use one runner. Example scenarios go in `scenarios/`. |
 | 3.2 | Random market generator | M | Seeded distributions from plan §6: arrival rate, buy probability, market-order and cancellation probabilities, and price and size distributions per instrument. It generalizes the `bench` workload. Reproducibility comes from the seed plus deterministic sequencing: one generator feeds commands in order, under the virtual clock. |
 | 3.3 | Delivery fault policies | M | Per-subscription policy, configured under `/test/…` or in a scenario: missing fields, explicit nulls, invalid values (a JSON-path list or a random choice by probability), duplicates, delays, out-of-order (hold and release). Faults apply to the outgoing copy only. A new `webhook_attempts` table records each attempt with the mutation applied, so a test can assert on what was actually sent. |
 | 3.4 | Reset and replay controls | S | `POST /test/reset` clears all state (test mode only). `POST /test/webhooks/{id}/redeliver?after=` re-enqueues deliveries from a sequence. Dead letters can be listed and retried. |
 | 3.5 | Tests and acceptance | M | A scenario suite in CI: the same file and seed give byte-identical event logs over two runs. Each fault type is visible at the receiver and absent from `/api/events`. Reset gives a clean state. |
+
+### Milestone 3 progress
+
+**3.0 — reproducible IDs ✅ (2026-10-15).**
+- **Delivered:**
+  - `ids` module: `IdScheme::{Random, Deterministic { seed }}`. Deterministic IDs are UUIDv8 from
+    SHA-256(`"exchange-simulator/ids/v1"`, seed, kind, length-prefixed natural key), with one function per kind:
+    `order`, `execution`, `event`, `delivery`, `subscription`, `report`. It replaces the old `IdGenerator`,
+    `UuidV7Ids` and `SequentialIds`.
+  - `MatchContext` carries the scheme, and an execution ID is (taker sequence, fill index).
+  - Config `ids: { mode: random | deterministic, seed }`, default `random`.
+  - **Event sequences come from the writer.** `Exchange.next_event_sequence` starts at max(`MAX(sequence)`,
+    `sqlite_sequence`) + 1 and moves on only after a successful commit. Events are built unstamped, then
+    `NewEvent::stamp` gives each its sequence and the ID derived from it, and they are inserted with explicit
+    sequences. Delivery IDs derive from (subscription, event sequence).
+  - **Settlement intake moved into the trade's transaction** (revising 2.3's tick-based intake). `commit_and_apply`
+    plans intake for the trade's executions and commits trade, events, settlement instructions, settlement events
+    and cursor together. Recovery runs one settlement step before serving, to catch up trades from before the
+    simulator was on. The ticker remains for due transitions under a running clock.
+  - `Store::commit` takes an optional `SettlementWrite`. Event and settlement writing are shared helpers.
+- **Tests:**
+  - `ids` unit tests: stable and seed-dependent; one ID pinned to a value computed independently with Python's
+    hashlib; no collisions across kinds and keys; random mode gives distinct v7s.
+  - `tests/reproducible.rs` (3), over a script touching every ID kind and all three event sources:
+    - Two runs are byte-identical in `/api/events`, trades, webhooks, settlements, the book, every order and
+      settlement detail, the delivery IDs and every command response.
+    - The same holds with two restarts in the middle.
+    - Random mode differs only in IDs.
+  - Event IDs equal `ids.event(sequence)`, and sequences have no gaps.
+  - The settlement failure test now covers both paths: a failed intake rolls the whole trade back; a failed tick
+    leaves transitions due. Neither leaves a gap in the sequence.
+  - The reproducibility suite was repeated five times without failure.
+- **Mutation checks**, each made a test fail: random execution IDs; random delivery IDs; random subscription IDs;
+  intake left to the ticker (the log order then varied); the sequence counter not advanced.
+- **Decisions:**
+  - A trade whose settlement intake cannot be written is not committed either. Trade and intake are one unit, and
+    both live in the same database.
+  - In simulated modes, the trade transaction grows by one instruction row and one event per execution. The
+    benchmark runs in `external` mode, so its numbers are unaffected.
+  - Hash-derived IDs are not time-ordered. Nothing relies on ID order: lists order by sequence or rowid.
 
 ## Milestone 4 — performance
 

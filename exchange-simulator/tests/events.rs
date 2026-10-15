@@ -4,7 +4,7 @@ use chrono::{TimeZone, Utc};
 use exchange_simulator::domain::{
     Instrument, InstrumentId, Order, OrderStatus, OrderType, ParticipantId, Side,
 };
-use exchange_simulator::engine::{BookUpdate, MatchContext, OrderBook, SequentialIds};
+use exchange_simulator::engine::{BookUpdate, IdScheme, MatchContext, OrderBook};
 use exchange_simulator::events::{self, Command, NewEvent};
 use serde_json::json;
 use uuid::Uuid;
@@ -26,7 +26,7 @@ fn acme() -> Instrument {
 
 struct Harness {
     book: OrderBook,
-    ids: SequentialIds,
+    ids: IdScheme,
     sequence: u64,
     /// Participants' settlement details, as the exchange would look them up.
     settlement: std::collections::HashMap<String, serde_json::Value>,
@@ -36,7 +36,7 @@ impl Harness {
     fn new() -> Self {
         Self {
             book: OrderBook::new(acme()),
-            ids: SequentialIds(1_000_000),
+            ids: IdScheme::Deterministic { seed: 1 },
             sequence: 0,
             settlement: Default::default(),
         }
@@ -70,23 +70,10 @@ impl Harness {
         let now = Utc.with_ymd_and_hms(2026, 10, 14, 12, 0, 0).unwrap();
         let update = self
             .book
-            .submit(
-                order,
-                &mut MatchContext {
-                    now,
-                    ids: &mut self.ids,
-                },
-            )
+            .submit(order, &mut MatchContext { now, ids: self.ids })
             .unwrap();
         let settlement = |id: &ParticipantId| self.settlement.get(&id.0).cloned();
-        let events = events::for_update(
-            Command::Submit,
-            &update,
-            &acme(),
-            &settlement,
-            now,
-            &mut self.ids,
-        );
+        let events = events::for_update(Command::Submit, &update, &acme(), &settlement, now);
         (update, events)
     }
 }
@@ -173,8 +160,22 @@ fn acceptance_trade_produces_trade_and_fill_events() {
     );
     assert_eq!(events[3].aggregate_id, buy.order.id.to_string());
 
-    let ids: std::collections::HashSet<_> = events.iter().map(|e| e.event_id).collect();
-    assert_eq!(ids.len(), events.len(), "event IDs are unique");
+    assert!(
+        events
+            .iter()
+            .all(|e| e.sequence == 0 && e.event_id.is_nil()),
+        "the writer stamps events, not the builder"
+    );
+    let mut stamped = events.clone();
+    let next = NewEvent::stamp(&mut stamped, 41, h.ids);
+    assert_eq!(next, 45);
+    let sequences: Vec<_> = stamped.iter().map(|e| e.sequence).collect();
+    assert_eq!(sequences, [41, 42, 43, 44]);
+    assert!(
+        stamped
+            .iter()
+            .all(|e| e.event_id == h.ids.event(e.sequence))
+    );
 }
 
 #[test]
@@ -238,14 +239,7 @@ fn cancel_is_reported_with_its_reason() {
     let mut h = Harness::new();
     let (placed, _) = h.submit("A", Side::Sell, Some(10000), 10);
     let update = h.book.cancel(placed.order.id).unwrap();
-    let events = events::for_update(
-        Command::Cancel,
-        &update,
-        &acme(),
-        &|_| None,
-        Utc::now(),
-        &mut h.ids,
-    );
+    let events = events::for_update(Command::Cancel, &update, &acme(), &|_| None, Utc::now());
     assert_eq!(types(&events), ["OrderCancelled"]);
     assert_eq!(events[0].payload["cancelReason"], "REQUESTED");
 }

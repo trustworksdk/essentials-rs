@@ -152,7 +152,7 @@ impl OrderBook {
     pub fn plan_submit(
         &self,
         order: Order,
-        ctx: &mut MatchContext<'_>,
+        ctx: &mut MatchContext,
     ) -> Result<BookUpdate, BookError> {
         self.validate(&order)?;
         if self.orders.contains_key(&order.id) {
@@ -197,7 +197,7 @@ impl OrderBook {
                     Side::Sell => (&maker, &taker),
                 };
                 executions.push(Execution {
-                    id: ctx.ids.next_id(),
+                    id: ctx.ids.execution(taker.sequence, executions.len()),
                     instrument_id: self.instrument.id.clone(),
                     buy_order_id: buy.id,
                     sell_order_id: sell.id,
@@ -264,7 +264,7 @@ impl OrderBook {
     pub fn submit(
         &mut self,
         order: Order,
-        ctx: &mut MatchContext<'_>,
+        ctx: &mut MatchContext,
     ) -> Result<BookUpdate, BookError> {
         let update = self.plan_submit(order, ctx)?;
         self.apply(&update)?;

@@ -28,6 +28,7 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `webhooks.request_timeout_ms` | `5000` | Per request; a timeout is a failed attempt |
 | `webhooks.max_attempts` | `10` | Attempts in total; then the delivery is dead-lettered (`DEAD`) |
 | `webhooks.initial_backoff_ms` / `max_backoff_ms` | `500` / `300000` | Exponential backoff between attempts, with jitter |
+| `ids.mode` / `ids.seed` | `random` / `0` | `deterministic` makes every ID reproducible from the seed (see Reproducible runs) |
 | `settlement.mode` | `external` | `external`, `simulated` or `both` (see Settlement) |
 | `settlement.tick_interval_ms` | `250` | How often the simulator takes in trades and fires due transitions |
 | `settlement.seed`, `settlement_days`, `*_probability`, `max_delay_days`, `max_delays`, `correction_days` | `1`, `2`, fail 0.02, delay 0.05, others 0, `3`, `2`, `1` | Simulation policy (see Settlement) |
@@ -262,8 +263,10 @@ Prometheus text format, with these series:
 - **`both`**: the simulator runs, and external outcomes may be reported back. They are kept apart, never merged.
 
 **How the simulator works:**
-- **Intake:** it reads `TradeExecuted` from the event log by sequence, from the beginning of the log, with its
-  position stored. Matching never waits for it, and it picks up where it left off after a restart.
+- **Intake:** each trade's instruction and `SettlementPending` are written in the trade's own transaction, so a
+  trade and its intake commit together or not at all. The simulator's position in the event log is stored too.
+  Trades committed while it was off (or before it was enabled) are taken in at startup, from the beginning of the
+  log.
 - **Lifecycle:** an instruction is `PENDING` until 00:00 UTC on its intended settlement date: T+`settlement_days`
   business days, Monday to Friday, with no holiday calendars. On that date one draw decides the outcome:
   - `CANCELLED`, `FAILED`, or `DELAYED` by 1..=`max_delay_days` business days (at most `max_delays` times),
@@ -312,6 +315,24 @@ Everything known about one execution's settlement, side by side:
 ### `GET /api/settlements?status=&limit=`
 
 Simulated instructions in trade order, optionally of one status. `limit` is 1–1000, default 100.
+
+## Reproducible runs
+
+With `ids.mode: deterministic`, every ID is a UUIDv8 derived from `ids.seed` and the natural key of what it names:
+- an order, from its sequence
+- an execution, from the incoming order's sequence and the fill index
+- an event, from its event sequence
+- a webhook delivery, from its subscription and event sequence
+- a subscription, from its ordinal
+- an external report, from its execution and ordinal
+
+With a frozen virtual clock (`clock.mode: virtual`) the same commands then give a byte-identical event log and
+identical API responses, run after run, and also when the service is restarted in between. Only real-time delivery
+bookkeeping differs: attempts, `deliveredAt`, retry times. `random` (the default) gives UUIDv7s.
+
+Event sequences are assigned by the single writer, and event IDs follow from them. Settlement intake for a trade
+happens in the trade's own transaction, so where `SettlementPending` lands in the log depends on the commands alone,
+not on a background tick.
 
 ## Test control
 

@@ -5,8 +5,7 @@ use exchange_simulator::domain::{
     Instrument, InstrumentId, Order, OrderStatus, OrderType, ParticipantId, Side,
 };
 use exchange_simulator::engine::{
-    BookError, IdGenerator, InvalidOrder, Level, MatchContext, OrderBook, RejectReason,
-    SequentialIds,
+    BookError, IdScheme, InvalidOrder, Level, MatchContext, OrderBook, RejectReason,
 };
 use uuid::Uuid;
 
@@ -29,7 +28,7 @@ fn acme() -> Instrument {
 struct Harness {
     book: OrderBook,
     sequence: u64,
-    ids: SequentialIds,
+    ids: IdScheme,
     now: DateTime<Utc>,
 }
 
@@ -43,7 +42,7 @@ impl Harness {
             book: OrderBook::new(instrument),
             sequence: 0,
             // Order IDs come from a separate range so they never collide with execution IDs.
-            ids: SequentialIds(1_000_000),
+            ids: IdScheme::Deterministic { seed: 1 },
             now: Utc.with_ymd_and_hms(2026, 10, 14, 12, 0, 0).unwrap(),
         }
     }
@@ -72,7 +71,7 @@ impl Harness {
     fn submit(&mut self, order: Order) -> exchange_simulator::engine::BookUpdate {
         let mut ctx = MatchContext {
             now: self.now,
-            ids: &mut self.ids,
+            ids: self.ids,
         };
         self.book.submit(order, &mut ctx).expect("valid order")
     }
@@ -442,13 +441,13 @@ fn malformed_orders_are_refused_before_matching() {
         lot_size: 10,
         ..acme()
     });
-    let mut ids = SequentialIds(0);
+    let ids = IdScheme::Deterministic { seed: 1 };
     let now = h.now;
-    let mut refuse = |h: &mut Harness, mutate: &dyn Fn(&mut Order)| {
+    let refuse = |h: &mut Harness, mutate: &dyn Fn(&mut Order)| {
         let mut order = h.order("A", Side::Buy, Some(10000), 100);
         mutate(&mut order);
         h.book
-            .plan_submit(order, &mut MatchContext { now, ids: &mut ids })
+            .plan_submit(order, &mut MatchContext { now, ids })
             .unwrap_err()
     };
     assert_eq!(
@@ -491,7 +490,7 @@ fn sequence_must_increase_and_ids_must_be_unique() {
     let resting = h.limit("A", Side::Buy, 10000, 10);
     let mut ctx = MatchContext {
         now: h.now,
-        ids: &mut SequentialIds(0),
+        ids: IdScheme::Deterministic { seed: 1 },
     };
 
     let mut replay = resting.order.clone();
@@ -515,7 +514,7 @@ fn planning_leaves_the_book_untouched_until_applied() {
     let buy = h.order("B", Side::Buy, Some(10000), 60);
     let mut ctx = MatchContext {
         now: h.now,
-        ids: &mut h.ids,
+        ids: h.ids,
     };
 
     let update = h.book.plan_submit(buy, &mut ctx).unwrap();
@@ -582,7 +581,7 @@ fn restored_book_keeps_price_time_priority() {
 
     let mut ctx = MatchContext {
         now: h.now,
-        ids: &mut SequentialIds(0),
+        ids: IdScheme::Deterministic { seed: 1 },
     };
     let mut next = h.order("F", Side::Buy, Some(10000), 150);
     next.sequence = restored.last_sequence() + 1;
@@ -719,10 +718,18 @@ fn seeded_random_flow_preserves_book_invariants() {
 }
 
 #[test]
-fn sequential_ids_are_deterministic() {
-    let mut ids = SequentialIds::default();
-    assert_eq!(ids.next_id(), Uuid::from_u128(1));
-    assert_eq!(ids.next_id(), Uuid::from_u128(2));
+fn execution_ids_follow_from_the_taker_sequence_and_fill() {
+    let mut h = Harness::new();
+    let first = h.limit("A", Side::Sell, 10000, 10);
+    let second = h.limit("C", Side::Sell, 10000, 10);
+    let sweep = h.limit("B", Side::Buy, 10000, 20);
+    let ids: Vec<_> = sweep.executions.iter().map(|e| e.id).collect();
+    let expected = [
+        h.ids.execution(sweep.order.sequence, 0),
+        h.ids.execution(sweep.order.sequence, 1),
+    ];
+    assert_eq!(ids, expected);
+    assert!(first.executions.is_empty() && second.executions.is_empty());
 }
 
 #[test]

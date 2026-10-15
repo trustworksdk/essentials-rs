@@ -188,7 +188,11 @@ pub struct TradeFacts {
 impl TradeFacts {
     /// Reads a canonical `TradeExecuted` envelope.
     pub fn from_event(event: &EventEnvelope) -> Result<Self, String> {
-        let p = &event.payload;
+        Self::from_payload(event.sequence, &event.payload)
+    }
+
+    /// Reads a `TradeExecuted` payload whose event has `sequence`.
+    pub fn from_payload(sequence: u64, p: &serde_json::Value) -> Result<Self, String> {
         let text = |field: &str| {
             p[field]
                 .as_str()
@@ -197,7 +201,7 @@ impl TradeFacts {
         };
         let number = |field: &str| p[field].as_u64().ok_or(format!("{field} missing"));
         Ok(Self {
-            sequence: event.sequence,
+            sequence,
             execution_id: text("executionId")?
                 .parse()
                 .map_err(|e| format!("executionId: {e}"))?,

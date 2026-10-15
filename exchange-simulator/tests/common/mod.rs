@@ -7,8 +7,8 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use exchange_simulator::app::App;
 use exchange_simulator::config::{
-    ClockConfig, ClockMode, Config, DatabaseConfig, EventsConfig, ExchangeConfig, LogFormat,
-    LoggingConfig, ServerConfig, SettlementConfig, TestControlConfig, WebhooksConfig,
+    ClockConfig, ClockMode, Config, DatabaseConfig, EventsConfig, ExchangeConfig, IdsConfig,
+    LogFormat, LoggingConfig, ServerConfig, SettlementConfig, TestControlConfig, WebhooksConfig,
 };
 use exchange_simulator::domain::IdentifierPolicy;
 use http_body_util::BodyExt;
@@ -61,6 +61,7 @@ impl TestApp {
                 start: None,
                 running: false,
             },
+            ids: IdsConfig::default(),
             settlement: SettlementConfig::default(),
             test_control: TestControlConfig { enabled: true },
             logging: LoggingConfig {

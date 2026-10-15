@@ -5,14 +5,15 @@ use std::time::Duration;
 use chrono::{DateTime, SubsecRound, Utc};
 use uuid::Uuid;
 
-use super::{BookError, BookUpdate, Clock, IdGenerator, MatchContext, OrderBook};
+use super::{BookError, BookUpdate, Clock, IdScheme, MatchContext, OrderBook};
 use crate::clock::{ClockError, SystemClock, VirtualClock};
 use crate::domain::{
     IdentifierPolicy, Instrument, InstrumentError, InstrumentId, Order, OrderStatus, OrderType,
     Participant, ParticipantId, Side,
 };
+use crate::events::NewEvent;
 use crate::events::{self, Command};
-use crate::persistence::{Outbox, Store};
+use crate::persistence::{Outbox, SettlementWrite, Store};
 use crate::settlement::{
     ExternalReport, NewReport, SettlementPolicy, SettlementSimulator, TradeFacts,
 };
@@ -104,7 +105,8 @@ pub enum ExchangeError {
 /// system clock.
 pub struct ExchangeOptions {
     pub identifier_policy: IdentifierPolicy,
-    pub ids: Box<dyn IdGenerator + Send>,
+    /// How IDs are made; `Deterministic` makes every ID reproducible from the seed and the command order.
+    pub ids: IdScheme,
     /// Domain time (orders, executions, events). Ignored when `virtual_clock` is set.
     pub clock: Box<dyn Clock + Send>,
     /// A controllable clock for domain time. Its state is persisted, and recovery resumes from the stored reading.
@@ -123,7 +125,7 @@ impl Default for ExchangeOptions {
     fn default() -> Self {
         Self {
             identifier_policy: IdentifierPolicy::Strict,
-            ids: Box::new(super::UuidV7Ids),
+            ids: IdScheme::Random,
             clock: Box::new(SystemClock),
             virtual_clock: None,
             simulation_id: None,
@@ -162,7 +164,10 @@ pub struct Exchange {
     participants: HashMap<ParticipantId, Option<serde_json::Value>>,
     last_sequence: u64,
     identifier_policy: IdentifierPolicy,
-    ids: Box<dyn IdGenerator + Send>,
+    ids: IdScheme,
+    /// The sequence the next event gets. The single writer assigns sequences (and with them event IDs) before commit,
+    /// and moves this on only once the commit succeeded.
+    next_event_sequence: u64,
     clock: Box<dyn Clock + Send>,
     virtual_clock: Option<VirtualClock>,
     settlement: Option<SettlementSimulator>,
@@ -229,13 +234,15 @@ impl Exchange {
                 "released webhook deliveries claimed before restart"
             );
         }
-        Ok(Self {
+        let next_event_sequence = store.next_event_sequence()?;
+        let mut exchange = Self {
             store,
             books,
             participants,
             last_sequence,
             identifier_policy: options.identifier_policy,
             ids: options.ids,
+            next_event_sequence,
             clock,
             virtual_clock: options.virtual_clock,
             settlement,
@@ -243,7 +250,11 @@ impl Exchange {
             subscriptions,
             simulation_id: options.simulation_id,
             delivery_signal: options.delivery_signal,
-        })
+        };
+        // Trades committed while the simulator was off (or before it existed) are taken in now, before any command,
+        // so intake order does not depend on when a background tick happens to run.
+        exchange.settlement_tick()?;
+        Ok(exchange)
     }
 
     pub fn register_instrument(&mut self, instrument: Instrument) -> Result<(), ExchangeError> {
@@ -342,7 +353,7 @@ impl Exchange {
 
         let now = self.now();
         let order = Order {
-            id: self.ids.next_id(),
+            id: self.ids.order(self.last_sequence + 1),
             client_order_id: command.client_order_id,
             instrument_id: command.instrument_id,
             participant_id: command.participant_id,
@@ -355,13 +366,7 @@ impl Exchange {
             status: OrderStatus::Open,
         };
         let started = std::time::Instant::now();
-        let update = book.plan_submit(
-            order,
-            &mut MatchContext {
-                now,
-                ids: self.ids.as_mut(),
-            },
-        )?;
+        let update = book.plan_submit(order, &mut MatchContext { now, ids: self.ids })?;
         ::metrics::histogram!(crate::metrics::MATCH_DURATION).record(started.elapsed());
         self.commit_and_apply(Command::Submit, update, now)
     }
@@ -447,7 +452,7 @@ impl Exchange {
         event_types.sort();
         event_types.dedup();
         let subscription = Subscription {
-            id: self.ids.next_id(),
+            id: self.ids.subscription(self.subscriptions.len() as u64 + 1),
             url,
             event_types,
             enabled: true,
@@ -495,38 +500,35 @@ impl Exchange {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(ExchangeError::Settlement)?;
             let now = self.now();
-            let plan = simulator.plan(&trades, now, self.ids.as_mut());
+            let plan = simulator.plan(&trades, now);
             if plan.transitions.is_empty() && plan.cursor == simulator.cursor() {
                 return Ok(total);
             }
+            let mut stamped: Vec<NewEvent> =
+                plan.transitions.iter().map(|t| t.event.clone()).collect();
+            let next = NewEvent::stamp(&mut stamped, self.next_event_sequence, self.ids);
             let outbox = Outbox {
                 subscriptions: &self.subscriptions,
                 simulation_id: self.simulation_id.as_deref(),
-                ids: self.ids.as_mut(),
+                ids: self.ids,
                 due: wall_now(),
             };
-            self.store.commit_settlement(
-                &plan.transitions,
-                SETTLEMENT_CONSUMER,
-                plan.cursor,
-                outbox,
-            )?;
-            for transition in &plan.transitions {
-                ::metrics::counter!(crate::metrics::EVENTS, "event_type" => transition.event.event_type)
+            let write = SettlementWrite {
+                instructions: plan.transitions.iter().map(|t| &t.instruction).collect(),
+                consumer: SETTLEMENT_CONSUMER,
+                cursor: plan.cursor,
+            };
+            self.store.commit_settlement(&stamped, write, outbox)?;
+            self.next_event_sequence = next;
+            for event in &stamped {
+                ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type)
                     .increment(1);
             }
-            let delivers = plan.transitions.iter().any(|t| {
-                self.subscriptions
-                    .iter()
-                    .any(|s| s.wants(t.event.event_type))
-            });
             let simulator = self.settlement.as_mut().expect("checked above");
             simulator.apply(&plan);
             ::metrics::gauge!(crate::metrics::SETTLEMENT_OPEN).set(simulator.open() as f64);
             total += plan.transitions.len();
-            if delivers && let Some(signal) = &self.delivery_signal {
-                signal.notify_one();
-            }
+            self.wake_delivery(&stamped);
             if page.len() < PAGE as usize {
                 return Ok(total);
             }
@@ -575,8 +577,9 @@ impl Exchange {
             };
         }
         let received_at = self.now();
+        let ordinal = self.store.report_count(report.execution_id)? + 1;
         let stored = ExternalReport {
-            id: self.ids.next_id(),
+            id: self.ids.report(report.execution_id, ordinal),
             execution_id: report.execution_id,
             status: report.status,
             reference: report.reference,
@@ -585,8 +588,9 @@ impl Exchange {
             occurred_at: report.occurred_at.unwrap_or(received_at),
             received_at,
         };
-        let event = events::NewEvent {
-            event_id: self.ids.next_id(),
+        let mut event = events::NewEvent {
+            event_id: Uuid::nil(),
+            sequence: 0,
             event_type: events::SETTLEMENT_OUTCOME_REPORTED,
             source: events::EXTERNAL_SOURCE,
             aggregate_id: stored.execution_id.to_string(),
@@ -602,19 +606,21 @@ impl Exchange {
                 "receivedAt": stored.received_at,
             }),
         };
+        let next = NewEvent::stamp(
+            std::slice::from_mut(&mut event),
+            self.next_event_sequence,
+            self.ids,
+        );
         let outbox = Outbox {
             subscriptions: &self.subscriptions,
             simulation_id: self.simulation_id.as_deref(),
-            ids: self.ids.as_mut(),
+            ids: self.ids,
             due: wall_now(),
         };
         self.store.commit_report(&stored, &event, outbox)?;
+        self.next_event_sequence = next;
         ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type).increment(1);
-        if self.subscriptions.iter().any(|s| s.wants(event.event_type))
-            && let Some(signal) = &self.delivery_signal
-        {
-            signal.notify_one();
-        }
+        self.wake_delivery(std::slice::from_ref(&event));
         Ok((stored, false))
     }
 
@@ -654,6 +660,9 @@ impl Exchange {
         Ok(self.clock_state())
     }
 
+    /// Commits a planned book update with its events, and (if the simulator runs) the settlement intake of its
+    /// trades in the same transaction, then applies both to memory. Intake here rather than on a later tick keeps
+    /// the event log's order a function of the commands alone.
     fn commit_and_apply(
         &mut self,
         command: Command,
@@ -662,23 +671,44 @@ impl Exchange {
     ) -> Result<SubmitOutcome, ExchangeError> {
         let instrument = self.books[&update.order.instrument_id].instrument();
         let participants = &self.participants;
-        let settlement = |id: &ParticipantId| participants.get(id).cloned().flatten();
-        let new_events = events::for_update(
-            command,
-            &update,
-            instrument,
-            &settlement,
-            now,
-            self.ids.as_mut(),
-        );
+        let lookup = |id: &ParticipantId| participants.get(id).cloned().flatten();
+        let mut new_events = events::for_update(command, &update, instrument, &lookup, now);
+        let mut next = NewEvent::stamp(&mut new_events, self.next_event_sequence, self.ids);
+        let settlement_plan = match &self.settlement {
+            Some(simulator) if !update.executions.is_empty() => {
+                let trades = new_events
+                    .iter()
+                    .filter(|e| e.event_type == events::TRADE_EXECUTED)
+                    .map(|e| TradeFacts::from_payload(e.sequence, &e.payload))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(ExchangeError::Settlement)?;
+                let mut plan = simulator.plan(&trades, now);
+                let mut settlement_events: Vec<NewEvent> =
+                    plan.transitions.iter().map(|t| t.event.clone()).collect();
+                next = NewEvent::stamp(&mut settlement_events, next, self.ids);
+                for (transition, event) in plan.transitions.iter_mut().zip(&settlement_events) {
+                    transition.event = event.clone();
+                }
+                new_events.extend(settlement_events);
+                Some(plan)
+            }
+            _ => None,
+        };
         let started = std::time::Instant::now();
         let outbox = Outbox {
             subscriptions: &self.subscriptions,
             simulation_id: self.simulation_id.as_deref(),
-            ids: self.ids.as_mut(),
+            ids: self.ids,
             due: wall_now(),
         };
-        self.store.commit(&update, &new_events, outbox, now)?;
+        let settlement_write = settlement_plan.as_ref().map(|plan| SettlementWrite {
+            instructions: plan.transitions.iter().map(|t| &t.instruction).collect(),
+            consumer: SETTLEMENT_CONSUMER,
+            cursor: plan.cursor,
+        });
+        self.store
+            .commit(&update, &new_events, settlement_write, outbox, now)?;
+        self.next_event_sequence = next;
         ::metrics::histogram!(crate::metrics::COMMIT_DURATION).record(started.elapsed());
         record_committed(command, &update, &new_events);
         let book = self
@@ -688,13 +718,22 @@ impl Exchange {
         book.apply(&update)
             .expect("nothing else touched the book between plan and apply");
         self.last_sequence = self.last_sequence.max(update.order.sequence);
-        let delivers = new_events
+        if let (Some(plan), Some(simulator)) = (&settlement_plan, self.settlement.as_mut()) {
+            simulator.apply(plan);
+            ::metrics::gauge!(crate::metrics::SETTLEMENT_OPEN).set(simulator.open() as f64);
+        }
+        self.wake_delivery(&new_events);
+        Ok(SubmitOutcome::Processed(update))
+    }
+
+    /// Wakes the delivery worker if any of `events` has a subscriber.
+    fn wake_delivery(&self, events: &[NewEvent]) {
+        let delivers = events
             .iter()
             .any(|e| self.subscriptions.iter().any(|s| s.wants(e.event_type)));
         if delivers && let Some(signal) = &self.delivery_signal {
             signal.notify_one();
         }
-        Ok(SubmitOutcome::Processed(update))
     }
 
     /// The clock reading at the precision the database stores, so memory and storage agree.

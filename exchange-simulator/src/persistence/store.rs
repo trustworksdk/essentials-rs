@@ -6,7 +6,8 @@ use uuid::Uuid;
 use crate::domain::{Execution, Instrument, InstrumentId, Order, Participant, ParticipantId};
 use crate::engine::BookUpdate;
 use crate::events::{self, EventEnvelope, NewEvent};
-use crate::settlement::{ExternalReport, Instruction, SettlementStatus, Transition};
+use crate::ids::IdScheme;
+use crate::settlement::{ExternalReport, Instruction, SettlementStatus};
 use crate::webhooks::{DeliveryJob, DeliveryOutcome, DeliveryResult, Subscription};
 
 /// Repository over the single writer connection. Every state change a matching step produces is written by
@@ -222,6 +223,7 @@ impl Store {
         &mut self,
         update: &BookUpdate,
         new_events: &[NewEvent],
+        settlement: Option<SettlementWrite<'_>>,
         outbox: Outbox<'_>,
         now: DateTime<Utc>,
     ) -> rusqlite::Result<()> {
@@ -269,7 +271,10 @@ impl Store {
                     timestamp(execution.executed_at),
                 ])?;
             }
-            write_events(&tx, new_events, outbox)?;
+            write_events(&tx, new_events, &outbox)?;
+            if let Some(settlement) = &settlement {
+                write_settlement(&tx, settlement)?;
+            }
         }
         tx.commit()
     }
@@ -493,55 +498,33 @@ impl Store {
     /// rows, and the consumer's new offset.
     pub fn commit_settlement(
         &mut self,
-        transitions: &[Transition],
-        consumer: &str,
-        cursor: u64,
+        events: &[NewEvent],
+        settlement: SettlementWrite<'_>,
         outbox: Outbox<'_>,
     ) -> rusqlite::Result<()> {
         let tx = self.conn.transaction()?;
-        {
-            let mut upsert = tx.prepare_cached(&format!(
-                "INSERT INTO settlement_instructions ({INSTRUCTION_COLUMNS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
-                 ON CONFLICT (execution_id) DO UPDATE SET
-                   intended_settlement_date = excluded.intended_settlement_date, status = excluded.status,
-                   attempts = excluded.attempts, delays = excluded.delays, due_at = excluded.due_at,
-                   settled_at = excluded.settled_at, amount_minor = excluded.amount_minor,
-                   updated_at = excluded.updated_at"
-            ))?;
-            for transition in transitions {
-                let i = &transition.instruction;
-                upsert.execute(params![
-                    i.execution_id.to_string(),
-                    to_sql(i.trade_sequence),
-                    i.instrument_id.0,
-                    i.buyer_id.0,
-                    i.seller_id.0,
-                    to_sql(i.quantity),
-                    i.price_ticks,
-                    i.currency,
-                    i.currency_scale,
-                    to_sql(i.tick_size_minor),
-                    i.amount_minor,
-                    i.trade_date.to_string(),
-                    i.intended_settlement_date.to_string(),
-                    i.status.as_str(),
-                    i.attempts,
-                    i.delays,
-                    i.due_at.map(timestamp),
-                    i.settled_at.map(timestamp),
-                    timestamp(i.updated_at),
-                ])?;
-            }
-            tx.execute(
-                "INSERT INTO consumer_offsets (consumer, last_sequence) VALUES (?1, ?2)
-                 ON CONFLICT (consumer) DO UPDATE SET last_sequence = excluded.last_sequence",
-                params![consumer, to_sql(cursor)],
-            )?;
-            let events: Vec<NewEvent> = transitions.iter().map(|t| t.event.clone()).collect();
-            write_events(&tx, &events, outbox)?;
-        }
+        write_settlement(&tx, &settlement)?;
+        write_events(&tx, events, &outbox)?;
         tx.commit()
+    }
+
+    /// The sequence the next event will get: one past the highest ever assigned (AUTOINCREMENT never reuses one).
+    pub fn next_event_sequence(&self) -> rusqlite::Result<u64> {
+        self.conn.query_row(
+            "SELECT MAX(COALESCE((SELECT MAX(sequence) FROM events), 0),
+                        COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)) + 1",
+            [],
+            |row| from_sql(row, 0),
+        )
+    }
+
+    /// How many external reports an execution has.
+    pub fn report_count(&self, execution_id: Uuid) -> rusqlite::Result<u64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM settlement_reports WHERE execution_id = ?1",
+            [execution_id.to_string()],
+            |row| from_sql(row, 0),
+        )
     }
 
     pub fn execution_exists(&self, id: Uuid) -> rusqlite::Result<bool> {
@@ -594,7 +577,7 @@ impl Store {
             timestamp(report.occurred_at),
             timestamp(report.received_at),
         ])?;
-        write_events(&tx, std::slice::from_ref(event), outbox)?;
+        write_events(&tx, std::slice::from_ref(event), &outbox)?;
         tx.commit()
     }
 
@@ -659,33 +642,45 @@ where
 }
 
 /// Where a transaction's events go out: the subscriptions to queue deliveries for, the run's simulation ID, the ID
-/// source for delivery rows, and the real time at which the deliveries become due.
+/// scheme for delivery rows, and the real time at which the deliveries become due.
 pub struct Outbox<'a> {
     pub subscriptions: &'a [Subscription],
     pub simulation_id: Option<&'a str>,
-    pub ids: &'a mut dyn crate::engine::IdGenerator,
+    pub ids: IdScheme,
     pub due: DateTime<Utc>,
 }
 
-/// Appends events to the canonical log and queues one pending delivery per event and interested subscription, inside
-/// the caller's transaction.
+/// Settlement work committed together with something else: instructions' new states and the simulator's cursor.
+pub struct SettlementWrite<'a> {
+    pub instructions: Vec<&'a Instruction>,
+    pub consumer: &'a str,
+    pub cursor: u64,
+}
+
+/// Appends stamped events to the canonical log at their assigned sequences, and queues one pending delivery per event
+/// and interested subscription, inside the caller's transaction.
 pub(crate) fn write_events(
     tx: &rusqlite::Transaction<'_>,
     new_events: &[NewEvent],
-    outbox: Outbox<'_>,
+    outbox: &Outbox<'_>,
 ) -> rusqlite::Result<()> {
     let due = timestamp(outbox.due);
     let mut insert_event = tx.prepare_cached(
-        "INSERT INTO events (event_id, event_type, schema_version, source, simulation_id, aggregate_id,
+        "INSERT INTO events (sequence, event_id, event_type, schema_version, source, simulation_id, aggregate_id,
                              correlation_id, payload, occurred_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
     let mut insert_delivery = tx.prepare_cached(
         "INSERT INTO webhook_deliveries (id, subscription_id, event_sequence, status, attempts, next_attempt_at)
          VALUES (?1, ?2, ?3, 'PENDING', 0, ?4)",
     )?;
     for event in new_events {
+        assert!(
+            event.sequence > 0,
+            "events are stamped before they are written"
+        );
         insert_event.execute(params![
+            to_sql(event.sequence),
             event.event_id.to_string(),
             event.event_type,
             events::SCHEMA_VERSION,
@@ -696,20 +691,66 @@ pub(crate) fn write_events(
             event.payload.to_string(),
             timestamp(event.occurred_at),
         ])?;
-        let sequence = tx.last_insert_rowid();
         for subscription in outbox
             .subscriptions
             .iter()
             .filter(|s| s.wants(event.event_type))
         {
             insert_delivery.execute(params![
-                outbox.ids.next_id().to_string(),
+                outbox
+                    .ids
+                    .delivery(subscription.id, event.sequence)
+                    .to_string(),
                 subscription.id.to_string(),
-                sequence,
+                to_sql(event.sequence),
                 due
             ])?;
         }
     }
+    Ok(())
+}
+
+fn write_settlement(
+    tx: &rusqlite::Transaction<'_>,
+    write: &SettlementWrite<'_>,
+) -> rusqlite::Result<()> {
+    let mut upsert = tx.prepare_cached(&format!(
+        "INSERT INTO settlement_instructions ({INSTRUCTION_COLUMNS})
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+         ON CONFLICT (execution_id) DO UPDATE SET
+           intended_settlement_date = excluded.intended_settlement_date, status = excluded.status,
+           attempts = excluded.attempts, delays = excluded.delays, due_at = excluded.due_at,
+           settled_at = excluded.settled_at, amount_minor = excluded.amount_minor,
+           updated_at = excluded.updated_at"
+    ))?;
+    for i in &write.instructions {
+        upsert.execute(params![
+            i.execution_id.to_string(),
+            to_sql(i.trade_sequence),
+            i.instrument_id.0,
+            i.buyer_id.0,
+            i.seller_id.0,
+            to_sql(i.quantity),
+            i.price_ticks,
+            i.currency,
+            i.currency_scale,
+            to_sql(i.tick_size_minor),
+            i.amount_minor,
+            i.trade_date.to_string(),
+            i.intended_settlement_date.to_string(),
+            i.status.as_str(),
+            i.attempts,
+            i.delays,
+            i.due_at.map(timestamp),
+            i.settled_at.map(timestamp),
+            timestamp(i.updated_at),
+        ])?;
+    }
+    tx.execute(
+        "INSERT INTO consumer_offsets (consumer, last_sequence) VALUES (?1, ?2)
+         ON CONFLICT (consumer) DO UPDATE SET last_sequence = excluded.last_sequence",
+        params![write.consumer, to_sql(write.cursor)],
+    )?;
     Ok(())
 }
 

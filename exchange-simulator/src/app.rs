@@ -12,7 +12,7 @@ use tokio::sync::{Notify, watch};
 use crate::api::{self, AppState};
 use crate::clock::VirtualClock;
 use crate::config::{ClockMode, Config, SettlementMode};
-use crate::engine::{Dispatcher, Exchange, ExchangeOptions, SystemClock, UuidV7Ids};
+use crate::engine::{Dispatcher, Exchange, ExchangeOptions, SystemClock};
 use crate::persistence::{self, Store};
 use crate::webhooks::DeliveryWorker;
 
@@ -37,7 +37,7 @@ impl App {
             Store::new(writer),
             ExchangeOptions {
                 identifier_policy: config.exchange.identifier_policy,
-                ids: Box::new(UuidV7Ids),
+                ids: config.ids.scheme(),
                 clock: Box::new(SystemClock),
                 virtual_clock: (config.clock.mode == ClockMode::Virtual).then(|| {
                     VirtualClock::new(
