@@ -248,6 +248,10 @@ Prometheus text format, with these series:
 - **Commands:** `exchange_commands_total{command,outcome}` and `exchange_command_duration_seconds{command}`.
 - **Hot path, split into stages:** `exchange_match_duration_seconds` and `exchange_commit_duration_seconds`.
 - **Queue:** `exchange_command_queue_depth` and `exchange_command_queue_rejections_total`.
+- **Latency breakdown per command:** `exchange_command_queue_wait_seconds{command}` (enqueued to started on the
+  exchange thread) and `exchange_command_ack_seconds{command}` (enqueued to answer received by the caller: queue
+  wait, execution and commit, and the hand-back). With `exchange_command_duration_seconds` they split an
+  acknowledgement into waiting and working. A command refused with 503 was never queued and records neither.
 - **Results:** `exchange_orders_total{status}`, `exchange_executions_total`, `exchange_traded_quantity_total` and
   `exchange_events_total{event_type}`.
 - **Webhooks:** `webhook_delivery_attempts_total{outcome}`, `webhook_delivery_duration_seconds`, and the outbox

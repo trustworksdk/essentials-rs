@@ -10,12 +10,14 @@ reported separately, as the plan requires:
 | durable + outbox | the same, plus one subscription to all six event types | the extra cost of writing a delivery row per event |
 | HTTP end to end | the service on a TCP port, N concurrent `reqwest` clients posting `POST /api/orders` | acknowledged-after-commit throughput and client-observed latency |
 | HTTP + webhook | the same, plus a local consumer subscribed to `TradeExecuted` | the cost of delivery running alongside, and when the last trade event was delivered |
+| `open-loop` (run on its own, not part of `all`) | the service on a TCP port, orders sent on a fixed schedule at each target rate | achieved rate, latency at that rate, 503s, and where the time went inside the service |
 | `checkpoint` (run on its own, not part of `all`) | durable with an observed auto-checkpoint, durable with auto-checkpoint off, raw fsync | which commits are slow, and why (item 1.2) |
 
 ```sh
 # from the workspace root; always --release
 cargo run --release -p exchange-simulator --bin bench -- all --dir /path/on/real/disk --out results.md
 cargo run --release -p exchange-simulator --bin bench -- all --quick        # 200k / 10k / 10k orders
+cargo run --release -p exchange-simulator --bin bench -- open-loop --rates 1000,2000,4000 --seconds 10 --dir /path/on/real/disk
 cargo run --release -p exchange-simulator --bin bench -- --help
 ```
 
@@ -79,3 +81,60 @@ disk was slower (1,857 orders/s) and is not counted.
 acknowledging only after commit; moving the WAL checkpoint to a background connection, which keeps the WAL bounded
 but takes it off the commit path; instrument-sharded matching in front of the writer; and the plan's explicitly
 non-durable fast mode.
+
+## Open loop and latency breakdown (step 4.1)
+
+The `http` rows are closed loop: 32 clients each wait for an answer before sending the next order. When the service
+slows down, the clients slow down with it, and the stall never shows up in the latencies (coordinated omission).
+`open-loop` avoids that:
+- **Fixed schedule:** order `i` is due at `start + i / rate` and is sent then, whether or not earlier orders have
+  been answered. Its latency is measured from that due time, not from the actual send.
+- **Generator health:** `generator lag` reports how late sends actually went out. Tokio's timer has 1 ms
+  resolution, so about 1–2 ms is normal. A lag far above that means the generator, not the service, was the limit.
+- **Client bound:** `--max-in-flight` (default 16384) caps open requests. At the cap the generator waits, and the
+  wait counts as latency.
+- **Shared process:** the generator and the service run in one process on one Tokio runtime, as in the `http` rows.
+  4.6 moves the load generator into its own container.
+- **Each row reports:**
+  - the accepted orders and the achieved rate (accepted orders over the time to the last answer);
+  - the client latency of accepted orders;
+  - 503s (queue full) and other failures;
+  - a server-side breakdown per submitted order, from `GET /metrics` before and after the run: mean and p99
+    bucket bound of queue wait, exchange-thread time (of which the SQLite commit) and acknowledgement (enqueue
+    to answer received).
+- **Queue bound and 503s:** the service queue holds `--queue-capacity` commands (default 10000, as in
+  `config/default.yaml`). 503s therefore start only once that many orders are waiting, which takes seconds at
+  rates just above capacity. A smaller queue turns overload into 503s sooner and caps the latency.
+
+### Results, 2026-10-16
+
+Same devcontainer as above, 10 s per rate. Full reports:
+[`results/2026-10-16-open-loop-vm-disk.md`](results/2026-10-16-open-loop-vm-disk.md) and
+[`results/2026-10-16-open-loop-tmpfs.md`](results/2026-10-16-open-loop-tmpfs.md).
+
+| Target | VM disk (fsync ≈ 300 µs) | tmpfs |
+|---:|---|---|
+| 1,000/s | 1,000/s · p50 1.8 ms · p99 5.0 ms | – |
+| 2,000/s | 2,000/s · p50 1.4 ms · p99 7.1 ms | 2,000/s · p50 1.2 ms · p99 14.6 ms |
+| 4,000/s | **saturated:** 3,850/s · p50 106 ms · p99 393 ms | – |
+| 5,000/s | – | 5,000/s · p50 1.5 ms · p99 3.8 ms |
+| 10,000/s | – | 10,000/s · p50 1.6 ms · p99 96 ms |
+| 15,000/s | – | 15,000/s · p50 1.9 ms · p99 25 ms |
+| 20,000/s | – | **saturated:** 15,050/s, 39,010 × 503 of 200,000 · p50 657 ms |
+
+**What this says:**
+- **Below capacity, latency stays low.** The p50 is 1–2 ms, of which the service accounts for well under 1 ms
+  (acknowledgement mean 0.4–0.9 ms). The rest is HTTP and the client in the same process.
+- **At capacity, queue wait is the whole story.** At 4,000/s on the VM disk the exchange thread still takes 244 µs
+  per order (229 µs of it commit), but orders wait 145 ms on average in the queue. Latency then grows with the
+  backlog until the queue is full. After that, orders are refused with 503 rather than queued, as at 20,000/s on
+  tmpfs.
+- **The durable ceiling is the commit, as in the baseline.** At 300 µs per fsync, about 3.9k orders/s; on tmpfs,
+  about 15k/s. That is what group commit (4.2) targets: one commit for many orders.
+- **Commit time per order falls as the rate rises** (958 µs at 500/s, 229 µs at 4,000/s on the VM disk). One
+  plausible cause is that a busy writer keeps the disk and the caches warm. Measure again after 4.2 before relying
+  on it.
+- **A cold disk distorts the first run.** The first 500/s run in a fresh container had p99 452 ms and a generator
+  lag of up to 158 ms, so the whole process stalled. A rerun gave p99 4.4 ms. The table uses the rerun.
+- **The disk is slower than on 2026-10-14** (fsync 300–500 µs today, 200 µs then). Compare rows only within one
+  report.

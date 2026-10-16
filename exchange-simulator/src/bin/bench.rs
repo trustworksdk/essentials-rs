@@ -25,11 +25,16 @@ use exchange_simulator::market::{
 use exchange_simulator::persistence::{self, Store};
 use exchange_simulator::webhooks::NewSubscription;
 
-const USAGE: &str = "usage: bench [all|matching|durable|http|checkpoint] [--quick] [--seed N] [--matching-orders N] \
-                     [--durable-orders N] [--http-orders N] [--concurrency N] [--dir DIR] [--out FILE]
+const USAGE: &str = "usage: bench [all|matching|durable|http|checkpoint|open-loop] [--quick] [--seed N] \
+                     [--matching-orders N] [--durable-orders N] [--http-orders N] [--concurrency N] [--rates R,R,..] \
+                     [--seconds S] [--queue-capacity N] [--max-in-flight N] [--dir DIR] [--out FILE]
 
 --dir: where the SQLite files go (default: the system temp dir). Check the reported fsync latency: on tmpfs it is
-       ~0 and the \"durable\" numbers measure SQLite in RAM.";
+       ~0 and the \"durable\" numbers measure SQLite in RAM.
+open-loop (not part of all): for each target rate in --rates (orders/s, default 1000,2000,4000,8000), sends orders
+       on a fixed schedule for --seconds (default 10; 3 with --quick) whatever the responses, and measures each
+       latency from the order's scheduled send time. --queue-capacity is the service's command queue bound (default
+       10000), --max-in-flight the client's limit on open requests (default 16384).";
 
 struct Options {
     mode: String,
@@ -38,6 +43,10 @@ struct Options {
     durable_orders: usize,
     http_orders: usize,
     concurrency: usize,
+    rates: Vec<f64>,
+    seconds: f64,
+    queue_capacity: usize,
+    max_in_flight: usize,
     dir: std::path::PathBuf,
     out: Option<String>,
 }
@@ -51,6 +60,10 @@ impl Options {
             durable_orders: 50_000,
             http_orders: 50_000,
             concurrency: 32,
+            rates: vec![1000.0, 2000.0, 4000.0, 8000.0],
+            seconds: 10.0,
+            queue_capacity: 10_000,
+            max_in_flight: 16_384,
             dir: std::env::temp_dir(),
             out: None,
         };
@@ -59,11 +72,14 @@ impl Options {
             let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
             let number = |text: String| text.parse::<usize>().map_err(|e| format!("{text}: {e}"));
             match arg.as_str() {
-                "all" | "matching" | "durable" | "http" | "checkpoint" => options.mode = arg,
+                "all" | "matching" | "durable" | "http" | "checkpoint" | "open-loop" => {
+                    options.mode = arg
+                }
                 "--quick" => {
                     options.matching_orders = 200_000;
                     options.durable_orders = 10_000;
                     options.http_orders = 10_000;
+                    options.seconds = 3.0;
                 }
                 "--seed" => options.seed = number(value("--seed")?)? as u64,
                 "--matching-orders" => {
@@ -72,6 +88,29 @@ impl Options {
                 "--durable-orders" => options.durable_orders = number(value("--durable-orders")?)?,
                 "--http-orders" => options.http_orders = number(value("--http-orders")?)?,
                 "--concurrency" => options.concurrency = number(value("--concurrency")?)?.max(1),
+                "--rates" => {
+                    options.rates = value("--rates")?
+                        .split(',')
+                        .map(|r| match r.trim().parse::<f64>() {
+                            Ok(rate) if rate > 0.0 && rate.is_finite() => Ok(rate),
+                            _ => Err(format!("--rates: {r} is not a positive rate")),
+                        })
+                        .collect::<Result<_, _>>()?
+                }
+                "--seconds" => {
+                    let text = value("--seconds")?;
+                    options.seconds = text
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|s| *s > 0.0 && s.is_finite())
+                        .ok_or(format!("--seconds: {text} is not a positive duration"))?
+                }
+                "--queue-capacity" => {
+                    options.queue_capacity = number(value("--queue-capacity")?)?.max(1)
+                }
+                "--max-in-flight" => {
+                    options.max_in_flight = number(value("--max-in-flight")?)?.max(1)
+                }
                 "--out" => options.out = Some(value("--out")?),
                 "--dir" => options.dir = value("--dir")?.into(),
                 "-h" | "--help" => return Err(USAGE.into()),
@@ -167,7 +206,9 @@ impl Latencies {
 }
 
 fn micros(d: Duration) -> String {
-    if d >= Duration::from_millis(10) {
+    if d >= Duration::from_secs(1) {
+        format!("{:.2} s", d.as_secs_f64())
+    } else if d >= Duration::from_millis(10) {
         format!("{:.1} ms", d.as_secs_f64() * 1e3)
     } else {
         format!("{} µs", d.as_micros())
@@ -432,66 +473,219 @@ fn bench_checkpoint(options: &Options, report: &mut Report) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The service started in-process on a TCP port, with ACME and the participants registered over HTTP.
+struct Service {
+    app: App,
+    server: tokio::task::JoinHandle<std::io::Result<()>>,
+    base: String,
+    client: reqwest::Client,
+    database: String,
+    dir: std::path::PathBuf,
+}
+
+impl Service {
+    async fn start(options: &Options, pool: usize) -> Self {
+        let dir = temp_dir(&options.dir, "http");
+        let config = Config {
+            server: ServerConfig {
+                bind: "127.0.0.1:0".into(),
+            },
+            exchange: ExchangeConfig {
+                identifier_policy: IdentifierPolicy::Strict,
+                command_queue_capacity: options.queue_capacity,
+            },
+            events: EventsConfig::default(),
+            webhooks: WebhooksConfig {
+                poll_interval_ms: 250,
+                batch_size: 100,
+                concurrency: 16,
+                request_timeout_ms: 5000,
+                max_attempts: 10,
+                initial_backoff_ms: 500,
+                max_backoff_ms: 300_000,
+            },
+            database: DatabaseConfig {
+                path: dir.join("exchange.db").to_string_lossy().into_owned(),
+                busy_timeout_ms: 5000,
+            },
+            clock: ClockConfig {
+                mode: ClockMode::System,
+                start: None,
+                running: false,
+            },
+            ids: IdsConfig::default(),
+            settlement: SettlementConfig::default(),
+            test_control: TestControlConfig::default(),
+            logging: LoggingConfig {
+                filter: "warn".into(),
+                format: LogFormat::Pretty,
+            },
+        };
+        let app = App::start(&config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(axum::serve(listener, app.router.clone()).into_future());
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(pool)
+            .build()
+            .unwrap();
+        let service = Self {
+            app,
+            server,
+            base,
+            client,
+            database: config.database.path,
+            dir,
+        };
+        service.post("/api/instruments", serde_json::json!({ "id": "ACME", "symbol": "ACME", "mic": "XCSE", "currency": "DKK", "currencyScale": 2 })).await;
+        for id in participant_ids() {
+            service
+                .post(
+                    "/api/participants",
+                    serde_json::json!({ "id": id, "name": id }),
+                )
+                .await;
+        }
+        service
+    }
+
+    async fn post(&self, path: &str, body: serde_json::Value) {
+        let response = self
+            .client
+            .post(format!("{}{path}", self.base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "POST {path}");
+    }
+
+    async fn metrics(&self) -> Scrape {
+        let url = format!("{}/metrics", self.base);
+        Scrape(
+            self.client
+                .get(url)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        )
+    }
+
+    fn count(&self, sql: &str) -> i64 {
+        let db = rusqlite::Connection::open(&self.database).unwrap();
+        db.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    async fn stop(self) {
+        self.server.abort();
+        self.app.shutdown().await;
+        let _ = std::fs::remove_dir_all(self.dir);
+    }
+}
+
+/// One `GET /metrics` text. The recorder is process-wide, so a run is read as the difference of two scrapes.
+struct Scrape(String);
+
+impl Scrape {
+    fn value(&self, series: &str) -> f64 {
+        self.0
+            .lines()
+            .find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// The cumulative bucket counts `(le, count)` of a histogram series; `labels` without braces, or empty.
+    fn buckets(&self, name: &str, labels: &str) -> Vec<(f64, f64)> {
+        let prefix = if labels.is_empty() {
+            format!("{name}_bucket{{le=\"")
+        } else {
+            format!("{name}_bucket{{{labels},le=\"")
+        };
+        self.0
+            .lines()
+            .filter_map(|line| {
+                let (le, count) = line.strip_prefix(&prefix)?.split_once("\"} ")?;
+                let le = if le == "+Inf" {
+                    f64::INFINITY
+                } else {
+                    le.parse().ok()?
+                };
+                Some((le, count.parse().ok()?))
+            })
+            .collect()
+    }
+}
+
+/// Mean and p99 bucket bound of one histogram between two scrapes, e.g. `180 µs / ≤ 1 ms`.
+fn histogram_delta(before: &Scrape, after: &Scrape, name: &str, labels: &str) -> String {
+    let braces = if labels.is_empty() {
+        String::new()
+    } else {
+        format!("{{{labels}}}")
+    };
+    let delta = |suffix: &str| {
+        let series = format!("{name}_{suffix}{braces}");
+        after.value(&series) - before.value(&series)
+    };
+    let count = delta("count");
+    if count < 1.0 {
+        return "–".into();
+    }
+    let mean = Duration::from_secs_f64(delta("sum") / count);
+    let earlier = before.buckets(name, labels);
+    let p99 = after
+        .buckets(name, labels)
+        .into_iter()
+        .find(|(le, cumulative)| {
+            let previous = earlier
+                .iter()
+                .find(|(l, _)| l == le)
+                .map_or(0.0, |(_, c)| *c);
+            cumulative - previous >= 0.99 * count
+        })
+        .map_or("?".into(), |(le, _)| {
+            if le.is_infinite() {
+                "> 10 s".into()
+            } else {
+                format!("≤ {}", micros(Duration::from_secs_f64(le)))
+            }
+        });
+    format!("{} / {p99}", micros(mean))
+}
+
+/// Where a submitted order's time went inside the service, between two scrapes: mean and p99 bucket bound of the
+/// queue wait, the exchange thread's time (of which the SQLite commit), and the acknowledgement (enqueue to reply).
+fn breakdown(before: &Scrape, after: &Scrape) -> String {
+    use exchange_simulator::metrics::{ACK_LATENCY, COMMAND_DURATION, COMMIT_DURATION, QUEUE_WAIT};
+    let submit = r#"command="submit""#;
+    format!(
+        "server per order (mean / p99): queue wait {}, exchange thread {} (commit {}), ack {}",
+        histogram_delta(before, after, QUEUE_WAIT, submit),
+        histogram_delta(before, after, COMMAND_DURATION, submit),
+        histogram_delta(before, after, COMMIT_DURATION, ""),
+        histogram_delta(before, after, ACK_LATENCY, submit),
+    )
+}
+
+fn order_bodies(seed: u64, n: usize) -> Arc<Vec<serde_json::Value>> {
+    Arc::new(
+        workload(seed, n)
+            .into_iter()
+            .map(|c| {
+                serde_json::json!({ "instrumentId": "ACME", "participantId": c.participant_id, "side": c.side,
+                                    "type": c.order_type, "priceTicks": c.limit_price_ticks, "quantity": c.quantity })
+            })
+            .collect(),
+    )
+}
+
 /// The full service over real TCP: `concurrency` HTTP clients submitting the workload; optionally a webhook consumer
 /// subscribed to `TradeExecuted`, with the time until every delivery is done.
 async fn bench_http(options: &Options, report: &mut Report, with_webhook: bool) {
-    let dir = temp_dir(&options.dir, "http");
-    let config = Config {
-        server: ServerConfig {
-            bind: "127.0.0.1:0".into(),
-        },
-        exchange: ExchangeConfig {
-            identifier_policy: IdentifierPolicy::Strict,
-            command_queue_capacity: 10_000,
-        },
-        events: EventsConfig::default(),
-        webhooks: WebhooksConfig {
-            poll_interval_ms: 250,
-            batch_size: 100,
-            concurrency: 16,
-            request_timeout_ms: 5000,
-            max_attempts: 10,
-            initial_backoff_ms: 500,
-            max_backoff_ms: 300_000,
-        },
-        database: DatabaseConfig {
-            path: dir.join("exchange.db").to_string_lossy().into_owned(),
-            busy_timeout_ms: 5000,
-        },
-        clock: ClockConfig {
-            mode: ClockMode::System,
-            start: None,
-            running: false,
-        },
-        ids: IdsConfig::default(),
-        settlement: SettlementConfig::default(),
-        test_control: TestControlConfig::default(),
-        logging: LoggingConfig {
-            filter: "warn".into(),
-            format: LogFormat::Pretty,
-        },
-    };
-    let app = App::start(&config).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(axum::serve(listener, app.router.clone()).into_future());
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(options.concurrency)
-        .build()
-        .unwrap();
-
-    let post = |path: &str, body: serde_json::Value| {
-        let request = client.post(format!("{base}{path}")).json(&body);
-        async move { assert!(request.send().await.unwrap().status().is_success()) }
-    };
-    post("/api/instruments", serde_json::json!({ "id": "ACME", "symbol": "ACME", "mic": "XCSE", "currency": "DKK", "currencyScale": 2 })).await;
-    for id in participant_ids() {
-        post(
-            "/api/participants",
-            serde_json::json!({ "id": id, "name": id }),
-        )
-        .await;
-    }
+    let service = Service::start(options, options.concurrency).await;
     let delivered = Arc::new(AtomicUsize::new(0));
     if with_webhook {
         let counter = delivered.clone();
@@ -505,31 +699,25 @@ async fn bench_http(options: &Options, report: &mut Report, with_webhook: bool) 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/hook", listener.local_addr().unwrap());
         tokio::spawn(axum::serve(listener, consumer).into_future());
-        post(
-            "/api/webhooks",
-            serde_json::json!({ "url": url, "eventTypes": ["TradeExecuted"] }),
-        )
-        .await;
+        service
+            .post(
+                "/api/webhooks",
+                serde_json::json!({ "url": url, "eventTypes": ["TradeExecuted"] }),
+            )
+            .await;
     }
 
-    let bodies: Arc<Vec<serde_json::Value>> = Arc::new(
-        workload(options.seed, options.http_orders)
-            .into_iter()
-            .map(|c| {
-                serde_json::json!({ "instrumentId": "ACME", "participantId": c.participant_id, "side": c.side,
-                                    "type": c.order_type, "priceTicks": c.limit_price_ticks, "quantity": c.quantity })
-            })
-            .collect(),
-    );
+    let bodies = order_bodies(options.seed, options.http_orders);
     let next = Arc::new(AtomicUsize::new(0));
+    let before = service.metrics().await;
     let started = Instant::now();
     let workers: Vec<_> = (0..options.concurrency)
         .map(|_| {
             let (client, bodies, next, url) = (
-                client.clone(),
+                service.client.clone(),
                 bodies.clone(),
                 next.clone(),
-                format!("{base}/api/orders"),
+                format!("{}/api/orders", service.base),
             );
             tokio::spawn(async move {
                 let mut latencies = Vec::new();
@@ -559,17 +747,18 @@ async fn bench_http(options: &Options, report: &mut Report, with_webhook: bool) 
         failures += f;
     }
     let elapsed = started.elapsed();
+    let after = service.metrics().await;
 
-    let db = rusqlite::Connection::open(&config.database.path).unwrap();
-    let count = |sql: &str| -> i64 { db.query_row(sql, [], |r| r.get(0)).unwrap() };
     let mut notes = format!(
-        "{} clients, {failures} non-2xx, {} executions",
+        "{} clients, {failures} non-2xx, {} executions; {}",
         options.concurrency,
-        count("SELECT COUNT(*) FROM executions")
+        service.count("SELECT COUNT(*) FROM executions"),
+        breakdown(&before, &after)
     );
     let scenario = if with_webhook {
-        let expected =
-            count("SELECT COUNT(*) FROM events WHERE event_type = 'TradeExecuted'") as usize;
+        let expected = service
+            .count("SELECT COUNT(*) FROM events WHERE event_type = 'TradeExecuted'")
+            as usize;
         while delivered.load(Ordering::Relaxed) < expected
             && started.elapsed() < Duration::from_secs(600)
         {
@@ -592,9 +781,83 @@ async fn bench_http(options: &Options, report: &mut Report, with_webhook: bool) 
         &latencies.summary(),
         &notes,
     );
-    server.abort();
-    app.shutdown().await;
-    let _ = std::fs::remove_dir_all(dir);
+    service.stop().await;
+}
+
+/// How one open-loop request ended.
+enum Outcome {
+    Accepted,
+    Overloaded,
+    Failed,
+}
+
+/// Open loop at `rate` orders/s: order `i` is due at `start + i / rate`, and is sent then whether or not earlier
+/// orders were answered. Latency runs from the due time, not the actual send, so a stalled server or a lagging
+/// generator shows up in the latency instead of quietly lowering the offered load (no coordinated omission).
+/// `--max-in-flight` bounds the open requests; at that bound the generator waits, and the wait counts as latency.
+async fn bench_open_loop(options: &Options, report: &mut Report, rate: f64) {
+    let service = Service::start(options, options.max_in_flight).await;
+    let n = ((rate * options.seconds).round() as usize).max(1);
+    let bodies = order_bodies(options.seed, n);
+    let url = format!("{}/api/orders", service.base);
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(options.max_in_flight));
+    let before = service.metrics().await;
+    let start = tokio::time::Instant::now() + Duration::from_millis(20);
+    let mut lags = Latencies::default();
+    let mut requests = Vec::with_capacity(n);
+    for i in 0..n {
+        let due = start + Duration::from_secs_f64(i as f64 / rate);
+        tokio::time::sleep_until(due).await;
+        let permit = in_flight.clone().acquire_owned().await.unwrap();
+        lags.0.push(due.elapsed());
+        let request = service.client.post(&url).json(&bodies[i]);
+        requests.push(tokio::spawn(async move {
+            let outcome = match request.send().await {
+                Ok(r) if r.status().is_success() => Outcome::Accepted,
+                Ok(r) if r.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
+                    Outcome::Overloaded
+                }
+                _ => Outcome::Failed,
+            };
+            drop(permit);
+            (outcome, due.elapsed(), tokio::time::Instant::now())
+        }));
+    }
+    let (mut accepted, mut overloaded, mut failed) = (Latencies::default(), 0, 0);
+    let mut last = start;
+    for request in requests {
+        let (outcome, latency, done) = request.await.unwrap();
+        last = last.max(done);
+        match outcome {
+            Outcome::Accepted => accepted.0.push(latency),
+            Outcome::Overloaded => overloaded += 1,
+            Outcome::Failed => failed += 1,
+        }
+    }
+    let elapsed = last - start;
+    let after = service.metrics().await;
+    let ok = accepted.0.len();
+    let latency = if ok == 0 {
+        "–".into()
+    } else {
+        accepted.summary()
+    };
+    let notes = format!(
+        "target {rate:.0}/s for {:.0} s: {n} sent, {ok} accepted, {overloaded} × 503, {failed} other failures; \
+         generator lag p99 {} max {}; {}",
+        options.seconds,
+        micros(lags.percentile(0.99)),
+        micros(lags.percentile(1.0)),
+        breakdown(&before, &after),
+    );
+    report.row(
+        &format!("HTTP open loop, target {rate:.0} orders/s"),
+        ok,
+        elapsed,
+        &latency,
+        &notes,
+    );
+    service.stop().await;
 }
 
 fn environment() -> String {
@@ -704,6 +967,11 @@ async fn main() {
     if all || options.mode == "http" {
         bench_http(&options, &mut report, false).await;
         bench_http(&options, &mut report, true).await;
+    }
+    if options.mode == "open-loop" {
+        for rate in options.rates.clone() {
+            bench_open_loop(&options, &mut report, rate).await;
+        }
     }
     let text = format!(
         "# exchange-simulator benchmark\n\n- Date: {}\n- Environment: {}\n- Build: {}\n- Seed: {}; workload: 80 % limit \

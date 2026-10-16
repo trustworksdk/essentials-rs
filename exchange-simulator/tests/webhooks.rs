@@ -465,6 +465,8 @@ async fn metrics_expose_commands_trades_latencies_and_the_outbox() {
         "exchange_match_duration_seconds_count",
         "exchange_commit_duration_seconds_count",
         r#"exchange_command_duration_seconds_count{command="submit"}"#,
+        r#"exchange_command_queue_wait_seconds_count{command="submit"}"#,
+        r#"exchange_command_ack_seconds_count{command="submit"}"#,
         "webhook_delivery_duration_seconds_count",
     ] {
         assert!(
@@ -473,6 +475,12 @@ async fn metrics_expose_commands_trades_latencies_and_the_outbox() {
         );
     }
     assert!(text.contains("# HELP exchange_commit_duration_seconds"));
+    assert!(text.contains("# HELP exchange_command_queue_wait_seconds"));
+    assert!(text.contains("# HELP exchange_command_ack_seconds"));
+    assert!(
+        text.contains(r#"exchange_command_ack_seconds_bucket{command="submit",le="0.001"}"#),
+        "the new histograms use the latency buckets: {text}"
+    );
     app.stop().await;
 }
 

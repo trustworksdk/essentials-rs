@@ -1,4 +1,5 @@
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -55,12 +56,43 @@ enum Request {
     RecordDeliveries(Vec<DeliveryResult>, Reply<()>),
 }
 
+impl Request {
+    /// The `command` label in metrics.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::RegisterInstrument(..) => "register_instrument",
+            Self::RegisterParticipant(..) => "register_participant",
+            Self::Submit(..) => "submit",
+            Self::Cancel(..) => "cancel",
+            Self::Snapshot(..) => "snapshot",
+            Self::RegisterWebhook(..) => "register_webhook",
+            Self::SetWebhookFaults(..) => "set_webhook_faults",
+            Self::Redeliver(..) => "redeliver",
+            Self::RetryDeadLetters(..) => "retry_dead_letters",
+            Self::Reset(..) => "reset",
+            Self::SetInstrumentEnabled(..) => "set_instrument_enabled",
+            Self::ClockState(..) => "clock_state",
+            Self::SettlementTick(..) => "settlement_tick",
+            Self::ReportSettlement(..) => "report_settlement",
+            Self::ChangeClock(..) => "change_clock",
+            Self::ClaimDeliveries(..) => "claim_deliveries",
+            Self::RecordDeliveries(..) => "record_deliveries",
+        }
+    }
+}
+
+/// A request on the queue, stamped when it was enqueued so the exchange thread can measure how long it waited.
+struct Queued {
+    request: Request,
+    enqueued: Instant,
+}
+
 /// Async handle to the single exchange thread. Commands are queued on a bounded channel and executed one at a time
 /// by the thread that owns the [`Exchange`] (and with it the SQLite writer). A full queue fails fast with
 /// [`DispatchError::Overloaded`] instead of buffering without limit or dropping commands silently.
 #[derive(Clone)]
 pub struct Dispatcher {
-    tx: mpsc::Sender<Request>,
+    tx: mpsc::Sender<Queued>,
 }
 
 impl Dispatcher {
@@ -105,9 +137,8 @@ impl Dispatcher {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<Option<BookSnapshot>, DispatchError> {
-        let (reply, response) = oneshot::channel();
-        self.enqueue(Request::Snapshot(instrument_id, reply))?;
-        response.await.map_err(|_| DispatchError::Stopped)
+        self.ask(|reply| Request::Snapshot(instrument_id, reply))
+            .await
     }
 
     /// Runs one settlement simulator step; resolves with the number of transitions.
@@ -125,9 +156,7 @@ impl Dispatcher {
     }
 
     pub async fn clock_state(&self) -> Result<ClockState, DispatchError> {
-        let (reply, response) = oneshot::channel();
-        self.enqueue(Request::ClockState(reply))?;
-        response.await.map_err(|_| DispatchError::Stopped)
+        self.ask(Request::ClockState).await
     }
 
     pub async fn change_clock(&self, change: ClockChange) -> Result<ClockState, DispatchError> {
@@ -204,39 +233,61 @@ impl Dispatcher {
     }
 
     async fn call<T>(&self, request: impl FnOnce(Reply<T>) -> Request) -> Result<T, DispatchError> {
-        let (reply, response) = oneshot::channel();
-        self.enqueue(request(reply))?;
-        Ok(response.await.map_err(|_| DispatchError::Stopped)??)
+        Ok(self.ask(request).await??)
     }
 
-    fn enqueue(&self, request: Request) -> Result<(), DispatchError> {
-        self.tx.try_send(request).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => {
-                ::metrics::counter!(crate::metrics::QUEUE_REJECTIONS).increment(1);
-                DispatchError::Overloaded
-            }
-            mpsc::error::TrySendError::Closed(_) => DispatchError::Stopped,
-        })
+    /// Enqueues a request and waits for its answer. The acknowledgement latency (enqueue to answer received) is
+    /// recorded whatever the answer; a refused request was never enqueued, and a caller that gives up waiting
+    /// records nothing.
+    async fn ask<T>(
+        &self,
+        request: impl FnOnce(oneshot::Sender<T>) -> Request,
+    ) -> Result<T, DispatchError> {
+        let (reply, response) = oneshot::channel();
+        let request = request(reply);
+        let command = request.name();
+        let enqueued = self.enqueue(request)?;
+        let answer = response.await.map_err(|_| DispatchError::Stopped)?;
+        ::metrics::histogram!(crate::metrics::ACK_LATENCY, "command" => command)
+            .record(enqueued.elapsed());
+        Ok(answer)
+    }
+
+    fn enqueue(&self, request: Request) -> Result<Instant, DispatchError> {
+        let enqueued = Instant::now();
+        let queued = Queued { request, enqueued };
+        self.tx
+            .try_send(queued)
+            .map(|()| enqueued)
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    ::metrics::counter!(crate::metrics::QUEUE_REJECTIONS).increment(1);
+                    DispatchError::Overloaded
+                }
+                mpsc::error::TrySendError::Closed(_) => DispatchError::Stopped,
+            })
     }
 }
 
-fn run(mut exchange: Exchange, mut rx: mpsc::Receiver<Request>) {
-    use crate::metrics::{COMMAND_DURATION, COMMANDS, QUEUE_DEPTH};
-    while let Some(request) = rx.blocking_recv() {
+fn run(mut exchange: Exchange, mut rx: mpsc::Receiver<Queued>) {
+    use crate::metrics::{COMMAND_DURATION, COMMANDS, QUEUE_DEPTH, QUEUE_WAIT};
+    while let Some(Queued { request, enqueued }) = rx.blocking_recv() {
         ::metrics::gauge!(QUEUE_DEPTH).set(rx.len() as f64);
-        let started = std::time::Instant::now();
-        let (command, outcome) = handle(&mut exchange, request);
+        let started = Instant::now();
+        let command = request.name();
+        ::metrics::histogram!(QUEUE_WAIT, "command" => command).record(started - enqueued);
+        let outcome = handle(&mut exchange, request);
         ::metrics::histogram!(COMMAND_DURATION, "command" => command).record(started.elapsed());
         ::metrics::counter!(COMMANDS, "command" => command, "outcome" => outcome).increment(1);
     }
     tracing::info!("exchange thread stopped");
 }
 
-/// Executes one request and answers it; returns the command name and outcome for metrics.
+/// Executes one request and answers it; returns the outcome for metrics.
 ///
 /// A reply fails only when the caller gave up waiting (e.g. the HTTP client disconnected). The command still took
 /// effect; there is no one left to tell.
-fn handle(exchange: &mut Exchange, request: Request) -> (&'static str, &'static str) {
+fn handle(exchange: &mut Exchange, request: Request) -> &'static str {
     fn answer<T>(reply: Reply<T>, result: Result<T, ExchangeError>) -> &'static str {
         let outcome = match &result {
             Ok(_) => "ok",
@@ -262,13 +313,13 @@ fn handle(exchange: &mut Exchange, request: Request) -> (&'static str, &'static 
             let result = exchange
                 .register_instrument(instrument.clone())
                 .map(|()| instrument);
-            ("register_instrument", answer(reply, result))
+            answer(reply, result)
         }
         Request::RegisterParticipant(participant, reply) => {
             let result = exchange
                 .register_participant(participant.clone())
                 .map(|()| participant);
-            ("register_participant", answer(reply, result))
+            answer(reply, result)
         }
         Request::Submit(order, reply) => {
             let result = exchange.submit(order).map(|outcome| {
@@ -279,57 +330,44 @@ fn handle(exchange: &mut Exchange, request: Request) -> (&'static str, &'static 
                 let instrument = instrument_of(exchange, instrument_id);
                 (outcome, instrument)
             });
-            ("submit", answer(reply, result))
+            answer(reply, result)
         }
         Request::Cancel(order_id, reply) => {
             let result = exchange.cancel(order_id).map(|update| {
                 let instrument = instrument_of(exchange, &update.order.instrument_id);
                 (update, instrument)
             });
-            ("cancel", answer(reply, result))
+            answer(reply, result)
         }
-        Request::SettlementTick(reply) => {
-            ("settlement_tick", answer(reply, exchange.settlement_tick()))
+        Request::SettlementTick(reply) => answer(reply, exchange.settlement_tick()),
+        Request::ReportSettlement(report, reply) => {
+            answer(reply, exchange.report_settlement(report))
         }
-        Request::ReportSettlement(report, reply) => (
-            "report_settlement",
-            answer(reply, exchange.report_settlement(report)),
-        ),
         Request::ClockState(reply) => {
             let _ = reply.send(exchange.clock_state());
-            ("clock_state", "ok")
+            "ok"
         }
-        Request::ChangeClock(change, reply) => {
-            ("change_clock", answer(reply, exchange.change_clock(change)))
+        Request::ChangeClock(change, reply) => answer(reply, exchange.change_clock(change)),
+        Request::SetInstrumentEnabled(id, enabled, reply) => {
+            answer(reply, exchange.set_instrument_enabled(&id, enabled))
         }
-        Request::SetInstrumentEnabled(id, enabled, reply) => (
-            "set_instrument_enabled",
-            answer(reply, exchange.set_instrument_enabled(&id, enabled)),
-        ),
-        Request::RegisterWebhook(request, reply) => (
-            "register_webhook",
-            answer(reply, exchange.register_webhook(request)),
-        ),
-        Request::SetWebhookFaults(id, policy, reply) => (
-            "set_webhook_faults",
-            answer(reply, exchange.set_webhook_faults(id, policy)),
-        ),
-        Request::Redeliver(id, after, reply) => {
-            ("redeliver", answer(reply, exchange.redeliver(id, after)))
+        Request::RegisterWebhook(request, reply) => {
+            answer(reply, exchange.register_webhook(request))
         }
-        Request::RetryDeadLetters(subscription, ids, reply) => (
-            "retry_dead_letters",
-            answer(reply, exchange.retry_dead_letters(subscription, &ids)),
-        ),
-        Request::Reset(reply) => ("reset", answer(reply, exchange.reset())),
-        Request::ClaimDeliveries(limit, lease, reply) => (
-            "claim_deliveries",
-            answer(reply, exchange.claim_deliveries(limit, lease)),
-        ),
-        Request::RecordDeliveries(results, reply) => (
-            "record_deliveries",
-            answer(reply, exchange.record_deliveries(&results)),
-        ),
+        Request::SetWebhookFaults(id, policy, reply) => {
+            answer(reply, exchange.set_webhook_faults(id, policy))
+        }
+        Request::Redeliver(id, after, reply) => answer(reply, exchange.redeliver(id, after)),
+        Request::RetryDeadLetters(subscription, ids, reply) => {
+            answer(reply, exchange.retry_dead_letters(subscription, &ids))
+        }
+        Request::Reset(reply) => answer(reply, exchange.reset()),
+        Request::ClaimDeliveries(limit, lease, reply) => {
+            answer(reply, exchange.claim_deliveries(limit, lease))
+        }
+        Request::RecordDeliveries(results, reply) => {
+            answer(reply, exchange.record_deliveries(&results))
+        }
         Request::Snapshot(instrument_id, reply) => {
             let _ = reply.send(exchange.book(&instrument_id).map(|book| BookSnapshot {
                 instrument: book.instrument().clone(),
@@ -337,7 +375,7 @@ fn handle(exchange: &mut Exchange, request: Request) -> (&'static str, &'static 
                 asks: book.depth(Side::Sell),
                 last_sequence: exchange.last_sequence(),
             }));
-            ("snapshot", "ok")
+            "ok"
         }
     }
 }
@@ -381,5 +419,62 @@ mod tests {
             dispatcher.snapshot(InstrumentId("ACME".into())).await,
             Err(DispatchError::Stopped)
         ));
+    }
+
+    /// The `_sum` and `_count` of a histogram series, as rendered by the process-wide recorder.
+    fn histogram(name: &str, labels: &str) -> (f64, f64) {
+        let text = crate::metrics::install().render();
+        let value = |suffix: &str| {
+            let series = format!("{name}_{suffix}{{{labels}}} ");
+            text.lines()
+                .find_map(|line| line.strip_prefix(&series)?.parse().ok())
+                .unwrap_or(0.0)
+        };
+        (value("sum"), value("count"))
+    }
+
+    #[tokio::test]
+    async fn queue_wait_and_acknowledgement_latency_are_measured_from_enqueueing() {
+        use crate::metrics::{ACK_LATENCY, COMMAND_DURATION, QUEUE_WAIT};
+        let labels = r#"command="clock_state""#;
+        let before = [QUEUE_WAIT, ACK_LATENCY, COMMAND_DURATION].map(|m| histogram(m, labels));
+
+        // The request sits in the queue for 100 ms before the exchange thread starts.
+        let (tx, rx) = mpsc::channel(1);
+        let dispatcher = Dispatcher { tx };
+        let asked = tokio::spawn({
+            let dispatcher = dispatcher.clone();
+            async move { dispatcher.clock_state().await }
+        });
+        while dispatcher.tx.capacity() > 0 {
+            tokio::task::yield_now().await;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let conn = crate::persistence::open(":memory:", std::time::Duration::from_secs(1)).unwrap();
+        let exchange =
+            Exchange::recover(crate::persistence::Store::new(conn), Default::default()).unwrap();
+        let thread = std::thread::spawn(move || run(exchange, rx));
+        asked.await.unwrap().unwrap();
+        drop(dispatcher);
+        thread.join().unwrap();
+
+        let after = [QUEUE_WAIT, ACK_LATENCY, COMMAND_DURATION].map(|m| histogram(m, labels));
+        let delta = |i: usize| (after[i].0 - before[i].0, after[i].1 - before[i].1);
+        let (wait, waits) = delta(0);
+        let (ack, acks) = delta(1);
+        let (duration, _) = delta(2);
+        assert_eq!(
+            (waits, acks),
+            (1.0, 1.0),
+            "one wait and one acknowledgement"
+        );
+        assert!(
+            wait >= 0.1,
+            "queue wait {wait} s covers the 100 ms in the queue"
+        );
+        assert!(
+            ack >= wait + duration,
+            "acknowledgement {ack} s covers the wait {wait} s and the execution {duration} s"
+        );
     }
 }

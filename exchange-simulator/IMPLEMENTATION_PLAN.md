@@ -725,12 +725,66 @@ the order below deliberately puts group commit before sharding.
 
 | # | Step | Size | Delivers |
 |---|---|---|---|
-| 4.1 | Latency breakdown and an open-loop load generator | M | New histograms for queue wait (enqueue → start) and acknowledgement latency (enqueue → reply). The bench gains a target-rate, open-loop mode that avoids coordinated omission, reporting achieved rate, latency at that rate, and 503 counts. |
+| 4.1 ✅ | Latency breakdown and an open-loop load generator | M | New histograms for queue wait (enqueue → start) and acknowledgement latency (enqueue → reply). The bench gains a target-rate, open-loop mode that avoids coordinated omission, reporting achieved rate, latency at that rate, and 503 counts. |
 | 4.2 | Group commit | M–L | The writer drains up to N queued commands (or waits up to T µs) and plans them in order on the books. It commits them in one transaction and replies to each after the commit. If the commit fails, all plans are dropped and every caller gets the error; nothing is applied. Ordering and determinism are unchanged. Expected: several times today's durable throughput. |
 | 4.3 | Background checkpointing | S | Turn off automatic WAL checkpointing on the writer *only together with* a background connection that runs `PRAGMA wal_checkpoint(PASSIVE)` when the WAL passes a size threshold. Without that, the WAL grows without bound and throughput halves (1.2). Target: the roughly 10 % of durable time and the p99 now spent in checkpoint commits. The occasional > 10 ms spikes come from the disk (1.2), and this will not remove them. Measure with `bench checkpoint`. |
 | 4.4 | Explicit non-durable modes | S | `persistence.mode: durable \| fast \| memory` (D4).<br>• **`fast`**: WAL with `synchronous=NORMAL`. Every commit still reaches the database file, and fsync happens only at checkpoints. All state survives a process or container restart (books, events, outbox, settlement instructions, simulator cursor, virtual clock), so settlement keeps working across restarts. Only a host or node crash, or power loss, can lose the last commits, and the database is never corrupted. (`synchronous=OFF` was rejected: it can corrupt the database on a host crash.)<br>• **`memory`**: an in-memory SQLite database for pure throughput runs. Nothing survives a restart (orders, trades, pending settlements, undelivered webhooks), so settlement works only while the process runs.<br>`/health` and `/metrics` report the mode, and responses carry a header in non-durable modes. The README documents the trade-offs, including that durability in Kubernetes also needs a persistent volume (`emptyDir` loses everything when the pod is rescheduled, even in `durable` mode). |
 | 4.5 | Instrument-sharded matching (only if 4.1 shows matching as a bottleneck) | M | Matching workers per instrument shard in front of the single writer. Today's data says matching is not the limit, so this is a measure-first step. |
 | 4.6 | Containerized benchmark and load report | M | There is no single target machine (D4): deployments are mostly Docker Compose or Kubernetes, and their hardware varies. So the benchmark runs as containers: the service image plus a load-generator container, with explicit CPU and memory limits and a named storage backing (volume or storage class). It ships as a compose profile and as a Kubernetes Job manifest. Each report records its environment: limits, storage, measured fsync latency, and node type where known. It compares `durable`, `fast` and `memory`, with and without outbox and webhooks, across instrument counts. Figures against the 1k–10k target are quoted per environment, never as one universal number. |
+
+### Milestone 4 progress
+
+**4.1 — latency breakdown and an open-loop load generator ✅ (2026-10-16).**
+- **Delivered:**
+  - **Two new histograms,** labelled by `command`:
+    - `exchange_command_queue_wait_seconds`: enqueue to start on the exchange thread.
+    - `exchange_command_ack_seconds`: enqueue until the caller has the answer.
+    - Each queued command now carries its enqueue `Instant`. The command name comes from the request itself
+      (`Request::name`), so the caller can label the acknowledgement before the exchange thread sees the request.
+    - The latency buckets now apply to every `_seconds` histogram, not just `*duration_seconds`.
+  - **`bench open-loop`:**
+    - For each target rate in `--rates` it runs for `--seconds`. Order `i` is due at `start + i / rate` and is sent
+      then, whatever the earlier responses. Latency is measured from the due time, so coordinated omission is
+      avoided.
+    - Each row reports: the achieved rate, the latency of accepted orders, 503s and other failures, the
+      generator's own lag, and the server-side breakdown per order (mean and p99 bucket bound of queue wait,
+      exchange-thread time, commit and acknowledgement), taken from `/metrics` before and after the run.
+    - New flags: `--queue-capacity` and `--max-in-flight`.
+  - **The closed-loop `http` rows** carry the same breakdown. Their service setup is shared with `open-loop`
+    (`Service`).
+  - **Docs:** README metrics list; `bench/README.md` gains an open-loop section with results in
+    `bench/results/2026-10-16-open-loop-*.md`.
+- **Results (devcontainer):**
+  - **VM disk, fsync about 300 µs:** 2,000/s held at p99 7 ms; saturated at about 3,850/s.
+  - **tmpfs:** 15,000/s held at p99 25 ms; at 20,000/s about 15,050/s accepted and 39,010 of 200,000 refused with
+    503.
+  - **Breakdown:** below capacity the service accounts for under 1 ms of the 1–2 ms p50. At capacity the
+    exchange thread still takes about 250 µs per order (commit 230 µs), and the queue wait grows to hundreds of
+    milliseconds. The commit is the limit, which supports doing group commit (4.2) before sharding (4.5).
+- **Tests:**
+  - A dispatcher unit test: a request held 100 ms in the queue records exactly one queue wait of at least 100 ms
+    and one acknowledgement, which covers the wait plus the execution.
+  - The metrics integration test (`tests/webhooks.rs`) checks that both histograms are exposed with HELP text and
+    latency buckets.
+  - The dispatcher tests were repeated five times without failure. All gates pass, e2e included.
+- **Mutation checks**, each made a test fail:
+  - queue wait measured from the start of execution;
+  - queue wait recorded without its `command` label;
+  - acknowledgement not recorded;
+  - acknowledgement shortened, so it no longer covers wait plus execution;
+  - latency buckets only for `*duration_seconds` again.
+- **Decisions:**
+  - **The acknowledgement is measured at the caller,** when the answer arrives, so it includes the hand-back
+    from the exchange thread. A caller that gives up (for example when the HTTP client disconnects) records none.
+    A command refused with 503 records neither histogram; `exchange_command_queue_rejections_total` counts it.
+  - **`open-loop` is not part of `all`,** like `checkpoint`: it runs 10 s per rate.
+  - **At `--max-in-flight` the generator waits** rather than dropping orders. The wait counts as latency, so
+    results stay honest, and `generator lag` shows it.
+- **Deviation:** the generator still runs in the service's process and Tokio runtime, as the `http` rows did.
+  Step 4.6 moves it into its own container.
+- **Finding:** the VM disk is slower than on 2026-10-14: fsync took 300–500 µs, against 200 µs then. The first run
+  on a cold disk also stalled the whole process (p99 452 ms at 500/s, against 4.4 ms on the rerun). Compare figures
+  only within one report.
 
 ## Suggested order
 

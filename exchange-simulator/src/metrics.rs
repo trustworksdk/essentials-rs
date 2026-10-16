@@ -9,6 +9,11 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 pub const COMMANDS: &str = "exchange_commands_total";
 /// Time the exchange thread spent on one command, matching and commit included. Label: `command`.
 pub const COMMAND_DURATION: &str = "exchange_command_duration_seconds";
+/// Time a command waited in the queue before the exchange thread started it (enqueue to start). Label: `command`.
+pub const QUEUE_WAIT: &str = "exchange_command_queue_wait_seconds";
+/// Time from enqueueing a command until its caller received the answer (queue wait, execution and commit, and the
+/// hand-back). Label: `command`.
+pub const ACK_LATENCY: &str = "exchange_command_ack_seconds";
 /// Time spent planning a match on the in-memory book (no I/O).
 pub const MATCH_DURATION: &str = "exchange_match_duration_seconds";
 /// Time spent in the SQLite transaction that makes a command durable.
@@ -43,7 +48,7 @@ pub fn install() -> PrometheusHandle {
     HANDLE
         .get_or_init(|| {
             let recorder = PrometheusBuilder::new()
-                .set_buckets_for_metric(Matcher::Suffix("duration_seconds".into()), LATENCY_BUCKETS)
+                .set_buckets_for_metric(Matcher::Suffix("_seconds".into()), LATENCY_BUCKETS)
                 .expect("buckets are non-empty")
                 .build_recorder();
             let handle = recorder.handle();
@@ -63,6 +68,16 @@ fn describe() {
         COMMAND_DURATION,
         Unit::Seconds,
         "Exchange thread time per command, commit included"
+    );
+    describe_histogram!(
+        QUEUE_WAIT,
+        Unit::Seconds,
+        "Time a command waited in the queue before the exchange thread started it"
+    );
+    describe_histogram!(
+        ACK_LATENCY,
+        Unit::Seconds,
+        "Time from enqueueing a command until its caller received the answer"
     );
     describe_histogram!(
         MATCH_DURATION,
