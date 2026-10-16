@@ -467,6 +467,7 @@ async fn metrics_expose_commands_trades_latencies_and_the_outbox() {
         r#"exchange_command_duration_seconds_count{command="submit"}"#,
         r#"exchange_command_queue_wait_seconds_count{command="submit"}"#,
         r#"exchange_command_ack_seconds_count{command="submit"}"#,
+        "exchange_group_commit_commands_count",
         "webhook_delivery_duration_seconds_count",
     ] {
         assert!(

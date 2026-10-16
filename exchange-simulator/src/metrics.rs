@@ -16,8 +16,11 @@ pub const QUEUE_WAIT: &str = "exchange_command_queue_wait_seconds";
 pub const ACK_LATENCY: &str = "exchange_command_ack_seconds";
 /// Time spent planning a match on the in-memory book (no I/O).
 pub const MATCH_DURATION: &str = "exchange_match_duration_seconds";
-/// Time spent in the SQLite transaction that makes a command durable.
+/// Time spent making orders and cancellations durable: per commit group, the `COMMIT`; with group commit off, the
+/// whole transaction of one command.
 pub const COMMIT_DURATION: &str = "exchange_commit_duration_seconds";
+/// Commands (orders and cancellations) per commit group.
+pub const GROUP_SIZE: &str = "exchange_group_commit_commands";
 /// Commands waiting for the exchange thread.
 pub const QUEUE_DEPTH: &str = "exchange_command_queue_depth";
 /// Commands refused because the queue was full.
@@ -37,6 +40,10 @@ pub const SETTLEMENT_OPEN: &str = "settlement_open_instructions";
 /// Outbox rows by status (`PENDING`, `IN_FLIGHT`, `DELIVERED`, `DEAD`), read from SQLite at scrape time.
 pub const OUTBOX: &str = "webhook_outbox_deliveries";
 
+const GROUP_BUCKETS: &[f64] = &[
+    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
+];
+
 const LATENCY_BUCKETS: &[f64] = &[
     0.000_01, 0.000_025, 0.000_05, 0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025,
     0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -49,6 +56,8 @@ pub fn install() -> PrometheusHandle {
         .get_or_init(|| {
             let recorder = PrometheusBuilder::new()
                 .set_buckets_for_metric(Matcher::Suffix("_seconds".into()), LATENCY_BUCKETS)
+                .expect("buckets are non-empty")
+                .set_buckets_for_metric(Matcher::Full(GROUP_SIZE.into()), GROUP_BUCKETS)
                 .expect("buckets are non-empty")
                 .build_recorder();
             let handle = recorder.handle();
@@ -87,8 +96,9 @@ fn describe() {
     describe_histogram!(
         COMMIT_DURATION,
         Unit::Seconds,
-        "SQLite transaction time per command"
+        "Time to make orders and cancellations durable, per commit group"
     );
+    describe_histogram!(GROUP_SIZE, "Orders and cancellations per commit group");
     describe_gauge!(QUEUE_DEPTH, "Commands waiting for the exchange thread");
     describe_counter!(
         QUEUE_REJECTIONS,

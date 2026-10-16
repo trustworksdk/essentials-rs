@@ -726,7 +726,7 @@ the order below deliberately puts group commit before sharding.
 | # | Step | Size | Delivers |
 |---|---|---|---|
 | 4.1 ✅ | Latency breakdown and an open-loop load generator | M | New histograms for queue wait (enqueue → start) and acknowledgement latency (enqueue → reply). The bench gains a target-rate, open-loop mode that avoids coordinated omission, reporting achieved rate, latency at that rate, and 503 counts. |
-| 4.2 | Group commit | M–L | The writer drains up to N queued commands (or waits up to T µs) and plans them in order on the books. It commits them in one transaction and replies to each after the commit. If the commit fails, all plans are dropped and every caller gets the error; nothing is applied. Ordering and determinism are unchanged. Expected: several times today's durable throughput. |
+| 4.2 ✅ | Group commit | M–L | The writer drains up to N queued commands (or waits up to T µs) and plans them in order on the books. It commits them in one transaction and replies to each after the commit. If the commit fails, all plans are dropped and every caller gets the error; nothing is applied. Ordering and determinism are unchanged. Expected: several times today's durable throughput. |
 | 4.3 | Background checkpointing | S | Turn off automatic WAL checkpointing on the writer *only together with* a background connection that runs `PRAGMA wal_checkpoint(PASSIVE)` when the WAL passes a size threshold. Without that, the WAL grows without bound and throughput halves (1.2). Target: the roughly 10 % of durable time and the p99 now spent in checkpoint commits. The occasional > 10 ms spikes come from the disk (1.2), and this will not remove them. Measure with `bench checkpoint`. |
 | 4.4 | Explicit non-durable modes | S | `persistence.mode: durable \| fast \| memory` (D4).<br>• **`fast`**: WAL with `synchronous=NORMAL`. Every commit still reaches the database file, and fsync happens only at checkpoints. All state survives a process or container restart (books, events, outbox, settlement instructions, simulator cursor, virtual clock), so settlement keeps working across restarts. Only a host or node crash, or power loss, can lose the last commits, and the database is never corrupted. (`synchronous=OFF` was rejected: it can corrupt the database on a host crash.)<br>• **`memory`**: an in-memory SQLite database for pure throughput runs. Nothing survives a restart (orders, trades, pending settlements, undelivered webhooks), so settlement works only while the process runs.<br>`/health` and `/metrics` report the mode, and responses carry a header in non-durable modes. The README documents the trade-offs, including that durability in Kubernetes also needs a persistent volume (`emptyDir` loses everything when the pod is rescheduled, even in `durable` mode). |
 | 4.5 | Instrument-sharded matching (only if 4.1 shows matching as a bottleneck) | M | Matching workers per instrument shard in front of the single writer. Today's data says matching is not the limit, so this is a measure-first step. |
@@ -785,6 +785,96 @@ the order below deliberately puts group commit before sharding.
 - **Finding:** the VM disk is slower than on 2026-10-14: fsync took 300–500 µs, against 200 µs then. The first run
   on a cold disk also stalled the whole process (p99 452 ms at 500/s, against 4.4 ms on the rerun). Compare figures
   only within one report.
+
+**4.2 — group commit ✅ (2026-10-16).**
+- **Delivered:**
+  - **`Exchange::begin_group` / `commit_group`.**
+    - In a group, each order or cancellation is planned on the books, written, and applied to memory in turn, so the
+      next command sees it.
+    - Its writes run in a SAVEPOINT inside the group's `BEGIN IMMEDIATE` transaction. `Store::commit` now always
+      uses a savepoint; on its own that is one transaction, exactly as before.
+    - The group becomes durable at one `COMMIT`. Metrics and the delivery worker's wake-up are deferred until then.
+  - **If the `COMMIT` fails:**
+    - SQLite rolls the group back.
+    - `Exchange::reload` rebuilds the books, both sequences and the settlement simulator from storage.
+    - `ExchangeError::GroupCommit` tells every caller in the group that nothing was stored (HTTP 500).
+    - If even the reload fails, the exchange thread panics rather than run with memory and storage apart.
+  - **A failed statement inside a group** rolls back to that command's savepoint, so only that command fails, as
+    without groups.
+    - If SQLite instead rolled back the whole transaction (as it can on disk full or I/O errors), the next command
+      refuses to write, so it does not commit on its own. The group's `COMMIT` then fails and reloads.
+  - **The dispatcher (`GroupCommit`):**
+    - After taking an order or a cancellation, the thread keeps taking queued orders and cancellations, up to
+      `max_commands`. While the queue is empty it waits until `max_wait` after the group opened.
+    - Any other request ends the group, then runs: a snapshot, a registration, a delivery claim.
+    - Answers are held until the commit. A failed commit answers every caller with the error.
+    - `max_commands: 1` keeps the old path, with no group at all.
+  - **Config:** `exchange.group_commit: { max_commands: 256, max_wait_us: 0 }`, so it is on by default.
+  - **Metrics:**
+    - `exchange_commit_duration_seconds` is now per commit group (the `COMMIT`).
+    - New: `exchange_group_commit_commands`, the commands per group.
+    - Per command, `exchange_command_duration_seconds` covers planning and writing, but not the shared commit.
+  - **Bench:**
+    - `--group-commit N` and `--group-wait-us N`.
+    - Grouped durable rows (the `Exchange` group API, groups of N).
+    - The breakdown shows the commits and the average group size.
+  - **Docs:** README (config, model, metrics); `bench/README.md` gains a group-commit section; results are in
+    `bench/results/2026-10-16-group-commit-*.md`.
+- **Results (devcontainer):**
+  - **VM disk (fsync 208–266 µs):**
+    - The open loop holds 12,000 orders/s at p99 11 ms and saturates at about 15,600/s. With group commit off, the
+      same day saturated at 3,725/s.
+    - HTTP with 32 clients: 13,060/s (4,850/s on 2026-10-14). With a webhook consumer: 9,650/s.
+    - `Exchange` alone in groups of 256: 20,700/s, against 2,200–2,800/s.
+  - **Groups follow the load:** 3.5 orders at 2,000/s, 19 at 12,000/s, and 92 at saturation. Latency at low load is
+    unchanged.
+  - **tmpfs:** saturation at about 19,000/s. The exchange thread then spends about 46 µs per order on planning and
+    SQL writes, and the commit about 4 µs.
+  - **Against the plan's expectation** ("several times today's durable throughput"): met, 4–9×, depending on the row.
+- **Tests:**
+  - **`tests/recovery.rs` (3 new):**
+    - A group is invisible to another connection until its commit, and each command sees the one before it (a trade
+      against an order in the same group, then cancelling it). There are no event-sequence gaps, and a restart
+      rebuilds the same book.
+    - A failed group `COMMIT`, forced through a deferred foreign-key violation that a temp trigger plants, changes
+      neither memory nor storage. This is with the settlement simulator on. A retry gets the same sequences, and the
+      trade is taken into settlement exactly once.
+    - A failed write inside a group fails only that command. It consumes no sequence, and the others commit.
+  - **Dispatcher unit tests (3 new), with commands queued before the thread starts:**
+    - 330 orders and cancellations give identical answers and a byte-identical event log with grouping off and in
+      groups of 64. A commit hook counts 6 commits against one per stored command.
+    - With a commit hook that delays each commit by 30 ms, every caller finds its order stored when it hears back.
+    - A failing group answers both of its callers with `GroupCommit`. A snapshot queued behind them ended the group
+      and sees an empty book, and the next order gets sequence 1.
+  - The metrics integration test checks `exchange_group_commit_commands`.
+  - The existing suites (reproducibility, scenarios, faults, reset, e2e) pass with group commit on by default.
+  - The dispatcher, recovery, reproducibility, Milestone 3, webhook and reset suites were repeated five times
+    without failure.
+- **Mutation checks**, each made a test fail:
+  - answering before the commit;
+  - a failed group answering with each command's own result;
+  - a snapshot run inside the group;
+  - `max_commands` ignored;
+  - no reload after a failed commit;
+  - a reload that keeps the last sequence;
+  - a reload that keeps the settlement simulator;
+  - `Store::commit` opening a transaction instead of a savepoint.
+
+  A no-op control mutation passed.
+- **Decisions:**
+  - **Memory runs ahead of storage inside a group.** It is never observable: answers are held, and every request
+    that reads or changes other state ends the group first. A failed commit reloads memory from storage, rather than
+    undoing book changes, which could not restore FIFO positions. A reload is rare and costs a book rebuild.
+  - **Only orders and cancellations are grouped.** They are the hot path; everything else keeps its own transaction.
+  - **`max_wait_us` defaults to 0.** A group takes what is already queued and never waits, so latency at low load does
+    not change. A wait would only help when commands arrive just after a commit, and it adds that wait to every
+    group's first order.
+  - **Default `max_commands` is 256.** At saturation groups reached 92 on the VM disk and about 253 on tmpfs, close
+    to the cap. A larger cap mainly lengthens the latency of the orders at the front of a group.
+- **Finding for 4.5 (sharded matching):** with the fsync amortized, the exchange thread's limit is about 46 µs of
+  work per order, mostly SQLite statements (order, executions, about 3.3 events with JSON payloads, outbox rows).
+  Matching is about 0.5 µs. Sharding matching would not raise throughput; cheaper writes would. 4.5 stays
+  measure-first, and the measurement now argues against it.
 
 ## Suggested order
 

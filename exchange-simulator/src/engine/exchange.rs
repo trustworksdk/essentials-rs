@@ -101,6 +101,9 @@ pub enum ExchangeError {
     Book(#[from] BookError),
     #[error("storage failure: {0}")]
     Storage(#[from] rusqlite::Error),
+    /// The commit of a group of commands failed (see [`Exchange::commit_group`]); none of them took effect.
+    #[error("storage failure, nothing was stored: {0}")]
+    GroupCommit(String),
 }
 
 /// Construction-time dependencies of an [`Exchange`]. `Default` gives strict identifiers, UUIDv7 IDs and the
@@ -159,6 +162,12 @@ pub enum ClockChange {
 ///
 /// Each command is planned on the book, committed to SQLite, and only then applied to memory. When the commit fails
 /// the plan is dropped, so memory never holds state the database does not; a caller only sees success after commit.
+///
+/// Orders and cancellations can also be committed as a group ([`Exchange::begin_group`]): each is planned, written
+/// and applied in turn, so the next one sees its effect, and the group becomes durable in one commit
+/// ([`Exchange::commit_group`]). Until then memory is ahead of storage, so the caller must hold every answer back and
+/// run nothing else in between. If the group's commit fails, memory is reloaded from storage, which then holds none of
+/// the group.
 pub struct Exchange {
     store: Store,
     books: HashMap<InstrumentId, OrderBook>,
@@ -181,23 +190,38 @@ pub struct Exchange {
     clock_start: Option<(DateTime<Utc>, bool)>,
     /// Counts resets. Delivery claims carry it, so results for deliveries claimed before a reset are dropped.
     epoch: u64,
+    /// The open commit group: what its commands wrote, reported once the group is durable.
+    group: Option<Vec<Committed>>,
+}
+
+/// What one committed command wrote, for metrics and the delivery worker.
+struct Committed {
+    order_status: Option<&'static str>,
+    executions: u64,
+    quantity: u64,
+    event_types: Vec<&'static str>,
+    delivers: bool,
+}
+
+impl Committed {
+    fn record(&self) {
+        use crate::metrics::{EVENTS, EXECUTIONS, ORDERS, TRADED_QUANTITY};
+        if let Some(status) = self.order_status {
+            ::metrics::counter!(ORDERS, "status" => status).increment(1);
+        }
+        ::metrics::counter!(EXECUTIONS).increment(self.executions);
+        ::metrics::counter!(TRADED_QUANTITY).increment(self.quantity);
+        for event_type in &self.event_types {
+            ::metrics::counter!(EVENTS, "event_type" => *event_type).increment(1);
+        }
+    }
 }
 
 impl Exchange {
     /// Loads instruments, participants and webhook subscriptions, rebuilds every book from the active orders in
     /// acceptance sequence, and releases webhook delivery claims left by a previous process.
     pub fn recover(store: Store, options: ExchangeOptions) -> Result<Self, ExchangeError> {
-        let mut books: HashMap<_, _> = store
-            .instruments(&Default::default())?
-            .into_iter()
-            .map(|instrument| (instrument.id.clone(), OrderBook::new(instrument)))
-            .collect();
-        for order in store.active_orders()? {
-            let book = books
-                .get_mut(&order.instrument_id)
-                .ok_or_else(|| ExchangeError::UnknownInstrument(order.instrument_id.clone()))?;
-            book.restore(order)?;
-        }
+        let books = load_books(&store)?;
         let participants = store
             .participants()?
             .into_iter()
@@ -262,6 +286,7 @@ impl Exchange {
             delivery_signal: options.delivery_signal,
             clock_start,
             epoch: 0,
+            group: None,
         };
         // Trades committed while the simulator was off (or before it existed) are taken in now, before any command,
         // so intake order does not depend on when a background tick happens to run.
@@ -381,6 +406,54 @@ impl Exchange {
         let update = book.plan_submit(order, &mut MatchContext { now, ids: self.ids })?;
         ::metrics::histogram!(crate::metrics::MATCH_DURATION).record(started.elapsed());
         self.commit_and_apply(Command::Submit, update, now)
+    }
+
+    /// Opens a commit group: the following [`Exchange::submit`]s and [`Exchange::cancel`]s become durable together
+    /// at [`Exchange::commit_group`]. Nothing else may run while the group is open.
+    pub fn begin_group(&mut self) -> Result<(), ExchangeError> {
+        assert!(self.group.is_none(), "a commit group is already open");
+        self.store.begin_group()?;
+        self.group = Some(Vec::new());
+        Ok(())
+    }
+
+    /// Makes the open group durable in one commit. If that fails, nothing of the group is stored, and memory is
+    /// reloaded from storage so it holds none of the group either.
+    ///
+    /// # Panics
+    /// If memory cannot be reloaded after a failed commit: memory and storage would then disagree, so the exchange
+    /// must not go on.
+    pub fn commit_group(&mut self) -> Result<(), ExchangeError> {
+        let committed = self.group.take().expect("a commit group is open");
+        let started = std::time::Instant::now();
+        if let Err(error) = self.store.commit_group() {
+            tracing::error!(%error, commands = committed.len(), "group commit failed; reloading from storage");
+            if let Err(reload) = self.reload() {
+                panic!("cannot reload the exchange after a failed group commit: {reload}");
+            }
+            return Err(error.into());
+        }
+        ::metrics::histogram!(crate::metrics::COMMIT_DURATION).record(started.elapsed());
+        for command in &committed {
+            command.record();
+        }
+        self.signal_deliveries(committed.iter().any(|c| c.delivers));
+        Ok(())
+    }
+
+    /// Rebuilds what commands change in memory (books, sequences, the settlement simulator) from storage.
+    fn reload(&mut self) -> Result<(), ExchangeError> {
+        self.books = load_books(&self.store)?;
+        self.last_sequence = self.store.max_sequence()?;
+        self.next_event_sequence = self.store.next_event_sequence()?;
+        if let Some(simulator) = &mut self.settlement {
+            *simulator = SettlementSimulator::new(
+                simulator.policy().clone(),
+                self.store.open_settlements()?,
+                self.store.consumer_offset(SETTLEMENT_CONSUMER)?,
+            );
+        }
+        Ok(())
     }
 
     /// Cancels the remaining quantity of an active order.
@@ -782,6 +855,13 @@ impl Exchange {
         update: BookUpdate,
         now: DateTime<Utc>,
     ) -> Result<SubmitOutcome, ExchangeError> {
+        if self.group.is_some() && self.store.connection().is_autocommit() {
+            // SQLite rolled the whole group back after a failed statement (e.g. disk full). Writing on would commit
+            // this command on its own; the group's commit will fail and reload instead.
+            return Err(ExchangeError::GroupCommit(
+                "the group's transaction was rolled back".into(),
+            ));
+        }
         let instrument = self.books[&update.order.instrument_id].instrument();
         let participants = &self.participants;
         let lookup = |id: &ParticipantId| participants.get(id).cloned().flatten();
@@ -822,8 +902,6 @@ impl Exchange {
         self.store
             .commit(&update, &new_events, settlement_write, outbox, now)?;
         self.next_event_sequence = next;
-        ::metrics::histogram!(crate::metrics::COMMIT_DURATION).record(started.elapsed());
-        record_committed(command, &update, &new_events);
         let book = self
             .books
             .get_mut(&update.order.instrument_id)
@@ -835,16 +913,34 @@ impl Exchange {
             simulator.apply(plan);
             ::metrics::gauge!(crate::metrics::SETTLEMENT_OPEN).set(simulator.open() as f64);
         }
-        self.wake_delivery(&new_events);
+        let committed = Committed {
+            order_status: (command == Command::Submit).then(|| update.order.status.as_str()),
+            executions: update.executions.len() as u64,
+            quantity: update.executions.iter().map(|e| e.quantity).sum(),
+            event_types: new_events.iter().map(|e| e.event_type).collect(),
+            delivers: self.delivers(&new_events),
+        };
+        match &mut self.group {
+            Some(group) => group.push(committed),
+            None => {
+                ::metrics::histogram!(crate::metrics::COMMIT_DURATION).record(started.elapsed());
+                committed.record();
+                self.signal_deliveries(committed.delivers);
+            }
+        }
         Ok(SubmitOutcome::Processed(update))
     }
 
     /// Wakes the delivery worker if any of `events` has a subscriber.
     fn wake_delivery(&self, events: &[NewEvent]) {
-        let delivers = events
+        self.signal_deliveries(self.delivers(events));
+    }
+
+    /// Whether any of `events` has a subscriber.
+    fn delivers(&self, events: &[NewEvent]) -> bool {
+        events
             .iter()
-            .any(|e| self.subscriptions.iter().any(|s| s.wants(e.event_type)));
-        self.signal_deliveries(delivers);
+            .any(|e| self.subscriptions.iter().any(|s| s.wants(e.event_type)))
     }
 
     /// Wakes the delivery worker when there is something new to deliver.
@@ -865,17 +961,20 @@ fn wall_now() -> DateTime<Utc> {
     Utc::now().trunc_subsecs(6)
 }
 
-fn record_committed(command: Command, update: &BookUpdate, new_events: &[events::NewEvent]) {
-    use crate::metrics::{EVENTS, EXECUTIONS, ORDERS, TRADED_QUANTITY};
-    if command == Command::Submit {
-        ::metrics::counter!(ORDERS, "status" => update.order.status.as_str()).increment(1);
+/// Every instrument's book, with its active orders restored in acceptance sequence.
+fn load_books(store: &Store) -> Result<HashMap<InstrumentId, OrderBook>, ExchangeError> {
+    let mut books: HashMap<_, _> = store
+        .instruments(&Default::default())?
+        .into_iter()
+        .map(|instrument| (instrument.id.clone(), OrderBook::new(instrument)))
+        .collect();
+    for order in store.active_orders()? {
+        let book = books
+            .get_mut(&order.instrument_id)
+            .ok_or_else(|| ExchangeError::UnknownInstrument(order.instrument_id.clone()))?;
+        book.restore(order)?;
     }
-    ::metrics::counter!(EXECUTIONS).increment(update.executions.len() as u64);
-    ::metrics::counter!(TRADED_QUANTITY)
-        .increment(update.executions.iter().map(|e| e.quantity).sum());
-    for event in new_events {
-        ::metrics::counter!(EVENTS, "event_type" => event.event_type).increment(1);
-    }
+    Ok(books)
 }
 
 fn same_terms(order: &Order, command: &SubmitOrder) -> bool {

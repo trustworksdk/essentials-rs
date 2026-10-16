@@ -68,9 +68,12 @@ impl App {
 
         let reader =
             persistence::open_reader(path, busy_timeout).context("opening read connection")?;
-        let (dispatcher, exchange_thread) =
-            Dispatcher::spawn(exchange, config.exchange.command_queue_capacity)
-                .context("starting exchange thread")?;
+        let (dispatcher, exchange_thread) = Dispatcher::spawn(
+            exchange,
+            config.exchange.command_queue_capacity,
+            config.exchange.group_commit.policy(),
+        )
+        .context("starting exchange thread")?;
         let (stop, stopped) = watch::channel(false);
         let mut background = vec![DeliveryWorker::spawn(
             dispatcher.clone(),

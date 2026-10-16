@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use exchange_simulator::app::App;
 use exchange_simulator::config::{
-    ClockConfig, ClockMode, Config, DatabaseConfig, EventsConfig, ExchangeConfig, IdsConfig,
-    LogFormat, LoggingConfig, ServerConfig, SettlementConfig, TestControlConfig, WebhooksConfig,
+    ClockConfig, ClockMode, Config, DatabaseConfig, EventsConfig, ExchangeConfig,
+    GroupCommitConfig, IdsConfig, LogFormat, LoggingConfig, ServerConfig, SettlementConfig,
+    TestControlConfig, WebhooksConfig,
 };
 use exchange_simulator::domain::{
     IdentifierPolicy, Instrument, InstrumentId, Order, OrderStatus, Participant, ParticipantId,
@@ -27,14 +28,17 @@ use exchange_simulator::webhooks::NewSubscription;
 
 const USAGE: &str = "usage: bench [all|matching|durable|http|checkpoint|open-loop] [--quick] [--seed N] \
                      [--matching-orders N] [--durable-orders N] [--http-orders N] [--concurrency N] [--rates R,R,..] \
-                     [--seconds S] [--queue-capacity N] [--max-in-flight N] [--dir DIR] [--out FILE]
+                     [--seconds S] [--queue-capacity N] [--max-in-flight N] [--group-commit N] [--group-wait-us N] \
+                     [--dir DIR] [--out FILE]
 
 --dir: where the SQLite files go (default: the system temp dir). Check the reported fsync latency: on tmpfs it is
        ~0 and the \"durable\" numbers measure SQLite in RAM.
 open-loop (not part of all): for each target rate in --rates (orders/s, default 1000,2000,4000,8000), sends orders
        on a fixed schedule for --seconds (default 10; 3 with --quick) whatever the responses, and measures each
        latency from the order's scheduled send time. --queue-capacity is the service's command queue bound (default
-       10000), --max-in-flight the client's limit on open requests (default 16384).";
+       10000), --max-in-flight the client's limit on open requests (default 16384).
+--group-commit: most orders per commit in the service, and the group size of the grouped durable row (default 256;
+       1 commits each order on its own). --group-wait-us: how long the service waits for more orders (default 0).";
 
 struct Options {
     mode: String,
@@ -47,6 +51,7 @@ struct Options {
     seconds: f64,
     queue_capacity: usize,
     max_in_flight: usize,
+    group_commit: GroupCommitConfig,
     dir: std::path::PathBuf,
     out: Option<String>,
 }
@@ -64,6 +69,7 @@ impl Options {
             seconds: 10.0,
             queue_capacity: 10_000,
             max_in_flight: 16_384,
+            group_commit: GroupCommitConfig::default(),
             dir: std::env::temp_dir(),
             out: None,
         };
@@ -107,6 +113,12 @@ impl Options {
                 }
                 "--queue-capacity" => {
                     options.queue_capacity = number(value("--queue-capacity")?)?.max(1)
+                }
+                "--group-commit" => {
+                    options.group_commit.max_commands = number(value("--group-commit")?)?.max(1)
+                }
+                "--group-wait-us" => {
+                    options.group_commit.max_wait_us = number(value("--group-wait-us")?)? as u64
                 }
                 "--max-in-flight" => {
                     options.max_in_flight = number(value("--max-in-flight")?)?.max(1)
@@ -288,16 +300,35 @@ fn bench_matching(options: &Options, report: &mut Report) {
 }
 
 /// The coordinator on a SQLite file: every order committed (orders, executions, events, outbox) before the next.
-fn bench_durable(options: &Options, report: &mut Report, subscribed: bool) {
+///
+/// With `group` > 1, orders are committed in groups of that size (`Exchange::begin_group` / `commit_group`), as the
+/// exchange thread does under load. An order's latency then runs from its group's start to the group's commit, when
+/// its caller would be answered.
+fn bench_durable(options: &Options, report: &mut Report, subscribed: bool, group: usize) {
     let dir = temp_dir(&options.dir, "durable");
     let mut exchange = durable_exchange(&dir, subscribed);
     let commands = workload(options.seed, options.durable_orders);
     let mut latencies = Latencies::default();
     let started = Instant::now();
-    for command in commands {
-        let t = Instant::now();
-        exchange.submit(command).expect("submit");
-        latencies.0.push(t.elapsed());
+    if group > 1 {
+        let mut commands = commands.into_iter().peekable();
+        while commands.peek().is_some() {
+            let t = Instant::now();
+            exchange.begin_group().expect("begin");
+            let mut n = 0;
+            for command in commands.by_ref().take(group) {
+                exchange.submit(command).expect("submit");
+                n += 1;
+            }
+            exchange.commit_group().expect("commit");
+            latencies.0.extend(std::iter::repeat_n(t.elapsed(), n));
+        }
+    } else {
+        for command in commands {
+            let t = Instant::now();
+            exchange.submit(command).expect("submit");
+            latencies.0.push(t.elapsed());
+        }
     }
     let elapsed = started.elapsed();
     let count = |sql: &str| -> i64 {
@@ -313,13 +344,17 @@ fn bench_durable(options: &Options, report: &mut Report, subscribed: bool) {
         count("SELECT COUNT(*) FROM events"),
         count("SELECT COUNT(*) FROM webhook_deliveries")
     );
-    let scenario = if subscribed {
+    let mut scenario = if subscribed {
         "durable, outbox for 1 subscriber to all event types (`Exchange` + SQLite)"
     } else {
         "durable, no subscribers (`Exchange` + SQLite)"
-    };
+    }
+    .to_string();
+    if group > 1 {
+        scenario.push_str(&format!(", groups of {group}"));
+    }
     report.row(
-        scenario,
+        &scenario,
         options.durable_orders,
         elapsed,
         &latencies.summary(),
@@ -493,6 +528,7 @@ impl Service {
             exchange: ExchangeConfig {
                 identifier_policy: IdentifierPolicy::Strict,
                 command_queue_capacity: options.queue_capacity,
+                group_commit: options.group_commit,
             },
             events: EventsConfig::default(),
             webhooks: WebhooksConfig {
@@ -657,16 +693,32 @@ fn histogram_delta(before: &Scrape, after: &Scrape, name: &str, labels: &str) ->
 }
 
 /// Where a submitted order's time went inside the service, between two scrapes: mean and p99 bucket bound of the
-/// queue wait, the exchange thread's time (of which the SQLite commit), and the acknowledgement (enqueue to reply).
+/// queue wait, the exchange thread's time per order (planning and writing; with group commit, the group's commit is
+/// not part of it), the acknowledgement (enqueue to reply), and the commits with their group sizes.
 fn breakdown(before: &Scrape, after: &Scrape) -> String {
-    use exchange_simulator::metrics::{ACK_LATENCY, COMMAND_DURATION, COMMIT_DURATION, QUEUE_WAIT};
+    use exchange_simulator::metrics::{
+        ACK_LATENCY, COMMAND_DURATION, COMMIT_DURATION, GROUP_SIZE, QUEUE_WAIT,
+    };
     let submit = r#"command="submit""#;
+    let groups =
+        after.value(&format!("{GROUP_SIZE}_count")) - before.value(&format!("{GROUP_SIZE}_count"));
+    let grouped =
+        after.value(&format!("{GROUP_SIZE}_sum")) - before.value(&format!("{GROUP_SIZE}_sum"));
+    let group = if groups > 0.0 {
+        format!(
+            "{:.0} groups of {:.1} orders on average",
+            groups,
+            grouped / groups
+        )
+    } else {
+        "no groups".into()
+    };
     format!(
-        "server per order (mean / p99): queue wait {}, exchange thread {} (commit {}), ack {}",
+        "server per order (mean / p99): queue wait {}, exchange thread {}, ack {}; commit {} per commit, {group}",
         histogram_delta(before, after, QUEUE_WAIT, submit),
         histogram_delta(before, after, COMMAND_DURATION, submit),
-        histogram_delta(before, after, COMMIT_DURATION, ""),
         histogram_delta(before, after, ACK_LATENCY, submit),
+        histogram_delta(before, after, COMMIT_DURATION, ""),
     )
 }
 
@@ -961,8 +1013,13 @@ async fn main() {
         bench_checkpoint(&options, &mut report);
     }
     if all || options.mode == "durable" {
-        bench_durable(&options, &mut report, false);
-        bench_durable(&options, &mut report, true);
+        let group = options.group_commit.max_commands;
+        bench_durable(&options, &mut report, false, 1);
+        bench_durable(&options, &mut report, true, 1);
+        if group > 1 {
+            bench_durable(&options, &mut report, false, group);
+            bench_durable(&options, &mut report, true, group);
+        }
     }
     if all || options.mode == "http" {
         bench_http(&options, &mut report, false).await;

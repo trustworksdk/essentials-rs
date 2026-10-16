@@ -40,6 +40,36 @@ pub struct ExchangeConfig {
     pub identifier_policy: IdentifierPolicy,
     /// Bound of the exchange command queue; a full queue rejects requests with 503.
     pub command_queue_capacity: usize,
+    #[serde(default)]
+    pub group_commit: GroupCommitConfig,
+}
+
+/// How orders and cancellations are grouped into one commit (see [`crate::engine::GroupCommit`]).
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(default)]
+pub struct GroupCommitConfig {
+    /// Most commands per commit; 1 commits every command on its own.
+    pub max_commands: usize,
+    /// How long to wait for more commands once the queue is empty; 0 groups only what is already queued.
+    pub max_wait_us: u64,
+}
+
+impl Default for GroupCommitConfig {
+    fn default() -> Self {
+        Self {
+            max_commands: 256,
+            max_wait_us: 0,
+        }
+    }
+}
+
+impl GroupCommitConfig {
+    pub fn policy(&self) -> crate::engine::GroupCommit {
+        crate::engine::GroupCommit {
+            max_commands: self.max_commands.max(1),
+            max_wait: Duration::from_micros(self.max_wait_us),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

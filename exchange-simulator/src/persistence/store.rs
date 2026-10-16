@@ -90,6 +90,22 @@ impl Store {
         &self.conn
     }
 
+    /// Opens the transaction of a commit group: the [`Store::commit`]s until [`Store::commit_group`] become durable
+    /// together. Other writes must not run while a group is open (they would fail to start their transaction).
+    pub fn begin_group(&mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")
+    }
+
+    /// Commits the open group. If the commit fails, the group is rolled back: none of its writes are stored.
+    pub fn commit_group(&mut self) -> rusqlite::Result<()> {
+        let result = self.conn.execute_batch("COMMIT");
+        if result.is_err() && !self.conn.is_autocommit() {
+            // Some failures (a deferred constraint, SQLITE_BUSY) leave the transaction open.
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        result
+    }
+
     pub fn insert_instrument(&self, instrument: &Instrument) -> rusqlite::Result<()> {
         self.conn
             .prepare_cached(
@@ -253,6 +269,9 @@ impl Store {
     /// order it traded with, its executions, its events, and a pending delivery of each event to every subscription
     /// that wants it (the outbox). Order rows are stamped `now` (domain time). Nothing is written if any statement
     /// fails.
+    ///
+    /// The writes run in a savepoint: on their own they are one transaction, and inside a group (see
+    /// [`Store::begin_group`]) they become part of the group's transaction, durable only at [`Store::commit_group`].
     pub fn commit(
         &mut self,
         update: &BookUpdate,
@@ -262,7 +281,7 @@ impl Store {
         now: DateTime<Utc>,
     ) -> rusqlite::Result<()> {
         let now = timestamp(now);
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         {
             let mut upsert = tx.prepare_cached(&format!(
                 "INSERT INTO orders ({ORDER_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
@@ -903,7 +922,7 @@ pub struct SettlementWrite<'a> {
 /// Appends stamped events to the canonical log at their assigned sequences, and queues one pending delivery per event
 /// and interested subscription, inside the caller's transaction.
 pub(crate) fn write_events(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     new_events: &[NewEvent],
     outbox: &Outbox<'_>,
 ) -> rusqlite::Result<()> {
@@ -953,10 +972,7 @@ pub(crate) fn write_events(
     Ok(())
 }
 
-fn write_settlement(
-    tx: &rusqlite::Transaction<'_>,
-    write: &SettlementWrite<'_>,
-) -> rusqlite::Result<()> {
+fn write_settlement(tx: &Connection, write: &SettlementWrite<'_>) -> rusqlite::Result<()> {
     let mut upsert = tx.prepare_cached(&format!(
         "INSERT INTO settlement_instructions ({INSTRUCTION_COLUMNS})
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)

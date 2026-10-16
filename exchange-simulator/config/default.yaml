@@ -8,6 +8,12 @@ exchange:
   identifier_policy: "strict"
   # Commands waiting for the exchange thread. When full, requests fail fast with 503 instead of queueing unbounded.
   command_queue_capacity: 10000
+  # Orders and cancellations already queued are committed together, up to max_commands per commit, and each caller
+  # is answered after that commit. max_commands: 1 commits every command on its own. max_wait_us > 0 waits that long
+  # for more commands once the queue is empty (more grouping, more latency at low load).
+  group_commit:
+    max_commands: 256
+    max_wait_us: 0
 # events.simulation_id: optional simulation run ID stamped on every event as simulationId, e.g.
 # EXCHANGE__EVENTS__SIMULATION_ID=run-1. Unset by default.
 events: {}

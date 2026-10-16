@@ -1137,3 +1137,172 @@ fn a_failed_settlement_write_changes_nothing() {
         "no gaps from the failed writes"
     );
 }
+
+/// Makes the COMMIT of any transaction that stored an order of quantity 7 fail: the trigger inserts a row violating
+/// a deferred foreign key, which SQLite checks only at COMMIT.
+const FAIL_COMMIT_ON_QUANTITY_7: &str = "
+    CREATE TEMP TABLE fail_parent (id INTEGER PRIMARY KEY);
+    CREATE TEMP TABLE fail_child (parent INTEGER REFERENCES fail_parent (id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TEMP TRIGGER fail_commit AFTER INSERT ON main.orders WHEN NEW.quantity = 7
+    BEGIN INSERT INTO fail_child VALUES (1); END;";
+
+/// Rows of `sql` in another connection: what a reader sees, committed state only.
+fn committed_count(db: &TempDb, sql: &str) -> i64 {
+    rusqlite::Connection::open(db.path())
+        .unwrap()
+        .query_row(sql, [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn a_group_is_durable_only_at_its_commit_and_each_command_sees_the_one_before() {
+    let db = TempDb::new();
+    let mut exchange = setup(&db);
+    exchange.begin_group().unwrap();
+    let sell = processed(exchange.submit(order("A", Side::Sell, Some(10000), 100)));
+    let buy = processed(exchange.submit(order("B", Side::Buy, Some(10000), 60)));
+    assert_eq!(
+        buy.executions.len(),
+        1,
+        "the buy trades with the sell written before it in the same group"
+    );
+    let cancelled = exchange.cancel(sell.order.id).unwrap();
+    assert_eq!(cancelled.order.remaining_quantity, 40);
+    assert_eq!(
+        committed_count(&db, "SELECT COUNT(*) FROM orders"),
+        0,
+        "nothing is visible before the group commits"
+    );
+    exchange.commit_group().unwrap();
+
+    assert_eq!(committed_count(&db, "SELECT COUNT(*) FROM orders"), 2);
+    assert_eq!(committed_count(&db, "SELECT COUNT(*) FROM executions"), 1);
+    assert_eq!(
+        stored(&exchange, sell.order.id).status,
+        OrderStatus::Cancelled
+    );
+    assert!(exchange.book(&acme().id).unwrap().is_empty());
+    assert_eq!(
+        count(&exchange, "SELECT MAX(sequence) - COUNT(*) FROM events"),
+        0,
+        "event sequences have no gaps"
+    );
+    // After a restart the books are what the group left.
+    drop(exchange);
+    let restarted = open(&db.path(), IdentifierPolicy::Strict);
+    assert!(restarted.book(&acme().id).unwrap().is_empty());
+    assert_eq!(restarted.last_sequence(), 2);
+}
+
+#[test]
+fn a_failed_group_commit_changes_neither_memory_nor_storage() {
+    use exchange_simulator::settlement::SettlementPolicy;
+    let db = TempDb::new();
+    let conn = persistence::open(db.path(), Duration::from_secs(5)).unwrap();
+    let mut exchange = Exchange::recover(
+        Store::new(conn),
+        ExchangeOptions {
+            settlement: Some(SettlementPolicy::default()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    exchange.register_instrument(acme()).unwrap();
+    for id in ["A", "B", "C"] {
+        exchange.register_participant(participant(id)).unwrap();
+    }
+    let sell = processed(exchange.submit(order("A", Side::Sell, Some(10000), 100)));
+    let events_before = count(&exchange, "SELECT COUNT(*) FROM events");
+    exchange
+        .store()
+        .connection()
+        .execute_batch(FAIL_COMMIT_ON_QUANTITY_7)
+        .unwrap();
+
+    exchange.begin_group().unwrap();
+    let trade = processed(exchange.submit(order("B", Side::Buy, Some(10000), 60)));
+    assert_eq!(trade.executions.len(), 1);
+    processed(exchange.submit(order("C", Side::Sell, Some(10100), 7)));
+    let error = exchange.commit_group().unwrap_err();
+    assert!(matches!(error, ExchangeError::Storage(_)), "{error}");
+
+    let book = exchange.book(&acme().id).unwrap();
+    assert_eq!(book.len(), 1, "neither order of the group is in memory");
+    assert_eq!(
+        book.order(sell.order.id).unwrap().remaining_quantity,
+        100,
+        "the fill was undone in memory"
+    );
+    assert_eq!(exchange.last_sequence(), 1, "no sequence was consumed");
+    assert_eq!(stored(&exchange, sell.order.id).remaining_quantity, 100);
+    for (table, expected) in [
+        ("orders", 1),
+        ("executions", 0),
+        ("settlement_instructions", 0),
+        ("events", events_before),
+    ] {
+        assert_eq!(
+            count(&exchange, &format!("SELECT COUNT(*) FROM {table}")),
+            expected,
+            "{table} holds nothing of the group"
+        );
+    }
+
+    // The same commands succeed once the fault is gone, with the sequences the failed group would have used, and
+    // the settlement simulator takes the trade in exactly once.
+    exchange
+        .store()
+        .connection()
+        .execute_batch("DROP TRIGGER fail_commit")
+        .unwrap();
+    exchange.begin_group().unwrap();
+    let retry = processed(exchange.submit(order("B", Side::Buy, Some(10000), 60)));
+    processed(exchange.submit(order("C", Side::Sell, Some(10100), 7)));
+    exchange.commit_group().unwrap();
+    assert_eq!(retry.order.sequence, 2);
+    assert_eq!(retry.executions[0].quantity, 60);
+    assert_eq!(exchange.last_sequence(), 3);
+    assert_eq!(exchange.book(&acme().id).unwrap().len(), 2);
+    assert_eq!(
+        count(&exchange, "SELECT COUNT(*) FROM settlement_instructions"),
+        1
+    );
+    assert_eq!(
+        count(&exchange, "SELECT MAX(sequence) - COUNT(*) FROM events"),
+        0,
+        "event sequences have no gaps"
+    );
+}
+
+#[test]
+fn a_failed_write_inside_a_group_fails_only_that_command() {
+    let db = TempDb::new();
+    let mut exchange = setup(&db);
+    exchange
+        .store()
+        .connection()
+        .execute_batch("CREATE TEMP TRIGGER fail BEFORE INSERT ON executions BEGIN SELECT RAISE(ABORT, 'disk on fire'); END;")
+        .unwrap();
+    exchange.begin_group().unwrap();
+    let sell = processed(exchange.submit(order("A", Side::Sell, Some(10000), 100)));
+    let error = exchange
+        .submit(order("B", Side::Buy, Some(10000), 60))
+        .unwrap_err();
+    assert!(matches!(error, ExchangeError::Storage(_)), "{error}");
+    let rests = processed(exchange.submit(order("C", Side::Sell, Some(10100), 50)));
+    exchange.commit_group().unwrap();
+
+    assert_eq!(
+        rests.order.sequence, 2,
+        "the failed order consumed no sequence"
+    );
+    assert_eq!(committed_count(&db, "SELECT COUNT(*) FROM orders"), 2);
+    assert_eq!(stored(&exchange, sell.order.id).remaining_quantity, 100);
+    let book = exchange.book(&acme().id).unwrap();
+    assert_eq!(book.len(), 2);
+    assert_eq!(book.order(sell.order.id).unwrap().remaining_quantity, 100);
+    assert_eq!(
+        count(&exchange, "SELECT MAX(sequence) - COUNT(*) FROM events"),
+        0
+    );
+}

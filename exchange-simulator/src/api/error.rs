@@ -92,7 +92,9 @@ impl From<ExchangeError> for ApiError {
             E::InvalidReport(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             E::ReportConflict { .. } => (StatusCode::CONFLICT, "report_conflict"),
             E::Clock(_) => (StatusCode::CONFLICT, "clock_backwards"),
-            E::Book(_) | E::Storage(_) | E::Settlement(_) => return Self::internal(error),
+            E::Book(_) | E::Storage(_) | E::GroupCommit(_) | E::Settlement(_) => {
+                return Self::internal(error);
+            }
         };
         Self::new(status, code, error.to_string())
     }

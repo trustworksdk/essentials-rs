@@ -49,6 +49,7 @@ impl TestApp {
             exchange: ExchangeConfig {
                 identifier_policy: IdentifierPolicy::Strict,
                 command_queue_capacity: 1024,
+                group_commit: Default::default(),
             },
             events: EventsConfig::default(),
             webhooks: webhooks_config(),

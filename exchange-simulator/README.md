@@ -22,6 +22,7 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `server.bind` | `127.0.0.1:8080` | Listen address (`0.0.0.0:8080` in the image) |
 | `exchange.identifier_policy` | `strict` | `strict` checks MIC/ISIN/CUSIP check digits; `permissive` checks lengths only |
 | `exchange.command_queue_capacity` | `10000` | Commands waiting for the exchange thread; when full, requests get `503 overloaded` |
+| `exchange.group_commit.max_commands` / `max_wait_us` | `256` / `0` | Group commit: most orders and cancellations per commit (`1` commits each on its own); how long to wait for more once the queue is empty |
 | `events.simulation_id` | unset | Stamped on every event as `simulationId` |
 | `webhooks.poll_interval_ms` | `250` | How often due deliveries (retries) are looked for; new events are sent at once |
 | `webhooks.batch_size` / `concurrency` | `100` / `16` | Deliveries claimed per round / concurrent requests |
@@ -51,8 +52,14 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
   It is recorded with status `REJECTED` and `rejectReason: "SELF_TRADE"`. Orders for a disabled instrument are recorded
   the same way, with `rejectReason: "INSTRUMENT_DISABLED"`.
 - **Durability:** a successful response means the order, any resting orders it traded with, its executions, its events
-  and their pending webhook deliveries are committed in one SQLite transaction. Books are rebuilt from SQLite on
-  startup.
+  and their pending webhook deliveries are committed to SQLite. Books are rebuilt from SQLite on startup.
+- **Group commit:** orders and cancellations already waiting in the queue are committed together, up to
+  `exchange.group_commit.max_commands` per commit. Each is still planned and written in queue order and sees the
+  ones before it, so outcomes, sequences and the event log are exactly as if each were committed alone. Every caller
+  is answered only after the shared commit. If one command's write fails, only that command fails. If the commit
+  itself fails, none of the group is stored, every caller in it gets `500`, and the books are reloaded from SQLite.
+  Any other request (a book snapshot, a registration) ends the group and runs after it. Under light load groups are
+  small (often one order), so latency is unchanged; under heavy load one fsync serves many orders.
 - **Sequence:** every accepted or rejected order gets the next exchange-wide `sequence`, which is its time priority.
   Malformed requests get no sequence.
 
@@ -246,7 +253,9 @@ Lists the subscriptions.
 
 Prometheus text format, with these series:
 - **Commands:** `exchange_commands_total{command,outcome}` and `exchange_command_duration_seconds{command}`.
-- **Hot path, split into stages:** `exchange_match_duration_seconds` and `exchange_commit_duration_seconds`.
+- **Hot path, split into stages:** `exchange_match_duration_seconds` and `exchange_commit_duration_seconds` (per
+  commit group, the `COMMIT`; with group commit off, each command's whole transaction), and the group sizes in
+  `exchange_group_commit_commands`.
 - **Queue:** `exchange_command_queue_depth` and `exchange_command_queue_rejections_total`.
 - **Latency breakdown per command:** `exchange_command_queue_wait_seconds{command}` (enqueued to started on the
   exchange thread) and `exchange_command_ack_seconds{command}` (enqueued to answer received by the caller: queue

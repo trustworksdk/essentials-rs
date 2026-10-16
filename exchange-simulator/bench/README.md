@@ -8,6 +8,7 @@ reported separately, as the plan requires:
 | in-memory matching | `OrderBook::submit` in a loop | pure price-time matching; no sequencing service, no I/O |
 | durable | `Exchange::submit` on a SQLite file, one order after the other | plan, commit (orders, executions, events, outbox), apply, for each order: the single-writer ceiling |
 | durable + outbox | the same, plus one subscription to all six event types | the extra cost of writing a delivery row per event |
+| durable, groups of N | the same two, committed in groups of `--group-commit` orders (default 256) | the commit ceiling with group commit; an order's latency is its group's |
 | HTTP end to end | the service on a TCP port, N concurrent `reqwest` clients posting `POST /api/orders` | acknowledged-after-commit throughput and client-observed latency |
 | HTTP + webhook | the same, plus a local consumer subscribed to `TradeExecuted` | the cost of delivery running alongside, and when the last trade event was delivered |
 | `open-loop` (run on its own, not part of `all`) | the service on a TCP port, orders sent on a fixed schedule at each target rate | achieved rate, latency at that rate, 503s, and where the time went inside the service |
@@ -138,3 +139,42 @@ Same devcontainer as above, 10 s per rate. Full reports:
   lag of up to 158 ms, so the whole process stalled. A rerun gave p99 4.4 ms. The table uses the rerun.
 - **The disk is slower than on 2026-10-14** (fsync 300–500 µs today, 200 µs then). Compare rows only within one
   report.
+
+## Group commit (step 4.2)
+
+The exchange thread commits the orders and cancellations already queued together, up to
+`exchange.group_commit.max_commands` (default 256), and answers each caller after that commit. `--group-commit N` sets
+it for the service rows and the grouped durable rows; `--group-commit 1` gives the earlier one-commit-per-order
+behaviour. The breakdown now reports the commits separately: the time of each `COMMIT`, and how many groups ran and
+their average size.
+
+### Results, 2026-10-16
+
+Same devcontainer, the same day as the open-loop results above, so the fsync cost differs from run to run (208–266 µs on
+the VM disk). Full reports: `results/2026-10-16-group-commit-*.md`.
+
+| | VM disk, group commit off | VM disk, group commit on | tmpfs, group commit on |
+|---|---|---|---|
+| `Exchange` alone, no subscribers | 2,200–2,800/s | **20,700/s** (groups of 256) | 24,700/s (21,100/s alone) |
+| `Exchange` alone + outbox | 2,100–3,700/s | **13,800/s** (groups of 256) | 16,400/s (14,700/s alone) |
+| HTTP, 32 clients | 4,850/s (2026-10-14) | **13,060/s**, p99 6.8 ms, groups of 29 | 17,340/s, p99 3.4 ms |
+| HTTP + `TradeExecuted` consumer | 3,740/s (2026-10-14) | **9,650/s**, p99 7.5 ms; every webhook delivered | 12,270/s |
+| Open loop, highest rate held | 2,000/s at p99 400 ms; 4,000/s saturated at 3,725/s | **12,000/s** at p99 11 ms; 16,000/s saturated at 15,600/s | 15,000/s at p99 17 ms; saturated at about 19,000/s |
+
+**Group sizes follow the load.** At 2,000/s on the VM disk groups held 3.5 orders on average; at 8,000/s, 10; at
+12,000/s, 19; at saturation, 92 (and 253 on tmpfs, close to the cap). At low load an order mostly commits alone, so
+its latency is as before (p50 about 1.9 ms over HTTP). Nothing waits for a group to fill (`max_wait_us: 0`).
+
+**What this says:**
+- **The fsync is no longer the ceiling.** With group commit, the VM disk sustains 12,000 orders/s in the open loop
+  (target 1k–10k), where it saturated below 4,000/s before. The `Exchange` alone does 4–9× more orders per second.
+- **The next limit is the exchange thread's own work.** At saturation on tmpfs it spends about 46 µs per order,
+  while the commit adds about 4 µs. Matching takes about 0.5 µs (2 M orders/s), so the 46 µs is mostly the SQLite
+  statements: the order, its executions, about 3.3 events with their JSON payloads, and outbox rows. Sharding matching
+  (4.5) would not help with that. Fewer or cheaper statements per order would.
+- **The load generator shares the process,** so near saturation the HTTP stack and the generator compete with the
+  exchange thread for CPU. 4.6 separates them.
+- **Stalls of the whole process** still occur on the VM disk: one 2,000/s run had a generator lag of up to 194 ms, and
+  its rerun had p99 5.4 ms. The first durable row of the `all` run was slower than the row with an outbox after it, a
+  cold disk again. Each report notes this.
+
