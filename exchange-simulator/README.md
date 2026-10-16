@@ -38,6 +38,7 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `test_control.enabled` | `false` | Mounts `/test/...`. Never enable outside test deployments |
 | `database.path` | `data/exchange.db` | SQLite file (WAL mode) |
 | `database.busy_timeout_ms` | `5000` | SQLite busy timeout |
+| `database.checkpoint` / `checkpoint_pages` | `background` / `1000` | Where WAL checkpoints run: `background` (a separate connection, from `checkpoint_pages` pages; see Persistence) or `inline` (SQLite's automatic checkpoint inside a commit) |
 | `logging.filter` / `logging.format` | `info` / `pretty` | Used when `RUST_LOG` is unset; `json` for structured logs |
 
 ## Model
@@ -60,6 +61,14 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
   itself fails, none of the group is stored, every caller in it gets `500`, and the books are reloaded from SQLite.
   Any other request (a book snapshot, a registration) ends the group and runs after it. Under light load groups are
   small (often one order), so latency is unchanged; under heavy load one fsync serves many orders.
+- **WAL checkpoints:** SQLite appends commits to a write-ahead log (WAL) and copies them into the database file in
+  checkpoints. By default (`database.checkpoint: background`) the writer never checkpoints inside a commit:
+  - A separate connection runs a `PASSIVE` checkpoint each time the WAL has grown by `checkpoint_pages` pages
+    (default 1000, SQLite's own threshold). It never blocks the writer.
+  - Under load the WAL cannot restart while commits keep arriving. So once it holds four times the threshold, the
+    writer runs one checkpoint itself, when the background has left little to copy, or regardless at eight times.
+  - The WAL therefore stays at about 16 MiB with the defaults. `inline` restores SQLite's automatic checkpoint
+    (4 MiB of WAL, and a checkpoint inside the commit that fills each 1000 pages).
 - **Sequence:** every accepted or rejected order gets the next exchange-wide `sequence`, which is its time priority.
   Malformed requests get no sequence.
 
@@ -256,6 +265,8 @@ Prometheus text format, with these series:
 - **Hot path, split into stages:** `exchange_match_duration_seconds` and `exchange_commit_duration_seconds` (per
   commit group, the `COMMIT`; with group commit off, each command's whole transaction), and the group sizes in
   `exchange_group_commit_commands`.
+- **WAL checkpoints** (with `database.checkpoint: background`): `exchange_wal_checkpoints_total{by,outcome}`,
+  `exchange_wal_checkpoint_duration_seconds{by}` (`by` is `background` or `writer`) and `exchange_wal_frames`.
 - **Queue:** `exchange_command_queue_depth` and `exchange_command_queue_rejections_total`.
 - **Latency breakdown per command:** `exchange_command_queue_wait_seconds{command}` (enqueued to started on the
   exchange thread) and `exchange_command_ack_seconds{command}` (enqueued to answer received by the caller: queue

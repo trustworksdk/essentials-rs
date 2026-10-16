@@ -727,7 +727,7 @@ the order below deliberately puts group commit before sharding.
 |---|---|---|---|
 | 4.1 ✅ | Latency breakdown and an open-loop load generator | M | New histograms for queue wait (enqueue → start) and acknowledgement latency (enqueue → reply). The bench gains a target-rate, open-loop mode that avoids coordinated omission, reporting achieved rate, latency at that rate, and 503 counts. |
 | 4.2 ✅ | Group commit | M–L | The writer drains up to N queued commands (or waits up to T µs) and plans them in order on the books. It commits them in one transaction and replies to each after the commit. If the commit fails, all plans are dropped and every caller gets the error; nothing is applied. Ordering and determinism are unchanged. Expected: several times today's durable throughput. |
-| 4.3 | Background checkpointing | S | Turn off automatic WAL checkpointing on the writer *only together with* a background connection that runs `PRAGMA wal_checkpoint(PASSIVE)` when the WAL passes a size threshold. Without that, the WAL grows without bound and throughput halves (1.2). Target: the roughly 10 % of durable time and the p99 now spent in checkpoint commits. The occasional > 10 ms spikes come from the disk (1.2), and this will not remove them. Measure with `bench checkpoint`. |
+| 4.3 ✅ | Background checkpointing | S | Turn off automatic WAL checkpointing on the writer *only together with* a background connection that runs `PRAGMA wal_checkpoint(PASSIVE)` when the WAL passes a size threshold. Without that, the WAL grows without bound and throughput halves (1.2). Target: the roughly 10 % of durable time and the p99 now spent in checkpoint commits. The occasional > 10 ms spikes come from the disk (1.2), and this will not remove them. Measure with `bench checkpoint`. |
 | 4.4 | Explicit non-durable modes | S | `persistence.mode: durable \| fast \| memory` (D4).<br>• **`fast`**: WAL with `synchronous=NORMAL`. Every commit still reaches the database file, and fsync happens only at checkpoints. All state survives a process or container restart (books, events, outbox, settlement instructions, simulator cursor, virtual clock), so settlement keeps working across restarts. Only a host or node crash, or power loss, can lose the last commits, and the database is never corrupted. (`synchronous=OFF` was rejected: it can corrupt the database on a host crash.)<br>• **`memory`**: an in-memory SQLite database for pure throughput runs. Nothing survives a restart (orders, trades, pending settlements, undelivered webhooks), so settlement works only while the process runs.<br>`/health` and `/metrics` report the mode, and responses carry a header in non-durable modes. The README documents the trade-offs, including that durability in Kubernetes also needs a persistent volume (`emptyDir` loses everything when the pod is rescheduled, even in `durable` mode). |
 | 4.5 | Instrument-sharded matching (only if 4.1 shows matching as a bottleneck) | M | Matching workers per instrument shard in front of the single writer. Today's data says matching is not the limit, so this is a measure-first step. |
 | 4.6 | Containerized benchmark and load report | M | There is no single target machine (D4): deployments are mostly Docker Compose or Kubernetes, and their hardware varies. So the benchmark runs as containers: the service image plus a load-generator container, with explicit CPU and memory limits and a named storage backing (volume or storage class). It ships as a compose profile and as a Kubernetes Job manifest. Each report records its environment: limits, storage, measured fsync latency, and node type where known. It compares `durable`, `fast` and `memory`, with and without outbox and webhooks, across instrument counts. Figures against the 1k–10k target are quoted per environment, never as one universal number. |
@@ -875,6 +875,83 @@ the order below deliberately puts group commit before sharding.
   work per order, mostly SQLite statements (order, executions, about 3.3 events with JSON payloads, outbox rows).
   Matching is about 0.5 µs. Sharding matching would not raise throughput; cheaper writes would. 4.5 stays
   measure-first, and the measurement now argues against it.
+
+**4.3 — background checkpointing ✅ (2026-10-16).**
+- **Delivered:**
+  - **`persistence/checkpoint.rs`:**
+    - The writer registers a WAL hook that only records the WAL size (in a thread-local, since rusqlite's hook is a
+      plain `fn`). Registering it turns off SQLite's automatic checkpoint on the writer.
+    - A `checkpoint` thread with its own connection runs `PRAGMA wal_checkpoint(PASSIVE)` when asked. Requests made
+      during a run coalesce into one more.
+  - **`Store::checkpoint_in_background(busy_timeout, pages)` and `Store::request_checkpoint_if_due()`.** The exchange
+    thread calls the latter after every request or commit group.
+    - It asks for a background checkpoint each time the WAL has grown by `pages`.
+    - At 4× `pages` the writer checkpoints itself, once a background checkpoint on the current WAL has left at most
+      `pages / 4` to copy, or regardless at 8×. A generation counter makes the writer ignore background results from
+      before a WAL restart.
+    - Dropping the store stops the thread after its current checkpoint. The writer closes first, so the checkpointer's
+      connection, the last one, removes the WAL.
+  - **Config:** `database.checkpoint: background | inline` (default `background`) and `database.checkpoint_pages`
+    (default 1000). A database without a file keeps the automatic checkpoint.
+  - **Metrics:** `exchange_wal_checkpoints_total{by,outcome}`, `exchange_wal_checkpoint_duration_seconds{by}` and
+    `exchange_wal_frames`.
+  - **Bench:** `--checkpoint background|inline`. `bench checkpoint` gains the background row, with counts of
+    background and writer checkpoints, their duration and the WAL size.
+  - **Docs:** README (config, model, metrics); a `bench/README.md` section; results in
+    `bench/results/2026-10-16-background-checkpoint-vm-disk.md` and
+    `bench/results/2026-10-16-checkpoint-*-open-loop-vm-disk.md`.
+- **Results (VM disk, fsync about 200 µs):**
+  - **Per-order commits** (`bench checkpoint`, 50k orders, three runs):
+    - Background: p99 0.45–0.51 ms against 1.38–1.51 ms inline, about 3× lower.
+    - p50 rises by 20–25 µs, throughput falls 6–8 %, and p99.9 goes from 2.1–2.2 to 2.7–2.9 ms.
+    - The WAL stays at 16 MiB, against 4 MiB inline.
+  - **The service with group commit (open loop):**
+    - 12,000/s: p99 8.0–9.3 ms against 11.6–14.0 ms inline.
+    - 16,000/s: p50 about 4.1 ms against 6.8–9.5 ms, and p99 17–20 ms against 22–70 ms.
+  - Spikes above 10 ms remain, from the disk, as 1.2 predicted.
+- **Tests:**
+  - **`tests/checkpoint.rs` (4):**
+    - With background checkpoints from 100 pages, 400 orders leave the WAL under 2.5 MiB, checkpoints complete, and
+      a restart sees every order and execution.
+    - With a threshold that is never reached, the WAL grows past 8 MiB, so the writer does not checkpoint by itself.
+    - Inline mode stays under 6 MiB.
+    - Through the service, the dispatcher's requests keep the WAL under 2.5 MiB.
+    - The bounds sit between measured sizes: 0.5–1.2 MB background, 4.2 MB inline, 19 MB with no checkpoint.
+  - **Unit tests (3):**
+    - With the background thread stopped, the writer still bounds the WAL at its cap.
+    - 2000 writes cause at most 100 background checkpoints (917 without the throttle).
+    - The writer's own checkpoint triggers when little is left to copy, never on a result from an earlier WAL, and
+      always at the cap.
+  - All suites pass with background checkpointing on by default. The checkpoint, recovery, reproducibility,
+    Milestone 3, webhook, reset and library suites were repeated five times without failure, and the checkpoint
+    suite 40 more times after the fix below.
+- **Mutation checks**, each made a test fail:
+  - the hook not registered (the writer auto-checkpoints);
+  - requests ignored;
+  - `complete` reported as `partial`;
+  - the dispatcher never requesting;
+  - the service ignoring `background`;
+  - no throttle;
+  - no writer checkpoint;
+  - the writer only at the cap;
+  - no cap;
+  - the generation ignored;
+  - a lenient remainder.
+- **Found and fixed along the way:**
+  - **The WAL rarely restarts by itself under load.** A restart needs a checkpoint to have copied every frame before
+    the next commit. Under constant commits a background checkpoint loses that race, and the first version's
+    checkpoint test failed once in 55 runs with a 3.3 MB WAL. Hence the writer's own checkpoint.
+  - **Asking after every commit past the threshold** kept the background thread checkpointing nonstop: 36,500
+    checkpoints per 50k orders, with p50 up about 40 %. Asking once per threshold of growth brought that down to
+    about 660.
+- **Decisions:**
+  - **`background` is the default,** since the service runs with group commit, where it clearly wins. Per-order
+    commits trade 6–8 % throughput and p99.9 for a 3× lower p99; `inline` remains for that case.
+  - **The writer's own checkpoint is the price of a bounded WAL.** It runs about once per 4000 pages, and since the
+    background has already copied most frames, it copies little. Its fsync of the database file is what remains in
+    p99.9. A `RESTART` or `TRUNCATE` checkpoint from the background connection would block the writer anyway.
+  - **WAL size:** about 16 MiB with the defaults, against 4 MiB inline. The plan's concern was unbounded growth
+    (1.2: 2.2 GiB per 50k orders with checkpoints off). It is bounded, and the cap is twice that size.
 
 ## Suggested order
 

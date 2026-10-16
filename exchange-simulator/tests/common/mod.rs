@@ -54,6 +54,8 @@ impl TestApp {
             events: EventsConfig::default(),
             webhooks: webhooks_config(),
             database: DatabaseConfig {
+                checkpoint: Default::default(),
+                checkpoint_pages: 1000,
                 path: dir.join("exchange.db").to_string_lossy().into_owned(),
                 busy_timeout_ms: 5000,
             },

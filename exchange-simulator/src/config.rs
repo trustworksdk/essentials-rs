@@ -229,6 +229,26 @@ impl WebhooksConfig {
 pub struct DatabaseConfig {
     pub path: String,
     pub busy_timeout_ms: u64,
+    /// Where WAL checkpoints run.
+    #[serde(default)]
+    pub checkpoint: CheckpointMode,
+    /// With background checkpoints: the WAL size, in pages, from which one is requested.
+    #[serde(default = "default_checkpoint_pages")]
+    pub checkpoint_pages: u32,
+}
+
+fn default_checkpoint_pages() -> u32 {
+    1000
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckpointMode {
+    /// A background connection checkpoints once the WAL reaches `checkpoint_pages`; commits never wait for it.
+    #[default]
+    Background,
+    /// SQLite's automatic checkpoint, inside the commit that crosses 1000 pages.
+    Inline,
 }
 
 #[derive(Clone, Debug, Deserialize)]

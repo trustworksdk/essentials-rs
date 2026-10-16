@@ -61,6 +61,10 @@ test_control:
 database:
   path: "data/exchange.db"
   busy_timeout_ms: 5000
+  # "background": a separate connection checkpoints the WAL once it holds checkpoint_pages pages, so no commit waits
+  # for a checkpoint. "inline": SQLite's automatic checkpoint, run inside the commit that crosses 1000 pages.
+  checkpoint: "background"
+  checkpoint_pages: 1000
 logging:
   # Used when RUST_LOG is unset.
   filter: "info"

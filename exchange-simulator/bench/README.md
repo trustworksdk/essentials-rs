@@ -12,7 +12,7 @@ reported separately, as the plan requires:
 | HTTP end to end | the service on a TCP port, N concurrent `reqwest` clients posting `POST /api/orders` | acknowledged-after-commit throughput and client-observed latency |
 | HTTP + webhook | the same, plus a local consumer subscribed to `TradeExecuted` | the cost of delivery running alongside, and when the last trade event was delivered |
 | `open-loop` (run on its own, not part of `all`) | the service on a TCP port, orders sent on a fixed schedule at each target rate | achieved rate, latency at that rate, 503s, and where the time went inside the service |
-| `checkpoint` (run on its own, not part of `all`) | durable with an observed auto-checkpoint, durable with auto-checkpoint off, raw fsync | which commits are slow, and why (item 1.2) |
+| `checkpoint` (run on its own, not part of `all`) | durable with an observed auto-checkpoint, with background checkpoints (4.3), with auto-checkpoint off, and raw fsync | which commits are slow, and why (item 1.2); what background checkpointing changes (4.3) |
 
 ```sh
 # from the workspace root; always --release
@@ -177,4 +177,49 @@ its latency is as before (p50 about 1.9 ms over HTTP). Nothing waits for a group
 - **Stalls of the whole process** still occur on the VM disk: one 2,000/s run had a generator lag of up to 194 ms, and
   its rerun had p99 5.4 ms. The first durable row of the `all` run was slower than the row with an outbox after it, a
   cold disk again. Each report notes this.
+
+## Background checkpointing (step 4.3)
+
+`--checkpoint background|inline` picks where WAL checkpoints run for the durable and service rows (default
+`background`, as in the service). `bench checkpoint` runs both, plus checkpointing off, on one commit per order. Each
+report's header names the mode.
+
+### Results, 2026-10-16
+
+Same devcontainer, VM disk (fsync about 200 µs). Full reports: `results/2026-10-16-background-checkpoint-vm-disk.md`
+and `results/2026-10-16-checkpoint-{inline,background}-open-loop-vm-disk.md`.
+
+**One commit per order, 50k orders (`bench checkpoint`).** Three runs with the final code; the first report's inline
+row ran on a cold disk and is not counted:
+
+| | Orders/s | p50 | p99 | p99.9 | Checkpoints | WAL |
+|---|---:|---:|---:|---:|---|---:|
+| inline (SQLite's automatic checkpoint) | 5,180–5,390 | 142–146 µs | 1.38–1.51 ms | 2.1–2.2 ms | 664, each inside a commit (p50 1.7 ms) | 4 MiB |
+| background | 4,750–5,060 | 163–173 µs | **0.45–0.51 ms** | 2.7–2.9 ms | 659 background (about 0.6 ms each) + 164 by the writer | 16 MiB |
+
+**The service with group commit (open loop):**
+
+| Target | inline | background |
+|---:|---|---|
+| 8,000/s | p50 2.4 ms · p99 76 ms (one stall) | p50 2.0 ms · p99 9.1 ms |
+| 12,000/s | p50 3.0 ms · p99 14.0 ms | p50 2.5 ms · **p99 9.3 ms** |
+| 16,000/s | p50 9.5 ms · p99 70 ms | **p50 4.1 ms · p99 17 ms** |
+
+Two earlier pairs of runs at 12,000 and 16,000/s gave the same picture: p99 11.6–13.1 against 8.0–8.6 ms at 12,000/s,
+and p50 6.8–7.0 against 4.1 ms at 16,000/s.
+
+**What this says:**
+- **The plan's target is met for p99:** checkpoints no longer sit in commits, and the p99 of a per-order commit
+  drops about 3×. With group commit, the service's p99 at 12,000/s drops by about a third, and at 16,000/s both p50 and
+  p99 fall by half or more.
+- **Per-order commits lose 6–8 % throughput and some p99.9.** The background connection's checkpoints sync the
+  database file on the same disk as the writer's WAL syncs, so the two compete. The writer still runs one checkpoint
+  every four thousand pages to let the WAL restart; it copies little but still syncs the database file, and those are
+  the p99.9. Under group commit, the service's normal mode, the trade is clearly worth it.
+- **Spikes above 10 ms remain,** as expected (item 1.2): they come from the disk, not from checkpoints.
+- **Why the writer still checkpoints:** a WAL restarts from its beginning only after a checkpoint has copied every
+  frame and before the next commit adds more. Under constant commits a background checkpoint never wins that race.
+  The first implementation asked for a checkpoint after every commit past the threshold. It ran 36,500 checkpoints
+  per 50k orders, raised p50 by about 40 %, and still relied on the writer. Asking once per threshold of growth fixed
+  that.
 

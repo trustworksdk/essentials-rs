@@ -1,5 +1,6 @@
 //! SQLite access: connection setup, schema migrations and the [`Store`] repository.
 
+mod checkpoint;
 mod store;
 
 pub use store::{

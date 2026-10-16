@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use exchange_simulator::app::App;
 use exchange_simulator::config::{
-    ClockConfig, ClockMode, Config, DatabaseConfig, EventsConfig, ExchangeConfig,
+    CheckpointMode, ClockConfig, ClockMode, Config, DatabaseConfig, EventsConfig, ExchangeConfig,
     GroupCommitConfig, IdsConfig, LogFormat, LoggingConfig, ServerConfig, SettlementConfig,
     TestControlConfig, WebhooksConfig,
 };
@@ -29,7 +29,7 @@ use exchange_simulator::webhooks::NewSubscription;
 const USAGE: &str = "usage: bench [all|matching|durable|http|checkpoint|open-loop] [--quick] [--seed N] \
                      [--matching-orders N] [--durable-orders N] [--http-orders N] [--concurrency N] [--rates R,R,..] \
                      [--seconds S] [--queue-capacity N] [--max-in-flight N] [--group-commit N] [--group-wait-us N] \
-                     [--dir DIR] [--out FILE]
+                     [--checkpoint background|inline] [--dir DIR] [--out FILE]
 
 --dir: where the SQLite files go (default: the system temp dir). Check the reported fsync latency: on tmpfs it is
        ~0 and the \"durable\" numbers measure SQLite in RAM.
@@ -38,7 +38,9 @@ open-loop (not part of all): for each target rate in --rates (orders/s, default 
        latency from the order's scheduled send time. --queue-capacity is the service's command queue bound (default
        10000), --max-in-flight the client's limit on open requests (default 16384).
 --group-commit: most orders per commit in the service, and the group size of the grouped durable row (default 256;
-       1 commits each order on its own). --group-wait-us: how long the service waits for more orders (default 0).";
+       1 commits each order on its own). --group-wait-us: how long the service waits for more orders (default 0).
+--checkpoint: where WAL checkpoints run for the durable and service rows (default background, as in the service;
+       inline is SQLite's automatic checkpoint inside the commit). The checkpoint mode compares both.";
 
 struct Options {
     mode: String,
@@ -52,6 +54,7 @@ struct Options {
     queue_capacity: usize,
     max_in_flight: usize,
     group_commit: GroupCommitConfig,
+    checkpoint: CheckpointMode,
     dir: std::path::PathBuf,
     out: Option<String>,
 }
@@ -70,6 +73,7 @@ impl Options {
             queue_capacity: 10_000,
             max_in_flight: 16_384,
             group_commit: GroupCommitConfig::default(),
+            checkpoint: CheckpointMode::Background,
             dir: std::env::temp_dir(),
             out: None,
         };
@@ -113,6 +117,17 @@ impl Options {
                 }
                 "--queue-capacity" => {
                     options.queue_capacity = number(value("--queue-capacity")?)?.max(1)
+                }
+                "--checkpoint" => {
+                    options.checkpoint = match value("--checkpoint")?.as_str() {
+                        "background" => CheckpointMode::Background,
+                        "inline" => CheckpointMode::Inline,
+                        other => {
+                            return Err(format!(
+                                "--checkpoint: {other} is not background or inline"
+                            ));
+                        }
+                    }
                 }
                 "--group-commit" => {
                     options.group_commit.max_commands = number(value("--group-commit")?)?.max(1)
@@ -306,7 +321,7 @@ fn bench_matching(options: &Options, report: &mut Report) {
 /// its caller would be answered.
 fn bench_durable(options: &Options, report: &mut Report, subscribed: bool, group: usize) {
     let dir = temp_dir(&options.dir, "durable");
-    let mut exchange = durable_exchange(&dir, subscribed);
+    let mut exchange = durable_exchange(&dir, subscribed, options.checkpoint);
     let commands = workload(options.seed, options.durable_orders);
     let mut latencies = Latencies::default();
     let started = Instant::now();
@@ -321,12 +336,14 @@ fn bench_durable(options: &Options, report: &mut Report, subscribed: bool, group
                 n += 1;
             }
             exchange.commit_group().expect("commit");
+            exchange.store().request_checkpoint_if_due();
             latencies.0.extend(std::iter::repeat_n(t.elapsed(), n));
         }
     } else {
         for command in commands {
             let t = Instant::now();
             exchange.submit(command).expect("submit");
+            exchange.store().request_checkpoint_if_due();
             latencies.0.push(t.elapsed());
         }
     }
@@ -364,11 +381,23 @@ fn bench_durable(options: &Options, report: &mut Report, subscribed: bool, group
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// An `Exchange` on a fresh SQLite file in `dir`, with ACME and the participants registered.
-fn durable_exchange(dir: &std::path::Path, subscribed: bool) -> Exchange {
+/// An `Exchange` on a fresh SQLite file in `dir`, with ACME and the participants registered. With background
+/// checkpoints the caller asks for them after each commit (`Store::request_checkpoint_if_due`), as the exchange thread
+/// does.
+fn durable_exchange(
+    dir: &std::path::Path,
+    subscribed: bool,
+    checkpoint: CheckpointMode,
+) -> Exchange {
     let path = dir.join("exchange.db");
     let conn = persistence::open(&path, Duration::from_secs(5)).unwrap();
-    let mut exchange = Exchange::recover(Store::new(conn), ExchangeOptions::default()).unwrap();
+    let mut store = Store::new(conn);
+    if checkpoint == CheckpointMode::Background {
+        store
+            .checkpoint_in_background(Duration::from_secs(5), 1000)
+            .unwrap();
+    }
+    let mut exchange = Exchange::recover(store, ExchangeOptions::default()).unwrap();
     exchange.register_instrument(acme()).unwrap();
     for id in participant_ids() {
         exchange
@@ -411,20 +440,34 @@ fn observed_autocheckpoint(
     Ok(())
 }
 
-/// Item 1.2: attributes durable commit latency spikes. Runs the durable workload (no subscribers) with SQLite's
-/// auto-checkpoint replaced by an identical, observed one, then with auto-checkpointing off, and measures raw fsync
+/// Items 1.2 and 4.3: attributes durable commit latency spikes and measures background checkpointing. Runs the
+/// durable workload (no subscribers, one commit per order) with SQLite's auto-checkpoint replaced by an identical,
+/// observed one, with checkpoints in the background (4.3), and with auto-checkpointing off, then measures raw fsync
 /// latency in the same directory.
 fn bench_checkpoint(options: &Options, report: &mut Report) {
+    #[derive(PartialEq)]
+    enum Variant {
+        Observed,
+        Background,
+        Off,
+    }
     let spikes = |latencies: &[Duration]| latencies.iter().filter(|l| **l > SPIKE).count();
-    for observed in [true, false] {
+    for variant in [Variant::Observed, Variant::Background, Variant::Off] {
+        let observed = variant == Variant::Observed;
         let dir = temp_dir(&options.dir, "checkpoint");
-        let mut exchange = durable_exchange(&dir, false);
-        let conn = exchange.store().connection();
-        if observed {
-            conn.wal_hook(Some(observed_autocheckpoint));
+        let mode = if variant == Variant::Background {
+            CheckpointMode::Background
         } else {
-            conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+            CheckpointMode::Inline
+        };
+        let mut exchange = durable_exchange(&dir, false, mode);
+        let conn = exchange.store().connection();
+        match variant {
+            Variant::Observed => conn.wal_hook(Some(observed_autocheckpoint)),
+            Variant::Off => conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap(),
+            Variant::Background => {}
         }
+        let before = Scrape(exchange_simulator::metrics::install().render());
         CHECKPOINTS.store(0, Ordering::Relaxed);
         let mut latencies = Latencies::default();
         let mut in_checkpoint = Vec::new();
@@ -434,6 +477,7 @@ fn bench_checkpoint(options: &Options, report: &mut Report) {
             let before = CHECKPOINTS.load(Ordering::Relaxed);
             let t = Instant::now();
             exchange.submit(command).expect("submit");
+            exchange.store().request_checkpoint_if_due();
             let latency = t.elapsed();
             latencies.0.push(latency);
             if CHECKPOINTS.load(Ordering::Relaxed) > before {
@@ -445,7 +489,33 @@ fn bench_checkpoint(options: &Options, report: &mut Report) {
         let elapsed = started.elapsed();
         let wal_mib =
             std::fs::metadata(dir.join("exchange.db-wal")).map_or(0, |m| m.len()) / (1 << 20);
-        let notes = if observed {
+        let after = Scrape(exchange_simulator::metrics::install().render());
+        let notes = if variant == Variant::Background {
+            let checkpoints = |by: &str| {
+                ["complete", "partial", "error"]
+                    .iter()
+                    .map(|outcome| {
+                        let series = format!(
+                            "exchange_wal_checkpoints_total{{by=\"{by}\",outcome=\"{outcome}\"}}"
+                        );
+                        after.value(&series) - before.value(&series)
+                    })
+                    .sum::<f64>()
+            };
+            format!(
+                "{:.0} background checkpoints ({}), {:.0} by the writer; {} spikes > {} ms; WAL {wal_mib} MiB",
+                checkpoints("background"),
+                histogram_delta(
+                    &before,
+                    &after,
+                    "exchange_wal_checkpoint_duration_seconds",
+                    r#"by="background""#
+                ),
+                checkpoints("writer"),
+                spikes(&latencies.0),
+                SPIKE.as_millis()
+            )
+        } else if observed {
             let mut checkpointed = Latencies(in_checkpoint.clone());
             format!(
                 "{} checkpoints; commits running one: {} spikes > {} ms, {}; other commits: {} spikes, max {}; WAL {wal_mib} MiB",
@@ -467,10 +537,10 @@ fn bench_checkpoint(options: &Options, report: &mut Report) {
                 SPIKE.as_millis()
             )
         };
-        let scenario = if observed {
-            "durable, auto-checkpoint every 1000 pages (default, observed)"
-        } else {
-            "durable, auto-checkpoint off"
+        let scenario = match variant {
+            Variant::Observed => "durable, auto-checkpoint every 1000 pages (inline, observed)",
+            Variant::Background => "durable, background checkpoint from 1000 pages (4.3)",
+            Variant::Off => "durable, auto-checkpoint off",
         };
         report.row(
             scenario,
@@ -541,6 +611,8 @@ impl Service {
                 max_backoff_ms: 300_000,
             },
             database: DatabaseConfig {
+                checkpoint: options.checkpoint,
+                checkpoint_pages: 1000,
                 path: dir.join("exchange.db").to_string_lossy().into_owned(),
                 busy_timeout_ms: 5000,
             },
@@ -1033,7 +1105,7 @@ async fn main() {
     let text = format!(
         "# exchange-simulator benchmark\n\n- Date: {}\n- Environment: {}\n- Build: {}\n- Seed: {}; workload: 80 % limit \
          orders within ±50 ticks of mid, 20 % market, quantities 1–100, {PARTICIPANTS} participants, one instrument\n- \
-         SQLite: {}, one writer thread\n- Database directory: `{}`; 4 KiB write + fsync there: {}\n\n{}\n",
+         SQLite: {}, one writer thread, checkpoints {}\n- Database directory: `{}`; 4 KiB write + fsync there: {}\n\n{}\n",
         Utc::now().format("%Y-%m-%d %H:%M UTC"),
         environment(),
         if cfg!(debug_assertions) {
@@ -1043,6 +1115,10 @@ async fn main() {
         },
         options.seed,
         sqlite_settings(&options.dir),
+        match options.checkpoint {
+            CheckpointMode::Background => "in the background from 1000 pages",
+            CheckpointMode::Inline => "inline (SQLite's automatic checkpoint)",
+        },
         options.dir.display(),
         micros(fsync_latency(&options.dir)),
         report.0.join("\n")

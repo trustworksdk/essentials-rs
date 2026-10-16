@@ -14,6 +14,9 @@ use crate::webhooks::{DeliveryJob, DeliveryOutcome, DeliveryResult, FaultPolicy,
 /// [`Store::commit`] in one transaction.
 pub struct Store {
     conn: Connection,
+    /// Set when WAL checkpoints run in the background (see [`Store::checkpoint_in_background`]). Declared after
+    /// `conn`, so the writer closes first and the checkpointer's connection, the last one, removes the WAL.
+    checkpointer: Option<super::checkpoint::Checkpointer>,
 }
 
 /// Optional equality filters for listing instruments; unset fields match everything.
@@ -83,7 +86,41 @@ const ORDER_COLUMNS: &str = "id, client_order_id, instrument_id, participant_id,
 
 impl Store {
     pub fn new(conn: Connection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            checkpointer: None,
+        }
+    }
+
+    /// Moves WAL checkpoints off the writer. SQLite's automatic checkpoint, which runs inside the commit that crosses
+    /// 1000 pages, is turned off; instead, once the WAL holds `pages` pages, [`Store::request_checkpoint_if_due`]
+    /// asks a background connection to checkpoint (`PASSIVE`, which never blocks the writer). A database without a
+    /// file (in memory) keeps the automatic checkpoint.
+    pub fn checkpoint_in_background(
+        &mut self,
+        busy_timeout: std::time::Duration,
+        pages: u32,
+    ) -> rusqlite::Result<()> {
+        let Some(path) = self.conn.path().filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        let path = std::path::PathBuf::from(path);
+        self.checkpointer = Some(super::checkpoint::Checkpointer::start(
+            &self.conn,
+            &path,
+            busy_timeout,
+            pages,
+        )?);
+        Ok(())
+    }
+
+    /// With background checkpoints, asks for one each time the WAL has grown by the threshold. Once the WAL holds four
+    /// times the threshold, the writer checkpoints itself, which bounds the WAL (see `persistence/checkpoint.rs`). Call it on the writer's thread after writing, outside a
+    /// transaction; the exchange thread does so after every command or commit group.
+    pub fn request_checkpoint_if_due(&self) {
+        if let Some(checkpointer) = &self.checkpointer {
+            checkpointer.after_write(&self.conn);
+        }
     }
 
     pub fn connection(&self) -> &Connection {
@@ -1126,4 +1163,77 @@ fn order_record(row: &Row<'_>) -> rusqlite::Result<OrderRecord> {
         created_at: parsed(row, 11)?,
         updated_at: parsed(row, 12)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_writer_checkpoints_at_the_cap_when_background_checkpoints_stop() {
+        let dir = std::env::temp_dir().join(format!("exchange-wal-{}", uuid::Uuid::now_v7()));
+        let path = dir.join("exchange.db");
+        let wal_bytes = || std::fs::metadata(dir.join("exchange.db-wal")).map_or(0, |m| m.len());
+        for fallback in [true, false] {
+            let _ = std::fs::remove_dir_all(&dir);
+            let conn = super::super::open(&path, std::time::Duration::from_secs(5)).unwrap();
+            let mut store = Store::new(conn);
+            store
+                .checkpoint_in_background(std::time::Duration::from_secs(5), 100)
+                .unwrap();
+            store.checkpointer.as_mut().unwrap().stop_for_test();
+            store
+                .conn
+                .execute_batch("CREATE TABLE filler (data BLOB)")
+                .unwrap();
+            for _ in 0..2000 {
+                store
+                    .conn
+                    .execute("INSERT INTO filler VALUES (zeroblob(4000))", [])
+                    .unwrap();
+                if fallback {
+                    store.request_checkpoint_if_due();
+                }
+            }
+            let wal = wal_bytes();
+            if fallback {
+                // With no background checkpoint to finish the job cheaply, the writer checkpoints at the cap:
+                // 8 x 100 pages of 4 KiB, plus the commit that crossed it.
+                assert!(wal < 4 << 20, "the writer bounded the WAL: {wal} bytes");
+            } else {
+                assert!(wal > 6 << 20, "without it the WAL grows: {wal} bytes");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn background_checkpoints_are_asked_for_once_per_threshold_of_growth() {
+        let dir = std::env::temp_dir().join(format!("exchange-wal-{}", uuid::Uuid::now_v7()));
+        let conn =
+            super::super::open(dir.join("exchange.db"), std::time::Duration::from_secs(5)).unwrap();
+        let mut store = Store::new(conn);
+        store
+            .checkpoint_in_background(std::time::Duration::from_secs(5), 100)
+            .unwrap();
+        store
+            .conn
+            .execute_batch("CREATE TABLE filler (data BLOB)")
+            .unwrap();
+        // About two pages per insert: some 4000 frames in all, so about 40 requests of one per 100 pages. Asking after
+        // every write past the threshold instead would checkpoint after most of the 2000 writes.
+        for _ in 0..2000 {
+            store
+                .conn
+                .execute("INSERT INTO filler VALUES (zeroblob(4000))", [])
+                .unwrap();
+            store.request_checkpoint_if_due();
+        }
+        let checkpointer = store.checkpointer.as_mut().unwrap();
+        checkpointer.stop_for_test();
+        let runs = checkpointer.runs();
+        assert!((1..=100).contains(&runs), "{runs} background checkpoints");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

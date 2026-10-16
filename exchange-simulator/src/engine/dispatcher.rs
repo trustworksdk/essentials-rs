@@ -314,6 +314,7 @@ fn run(mut exchange: Exchange, mut rx: mpsc::Receiver<Queued>, grouping: GroupCo
             let outcome = handle(&mut exchange, queued.request);
             finish(command, started, outcome);
         }
+        exchange.store().request_checkpoint_if_due();
     }
     tracing::info!("exchange thread stopped");
 }

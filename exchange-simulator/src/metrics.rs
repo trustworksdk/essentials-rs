@@ -19,6 +19,13 @@ pub const MATCH_DURATION: &str = "exchange_match_duration_seconds";
 /// Time spent making orders and cancellations durable: per commit group, the `COMMIT`; with group commit off, the
 /// whole transaction of one command.
 pub const COMMIT_DURATION: &str = "exchange_commit_duration_seconds";
+/// WAL checkpoints with background checkpointing. Labels: `by` (`background`, or `writer` when the background
+/// checkpoints fell behind) and `outcome` (`complete`, `partial` when frames remained, `error`).
+pub const CHECKPOINTS: &str = "exchange_wal_checkpoints_total";
+/// Duration of one WAL checkpoint with background checkpointing. Label: `by`.
+pub const CHECKPOINT_DURATION: &str = "exchange_wal_checkpoint_duration_seconds";
+/// Frames (pages) in the WAL after the writer's last commit, with background checkpoints.
+pub const WAL_FRAMES: &str = "exchange_wal_frames";
 /// Commands (orders and cancellations) per commit group.
 pub const GROUP_SIZE: &str = "exchange_group_commit_commands";
 /// Commands waiting for the exchange thread.
@@ -99,6 +106,16 @@ fn describe() {
         "Time to make orders and cancellations durable, per commit group"
     );
     describe_histogram!(GROUP_SIZE, "Orders and cancellations per commit group");
+    describe_counter!(CHECKPOINTS, "WAL checkpoints by who ran them and outcome");
+    describe_histogram!(
+        CHECKPOINT_DURATION,
+        Unit::Seconds,
+        "Duration of one WAL checkpoint"
+    );
+    describe_gauge!(
+        WAL_FRAMES,
+        "Frames in the WAL after the writer's last commit"
+    );
     describe_gauge!(QUEUE_DEPTH, "Commands waiting for the exchange thread");
     describe_counter!(
         QUEUE_REJECTIONS,

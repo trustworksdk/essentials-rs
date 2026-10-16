@@ -11,7 +11,7 @@ use tokio::sync::{Notify, watch};
 
 use crate::api::{self, AppState};
 use crate::clock::VirtualClock;
-use crate::config::{ClockMode, Config, SettlementMode};
+use crate::config::{CheckpointMode, ClockMode, Config, SettlementMode};
 use crate::engine::{Dispatcher, Exchange, ExchangeOptions, SystemClock};
 use crate::persistence::{self, Store};
 use crate::webhooks::DeliveryWorker;
@@ -33,8 +33,14 @@ impl App {
         let writer = persistence::open(path, busy_timeout)
             .with_context(|| format!("opening database {path}"))?;
         let delivery_signal = Arc::new(Notify::new());
+        let mut store = Store::new(writer);
+        if config.database.checkpoint == CheckpointMode::Background {
+            store
+                .checkpoint_in_background(busy_timeout, config.database.checkpoint_pages)
+                .context("starting background checkpoints")?;
+        }
         let exchange = Exchange::recover(
-            Store::new(writer),
+            store,
             ExchangeOptions {
                 identifier_policy: config.exchange.identifier_policy,
                 ids: config.ids.scheme(),
