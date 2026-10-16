@@ -125,6 +125,8 @@ fn sandbox_config(scenario: &Scenario, base: &Config, dir: &std::path::Path) -> 
         seed: scenario.seed,
     };
     config.test_control.enabled = true;
+    // A scenario declares its own webhooks; the service's real consumers must never receive sandbox events.
+    config.webhooks.subscriptions.clear();
     config.events.simulation_id = Some(scenario.name.clone());
     let s = &mut config.settlement;
     s.seed = scenario.seed;
@@ -747,4 +749,38 @@ fn check_response(
         failures.extend(mismatches(expected, &body));
     }
     failures
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sandbox_never_inherits_the_services_webhook_subscriptions() {
+        let mut base: Config = config::Config::builder()
+            .add_source(config::File::from_str(
+                include_str!("../../config/default.yaml"),
+                config::FileFormat::Yaml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        base.webhooks.subscriptions = vec![crate::config::SubscriptionConfig {
+            name: "production-consumer".into(),
+            url: "http://consumer/hook".into(),
+            event_types: vec!["TradeExecuted".into()],
+            secret: None,
+            secret_env: None,
+            secret_file: None,
+            ordered: false,
+            enabled: true,
+            paused: false,
+        }];
+        let scenario: Scenario =
+            serde_saphyr::from_str("name: s\nseed: 1\nstart: 2030-01-07T09:00:00Z\nsteps: []\n")
+                .unwrap();
+        let sandbox = sandbox_config(&scenario, &base, std::path::Path::new("/tmp/x"));
+        assert!(sandbox.webhooks.subscriptions.is_empty());
+    }
 }

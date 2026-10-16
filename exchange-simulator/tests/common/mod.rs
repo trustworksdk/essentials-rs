@@ -25,6 +25,7 @@ pub struct TestApp {
 /// Fast webhook timings for tests.
 pub fn webhooks_config() -> WebhooksConfig {
     WebhooksConfig {
+        subscriptions: Vec::new(),
         poll_interval_ms: 20,
         batch_size: 50,
         concurrency: 8,
@@ -42,7 +43,20 @@ impl TestApp {
 
     pub async fn start_with(adjust: impl FnOnce(&mut Config)) -> Self {
         let dir = std::env::temp_dir().join(format!("exchange-sim-it-{}", Uuid::now_v7()));
-        let mut config = Config {
+        let mut config = Self::config(&dir);
+        adjust(&mut config);
+        let mut test = Self {
+            app: None,
+            dir,
+            config,
+        };
+        test.restart().await;
+        test
+    }
+
+    /// The test configuration with its database in `dir`.
+    pub fn config(dir: &std::path::Path) -> Config {
+        Config {
             server: ServerConfig {
                 bind: "127.0.0.1:0".into(),
             },
@@ -73,15 +87,7 @@ impl TestApp {
                 filter: "warn".into(),
                 format: LogFormat::Pretty,
             },
-        };
-        adjust(&mut config);
-        let mut test = Self {
-            app: None,
-            dir,
-            config,
-        };
-        test.restart().await;
-        test
+        }
     }
 
     /// Stops the service (draining the exchange thread) and starts a new one on the same database.

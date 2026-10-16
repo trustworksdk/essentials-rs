@@ -17,7 +17,10 @@ use crate::persistence::{Outbox, SettlementWrite, Store};
 use crate::settlement::{
     ExternalReport, NewReport, SettlementPolicy, SettlementSimulator, TradeFacts,
 };
-use crate::webhooks::{DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription};
+use crate::webhooks::{
+    DeclaredSubscription, DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription,
+    SubscriptionSource,
+};
 
 /// The settlement simulator's name in `consumer_offsets`.
 pub const SETTLEMENT_CONSUMER: &str = "settlement-simulator";
@@ -124,6 +127,9 @@ pub struct ExchangeOptions {
     pub settlement: Option<SettlementPolicy>,
     /// Accepts settlement outcomes reported by an external service (settlement mode `external` or `both`).
     pub external_outcomes: bool,
+    /// Webhook subscriptions declared in configuration, reconciled at recovery and after a reset. Names must be
+    /// unique (see [`crate::webhooks::validate_declared`]).
+    pub webhooks: Vec<DeclaredSubscription>,
 }
 
 impl Default for ExchangeOptions {
@@ -137,6 +143,7 @@ impl Default for ExchangeOptions {
             delivery_signal: None,
             settlement: None,
             external_outcomes: true,
+            webhooks: Vec::new(),
         }
     }
 }
@@ -192,6 +199,8 @@ pub struct Exchange {
     epoch: u64,
     /// The open commit group: what its commands wrote, reported once the group is durable.
     group: Option<Vec<Committed>>,
+    /// Webhook subscriptions declared in configuration (see [`Exchange::reconcile_webhooks`]).
+    declared_webhooks: Vec<DeclaredSubscription>,
 }
 
 /// What one committed command wrote, for metrics and the delivery worker.
@@ -287,7 +296,11 @@ impl Exchange {
             clock_start,
             epoch: 0,
             group: None,
+            declared_webhooks: options.webhooks,
         };
+        crate::webhooks::validate_declared(&exchange.declared_webhooks)
+            .map_err(ExchangeError::InvalidWebhook)?;
+        exchange.reconcile_webhooks()?;
         // Trades committed while the simulator was off (or before it existed) are taken in now, before any command,
         // so intake order does not depend on when a background tick happens to run.
         exchange.settlement_tick()?;
@@ -501,54 +514,114 @@ impl Exchange {
         &mut self,
         request: NewSubscription,
     ) -> Result<Subscription, ExchangeError> {
+        let request = validate_subscription(request)?;
+        self.create_webhook(request, None, SubscriptionSource::Api, (true, false))
+    }
+
+    /// Stores a new, already validated subscription.
+    fn create_webhook(
+        &mut self,
+        request: NewSubscription,
+        name: Option<String>,
+        source: SubscriptionSource,
+        (enabled, paused): (bool, bool),
+    ) -> Result<Subscription, ExchangeError> {
         let NewSubscription {
             url,
-            mut event_types,
+            event_types,
             secret,
             ordered,
         } = request;
-        let parsed = reqwest::Url::parse(&url)
-            .map_err(|e| ExchangeError::InvalidWebhook(format!("url: {e}")))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return Err(ExchangeError::InvalidWebhook(
-                "url must be http or https".into(),
-            ));
-        }
-        if event_types.is_empty() {
-            return Err(ExchangeError::InvalidWebhook(
-                "eventTypes must not be empty".into(),
-            ));
-        }
-        if let Some(unknown) = event_types
-            .iter()
-            .find(|t| !events::EVENT_TYPES.contains(&t.as_str()))
-        {
-            return Err(ExchangeError::InvalidWebhook(format!(
-                "unknown event type {unknown}"
-            )));
-        }
-        if let Some(secret) = &secret
-            && !(16..=256).contains(&secret.chars().count())
-        {
-            return Err(ExchangeError::InvalidWebhook(
-                "secret must be 16 to 256 characters".into(),
-            ));
-        }
-        event_types.sort();
-        event_types.dedup();
         let subscription = Subscription {
             id: self.ids.subscription(self.subscriptions.len() as u64 + 1),
             url,
             event_types,
-            enabled: true,
+            enabled,
             created_at: self.now(),
             secret,
             ordered,
             faults: None,
+            name,
+            source,
+            paused,
         };
         self.store.insert_subscription(&subscription)?;
         self.subscriptions.push(subscription.clone());
         Ok(subscription)
+    }
+
+    /// Brings the subscriptions declared in configuration (`webhooks.subscriptions`) into the database, by name:
+    /// creates the missing ones, updates the ones whose url, event types, secret, ordering, enabled or paused flag
+    /// changed,
+    /// and disables configuration-owned ones no longer declared (keeping their history). Subscriptions created through
+    /// the API are left alone. Runs at recovery and after a reset.
+    fn reconcile_webhooks(&mut self) -> Result<(), ExchangeError> {
+        let declared = self.declared_webhooks.clone();
+        let mut wake = false;
+        for entry in &declared {
+            let wanted =
+                validate_subscription(entry.subscription.clone()).map_err(|e| match e {
+                    ExchangeError::InvalidWebhook(message) => ExchangeError::InvalidWebhook(
+                        format!("webhooks.subscriptions {}: {message}", entry.name),
+                    ),
+                    other => other,
+                })?;
+            let existing = self
+                .subscriptions
+                .iter()
+                .position(|s| s.name.as_deref() == Some(entry.name.as_str()));
+            match existing {
+                None => {
+                    let created = self.create_webhook(
+                        wanted,
+                        Some(entry.name.clone()),
+                        SubscriptionSource::Config,
+                        (entry.enabled, entry.paused),
+                    )?;
+                    tracing::info!(name = %entry.name, id = %created.id, url = %created.url, "webhook subscription created from configuration");
+                    wake |= created.enabled && !created.paused;
+                }
+                Some(index) => {
+                    let current = &self.subscriptions[index];
+                    if current.source != SubscriptionSource::Config {
+                        return Err(ExchangeError::InvalidWebhook(format!(
+                            "webhooks.subscriptions {}: the name belongs to a subscription created through the API",
+                            entry.name
+                        )));
+                    }
+                    let updated = Subscription {
+                        url: wanted.url,
+                        event_types: wanted.event_types,
+                        secret: wanted.secret,
+                        ordered: wanted.ordered,
+                        enabled: entry.enabled,
+                        paused: entry.paused,
+                        ..current.clone()
+                    };
+                    if updated != *current {
+                        self.store.update_subscription(&updated)?;
+                        tracing::info!(name = %entry.name, id = %updated.id, url = %updated.url, enabled = updated.enabled, paused = updated.paused, "webhook subscription updated from configuration");
+                        wake |= updated.enabled && !updated.paused;
+                        self.subscriptions[index] = updated;
+                    }
+                }
+            }
+        }
+        for subscription in &mut self.subscriptions {
+            let still_declared = declared
+                .iter()
+                .any(|d| subscription.name.as_deref() == Some(d.name.as_str()));
+            if subscription.source == SubscriptionSource::Config
+                && subscription.enabled
+                && !still_declared
+            {
+                subscription.enabled = false;
+                self.store.update_subscription(subscription)?;
+                tracing::warn!(name = ?subscription.name, id = %subscription.id, "webhook subscription no longer in the configuration; disabled, its history kept");
+            }
+        }
+        self.signal_deliveries(wake);
+        Ok(())
     }
 
     /// Sets (or with `None` clears) a subscription's delivery fault policy. It applies to attempts from the next claim
@@ -631,6 +704,8 @@ impl Exchange {
                 .save_virtual_clock(clock.now(), clock.is_running())?;
         }
         self.epoch += 1;
+        // Configuration-declared subscriptions come back, as on a new database.
+        self.reconcile_webhooks()?;
         tracing::info!(epoch = self.epoch, "exchange state reset");
         Ok(())
     }
@@ -975,6 +1050,42 @@ fn load_books(store: &Store) -> Result<HashMap<InstrumentId, OrderBook>, Exchang
         book.restore(order)?;
     }
     Ok(books)
+}
+
+/// Checks a subscription request (http(s) URL, known event types, secret length) and normalizes its event types
+/// (sorted, without duplicates).
+fn validate_subscription(mut request: NewSubscription) -> Result<NewSubscription, ExchangeError> {
+    let parsed = reqwest::Url::parse(&request.url)
+        .map_err(|e| ExchangeError::InvalidWebhook(format!("url: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ExchangeError::InvalidWebhook(
+            "url must be http or https".into(),
+        ));
+    }
+    if request.event_types.is_empty() {
+        return Err(ExchangeError::InvalidWebhook(
+            "eventTypes must not be empty".into(),
+        ));
+    }
+    if let Some(unknown) = request
+        .event_types
+        .iter()
+        .find(|t| !events::EVENT_TYPES.contains(&t.as_str()))
+    {
+        return Err(ExchangeError::InvalidWebhook(format!(
+            "unknown event type {unknown}"
+        )));
+    }
+    if let Some(secret) = &request.secret
+        && !(16..=256).contains(&secret.chars().count())
+    {
+        return Err(ExchangeError::InvalidWebhook(
+            "secret must be 16 to 256 characters".into(),
+        ));
+    }
+    request.event_types.sort();
+    request.event_types.dedup();
+    Ok(request)
 }
 
 fn same_terms(order: &Order, command: &SubmitOrder) -> bool {

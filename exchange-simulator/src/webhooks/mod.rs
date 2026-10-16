@@ -38,6 +38,69 @@ pub struct Subscription {
     /// Faults injected into outgoing copies (test control only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub faults: Option<FaultPolicy>,
+    /// The name a configuration declares it under; API-created subscriptions have none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub source: SubscriptionSource,
+    /// Deliveries are recorded but held until unpaused, then sent in order. (Disabled, by contrast, records none.)
+    pub paused: bool,
+}
+
+/// Who owns a subscription.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubscriptionSource {
+    /// Created through `POST /api/webhooks`.
+    #[default]
+    Api,
+    /// Declared under `webhooks.subscriptions` and reconciled at startup; the configuration is its source of truth.
+    Config,
+}
+
+impl SubscriptionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Config => "config",
+        }
+    }
+}
+
+/// A subscription declared in configuration, with its secret already resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclaredSubscription {
+    /// Its identity across restarts: 1 to 64 letters, digits, `.`, `_` or `-`.
+    pub name: String,
+    pub subscription: NewSubscription,
+    /// Off: no deliveries are recorded for it.
+    pub enabled: bool,
+    /// Deliveries are recorded and held.
+    pub paused: bool,
+}
+
+/// Checks the names of declared subscriptions: each 1 to 64 letters, digits, `.`, `_` or `-`, and unique.
+pub fn validate_declared(declared: &[DeclaredSubscription]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for entry in declared {
+        let valid = (1..=64).contains(&entry.name.len())
+            && entry
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !valid {
+            return Err(format!(
+                "webhooks.subscriptions: name {:?} must be 1 to 64 letters, digits, '.', '_' or '-'",
+                entry.name
+            ));
+        }
+        if !seen.insert(entry.name.as_str()) {
+            return Err(format!(
+                "webhooks.subscriptions: name {} is declared twice",
+                entry.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A request to register a subscription.

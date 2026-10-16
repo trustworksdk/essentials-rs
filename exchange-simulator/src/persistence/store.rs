@@ -8,7 +8,9 @@ use crate::engine::BookUpdate;
 use crate::events::{self, EventEnvelope, NewEvent};
 use crate::ids::IdScheme;
 use crate::settlement::{ExternalReport, Instruction, SettlementStatus};
-use crate::webhooks::{DeliveryJob, DeliveryOutcome, DeliveryResult, FaultPolicy, Subscription};
+use crate::webhooks::{
+    DeliveryJob, DeliveryOutcome, DeliveryResult, FaultPolicy, Subscription, SubscriptionSource,
+};
 
 /// Repository over the single writer connection. Every state change a matching step produces is written by
 /// [`Store::commit`] in one transaction.
@@ -393,8 +395,9 @@ impl Store {
             serde_json::to_string(&subscription.event_types).expect("strings serialize");
         self.conn
             .prepare_cached(
-                "INSERT INTO webhook_subscriptions (id, url, enabled, event_types, created_at, secret, ordered)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO webhook_subscriptions (id, url, enabled, event_types, created_at, secret, ordered, name, source,
+                                                    paused)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?
             .execute(params![
                 subscription.id.to_string(),
@@ -404,14 +407,41 @@ impl Store {
                 timestamp(subscription.created_at),
                 subscription.secret,
                 subscription.ordered,
+                subscription.name,
+                subscription.source.as_str(),
+                subscription.paused,
             ])
             .map(drop)
+    }
+
+    /// Stores a subscription's url, event types, secret, ordering, enabled and paused flags; false when there is no
+    /// such subscription. Its pending deliveries keep their place and go to the new URL; while it is disabled or paused
+    /// they wait.
+    pub fn update_subscription(&self, subscription: &Subscription) -> rusqlite::Result<bool> {
+        let event_types =
+            serde_json::to_string(&subscription.event_types).expect("strings serialize");
+        self.conn
+            .prepare_cached(
+                "UPDATE webhook_subscriptions SET url = ?2, enabled = ?3, event_types = ?4, secret = ?5, ordered = ?6,
+                                                 paused = ?7
+                 WHERE id = ?1",
+            )?
+            .execute(params![
+                subscription.id.to_string(),
+                subscription.url,
+                subscription.enabled,
+                event_types,
+                subscription.secret,
+                subscription.ordered,
+                subscription.paused,
+            ])
+            .map(|n| n == 1)
     }
 
     pub fn subscriptions(&self) -> rusqlite::Result<Vec<Subscription>> {
         self.conn
             .prepare_cached(
-                "SELECT id, url, enabled, event_types, created_at, secret, ordered, fault_policy
+                "SELECT id, url, enabled, event_types, created_at, secret, ordered, fault_policy, name, source, paused
                  FROM webhook_subscriptions ORDER BY created_at, id",
             )?
             .query_map([], |row| {
@@ -427,6 +457,12 @@ impl Store {
                     secret: row.get(5)?,
                     ordered: row.get(6)?,
                     faults: json_column(row, 7)?,
+                    name: row.get(8)?,
+                    source: match row.get::<_, String>(9)?.as_str() {
+                        "config" => SubscriptionSource::Config,
+                        _ => SubscriptionSource::Api,
+                    },
+                    paused: row.get(10)?,
                 })
             })?
             .collect()
@@ -495,7 +531,7 @@ impl Store {
                  FROM webhook_deliveries d
                  JOIN webhook_subscriptions s ON s.id = d.subscription_id
                  JOIN events e ON e.sequence = d.event_sequence
-                 WHERE d.status IN ('PENDING', 'IN_FLIGHT') AND d.next_attempt_at <= ?1
+                 WHERE d.status IN ('PENDING', 'IN_FLIGHT') AND d.next_attempt_at <= ?1 AND s.enabled = 1 AND s.paused = 0
                    AND (s.ordered = 0 OR d.event_sequence = (
                          SELECT MIN(u.event_sequence) FROM webhook_deliveries u
                          WHERE u.subscription_id = d.subscription_id AND u.status IN ('PENDING', 'IN_FLIGHT')))

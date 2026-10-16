@@ -83,6 +83,10 @@ impl App {
                 delivery_signal: Some(delivery_signal.clone()),
                 settlement: config.settlement.simulator_policy(),
                 external_outcomes: config.settlement.mode != SettlementMode::Simulated,
+                webhooks: config
+                    .webhooks
+                    .declared()
+                    .context("reading webhooks.subscriptions")?,
             },
         )
         .context("recovering order books")?;

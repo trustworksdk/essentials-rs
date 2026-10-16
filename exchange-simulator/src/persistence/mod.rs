@@ -24,6 +24,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/007_settlement.sql"),
     include_str!("../../migrations/008_settlement_reports.sql"),
     include_str!("../../migrations/009_delivery_faults.sql"),
+    include_str!("../../migrations/010_named_subscriptions.sql"),
 ];
 
 /// How much of the exchange's state survives what (`database.mode`).

@@ -366,12 +366,19 @@ pub struct SubscriptionView {
     pub url: String,
     pub event_types: Vec<String>,
     pub enabled: bool,
+    /// Deliveries are recorded but held until it is unpaused.
+    pub paused: bool,
     pub signed: bool,
     pub ordered: bool,
     pub created_at: DateTime<Utc>,
     /// The delivery fault policy, when test control set one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub faults: Option<FaultPolicy>,
+    /// The name it is declared under in `webhooks.subscriptions`; API-created subscriptions have none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `api` or `config`: who owns it.
+    pub source: crate::webhooks::SubscriptionSource,
 }
 
 impl From<Subscription> for SubscriptionView {
@@ -381,10 +388,13 @@ impl From<Subscription> for SubscriptionView {
             url: s.url,
             event_types: s.event_types,
             enabled: s.enabled,
+            paused: s.paused,
             signed: s.secret.is_some(),
             ordered: s.ordered,
             created_at: s.created_at,
             faults: s.faults,
+            name: s.name,
+            source: s.source,
         }
     }
 }

@@ -208,9 +208,89 @@ pub struct WebhooksConfig {
     pub max_attempts: u32,
     pub initial_backoff_ms: u64,
     pub max_backoff_ms: u64,
+    /// Subscriptions declared here are created or updated at startup, by name (see
+    /// [`crate::webhooks::DeclaredSubscription`]).
+    #[serde(default)]
+    pub subscriptions: Vec<SubscriptionConfig>,
+}
+
+/// One entry of `webhooks.subscriptions`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionConfig {
+    /// Identifies the subscription across restarts and configuration changes.
+    pub name: String,
+    pub url: String,
+    pub event_types: Vec<String>,
+    /// The signing secret itself. At most one of `secret`, `secret_env` and `secret_file` may be set; with none,
+    /// deliveries are unsigned.
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// The name of an environment variable holding the secret.
+    #[serde(default)]
+    pub secret_env: Option<String>,
+    /// A file holding the secret, e.g. a Docker secret under `/run/secrets`; surrounding whitespace is ignored.
+    #[serde(default)]
+    pub secret_file: Option<String>,
+    #[serde(default)]
+    pub ordered: bool,
+    /// `false` turns it off: no deliveries are recorded for it until it is enabled again.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    /// `true` holds its deliveries: they are recorded and sent, in order, once it is unpaused.
+    #[serde(default)]
+    pub paused: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
+impl SubscriptionConfig {
+    /// The subscription with its secret read from wherever it is configured.
+    pub fn resolve(&self) -> anyhow::Result<crate::webhooks::DeclaredSubscription> {
+        let name = &self.name;
+        let secret = match (&self.secret, &self.secret_env, &self.secret_file) {
+            (None, None, None) => None,
+            (Some(secret), None, None) => Some(secret.clone()),
+            (None, Some(variable), None) => Some(std::env::var(variable).map_err(|_| {
+                anyhow::anyhow!("webhooks.subscriptions {name}: secret_env {variable} is not set")
+            })?),
+            (None, None, Some(file)) => Some(
+                std::fs::read_to_string(file)
+                    .map_err(|e| {
+                        anyhow::anyhow!("webhooks.subscriptions {name}: secret_file {file}: {e}")
+                    })?
+                    .trim()
+                    .to_string(),
+            ),
+            _ => anyhow::bail!(
+                "webhooks.subscriptions {name}: set at most one of secret, secret_env and secret_file"
+            ),
+        };
+        Ok(crate::webhooks::DeclaredSubscription {
+            name: name.clone(),
+            subscription: crate::webhooks::NewSubscription {
+                url: self.url.clone(),
+                event_types: self.event_types.clone(),
+                secret,
+                ordered: self.ordered,
+            },
+            enabled: self.enabled,
+            paused: self.paused,
+        })
+    }
 }
 
 impl WebhooksConfig {
+    /// Every declared subscription, secrets resolved.
+    pub fn declared(&self) -> anyhow::Result<Vec<crate::webhooks::DeclaredSubscription>> {
+        self.subscriptions
+            .iter()
+            .map(SubscriptionConfig::resolve)
+            .collect()
+    }
+
     pub fn worker(&self) -> WorkerConfig {
         WorkerConfig {
             poll_interval: Duration::from_millis(self.poll_interval_ms),
@@ -345,5 +425,122 @@ mod tests {
             "Default matches config/default.yaml"
         );
         assert!(!config.test_control.enabled);
+    }
+
+    fn with_overlay(yaml: &str) -> Result<Config, config::ConfigError> {
+        config::Config::builder()
+            .add_source(config::File::from_str(DEFAULTS, config::FileFormat::Yaml))
+            .add_source(config::File::from_str(yaml, config::FileFormat::Yaml))
+            .build()?
+            .try_deserialize()
+    }
+
+    #[test]
+    fn declared_subscriptions_parse_from_a_yaml_file() {
+        let config = with_overlay(
+            "
+webhooks:
+  subscriptions:
+    - name: settlement
+      url: http://settlement:8080/trades
+      event_types: [TradeExecuted]
+      secret_env: SETTLEMENT_SECRET
+      ordered: true
+    - name: audit
+      url: http://audit:9000/events
+      event_types: [OrderAccepted, TradeExecuted]
+      paused: true
+",
+        )
+        .unwrap();
+        let [settlement, audit] = config.webhooks.subscriptions.as_slice() else {
+            panic!("two subscriptions")
+        };
+        assert_eq!(settlement.name, "settlement");
+        assert_eq!(settlement.secret_env.as_deref(), Some("SETTLEMENT_SECRET"));
+        assert!(settlement.ordered && settlement.enabled && !settlement.paused);
+        assert_eq!(audit.event_types, ["OrderAccepted", "TradeExecuted"]);
+        assert!(audit.paused && audit.enabled && !audit.ordered);
+        assert!(
+            with_overlay("{}")
+                .unwrap()
+                .webhooks
+                .subscriptions
+                .is_empty()
+        );
+
+        let typo = with_overlay(
+            "
+webhooks:
+  subscriptions:
+    - name: x
+      url: http://x/
+      event_types: [TradeExecuted]
+      secrets: oops
+",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            typo.contains("secrets"),
+            "unknown fields are refused: {typo}"
+        );
+    }
+
+    #[test]
+    fn secrets_resolve_from_the_value_an_environment_variable_or_a_file() {
+        let base = SubscriptionConfig {
+            name: "s".into(),
+            url: "http://x/".into(),
+            event_types: vec!["TradeExecuted".into()],
+            secret: None,
+            secret_env: None,
+            secret_file: None,
+            ordered: false,
+            enabled: true,
+            paused: false,
+        };
+        let secret = |entry: SubscriptionConfig| entry.resolve().map(|d| d.subscription.secret);
+        assert_eq!(secret(base.clone()).unwrap(), None);
+        assert_eq!(
+            secret(SubscriptionConfig {
+                secret: Some("literal".into()),
+                ..base.clone()
+            })
+            .unwrap()
+            .as_deref(),
+            Some("literal")
+        );
+        // HOME is set in any environment these tests run in.
+        assert_eq!(
+            secret(SubscriptionConfig {
+                secret_env: Some("HOME".into()),
+                ..base.clone()
+            })
+            .unwrap(),
+            std::env::var("HOME").ok()
+        );
+        let file = std::env::temp_dir().join(format!("exchange-secret-{}", uuid::Uuid::now_v7()));
+        std::fs::write(&file, "  from-a-file\n").unwrap();
+        assert_eq!(
+            secret(SubscriptionConfig {
+                secret_file: Some(file.to_string_lossy().into_owned()),
+                ..base.clone()
+            })
+            .unwrap()
+            .as_deref(),
+            Some("from-a-file")
+        );
+        let _ = std::fs::remove_file(&file);
+        let missing = secret(SubscriptionConfig {
+            secret_file: Some("/nonexistent/secret".into()),
+            ..base.clone()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing.contains("secret_file /nonexistent/secret"),
+            "{missing}"
+        );
     }
 }

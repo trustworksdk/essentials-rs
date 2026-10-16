@@ -29,6 +29,7 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `webhooks.request_timeout_ms` | `5000` | Per request; a timeout is a failed attempt |
 | `webhooks.max_attempts` | `10` | Attempts in total; then the delivery is dead-lettered (`DEAD`) |
 | `webhooks.initial_backoff_ms` / `max_backoff_ms` | `500` / `300000` | Exponential backoff between attempts, with jitter |
+| `webhooks.subscriptions` | `[]` | Subscriptions declared in configuration, reconciled by name at startup (see Declared subscriptions) |
 | `ids.mode` / `ids.seed` | `random` / `0` | `deterministic` makes every ID reproducible from the seed (see Reproducible runs) |
 | `settlement.mode` | `external` | `external`, `simulated` or `both` (see Settlement) |
 | `settlement.tick_interval_ms` | `250` | How often the simulator takes in trades and fires due transitions |
@@ -250,7 +251,8 @@ incoming order's fill event, then `OrderCancelled` for a market remainder. A com
 ### `POST /api/webhooks`
 
 `{ "url": "http://consumer:8080/trades", "eventTypes": ["TradeExecuted"], "secret": "…", "ordered": false }` → `201`
-`{ "id", "url", "eventTypes", "enabled", "signed", "ordered", "createdAt" }`. The URL must be `http` or `https`, and the event
+`{ "id", "url", "eventTypes", "enabled", "paused", "signed", "ordered", "createdAt", "source": "api" }`. Subscriptions
+declared in configuration also show their `name`, with `source: "config"`. The URL must be `http` or `https`, and the event
 types must be ones listed above. `secret` is optional (16–256 characters). When it is given, deliveries are signed. It
 is never returned; responses show `signed: true` instead. A subscription receives events committed after it was registered; replay earlier events with
 `/api/events`.
@@ -285,6 +287,45 @@ def verify(secret: bytes, headers, raw_body: bytes, tolerance=300) -> bool:
     expected = "sha256=" + hmac.new(secret, timestamp.encode() + b"." + raw_body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, headers["X-Signature"]) and abs(time.time() - int(timestamp)) <= tolerance
 ```
+
+### Declared subscriptions
+
+For a standing consumer, declare the subscription in the configuration file (named by `EXCHANGE_CONFIG`) rather than
+registering it through the API. That way it is in place on every start, comes back after `/test/reset`, and is
+reviewed with the rest of the deployment:
+
+```yaml
+webhooks:
+  subscriptions:
+    - name: settlement                       # its identity: 1-64 letters, digits, '.', '_' or '-'
+      url: http://settlement-service:8080/trades
+      event_types: [TradeExecuted]
+      secret_env: SETTLEMENT_WEBHOOK_SECRET  # or secret: "...", or secret_file: /run/secrets/settlement
+      ordered: true                          # default false
+    - name: audit
+      url: http://audit:9000/events
+      event_types: [OrderAccepted, OrderCancelled, TradeExecuted]
+      paused: true                           # default false
+```
+
+- **Startup:** the service reconciles the list by `name`.
+  - A missing subscription is created. One whose URL, event types, secret, ordering or flags changed is updated in
+    place, keeping its ID and its pending deliveries, which then go to the new URL.
+  - One that is no longer listed is disabled, not deleted, so its history stays.
+  - Subscriptions created through the API are left alone.
+- **Startup fails** with a message naming the subscription if an entry is invalid: a duplicate or malformed name, an
+  unknown event type, a non-http URL, a secret of the wrong length, a missing `secret_env` variable or `secret_file`,
+  or more than one secret source. A YAML key that is not listed above is refused too, so typos do not pass silently.
+- **`paused: true`** records a delivery for every matching event but sends none until it is unpaused. They then go
+  out in order. Use it for a consumer under maintenance.
+- **`enabled: false`** turns the subscription off: no deliveries are recorded at all.
+- **Secrets:** `secret_env` names an environment variable and `secret_file` a file, e.g. a Docker secret under
+  `/run/secrets`. Surrounding whitespace is ignored. The secret is never returned by the API.
+- **Changing a declared subscription:** edit the file and restart the service. The configuration is its source of
+  truth; the maintenance API (4.6b) treats declared subscriptions as read-only.
+- **Scenarios:** the scenario sandbox (`/test/scenarios`, `scenario run`) never inherits declared subscriptions, so
+  sandbox events never reach real consumers.
+- **Environment variables:** a list cannot be set through `EXCHANGE__…` variables; use the file.
 
 ### `GET /api/webhooks`
 

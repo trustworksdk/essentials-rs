@@ -729,8 +729,12 @@ the order below deliberately puts group commit before sharding.
 | 4.2 ✅ | Group commit | M–L | The writer drains up to N queued commands (or waits up to T µs) and plans them in order on the books. It commits them in one transaction and replies to each after the commit. If the commit fails, all plans are dropped and every caller gets the error; nothing is applied. Ordering and determinism are unchanged. Expected: several times today's durable throughput. |
 | 4.3 ✅ | Background checkpointing | S | Turn off automatic WAL checkpointing on the writer *only together with* a background connection that runs `PRAGMA wal_checkpoint(PASSIVE)` when the WAL passes a size threshold. Without that, the WAL grows without bound and throughput halves (1.2). Target: the roughly 10 % of durable time and the p99 now spent in checkpoint commits. The occasional > 10 ms spikes come from the disk (1.2), and this will not remove them. Measure with `bench checkpoint`. |
 | 4.4 ✅ | Explicit non-durable modes | S | `persistence.mode: durable \| fast \| memory` (D4).<br>• **`fast`**: WAL with `synchronous=NORMAL`. Every commit still reaches the database file, and fsync happens only at checkpoints. All state survives a process or container restart (books, events, outbox, settlement instructions, simulator cursor, virtual clock), so settlement keeps working across restarts. Only a host or node crash, or power loss, can lose the last commits, and the database is never corrupted. (`synchronous=OFF` was rejected: it can corrupt the database on a host crash.)<br>• **`memory`**: an in-memory SQLite database for pure throughput runs. Nothing survives a restart (orders, trades, pending settlements, undelivered webhooks), so settlement works only while the process runs.<br>`/health` and `/metrics` report the mode, and responses carry a header in non-durable modes. The README documents the trade-offs, including that durability in Kubernetes also needs a persistent volume (`emptyDir` loses everything when the pod is rescheduled, even in `durable` mode). |
-| 4.5 | Instrument-sharded matching (only if 4.1 shows matching as a bottleneck) | M | Matching workers per instrument shard in front of the single writer. Today's data says matching is not the limit, so this is a measure-first step. |
-| 4.6 | Containerized benchmark and load report | M | There is no single target machine (D4): deployments are mostly Docker Compose or Kubernetes, and their hardware varies. So the benchmark runs as containers: the service image plus a load-generator container, with explicit CPU and memory limits and a named storage backing (volume or storage class). It ships as a compose profile and as a Kubernetes Job manifest. Each report records its environment: limits, storage, measured fsync latency, and node type where known. It compares `durable`, `fast` and `memory`, with and without outbox and webhooks, across instrument counts. Figures against the 1k–10k target are quoted per environment, never as one universal number. |
+| 4.5 ⏭ | Instrument-sharded matching (only if 4.1 shows matching as a bottleneck) | M | **Skipped (D7).** Matching workers per instrument shard in front of the single writer. Measured in 4.1–4.4: matching takes about 0.5 µs of the exchange thread's roughly 46 µs per order; the rest is SQLite writes. Revisit only if a later profile shows matching as the limit. |
+| 4.6 | Containerized benchmark and load report | M | There is no single target machine (D4): deployments are mostly Docker Compose or Kubernetes, and their hardware varies. So the benchmark runs as containers: the service image plus a load-generator container, with explicit CPU and memory limits and a named storage backing (volume or storage class). It ships as a compose profile and as a Kubernetes Job manifest. Each report records its environment: limits, storage, measured fsync latency, and node type where known. It compares `durable`, `fast` and `memory`, with and without outbox and webhooks, across instrument counts. Figures against the 1k–10k target are quoted per environment, never as one universal number. Extended by D7 into the sub-steps below; Docker Compose comes first. |
+| 4.6a ✅ | Webhook subscriptions declared in config | M | `webhooks.subscriptions`: a list of `{ name, url, event_types, secret \| secret_env \| secret_file, ordered, enabled }`. At startup, and after `/test/reset`, the service reconciles them by `name`: creates the missing ones and updates changed ones. Ones removed from the config are disabled, not deleted, so their history stays. Config-declared subscriptions are marked `source: config` and are read-only through the API; API-created ones work as before. A migration adds `name` (unique) and `source`. |
+| 4.6b | Webhook maintenance API | M | Under `/api/webhooks/{id}`: `GET` with delivery stats (pending, in flight, delivered, dead, oldest pending); `PATCH` (url, eventTypes, ordered, enabled); `DELETE` (pending deliveries are dropped, history kept); `POST …/secret` to rotate the secret, with a grace period during which both signatures are sent; `GET …/deliveries?status=` for deliveries and dead letters with their last error; `POST …/redeliver?after=` and `POST …/dead-letters/retry`. The `/test` equivalents stay as aliases. |
+| 4.6c | Usage guide and Compose setup | M | A `docs/` guide for operators and client developers: Compose quick start, configuration reference, writing a webhook receiver (signature check, idempotency by `eventId`, ordering, retries, dead letters, secret rotation), maintenance and troubleshooting, and benchmarking. A runnable Compose example with a sample receiver and config-declared subscriptions. The README stays the API reference and links to the guide. |
+| 4.6d | Containerized benchmark and load report | M | As described for 4.6 above: the bench in a container beside the service, with CPU and memory limits and a named volume, as a Compose profile first and a Kubernetes Job manifest after. The report takes its environment from the container's cgroup limits (added in 4.4), and runs across modes, webhooks on and off, and instrument counts. |
 
 ### Milestone 4 progress
 
@@ -1031,6 +1035,69 @@ the order below deliberately puts group commit before sharding.
   saturation). `memory` is what lifts the ceiling, to about 25k/s. The next limit is the exchange thread's
   per-order work and the in-process HTTP stack (4.2, 4.6).
 
+**4.5 — skipped (D7, 2026-10-16).** 4.1–4.4 measured matching at about 0.5 µs of the exchange thread's roughly 46 µs
+per order. Sharding it would not raise throughput.
+
+**4.6a — webhook subscriptions declared in config ✅ (2026-10-16).**
+- **Delivered:**
+  - **Config:** `webhooks.subscriptions`, a list of `{ name, url, event_types, secret | secret_env | secret_file,
+    ordered, enabled, paused }` (`config::SubscriptionConfig`). Unknown keys are refused.
+    `SubscriptionConfig::resolve` reads the secret from the value, an environment variable or a file (whitespace
+    trimmed). Setting more than one source is an error.
+  - **`Exchange::reconcile_webhooks`** runs at recovery and after a reset, by name:
+    - It creates missing subscriptions and updates changed ones in place (same ID, pending deliveries kept, new URL
+      used from the next claim).
+    - It disables configuration-owned subscriptions that are no longer declared, keeping their history.
+    - It leaves API subscriptions alone, and fails if a declared name belongs to one.
+    - `webhooks::validate_declared` checks names (1–64 of `[A-Za-z0-9._-]`, unique). Every entry goes through the
+      same validation as `POST /api/webhooks`, and errors name the entry. An invalid configuration stops startup.
+  - **Migration 010:** `name` (unique where set), `source` (`api` | `config`) and `paused`.
+  - **Paused versus disabled:**
+    - A paused subscription still gets a delivery for each matching event, but the claim query skips it
+      (`s.paused = 0`).
+    - A disabled one gets none.
+    - The claim query now also skips disabled subscriptions (`s.enabled = 1`). Until now nothing could disable a
+      subscription, so their pending deliveries would have been sent.
+  - **API:** subscriptions show `paused` and `source`, and `name` when declared.
+  - **Scenarios:** the sandbox clears `webhooks.subscriptions`, so sandbox events never reach real consumers.
+  - **Docs:** a README section "Declared subscriptions" and a commented example in `config/default.yaml`.
+- **Tests:**
+  - **`tests/webhook_config.rs` (4):**
+    - A declared subscription is created with `source: config`, signed with a `secret_file` secret (trailing newline
+      ignored) and delivered.
+    - A paused subscription holds its two deliveries, and a disabled one records none.
+    - **A restart with a changed configuration:**
+      - It updates `trades` in place (same ID, new URL and event types).
+      - It disables the removed `orders`.
+      - It unpauses `later`, whose held deliveries then reach its new URL.
+      - It creates `fresh` and leaves the API subscription byte-identical.
+    - A reset removes API subscriptions and brings declared ones back.
+    - Seven invalid declarations each stop startup with a message naming the problem.
+  - **Unit tests:** the YAML overlay parses, and a typo is refused; secrets resolve from a value, a variable or a
+    file, with a clear error for a missing file; the scenario sandbox has no declared subscriptions.
+  - The new and the webhook, reset and scenario suites were repeated five times without failure. All gates pass,
+    e2e included.
+- **Mutation checks**, each made a test fail:
+  - paused deliveries sent;
+  - no reconcile after a reset;
+  - removed subscriptions left enabled;
+  - updates not stored;
+  - the secret file not trimmed;
+  - duplicate names allowed;
+  - the sandbox inheriting subscriptions;
+  - several secret sources accepted.
+- **Decisions:**
+  - **`paused` is new and separate from `enabled`.** The user asked for webhook clients that are easy to maintain:
+    pausing a consumer for maintenance must not lose events, while turning one off (or removing it from the
+    configuration) must not let a backlog grow without limit. So `paused` holds deliveries, and `enabled: false`
+    records none.
+  - **Removed means disabled, not deleted.** History, attempts and dead letters stay inspectable (4.6b). Declaring
+    the name again re-enables the same subscription.
+  - **Declared subscriptions are changed only through the configuration file and a restart.** Hot reload was left
+    out; under Compose, a restart is one command.
+  - **Lists cannot be set through `EXCHANGE__…` environment variables** (a limit of the `config` crate), so the
+    documented route is a mounted YAML file.
+
 ## Suggested order
 
 1. Milestone 1 wrap-up: 1.1 now, then 1.2, then 1.3a–d.
@@ -1059,5 +1126,14 @@ Settled on 2026-10-15:
     lasts only while the process runs (4.4).
 - **D6 — reproducible IDs:** event and execution IDs (in fact all IDs) must be stable and reproducible across runs.
   This is a new step, 3.0, the first of Milestone 3.
+
+Settled on 2026-10-16:
+- **D7 — client setup and maintenance (extends 4.6):** the service will mostly run under Docker Compose to begin
+  with, so webhook clients must be easy to set up and maintain, and usage must be documented in detail.
+  - Webhook subscriptions are declared in config and reconciled at startup by name (4.6a).
+  - The regular API gains every maintenance operation: update, pause, delete, secret rotation, delivery inspection,
+    retry and redelivery (4.6b).
+  - Usage documentation is a separate guide under `docs/`; the README stays the API reference (4.6c).
+  - 4.5 (instrument-sharded matching) is skipped. 4.1–4.4 showed matching is not the bottleneck.
 
 Still open: none.
