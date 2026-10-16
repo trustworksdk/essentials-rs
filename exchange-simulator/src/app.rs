@@ -11,7 +11,7 @@ use tokio::sync::{Notify, watch};
 
 use crate::api::{self, AppState};
 use crate::clock::VirtualClock;
-use crate::config::{CheckpointMode, ClockMode, Config, SettlementMode};
+use crate::config::{CheckpointMode, ClockMode, Config, PersistenceMode, SettlementMode};
 use crate::engine::{Dispatcher, Exchange, ExchangeOptions, SystemClock};
 use crate::persistence::{self, Store};
 use crate::webhooks::DeliveryWorker;
@@ -21,6 +21,8 @@ use crate::webhooks::DeliveryWorker;
 /// Must be started inside a Tokio runtime.
 pub struct App {
     pub router: Router,
+    /// Where the database is: the configured file, or the name of the in-memory database.
+    location: String,
     exchange_thread: JoinHandle<()>,
     background: Vec<tokio::task::JoinHandle<()>>,
     stop: watch::Sender<bool>,
@@ -29,12 +31,38 @@ pub struct App {
 impl App {
     pub fn start(config: &Config) -> anyhow::Result<Self> {
         let busy_timeout = Duration::from_millis(config.database.busy_timeout_ms);
-        let path = &config.database.path;
-        let writer = persistence::open(path, busy_timeout)
-            .with_context(|| format!("opening database {path}"))?;
+        let mode = config.database.mode;
+        let location = match mode {
+            PersistenceMode::Memory => persistence::memory_location(),
+            PersistenceMode::Durable | PersistenceMode::Fast => config.database.path.clone(),
+        };
+        let path = &location;
+        let writer = persistence::open_mode(
+            path,
+            mode,
+            busy_timeout,
+            config.database.memory_max_mib.saturating_mul(1 << 20),
+        )
+        .with_context(|| format!("opening database {path}"))?;
+        match mode {
+            PersistenceMode::Durable => {}
+            PersistenceMode::Fast => tracing::warn!(
+                "persistence mode fast: commits are synced to disk only at checkpoints; a host crash or power loss \
+                 can lose the last ones"
+            ),
+            PersistenceMode::Memory => tracing::warn!(
+                "persistence mode memory: all state (orders, trades, settlements, webhooks) is lost when the \
+                 process stops"
+            ),
+        }
+        // Install the recorder first: anything recorded before it is lost.
+        let metrics = crate::metrics::install();
+        crate::metrics::set_persistence_mode(mode);
         let delivery_signal = Arc::new(Notify::new());
         let mut store = Store::new(writer);
-        if config.database.checkpoint == CheckpointMode::Background {
+        if config.database.checkpoint == CheckpointMode::Background
+            && mode != PersistenceMode::Memory
+        {
             store
                 .checkpoint_in_background(busy_timeout, config.database.checkpoint_pages)
                 .context("starting background checkpoints")?;
@@ -66,6 +94,7 @@ impl App {
             .sum();
         tracing::info!(
             path = %path,
+            mode = mode.as_str(),
             instruments = instruments.len(),
             resting_orders,
             last_sequence = exchange.last_sequence(),
@@ -96,7 +125,7 @@ impl App {
             ));
             tracing::info!(mode = ?config.settlement.mode, "settlement simulator running");
         }
-        let state = AppState::new(dispatcher, Store::new(reader), crate::metrics::install());
+        let state = AppState::new(dispatcher, Store::new(reader), metrics, mode);
         let mut router = api::router(state.clone());
         if config.test_control.enabled {
             tracing::warn!(
@@ -104,12 +133,20 @@ impl App {
             );
             router = router.merge(api::test_control::router(state, Arc::new(config.clone())));
         }
+        let router = api::mark_persistence(router, mode);
         Ok(Self {
+            location,
             router,
             exchange_thread,
             background,
             stop,
         })
+    }
+
+    /// The database's location: its file path, or in `memory` mode a SQLite URI that other connections in this process
+    /// can open while the service runs.
+    pub fn database_location(&self) -> &str {
+        &self.location
     }
 
     /// Stops the delivery worker (after its current batch), drops the router (the last command senders) and waits for

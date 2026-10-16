@@ -36,10 +36,42 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `clock.mode` | `system` | `virtual` gives a controllable clock for domain time (see Test control) |
 | `clock.start` / `clock.running` | unset / `false` | Virtual clock only: first reading (default: real time at first start); start running instead of frozen |
 | `test_control.enabled` | `false` | Mounts `/test/...`. Never enable outside test deployments |
-| `database.path` | `data/exchange.db` | SQLite file (WAL mode) |
+| `database.mode` | `durable` | `durable`, `fast` or `memory` (see Persistence modes) |
+| `database.path` | `data/exchange.db` | SQLite file (WAL mode); unused in `memory` mode |
+| `database.memory_max_mib` | `4096` | `memory` mode only: the most the in-memory database may grow to |
 | `database.busy_timeout_ms` | `5000` | SQLite busy timeout |
 | `database.checkpoint` / `checkpoint_pages` | `background` / `1000` | Where WAL checkpoints run: `background` (a separate connection, from `checkpoint_pages` pages; see Persistence) or `inline` (SQLite's automatic checkpoint inside a commit) |
 | `logging.filter` / `logging.format` | `info` / `pretty` | Used when `RUST_LOG` is unset; `json` for structured logs |
+
+## Persistence modes
+
+`database.mode` (environment: `EXCHANGE__DATABASE__MODE`) trades durability for speed. In every mode a caller is
+answered only after its command is committed, and memory never holds state the database does not.
+
+| Mode | Storage | Survives a process or container restart | Survives a host crash or power loss |
+|---|---|---|---|
+| `durable` (default) | WAL, `synchronous=FULL`: each commit is synced to disk | everything | everything acknowledged |
+| `fast` | WAL, `synchronous=NORMAL`: synced only at checkpoints | everything | all but the last commits before the crash; never a corrupt database |
+| `memory` | in-memory SQLite (`memdb`), nothing on disk | nothing | nothing |
+
+- **`fast`:** orders, books, trades, events, the webhook outbox, settlement instructions, the settlement simulator's
+  position and the virtual clock are all in the database file, so everything carries over a restart, settlement
+  included. (`synchronous=OFF` was rejected: it can corrupt the database on a host crash.)
+- **`memory`:** for pure throughput runs. Orders, trades, pending settlements and undelivered webhooks are lost when
+  the process stops, so settlement works only while it runs.
+  - The database lives in RAM. It needs about 2.6 KiB per order with no webhook subscribers, and 3.7 KiB with a
+    subscriber to every event type. The default cap of 4 GiB (`memory_max_mib`) holds roughly a million orders;
+    beyond it, commands fail with a storage error.
+  - SQLite grows it by doubling one buffer, so leave RAM for two to three times its size.
+  - There is no WAL in memory: an API read waits for the current commit, and the writer waits for a read in
+    progress.
+- **How the mode is reported:** `GET /health` includes `"persistence": "<mode>"`. `/metrics` has
+  `exchange_persistence_mode{mode}`, which is 1 for the active mode. In `fast` and `memory` mode every response
+  carries `Exchange-Persistence: <mode>`, so no client mistakes the service for a durable one.
+- **Kubernetes and Docker:** durability also depends on where the file lives. With `durable` or `fast` in Kubernetes,
+  put `database.path` on a persistent volume. An `emptyDir` is lost when the pod is rescheduled, so it then keeps
+  nothing across pods even in `durable` mode. The same holds for a container without a volume in Docker; the compose
+  file mounts one.
 
 ## Model
 

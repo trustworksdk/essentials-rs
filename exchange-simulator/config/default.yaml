@@ -59,7 +59,14 @@ test_control:
   # Mounts /test/... (virtual clock controls). Never enable outside test deployments.
   enabled: false
 database:
+  # "durable": every acknowledged command is synced to disk (WAL, synchronous=FULL).
+  # "fast": synced only at checkpoints (synchronous=NORMAL). Survives process and container restarts; a host crash or
+  #   power loss can lose the last commits, but never corrupts the database.
+  # "memory": an in-memory database. Nothing survives the process. path is unused.
+  mode: "durable"
   path: "data/exchange.db"
+  # memory mode only: the most the database may grow to, in MiB.
+  memory_max_mib: 4096
   busy_timeout_ms: 5000
   # "background": a separate connection checkpoints the WAL once it holds checkpoint_pages pages, so no commit waits
   # for a checkpoint. "inline": SQLite's automatic checkpoint, run inside the commit that crosses 1000 pages.

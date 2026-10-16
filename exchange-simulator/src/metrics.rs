@@ -44,6 +44,8 @@ pub const WEBHOOK_ATTEMPTS: &str = "webhook_delivery_attempts_total";
 pub const WEBHOOK_DURATION: &str = "webhook_delivery_duration_seconds";
 /// Settlement instructions with a transition still to come.
 pub const SETTLEMENT_OPEN: &str = "settlement_open_instructions";
+/// 1 for the persistence mode the service runs in, 0 for the others. Label: `mode`.
+pub const PERSISTENCE_MODE: &str = "exchange_persistence_mode";
 /// Outbox rows by status (`PENDING`, `IN_FLIGHT`, `DELIVERED`, `DEAD`), read from SQLite at scrape time.
 pub const OUTBOX: &str = "webhook_outbox_deliveries";
 
@@ -75,6 +77,17 @@ pub fn install() -> PrometheusHandle {
             handle
         })
         .clone()
+}
+
+/// Records the persistence mode the service runs in.
+pub fn set_persistence_mode(mode: crate::persistence::PersistenceMode) {
+    for each in crate::persistence::PersistenceMode::ALL {
+        ::metrics::gauge!(PERSISTENCE_MODE, "mode" => each.as_str()).set(if each == mode {
+            1.0
+        } else {
+            0.0
+        });
+    }
 }
 
 fn describe() {
@@ -132,6 +145,10 @@ fn describe() {
         "Webhook HTTP attempt duration"
     );
     describe_gauge!(OUTBOX, "Webhook deliveries by status");
+    describe_gauge!(
+        PERSISTENCE_MODE,
+        "1 for the persistence mode the service runs in (durable, fast, memory)"
+    );
     describe_gauge!(
         SETTLEMENT_OPEN,
         "Settlement instructions with a transition still to come"

@@ -728,7 +728,7 @@ the order below deliberately puts group commit before sharding.
 | 4.1 ✅ | Latency breakdown and an open-loop load generator | M | New histograms for queue wait (enqueue → start) and acknowledgement latency (enqueue → reply). The bench gains a target-rate, open-loop mode that avoids coordinated omission, reporting achieved rate, latency at that rate, and 503 counts. |
 | 4.2 ✅ | Group commit | M–L | The writer drains up to N queued commands (or waits up to T µs) and plans them in order on the books. It commits them in one transaction and replies to each after the commit. If the commit fails, all plans are dropped and every caller gets the error; nothing is applied. Ordering and determinism are unchanged. Expected: several times today's durable throughput. |
 | 4.3 ✅ | Background checkpointing | S | Turn off automatic WAL checkpointing on the writer *only together with* a background connection that runs `PRAGMA wal_checkpoint(PASSIVE)` when the WAL passes a size threshold. Without that, the WAL grows without bound and throughput halves (1.2). Target: the roughly 10 % of durable time and the p99 now spent in checkpoint commits. The occasional > 10 ms spikes come from the disk (1.2), and this will not remove them. Measure with `bench checkpoint`. |
-| 4.4 | Explicit non-durable modes | S | `persistence.mode: durable \| fast \| memory` (D4).<br>• **`fast`**: WAL with `synchronous=NORMAL`. Every commit still reaches the database file, and fsync happens only at checkpoints. All state survives a process or container restart (books, events, outbox, settlement instructions, simulator cursor, virtual clock), so settlement keeps working across restarts. Only a host or node crash, or power loss, can lose the last commits, and the database is never corrupted. (`synchronous=OFF` was rejected: it can corrupt the database on a host crash.)<br>• **`memory`**: an in-memory SQLite database for pure throughput runs. Nothing survives a restart (orders, trades, pending settlements, undelivered webhooks), so settlement works only while the process runs.<br>`/health` and `/metrics` report the mode, and responses carry a header in non-durable modes. The README documents the trade-offs, including that durability in Kubernetes also needs a persistent volume (`emptyDir` loses everything when the pod is rescheduled, even in `durable` mode). |
+| 4.4 ✅ | Explicit non-durable modes | S | `persistence.mode: durable \| fast \| memory` (D4).<br>• **`fast`**: WAL with `synchronous=NORMAL`. Every commit still reaches the database file, and fsync happens only at checkpoints. All state survives a process or container restart (books, events, outbox, settlement instructions, simulator cursor, virtual clock), so settlement keeps working across restarts. Only a host or node crash, or power loss, can lose the last commits, and the database is never corrupted. (`synchronous=OFF` was rejected: it can corrupt the database on a host crash.)<br>• **`memory`**: an in-memory SQLite database for pure throughput runs. Nothing survives a restart (orders, trades, pending settlements, undelivered webhooks), so settlement works only while the process runs.<br>`/health` and `/metrics` report the mode, and responses carry a header in non-durable modes. The README documents the trade-offs, including that durability in Kubernetes also needs a persistent volume (`emptyDir` loses everything when the pod is rescheduled, even in `durable` mode). |
 | 4.5 | Instrument-sharded matching (only if 4.1 shows matching as a bottleneck) | M | Matching workers per instrument shard in front of the single writer. Today's data says matching is not the limit, so this is a measure-first step. |
 | 4.6 | Containerized benchmark and load report | M | There is no single target machine (D4): deployments are mostly Docker Compose or Kubernetes, and their hardware varies. So the benchmark runs as containers: the service image plus a load-generator container, with explicit CPU and memory limits and a named storage backing (volume or storage class). It ships as a compose profile and as a Kubernetes Job manifest. Each report records its environment: limits, storage, measured fsync latency, and node type where known. It compares `durable`, `fast` and `memory`, with and without outbox and webhooks, across instrument counts. Figures against the 1k–10k target are quoted per environment, never as one universal number. |
 
@@ -952,6 +952,84 @@ the order below deliberately puts group commit before sharding.
     p99.9. A `RESTART` or `TRUNCATE` checkpoint from the background connection would block the writer anyway.
   - **WAL size:** about 16 MiB with the defaults, against 4 MiB inline. The plan's concern was unbounded growth
     (1.2: 2.2 GiB per 50k orders with checkpoints off). It is bounded, and the cap is twice that size.
+
+**4.4 — explicit non-durable modes ✅ (2026-10-16).**
+- **Delivered:**
+  - **`database.mode: durable | fast | memory`** (`persistence::PersistenceMode`, default `durable`), opened by
+    `persistence::open_mode`:
+    - `durable`: WAL, with `synchronous=FULL` now set explicitly rather than inherited from SQLite's default.
+    - `fast`: WAL with `synchronous=NORMAL`.
+    - `memory`: SQLite's `memdb` VFS under a fresh name per start (`persistence::memory_location`), with
+      `synchronous=OFF`. The writer, the API reader and test helpers share it, and it disappears with the last
+      connection. Background checkpointing is skipped.
+  - **`database.memory_max_mib`** (default 4096) replaces `memdb`'s 1 GiB cap through
+    `sqlite3_file_control(SQLITE_FCNTL_SIZE_LIMIT)`. This is the crate's first `unsafe` block (see Decisions).
+  - **Reporting:**
+    - `GET /health` includes `persistence`.
+    - `/metrics` has `exchange_persistence_mode{mode}`, 1 for the active mode and 0 for the others.
+    - In `fast` and `memory` mode every response, test-control and 404s included, carries
+      `Exchange-Persistence: <mode>`.
+    - A warning is logged at startup in non-durable modes.
+  - **`App::database_location()`:** the file path, or the in-memory URI, for tools and tests that read the database
+    directly.
+  - **Bench:**
+    - `--persistence durable|fast|memory`, named in the report header.
+    - Non-durable rows are prefixed with their mode.
+    - The per-order rows report the database size.
+  - **Docs:** a README section on persistence modes (trade-offs, RAM sizing, and Kubernetes `emptyDir` and Docker
+    volumes); a `bench/README.md` section; results in `bench/results/2026-10-16-persistence-*.md`.
+- **Results (VM disk):**
+  - **`Exchange`, one commit per order:** durable 2,380/s, fast 7,210/s, memory 26,400/s.
+  - **Groups of 256:** 22,900, 23,500 and 34,500/s.
+  - **HTTP, 32 clients:** 13,950, 16,770 and 22,380/s.
+  - **Open-loop saturation:** about 16,400, 18,600 and 25,000/s.
+  - **Database size:** 2.6 KiB per order (3.7 KiB with an outbox subscriber to every event type).
+- **Tests:**
+  - **`tests/persistence_modes.rs` (5):**
+    - Each mode opens with its promised journal and sync settings.
+    - The in-memory database is shared with a read-only reader, gone after the last connection, separate per
+      location, and writes no files.
+    - The size cap holds at 4 MiB, and a larger configured cap replaces SQLite's default.
+    - Durable responses carry no header.
+    - `fast` mode reports itself in `/health` and in a header on every kind of response. Trades, the book and the
+      event log are identical after a restart.
+    - `memory` mode trades and settles at T+2 under the virtual clock while running, writes no file, and is empty
+      after a restart.
+  - **`tests/persistence_metrics.rs` (1),** in its own binary because the gauge is process-wide: the gauge is right
+    in each mode.
+  - The existing `/health` test expects `persistence: durable`.
+  - The two new suites were repeated five times without failure.
+- **Mutation checks**, each made a test fail:
+  - `fast` keeping `FULL`;
+  - no memory cap;
+  - one shared memory name;
+  - no header;
+  - a header in durable mode too;
+  - the gauge set before the recorder;
+  - `/health` always durable;
+  - `memory` mode using the file path.
+- **Found and fixed:** the mode gauge was set before `App::start` installed the metrics recorder, so the first
+  service in a process lost it. The recorder is now installed first. The isolated gauge test caught this, and its
+  mutation check confirms it.
+- **Decisions:**
+  - **The key is `database.mode`, not the plan's `persistence.mode` (deviation).** It sits beside `database.path`
+    and the checkpoint settings it governs.
+  - **`memory` uses SQLite's `memdb` VFS, not `:memory:`.** `:memory:` gives each connection its own database, and
+    the service has three connections. `memdb` has no WAL, so reads and the writer take turns, which is documented.
+  - **`unsafe` for the size limit.** rusqlite exposes no safe call for `SQLITE_FCNTL_SIZE_LIMIT` (its own code has
+    it as a TODO). The alternative, a compile-time `SQLITE_MEMDB_DEFAULT_MAXSIZE` through `LIBSQLITE3_FLAGS`, would
+    depend silently on the build environment. The block is a few lines, has a `SAFETY` comment, and runs once per
+    start.
+  - **The header is `Exchange-Persistence`.** It is on every response, so a client sees it whichever endpoint it
+    uses.
+- **Finding, memory limits:** one `memory` run at 30,000/s collapsed (2,170/s, p99 87 s). The devcontainer is
+  limited to **8 GiB** (`docker stats` showed 98 %), about 4 GiB of it held at rest by rust-analyzer, the VS Code
+  server and dockerd. `/proc/meminfo` shows the VM's 15.6 GiB instead, so the bench header understated the pressure.
+  The header now also reports the cgroup memory and CPU limits, which 4.6 needs anyway. Reruns with rust-analyzer
+  idle saturated normally.
+- **Finding:** with group commit, `fast` gains little over `durable` at the service level (about 15 % at
+  saturation). `memory` is what lifts the ceiling, to about 25k/s. The next limit is the exchange thread's
+  per-order work and the in-process HTTP stack (4.2, 4.6).
 
 ## Suggested order
 

@@ -9,8 +9,8 @@ use chrono::Utc;
 use exchange_simulator::app::App;
 use exchange_simulator::config::{
     CheckpointMode, ClockConfig, ClockMode, Config, DatabaseConfig, EventsConfig, ExchangeConfig,
-    GroupCommitConfig, IdsConfig, LogFormat, LoggingConfig, ServerConfig, SettlementConfig,
-    TestControlConfig, WebhooksConfig,
+    GroupCommitConfig, IdsConfig, LogFormat, LoggingConfig, PersistenceMode, ServerConfig,
+    SettlementConfig, TestControlConfig, WebhooksConfig,
 };
 use exchange_simulator::domain::{
     IdentifierPolicy, Instrument, InstrumentId, Order, OrderStatus, Participant, ParticipantId,
@@ -29,7 +29,7 @@ use exchange_simulator::webhooks::NewSubscription;
 const USAGE: &str = "usage: bench [all|matching|durable|http|checkpoint|open-loop] [--quick] [--seed N] \
                      [--matching-orders N] [--durable-orders N] [--http-orders N] [--concurrency N] [--rates R,R,..] \
                      [--seconds S] [--queue-capacity N] [--max-in-flight N] [--group-commit N] [--group-wait-us N] \
-                     [--checkpoint background|inline] [--dir DIR] [--out FILE]
+                     [--checkpoint background|inline] [--persistence durable|fast|memory] [--dir DIR] [--out FILE]
 
 --dir: where the SQLite files go (default: the system temp dir). Check the reported fsync latency: on tmpfs it is
        ~0 and the \"durable\" numbers measure SQLite in RAM.
@@ -40,7 +40,9 @@ open-loop (not part of all): for each target rate in --rates (orders/s, default 
 --group-commit: most orders per commit in the service, and the group size of the grouped durable row (default 256;
        1 commits each order on its own). --group-wait-us: how long the service waits for more orders (default 0).
 --checkpoint: where WAL checkpoints run for the durable and service rows (default background, as in the service;
-       inline is SQLite's automatic checkpoint inside the commit). The checkpoint mode compares both.";
+       inline is SQLite's automatic checkpoint inside the commit). The checkpoint mode compares both.
+--persistence: database.mode for the durable and service rows (default durable). The checkpoint mode always runs
+       durable.";
 
 struct Options {
     mode: String,
@@ -55,6 +57,7 @@ struct Options {
     max_in_flight: usize,
     group_commit: GroupCommitConfig,
     checkpoint: CheckpointMode,
+    persistence: PersistenceMode,
     dir: std::path::PathBuf,
     out: Option<String>,
 }
@@ -74,6 +77,7 @@ impl Options {
             max_in_flight: 16_384,
             group_commit: GroupCommitConfig::default(),
             checkpoint: CheckpointMode::Background,
+            persistence: PersistenceMode::Durable,
             dir: std::env::temp_dir(),
             out: None,
         };
@@ -117,6 +121,15 @@ impl Options {
                 }
                 "--queue-capacity" => {
                     options.queue_capacity = number(value("--queue-capacity")?)?.max(1)
+                }
+                "--persistence" => {
+                    let text = value("--persistence")?;
+                    options.persistence = PersistenceMode::ALL
+                        .into_iter()
+                        .find(|m| m.as_str() == text)
+                        .ok_or(format!(
+                            "--persistence: {text} is not durable, fast or memory"
+                        ))?
                 }
                 "--checkpoint" => {
                     options.checkpoint = match value("--checkpoint")?.as_str() {
@@ -321,7 +334,7 @@ fn bench_matching(options: &Options, report: &mut Report) {
 /// its caller would be answered.
 fn bench_durable(options: &Options, report: &mut Report, subscribed: bool, group: usize) {
     let dir = temp_dir(&options.dir, "durable");
-    let mut exchange = durable_exchange(&dir, subscribed, options.checkpoint);
+    let mut exchange = durable_exchange(&dir, subscribed, options.checkpoint, options.persistence);
     let commands = workload(options.seed, options.durable_orders);
     let mut latencies = Latencies::default();
     let started = Instant::now();
@@ -355,11 +368,14 @@ fn bench_durable(options: &Options, report: &mut Report, subscribed: bool, group
             .query_row(sql, [], |r| r.get(0))
             .unwrap()
     };
+    let bytes = count("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()");
     let notes = format!(
-        "{} executions, {} events, {} outbox rows",
+        "{} executions, {} events, {} outbox rows; database {} MiB ({:.1} KiB per order)",
         count("SELECT COUNT(*) FROM executions"),
         count("SELECT COUNT(*) FROM events"),
-        count("SELECT COUNT(*) FROM webhook_deliveries")
+        count("SELECT COUNT(*) FROM webhook_deliveries"),
+        bytes >> 20,
+        bytes as f64 / 1024.0 / options.durable_orders as f64
     );
     let mut scenario = if subscribed {
         "durable, outbox for 1 subscriber to all event types (`Exchange` + SQLite)"
@@ -369,6 +385,9 @@ fn bench_durable(options: &Options, report: &mut Report, subscribed: bool, group
     .to_string();
     if group > 1 {
         scenario.push_str(&format!(", groups of {group}"));
+    }
+    if options.persistence != PersistenceMode::Durable {
+        scenario = format!("{} mode: {scenario}", options.persistence.as_str());
     }
     report.row(
         &scenario,
@@ -388,11 +407,15 @@ fn durable_exchange(
     dir: &std::path::Path,
     subscribed: bool,
     checkpoint: CheckpointMode,
+    mode: PersistenceMode,
 ) -> Exchange {
-    let path = dir.join("exchange.db");
-    let conn = persistence::open(&path, Duration::from_secs(5)).unwrap();
+    let location = match mode {
+        PersistenceMode::Memory => persistence::memory_location(),
+        _ => dir.join("exchange.db").to_string_lossy().into_owned(),
+    };
+    let conn = persistence::open_mode(&location, mode, Duration::from_secs(5), 16 << 30).unwrap();
     let mut store = Store::new(conn);
-    if checkpoint == CheckpointMode::Background {
+    if checkpoint == CheckpointMode::Background && mode != PersistenceMode::Memory {
         store
             .checkpoint_in_background(Duration::from_secs(5), 1000)
             .unwrap();
@@ -460,7 +483,7 @@ fn bench_checkpoint(options: &Options, report: &mut Report) {
         } else {
             CheckpointMode::Inline
         };
-        let mut exchange = durable_exchange(&dir, false, mode);
+        let mut exchange = durable_exchange(&dir, false, mode, PersistenceMode::Durable);
         let conn = exchange.store().connection();
         match variant {
             Variant::Observed => conn.wal_hook(Some(observed_autocheckpoint)),
@@ -611,6 +634,8 @@ impl Service {
                 max_backoff_ms: 300_000,
             },
             database: DatabaseConfig {
+                mode: options.persistence,
+                memory_max_mib: 16 * 1024,
                 checkpoint: options.checkpoint,
                 checkpoint_pages: 1000,
                 path: dir.join("exchange.db").to_string_lossy().into_owned(),
@@ -630,6 +655,7 @@ impl Service {
             },
         };
         let app = App::start(&config).unwrap();
+        let database = app.database_location().to_string();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(axum::serve(listener, app.router.clone()).into_future());
@@ -642,7 +668,7 @@ impl Service {
             server,
             base,
             client,
-            database: config.database.path,
+            database,
             dir,
         };
         service.post("/api/instruments", serde_json::json!({ "id": "ACME", "symbol": "ACME", "mic": "XCSE", "currency": "DKK", "currencyScale": 2 })).await;
@@ -1009,13 +1035,47 @@ fn environment() -> String {
         })
         .unwrap_or(0);
     format!(
-        "{cpu}, {cpus} CPUs available, {memory} GiB RAM, {} {} (kernel {})",
+        "{cpu}, {cpus} CPUs available, {memory} GiB RAM on the host, {}; {} {} (kernel {})",
+        container_limits(),
         std::env::consts::OS,
         std::env::consts::ARCH,
         std::fs::read_to_string("/proc/sys/kernel/osrelease")
             .unwrap_or_default()
             .trim()
     )
+}
+
+/// The cgroup (v2) limits this process runs under. In a container `/proc/meminfo` shows the host's memory, not the
+/// container's limit, which is what decides when a run starts to thrash.
+fn container_limits() -> String {
+    let read = |file: &str| {
+        std::fs::read_to_string(format!("/sys/fs/cgroup/{file}"))
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
+    let memory = match read("memory.max").as_deref() {
+        Some("max") => "no memory limit".to_string(),
+        Some(bytes) => match bytes.parse::<u64>() {
+            Ok(bytes) => format!(
+                "container memory limit {:.1} GiB",
+                bytes as f64 / (1u64 << 30) as f64
+            ),
+            Err(_) => "memory limit unknown".into(),
+        },
+        None => "memory limit unknown".into(),
+    };
+    let cpu = match read("cpu.max") {
+        Some(max) => match max.split_once(' ') {
+            Some(("max", _)) => "no CPU limit".to_string(),
+            Some((quota, period)) => match (quota.parse::<f64>(), period.parse::<f64>()) {
+                (Ok(q), Ok(p)) if p > 0.0 => format!("CPU limit {:.1}", q / p),
+                _ => "CPU limit unknown".into(),
+            },
+            None => "CPU limit unknown".into(),
+        },
+        None => "CPU limit unknown".into(),
+    };
+    format!("{memory}, {cpu}")
 }
 
 /// Average latency of a 4 KiB write plus `fsync` in `base`: what one durable commit costs at least.
@@ -1037,9 +1097,13 @@ fn fsync_latency(base: &std::path::Path) -> Duration {
 }
 
 /// The journal and sync mode a database opened by the service actually uses.
-fn sqlite_settings(base: &std::path::Path) -> String {
+fn sqlite_settings(base: &std::path::Path, mode: PersistenceMode) -> String {
     let dir = temp_dir(base, "pragma");
-    let conn = persistence::open(dir.join("probe.db"), Duration::from_secs(1)).unwrap();
+    let location = match mode {
+        PersistenceMode::Memory => persistence::memory_location(),
+        _ => dir.join("probe.db").to_string_lossy().into_owned(),
+    };
+    let conn = persistence::open_mode(&location, mode, Duration::from_secs(1), 1 << 30).unwrap();
     let journal: String = conn
         .pragma_query_value(None, "journal_mode", |r| r.get(0))
         .unwrap();
@@ -1058,7 +1122,10 @@ fn sqlite_settings(base: &std::path::Path) -> String {
         3 => "EXTRA",
         _ => "?",
     };
-    format!("{version}, journal_mode={journal}, synchronous={sync}")
+    format!(
+        "{version}, database.mode={}, journal_mode={journal}, synchronous={sync}",
+        mode.as_str()
+    )
 }
 
 #[tokio::main]
@@ -1114,10 +1181,11 @@ async fn main() {
             "release"
         },
         options.seed,
-        sqlite_settings(&options.dir),
-        match options.checkpoint {
-            CheckpointMode::Background => "in the background from 1000 pages",
-            CheckpointMode::Inline => "inline (SQLite's automatic checkpoint)",
+        sqlite_settings(&options.dir, options.persistence),
+        match (options.persistence, options.checkpoint) {
+            (PersistenceMode::Memory, _) => "none (in memory)",
+            (_, CheckpointMode::Background) => "in the background from 1000 pages",
+            (_, CheckpointMode::Inline) => "inline (SQLite's automatic checkpoint)",
         },
         options.dir.display(),
         micros(fsync_latency(&options.dir)),

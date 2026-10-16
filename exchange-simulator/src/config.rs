@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::domain::IdentifierPolicy;
 use crate::ids::IdScheme;
+pub use crate::persistence::PersistenceMode;
 use crate::settlement::SettlementPolicy;
 use crate::webhooks::{RetryPolicy, WorkerConfig};
 
@@ -227,8 +228,15 @@ impl WebhooksConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct DatabaseConfig {
+    /// `durable`, `fast` or `memory` (see [`PersistenceMode`]).
+    #[serde(default)]
+    pub mode: PersistenceMode,
+    /// The database file; unused in `memory` mode.
     pub path: String,
     pub busy_timeout_ms: u64,
+    /// In `memory` mode, the most the database may grow to, in MiB; beyond it commands fail with a storage error.
+    #[serde(default = "default_memory_max_mib")]
+    pub memory_max_mib: u64,
     /// Where WAL checkpoints run.
     #[serde(default)]
     pub checkpoint: CheckpointMode,
@@ -239,6 +247,10 @@ pub struct DatabaseConfig {
 
 fn default_checkpoint_pages() -> u32 {
     1000
+}
+
+fn default_memory_max_mib() -> u64 {
+    4096
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]

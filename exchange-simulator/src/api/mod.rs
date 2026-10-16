@@ -24,7 +24,7 @@ pub use model::*;
 use crate::domain::{Instrument, InstrumentId, Participant};
 use crate::engine::{DispatchError, Dispatcher, ExchangeError, SubmitOutcome};
 use crate::events::EventEnvelope;
-use crate::persistence::{ExecutionFilter, InstrumentFilter, Store};
+use crate::persistence::{ExecutionFilter, InstrumentFilter, PersistenceMode, Store};
 use crate::webhooks::NewSubscription;
 
 /// Shared handler state.
@@ -33,15 +33,22 @@ pub struct AppState {
     dispatcher: Dispatcher,
     reader: Arc<Mutex<Store>>,
     metrics: PrometheusHandle,
+    persistence: PersistenceMode,
 }
 
 impl AppState {
     /// `reader` should be a read-only connection to the database the dispatcher's exchange writes.
-    pub fn new(dispatcher: Dispatcher, reader: Store, metrics: PrometheusHandle) -> Self {
+    pub fn new(
+        dispatcher: Dispatcher,
+        reader: Store,
+        metrics: PrometheusHandle,
+        persistence: PersistenceMode,
+    ) -> Self {
         Self {
             dispatcher,
             reader: Arc::new(Mutex::new(reader)),
             metrics,
+            persistence,
         }
     }
 
@@ -86,6 +93,27 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Liveness and readiness: the process is up and the database answers.
+/// The header that marks every response from a service in a non-durable persistence mode.
+pub const PERSISTENCE_HEADER: &str = "exchange-persistence";
+
+/// In `fast` and `memory` mode, adds `Exchange-Persistence: <mode>` to every response, so a client cannot mistake
+/// the service for a durable one. Durable responses carry no header.
+pub fn mark_persistence(router: Router, mode: PersistenceMode) -> Router {
+    if mode == PersistenceMode::Durable {
+        return router;
+    }
+    let value = axum::http::HeaderValue::from_static(mode.as_str());
+    router.layer(axum::middleware::map_response(
+        move |mut response: axum::response::Response| {
+            let value = value.clone();
+            async move {
+                response.headers_mut().insert(PERSISTENCE_HEADER, value);
+                response
+            }
+        },
+    ))
+}
+
 async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     match state
         .read(|store| crate::persistence::schema_version(store.connection()))
@@ -93,7 +121,9 @@ async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     {
         Ok(version) => (
             StatusCode::OK,
-            Json(json!({ "status": "ok", "schemaVersion": version })),
+            Json(
+                json!({ "status": "ok", "schemaVersion": version, "persistence": state.persistence.as_str() }),
+            ),
         ),
         Err(error) => {
             tracing::warn!(?error, "health check failed");

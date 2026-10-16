@@ -54,6 +54,8 @@ impl TestApp {
             events: EventsConfig::default(),
             webhooks: webhooks_config(),
             database: DatabaseConfig {
+                mode: Default::default(),
+                memory_max_mib: 1024,
                 checkpoint: Default::default(),
                 checkpoint_pages: 1000,
                 path: dir.join("exchange.db").to_string_lossy().into_owned(),
@@ -98,9 +100,14 @@ impl TestApp {
         self.app.as_ref().expect("running").router.clone()
     }
 
-    /// A separate connection to the database, for asserting on stored state.
+    /// A separate connection to the database, for asserting on stored state. In `memory` mode only while the service
+    /// runs.
     pub fn db(&self) -> rusqlite::Connection {
-        rusqlite::Connection::open(&self.config.database.path).unwrap()
+        let location = match &self.app {
+            Some(app) => app.database_location().to_string(),
+            None => self.config.database.path.clone(),
+        };
+        rusqlite::Connection::open(location).unwrap()
     }
 
     pub fn count(&self, sql: &str) -> i64 {

@@ -37,7 +37,9 @@ tmpfs that cost is about 1 µs, and the "durable" rows then measure SQLite in RA
 
 ## Results, 2026-10-14
 
-Measured inside the devcontainer: Docker Desktop VM (linuxkit kernel, aarch64), 8 CPUs, 15 GiB. Full reports are in
+Measured inside the devcontainer: Docker Desktop VM (linuxkit kernel, aarch64), 8 CPUs, 15 GiB on the VM. The
+container itself is limited to 8 GiB, which the reports up to 2026-10-16 did not show; see the persistence-mode
+results below. Full reports are in
 [`results/`](results/).
 
 | | VM disk (fsync ≈ 200 µs) | tmpfs (no real fsync) |
@@ -222,4 +224,42 @@ and p50 6.8–7.0 against 4.1 ms at 16,000/s.
   The first implementation asked for a checkpoint after every commit past the threshold. It ran 36,500 checkpoints
   per 50k orders, raised p50 by about 40 %, and still relied on the writer. Asking once per threshold of growth fixed
   that.
+
+## Persistence modes (step 4.4)
+
+`--persistence durable|fast|memory` sets `database.mode` for the durable and service rows; the report header names
+it, and non-durable rows are prefixed with the mode. The per-order rows also report the database size.
+
+### Results, 2026-10-16
+
+Same devcontainer, VM disk (fsync about 200–240 µs). Full reports: `results/2026-10-16-persistence-*-vm-disk.md`
+and `results/2026-10-16-persistence-*-open-loop-vm-disk.md`.
+
+| | durable | fast | memory |
+|---|---:|---:|---:|
+| `Exchange`, one commit per order | 2,380/s (p50 154 µs) | 7,210/s (p50 61 µs) | 26,400/s (p50 32 µs) |
+| `Exchange`, groups of 256 | 22,900/s | 23,500/s | 34,500/s |
+| HTTP, 32 clients | 13,950/s (p99 4.8 ms) | 16,770/s (p99 8.3 ms) | 22,380/s (p99 2.0 ms) |
+| HTTP + `TradeExecuted` consumer | 9,780/s | 11,910/s | 14,030/s |
+| Open loop: highest rate held of 15k/20k/25k/30k | 15,000/s (p99 46 ms) | 15,000/s (p99 91 ms) | **25,000/s** (p99 13–20 ms) |
+| Open loop: saturation | about 16,400/s | about 18,600/s | about 24,200–25,400/s |
+
+**What this says:**
+- **With group commit, `fast` gains little over `durable`** (groups of 256: 23,500 against 22,900/s), because one
+  fsync already serves a whole group. `fast` matters for one-commit-per-order workloads (3×) and under saturation
+  (about 15 % more).
+- **`memory` lifts the ceiling to about 25,000 orders/s** over HTTP. What remains is the exchange thread's own work
+  and the HTTP stack sharing the process (4.2).
+- **The database needs about 2.6 KiB per order** (3.7 KiB with an outbox subscriber to every event type).
+- **One `memory` run at 30,000/s collapsed:** 2,170 orders/s, p99 87 s, 534 connection failures. The cause was the
+  devcontainer's **8 GiB memory limit**. `docker stats` showed 98 % in use. About 4 GiB of it is taken at rest (2.1 GB
+  of it rust-analyzer, which was re-indexing after a build, plus the VS Code server and dockerd). The rest went to a
+  1 GB in-memory database, which can briefly need about 3 GB while doubling its buffer, and to the run's request
+  bodies and HTTP buffers.
+  - Two reruns of the same sequence, with rust-analyzer idle, saturated normally (24,200 and 25,400/s with 503s). The
+    process's memory was freed between rates.
+  - `/proc/meminfo` shows the VM's 15.6 GiB, not the container's limit, so earlier reports overstated the RAM. Since
+    then the report header also gives the container's cgroup memory and CPU limits.
+  - Leave headroom for `memory` runs under the container limit (see the README), and do not benchmark while a build or
+    an indexer is running.
 
