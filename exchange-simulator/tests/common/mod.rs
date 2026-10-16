@@ -26,6 +26,7 @@ pub struct TestApp {
 pub fn webhooks_config() -> WebhooksConfig {
     WebhooksConfig {
         subscriptions: Vec::new(),
+        secret_grace_seconds: 3600,
         poll_interval_ms: 20,
         batch_size: 50,
         concurrency: 8,

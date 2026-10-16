@@ -3,6 +3,8 @@
 //! For a subscription registered with a secret, each delivery attempt carries:
 //! - `X-Signature-Timestamp: <unix seconds>`, the time of the attempt;
 //! - `X-Signature: sha256=<lowercase hex>`, the HMAC-SHA256 under the secret of `"{timestamp}.{raw request body}"`.
+//!   During the grace period after a secret rotation the header carries one value per secret, comma-separated and the
+//!   current secret first (`sha256=<new>, sha256=<previous>`); a consumer accepts the request if any value matches.
 //!
 //! A consumer recomputes the HMAC over the raw body bytes as received (not a re-serialization), compares in constant
 //! time, and rejects timestamps too far from its own clock to stop replays. Retries are signed again with a new

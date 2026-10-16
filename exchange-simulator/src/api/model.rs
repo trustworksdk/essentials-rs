@@ -379,6 +379,12 @@ pub struct SubscriptionView {
     pub name: Option<String>,
     /// `api` or `config`: who owns it.
     pub source: crate::webhooks::SubscriptionSource,
+    /// After a secret rotation, until when deliveries are also signed with the previous secret.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_secret_valid_until: Option<DateTime<Utc>>,
+    /// Shown only when listing with `includeDeleted=true`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
 }
 
 impl From<Subscription> for SubscriptionView {
@@ -395,6 +401,8 @@ impl From<Subscription> for SubscriptionView {
             faults: s.faults,
             name: s.name,
             source: s.source,
+            previous_secret_valid_until: s.previous_secret.map(|(_, until)| until),
+            deleted: s.deleted,
         }
     }
 }

@@ -212,6 +212,14 @@ pub struct WebhooksConfig {
     /// [`crate::webhooks::DeclaredSubscription`]).
     #[serde(default)]
     pub subscriptions: Vec<SubscriptionConfig>,
+    /// When the configuration changes a declared subscription's secret, how long the previous one stays valid (both
+    /// signatures are sent meanwhile).
+    #[serde(default = "default_secret_grace_seconds")]
+    pub secret_grace_seconds: u64,
+}
+
+fn default_secret_grace_seconds() -> u64 {
+    3600
 }
 
 /// One entry of `webhooks.subscriptions`.

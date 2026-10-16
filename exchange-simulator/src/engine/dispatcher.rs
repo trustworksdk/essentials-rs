@@ -9,7 +9,9 @@ use super::{
 };
 use crate::domain::{Instrument, InstrumentId, Participant, Side};
 use crate::settlement::{ExternalReport, NewReport};
-use crate::webhooks::{DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription};
+use crate::webhooks::{
+    DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription, WebhookChange,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
@@ -44,6 +46,9 @@ enum Request {
     Snapshot(InstrumentId, oneshot::Sender<Option<BookSnapshot>>),
     RegisterWebhook(NewSubscription, Reply<Subscription>),
     SetWebhookFaults(Uuid, Option<FaultPolicy>, Reply<Subscription>),
+    UpdateWebhook(Uuid, WebhookChange, Reply<Subscription>),
+    DeleteWebhook(Uuid, Reply<()>),
+    RotateWebhookSecret(Uuid, String, chrono::Duration, Reply<Subscription>),
     Redeliver(Uuid, u64, Reply<usize>),
     RetryDeadLetters(Option<Uuid>, Vec<Uuid>, Reply<usize>),
     Reset(Reply<()>),
@@ -67,6 +72,9 @@ impl Request {
             Self::Snapshot(..) => "snapshot",
             Self::RegisterWebhook(..) => "register_webhook",
             Self::SetWebhookFaults(..) => "set_webhook_faults",
+            Self::UpdateWebhook(..) => "update_webhook",
+            Self::DeleteWebhook(..) => "delete_webhook",
+            Self::RotateWebhookSecret(..) => "rotate_webhook_secret",
             Self::Redeliver(..) => "redeliver",
             Self::RetryDeadLetters(..) => "retry_dead_letters",
             Self::Reset(..) => "reset",
@@ -218,6 +226,29 @@ impl Dispatcher {
         policy: Option<FaultPolicy>,
     ) -> Result<Subscription, DispatchError> {
         self.call(|reply| Request::SetWebhookFaults(subscription_id, policy, reply))
+            .await
+    }
+
+    pub async fn update_webhook(
+        &self,
+        id: Uuid,
+        change: WebhookChange,
+    ) -> Result<Subscription, DispatchError> {
+        self.call(|reply| Request::UpdateWebhook(id, change, reply))
+            .await
+    }
+
+    pub async fn delete_webhook(&self, id: Uuid) -> Result<(), DispatchError> {
+        self.call(|reply| Request::DeleteWebhook(id, reply)).await
+    }
+
+    pub async fn rotate_webhook_secret(
+        &self,
+        id: Uuid,
+        secret: String,
+        grace: chrono::Duration,
+    ) -> Result<Subscription, DispatchError> {
+        self.call(|reply| Request::RotateWebhookSecret(id, secret, grace, reply))
             .await
     }
 
@@ -474,6 +505,13 @@ fn handle(exchange: &mut Exchange, request: Request) -> &'static str {
             answer(reply, exchange.set_webhook_faults(id, policy))
         }
         Request::Redeliver(id, after, reply) => answer(reply, exchange.redeliver(id, after)),
+        Request::UpdateWebhook(id, change, reply) => {
+            answer(reply, exchange.update_webhook(id, change))
+        }
+        Request::DeleteWebhook(id, reply) => answer(reply, exchange.delete_webhook(id)),
+        Request::RotateWebhookSecret(id, secret, grace, reply) => {
+            answer(reply, exchange.rotate_webhook_secret(id, secret, grace))
+        }
         Request::RetryDeadLetters(subscription, ids, reply) => {
             answer(reply, exchange.retry_dead_letters(subscription, &ids))
         }

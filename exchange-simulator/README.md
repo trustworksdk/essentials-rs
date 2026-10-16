@@ -30,6 +30,7 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `webhooks.max_attempts` | `10` | Attempts in total; then the delivery is dead-lettered (`DEAD`) |
 | `webhooks.initial_backoff_ms` / `max_backoff_ms` | `500` / `300000` | Exponential backoff between attempts, with jitter |
 | `webhooks.subscriptions` | `[]` | Subscriptions declared in configuration, reconciled by name at startup (see Declared subscriptions) |
+| `webhooks.secret_grace_seconds` | `3600` | When the configuration changes a declared subscription's secret, how long the previous one keeps signing too |
 | `ids.mode` / `ids.seed` | `random` / `0` | `deterministic` makes every ID reproducible from the seed (see Reproducible runs) |
 | `settlement.mode` | `external` | `external`, `simulated` or `both` (see Settlement) |
 | `settlement.tick_interval_ms` | `250` | How often the simulator takes in trades and fires due transitions |
@@ -275,9 +276,14 @@ Delivery is a `POST` of the event envelope with headers `X-Event-Id`, `X-Event-T
   time of the attempt) and `X-Signature: sha256=<hex>`, the HMAC-SHA256 under the secret of
   `"{X-Signature-Timestamp}.{raw body}"`. A retry is signed again with a new timestamp; its body is byte-identical.
   Subscriptions without a secret are unsigned, so use them on test networks only.
+- **Rotation:** for the grace period after a secret rotation, `X-Signature` carries one value per secret,
+  comma-separated with the current secret first: `sha256=<new>, sha256=<previous>`. A request is authentic if any
+  value matches. A consumer can therefore switch to the new secret at any point in the grace period without rejecting
+  a delivery.
 
 To verify a signature, recompute the HMAC over the raw body *as received*, not over a re-serialization, compare in
-constant time, and reject timestamps far from your clock (e.g. more than 5 minutes) to stop replays:
+constant time against each value in the header, and reject timestamps far from your clock (e.g. more than 5 minutes)
+to stop replays:
 
 ```python
 import hashlib, hmac, time
@@ -285,7 +291,9 @@ import hashlib, hmac, time
 def verify(secret: bytes, headers, raw_body: bytes, tolerance=300) -> bool:
     timestamp = headers["X-Signature-Timestamp"]
     expected = "sha256=" + hmac.new(secret, timestamp.encode() + b"." + raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, headers["X-Signature"]) and abs(time.time() - int(timestamp)) <= tolerance
+    candidates = [value.strip() for value in headers["X-Signature"].split(",")]
+    matches = any(hmac.compare_digest(expected, candidate) for candidate in candidates)
+    return matches and abs(time.time() - int(timestamp)) <= tolerance
 ```
 
 ### Declared subscriptions
@@ -322,14 +330,48 @@ webhooks:
 - **Secrets:** `secret_env` names an environment variable and `secret_file` a file, e.g. a Docker secret under
   `/run/secrets`. Surrounding whitespace is ignored. The secret is never returned by the API.
 - **Changing a declared subscription:** edit the file and restart the service. The configuration is its source of
-  truth; the maintenance API (4.6b) treats declared subscriptions as read-only.
+  truth: through the API (below) only `paused` can be changed, and only until the next restart reapplies the file.
+  Every other change, a delete or a secret rotation gets `409 managed_by_configuration`. A secret changed in the file
+  keeps the previous one signing for `webhooks.secret_grace_seconds` (default an hour), across restarts.
 - **Scenarios:** the scenario sandbox (`/test/scenarios`, `scenario run`) never inherits declared subscriptions, so
   sandbox events never reach real consumers.
 - **Environment variables:** a list cannot be set through `EXCHANGE__…` variables; use the file.
 
-### `GET /api/webhooks`
+### `GET /api/webhooks?includeDeleted=`
 
-Lists the subscriptions.
+Lists the subscriptions; deleted ones only with `includeDeleted=true` (shown with `deleted: true`).
+
+### Maintaining a subscription
+
+For subscriptions created through the API. One declared in configuration takes only `paused`; the rest get `409`.
+Inspecting, listing deliveries, retrying and redelivering work for every subscription. A deleted or unknown ID gets
+`404`.
+
+- **`GET /api/webhooks/{id}`:** the subscription and how its deliveries stand:
+  `"deliveries": { "pending", "inFlight", "delivered", "dead", "oldestUnfinished": { "eventSequence", "occurredAt" } }`.
+  `oldestUnfinished` is the oldest event not yet delivered, which shows how far behind the consumer is.
+- **`PATCH /api/webhooks/{id}`** with any of `{ "url", "eventTypes", "ordered", "enabled", "paused" }` → `200` and the
+  subscription.
+  - Pending deliveries keep their place and go to the new URL.
+  - `paused: true` holds deliveries; they go out in order when it is unpaused.
+  - `enabled: false` records no new deliveries at all.
+  - Validation is as for `POST`.
+- **`DELETE /api/webhooks/{id}`** → `204`. The subscription disappears from the API, gets no new deliveries, and sends
+  none of its pending ones, retries included. Its deliveries and attempts stay in the database.
+- **`POST /api/webhooks/{id}/secret`** with `{ "secret", "graceSeconds" }` → `200`.
+  - It replaces the signing secret (16–256 characters; an unsigned subscription becomes signed).
+  - For `graceSeconds` (default 3600, at most 604800; 0 for none) the previous secret signs too (see Rotation above).
+    The response shows `previousSecretValidUntil`.
+  - Secrets are never returned.
+- **`GET /api/webhooks/{id}/deliveries?status=&after=&limit=`:** the deliveries in event order, with
+  `{ "deliveryId", "eventSequence", "eventId", "eventType", "status", "attempts", "lastError", "nextAttemptAt",
+  "deliveredAt" }`.
+  - `status` is `PENDING`, `IN_FLIGHT`, `DELIVERED` or `DEAD` (the dead letters).
+  - Page with `after` (an event sequence) and `limit` (default 100, at most 1000).
+- **`POST /api/webhooks/{id}/dead-letters/retry`** with an optional `{ "deliveryIds": [...] }` → `{ "retried" }`. It
+  retries all of the subscription's dead letters, or the listed ones, with a fresh attempt budget.
+- **`POST /api/webhooks/{id}/redeliver?after=`** → `{ "queued" }`. It sends every event after sequence `after` again,
+  including events from before the subscription existed: a replay for a consumer that lost data.
 
 ### `GET /metrics`
 
@@ -443,8 +485,8 @@ inject delivery faults and run scenarios. They return `404` otherwise.
 | POST | `/test/clock/set` | `{ "to": "2030-01-07T09:00:00Z" }` | Move to an instant; earlier than now is `409 clock_backwards` |
 | POST | `/test/clock/freeze` / `/test/clock/resume` | – | Stop the clock, or let it run with real time |
 | POST | `/test/reset` | – | `204`: clears all state, as on a new database (see below) |
-| GET | `/test/deliveries?subscriptionId=&status=` | – | Webhook deliveries in event order, optionally one subscription's or one status (`DEAD` lists the dead letters): `deliveryId`, `subscriptionId`, `url`, `eventSequence`, `eventId`, `eventType`, `status`, `attempts`, `lastError` |
-| POST | `/test/webhooks/{id}/redeliver?after=` | – | Queues the subscription's events after sequence `after` (default 0: all) for delivery again: `{ "queued": n }` |
+| GET | `/test/deliveries?subscriptionId=&status=` | – | Webhook deliveries in event order, optionally one subscription's or one status (`DEAD` lists the dead letters): `deliveryId`, `subscriptionId`, `url`, `eventSequence`, `eventId`, `eventType`, `status`, `attempts`, `lastError`, `nextAttemptAt`, `deliveredAt`. Across all subscriptions; the regular API has the per-subscription equivalents (Maintaining a subscription) |
+| POST | `/test/webhooks/{id}/redeliver?after=` | – | Queues the subscription's events after sequence `after` (default 0: all) for delivery again: `{ "queued": n }`. Same as `POST /api/webhooks/{id}/redeliver` |
 | POST | `/test/dead-letters/retry` | Optional `{ "subscriptionId", "deliveryIds": [...] }` | Retries dead letters (all, one subscription's, or the listed ones) with a fresh attempt budget: `{ "retried": n }` |
 | PUT / DELETE | `/test/webhooks/{id}/faults` | A fault policy / – | Set or clear the subscription's delivery faults (see Fault injection); returns the subscription |
 | GET | `/test/attempts?subscriptionId=` | – | Every request sent and every hold, oldest first: `deliveryId`, `subscriptionId`, `url`, `eventSequence`, `eventId`, `eventType`, `attempt`, `outcome` (`SENT`\|`HELD`), `faults`, `body` (only when a fault changed it), `httpStatus`, `error`, `at` |

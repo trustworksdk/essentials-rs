@@ -87,6 +87,9 @@ impl App {
                     .webhooks
                     .declared()
                     .context("reading webhooks.subscriptions")?,
+                webhook_secret_grace: chrono::Duration::seconds(
+                    i64::try_from(config.webhooks.secret_grace_seconds).unwrap_or(i64::MAX / 1000),
+                ),
             },
         )
         .context("recovering order books")?;

@@ -44,6 +44,12 @@ pub struct Subscription {
     pub source: SubscriptionSource,
     /// Deliveries are recorded but held until unpaused, then sent in order. (Disabled, by contrast, records none.)
     pub paused: bool,
+    /// The secret replaced by the last rotation, and until when deliveries are also signed with it. Never serialized.
+    #[serde(skip_serializing)]
+    pub previous_secret: Option<(String, DateTime<Utc>)>,
+    /// Deleted through the API: kept for its history, but hidden, receiving nothing and sending nothing.
+    #[serde(skip_serializing)]
+    pub deleted: bool,
 }
 
 /// Who owns a subscription.
@@ -103,6 +109,16 @@ pub fn validate_declared(declared: &[DeclaredSubscription]) -> Result<(), String
     Ok(())
 }
 
+/// A change to a subscription (`PATCH /api/webhooks/{id}`); `None` leaves a field as it is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WebhookChange {
+    pub url: Option<String>,
+    pub event_types: Option<Vec<String>>,
+    pub ordered: Option<bool>,
+    pub enabled: Option<bool>,
+    pub paused: Option<bool>,
+}
+
 /// A request to register a subscription.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NewSubscription {
@@ -117,7 +133,7 @@ pub struct NewSubscription {
 
 impl Subscription {
     pub fn wants(&self, event_type: &str) -> bool {
-        self.enabled && self.event_types.iter().any(|t| t == event_type)
+        self.enabled && !self.deleted && self.event_types.iter().any(|t| t == event_type)
     }
 }
 
@@ -131,6 +147,8 @@ pub struct DeliveryJob {
     pub attempts: u32,
     /// The subscription's signing secret, if any.
     pub secret: Option<String>,
+    /// The previous secret while its grace period after a rotation lasts: deliveries are signed with both.
+    pub previous_secret: Option<String>,
     /// The subscription's fault policy, if any.
     pub faults: Option<FaultPolicy>,
     /// Whether an out-of-order fault held this delivery back before.

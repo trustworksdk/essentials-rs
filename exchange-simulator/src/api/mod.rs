@@ -5,6 +5,7 @@ mod error;
 mod model;
 pub mod settlements;
 pub mod test_control;
+pub mod webhooks;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -25,7 +26,6 @@ use crate::domain::{Instrument, InstrumentId, Participant};
 use crate::engine::{DispatchError, Dispatcher, ExchangeError, SubmitOutcome};
 use crate::events::EventEnvelope;
 use crate::persistence::{ExecutionFilter, InstrumentFilter, PersistenceMode, Store};
-use crate::webhooks::NewSubscription;
 
 /// Shared handler state.
 #[derive(Clone)]
@@ -87,9 +87,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/orderbooks/{instrument_id}", get(order_book))
         .route("/api/trades", get(list_trades))
         .route("/api/events", get(list_events))
-        .route("/api/webhooks", post(register_webhook).get(list_webhooks))
         .with_state(state.clone())
-        .merge(settlements::router(state))
+        .merge(settlements::router(state.clone()))
+        .merge(webhooks::router(state))
 }
 
 /// Liveness and readiness: the process is up and the database answers.
@@ -318,38 +318,6 @@ async fn list_events(
         state
             .read(move |store| store.events(after, limit, q.event_type.as_deref()))
             .await?,
-    ))
-}
-
-async fn register_webhook(
-    State(state): State<AppState>,
-    body: Result<Json<WebhookRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<SubscriptionView>), ApiError> {
-    let Json(body) = body?;
-    let subscription = state
-        .dispatcher
-        .register_webhook(NewSubscription {
-            url: body.url,
-            event_types: body.event_types,
-            secret: body.secret,
-            ordered: body.ordered,
-        })
-        .await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(SubscriptionView::from(subscription)),
-    ))
-}
-
-async fn list_webhooks(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<SubscriptionView>>, ApiError> {
-    let subscriptions = state.read(|store| store.subscriptions()).await?;
-    Ok(Json(
-        subscriptions
-            .into_iter()
-            .map(SubscriptionView::from)
-            .collect(),
     ))
 }
 

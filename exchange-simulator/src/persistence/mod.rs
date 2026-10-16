@@ -4,8 +4,8 @@ mod checkpoint;
 mod store;
 
 pub use store::{
-    AttemptRow, DeliveryRecord, ExecutionFilter, InstrumentFilter, OrderRecord, Outbox,
-    SettlementWrite, Store,
+    AttemptRow, DeliveryRecord, DeliveryStats, ExecutionFilter, InstrumentFilter, OrderRecord,
+    Outbox, SettlementWrite, Store,
 };
 
 use std::path::Path;
@@ -25,6 +25,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/008_settlement_reports.sql"),
     include_str!("../../migrations/009_delivery_faults.sql"),
     include_str!("../../migrations/010_named_subscriptions.sql"),
+    include_str!("../../migrations/011_webhook_maintenance.sql"),
 ];
 
 /// How much of the exchange's state survives what (`database.mode`).

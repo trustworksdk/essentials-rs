@@ -76,6 +76,7 @@ impl From<ExchangeError> for ApiError {
             E::UnknownInstrument(_) => (StatusCode::UNPROCESSABLE_ENTITY, "unknown_instrument"),
             E::UnknownParticipant(_) => (StatusCode::UNPROCESSABLE_ENTITY, "unknown_participant"),
             E::UnknownOrder(_) | E::UnknownSubscription(_) => (StatusCode::NOT_FOUND, "not_found"),
+            E::ManagedByConfiguration { .. } => (StatusCode::CONFLICT, "managed_by_configuration"),
             E::OrderNotActive { .. } => (StatusCode::CONFLICT, "order_not_active"),
             E::DuplicateInstrument(_) | E::DuplicateListing { .. } | E::DuplicateParticipant(_) => {
                 (StatusCode::CONFLICT, "already_exists")

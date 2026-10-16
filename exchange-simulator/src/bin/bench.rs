@@ -626,6 +626,7 @@ impl Service {
             events: EventsConfig::default(),
             webhooks: WebhooksConfig {
                 subscriptions: Vec::new(),
+                secret_grace_seconds: 3600,
                 poll_interval_ms: 250,
                 batch_size: 100,
                 concurrency: 16,

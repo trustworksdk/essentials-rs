@@ -19,7 +19,7 @@ use crate::settlement::{
 };
 use crate::webhooks::{
     DeclaredSubscription, DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription,
-    SubscriptionSource,
+    SubscriptionSource, WebhookChange,
 };
 
 /// The settlement simulator's name in `consumer_offsets`.
@@ -79,6 +79,11 @@ pub enum ExchangeError {
     InvalidWebhook(String),
     #[error("unknown webhook subscription {0}")]
     UnknownSubscription(Uuid),
+    #[error(
+        "webhook subscription {name} ({id}) is declared in the configuration (webhooks.subscriptions): change it there \
+         and restart; through the API only `paused` can be changed, until the next restart"
+    )]
+    ManagedByConfiguration { id: Uuid, name: String },
     #[error("the exchange uses the system clock; configure clock.mode = virtual to control time")]
     ClockNotVirtual,
     #[error(transparent)]
@@ -130,6 +135,8 @@ pub struct ExchangeOptions {
     /// Webhook subscriptions declared in configuration, reconciled at recovery and after a reset. Names must be
     /// unique (see [`crate::webhooks::validate_declared`]).
     pub webhooks: Vec<DeclaredSubscription>,
+    /// How long a declared subscription's previous secret stays valid after the configuration changes it.
+    pub webhook_secret_grace: chrono::Duration,
 }
 
 impl Default for ExchangeOptions {
@@ -144,6 +151,7 @@ impl Default for ExchangeOptions {
             settlement: None,
             external_outcomes: true,
             webhooks: Vec::new(),
+            webhook_secret_grace: chrono::Duration::hours(1),
         }
     }
 }
@@ -201,6 +209,7 @@ pub struct Exchange {
     group: Option<Vec<Committed>>,
     /// Webhook subscriptions declared in configuration (see [`Exchange::reconcile_webhooks`]).
     declared_webhooks: Vec<DeclaredSubscription>,
+    webhook_secret_grace: chrono::Duration,
 }
 
 /// What one committed command wrote, for metrics and the delivery worker.
@@ -297,6 +306,7 @@ impl Exchange {
             epoch: 0,
             group: None,
             declared_webhooks: options.webhooks,
+            webhook_secret_grace: options.webhook_secret_grace,
         };
         crate::webhooks::validate_declared(&exchange.declared_webhooks)
             .map_err(ExchangeError::InvalidWebhook)?;
@@ -544,6 +554,8 @@ impl Exchange {
             name,
             source,
             paused,
+            previous_secret: None,
+            deleted: false,
         };
         self.store.insert_subscription(&subscription)?;
         self.subscriptions.push(subscription.clone());
@@ -589,6 +601,11 @@ impl Exchange {
                             entry.name
                         )));
                     }
+                    let previous_secret = if wanted.secret == current.secret {
+                        current.previous_secret.clone()
+                    } else {
+                        self.grace(current.secret.clone(), wanted.secret.is_some())
+                    };
                     let updated = Subscription {
                         url: wanted.url,
                         event_types: wanted.event_types,
@@ -596,6 +613,7 @@ impl Exchange {
                         ordered: wanted.ordered,
                         enabled: entry.enabled,
                         paused: entry.paused,
+                        previous_secret,
                         ..current.clone()
                     };
                     if updated != *current {
@@ -624,6 +642,119 @@ impl Exchange {
         Ok(())
     }
 
+    /// The previous secret to keep signing with after a change away from `old`: for `webhook_secret_grace`, when there
+    /// was an old secret and there still is a new one.
+    fn grace(&self, old: Option<String>, signed: bool) -> Option<(String, DateTime<Utc>)> {
+        old.filter(|_| signed && self.webhook_secret_grace > chrono::Duration::zero())
+            .map(|old| (old, wall_now() + self.webhook_secret_grace))
+    }
+
+    /// The index of a subscription that exists and is not deleted.
+    fn live_subscription(&self, id: Uuid) -> Result<usize, ExchangeError> {
+        self.subscriptions
+            .iter()
+            .position(|s| s.id == id && !s.deleted)
+            .ok_or(ExchangeError::UnknownSubscription(id))
+    }
+
+    /// Refuses to change a configuration-owned subscription through the API.
+    fn api_owned(&self, index: usize) -> Result<(), ExchangeError> {
+        let subscription = &self.subscriptions[index];
+        match subscription.source {
+            SubscriptionSource::Api => Ok(()),
+            SubscriptionSource::Config => Err(ExchangeError::ManagedByConfiguration {
+                id: subscription.id,
+                name: subscription.name.clone().unwrap_or_default(),
+            }),
+        }
+    }
+
+    /// Changes a subscription's URL, event types, ordering, or enabled and paused flags; unset fields stay. Pending
+    /// deliveries keep their place and go to the new URL. A subscription declared in configuration only takes
+    /// `paused`, which lasts until the next restart reapplies the configuration.
+    pub fn update_webhook(
+        &mut self,
+        id: Uuid,
+        change: WebhookChange,
+    ) -> Result<Subscription, ExchangeError> {
+        let index = self.live_subscription(id)?;
+        let WebhookChange {
+            url,
+            event_types,
+            ordered,
+            enabled,
+            paused,
+        } = change;
+        if url.is_some() || event_types.is_some() || ordered.is_some() || enabled.is_some() {
+            self.api_owned(index)?;
+        }
+        let current = &self.subscriptions[index];
+        let wanted = validate_subscription(NewSubscription {
+            url: url.unwrap_or_else(|| current.url.clone()),
+            event_types: event_types.unwrap_or_else(|| current.event_types.clone()),
+            secret: current.secret.clone(),
+            ordered: ordered.unwrap_or(current.ordered),
+        })?;
+        let updated = Subscription {
+            url: wanted.url,
+            event_types: wanted.event_types,
+            ordered: wanted.ordered,
+            enabled: enabled.unwrap_or(current.enabled),
+            paused: paused.unwrap_or(current.paused),
+            ..current.clone()
+        };
+        if updated != *current {
+            self.store.update_subscription(&updated)?;
+            self.signal_deliveries(updated.enabled && !updated.paused);
+            self.subscriptions[index] = updated;
+        }
+        Ok(self.subscriptions[index].clone())
+    }
+
+    /// Deletes a subscription created through the API: it disappears from the API, gets no new deliveries and sends
+    /// none of its pending ones. Its deliveries and attempts stay in the database.
+    pub fn delete_webhook(&mut self, id: Uuid) -> Result<(), ExchangeError> {
+        let index = self.live_subscription(id)?;
+        self.api_owned(index)?;
+        let mut deleted = self.subscriptions[index].clone();
+        deleted.deleted = true;
+        self.store.update_subscription(&deleted)?;
+        self.subscriptions[index] = deleted;
+        Ok(())
+    }
+
+    /// Replaces a subscription's signing secret (API-created subscriptions only). For `grace` the previous secret stays
+    /// valid: deliveries carry signatures under both, so the consumer can switch without rejecting any.
+    pub fn rotate_webhook_secret(
+        &mut self,
+        id: Uuid,
+        secret: String,
+        grace: chrono::Duration,
+    ) -> Result<Subscription, ExchangeError> {
+        let index = self.live_subscription(id)?;
+        self.api_owned(index)?;
+        let current = &self.subscriptions[index];
+        let wanted = validate_subscription(NewSubscription {
+            url: current.url.clone(),
+            event_types: current.event_types.clone(),
+            secret: Some(secret),
+            ordered: current.ordered,
+        })?;
+        let previous_secret = current
+            .secret
+            .clone()
+            .filter(|old| Some(old) != wanted.secret.as_ref() && grace > chrono::Duration::zero())
+            .map(|old| (old, wall_now() + grace));
+        let updated = Subscription {
+            secret: wanted.secret,
+            previous_secret,
+            ..current.clone()
+        };
+        self.store.update_subscription(&updated)?;
+        self.subscriptions[index] = updated;
+        Ok(self.subscriptions[index].clone())
+    }
+
     /// Sets (or with `None` clears) a subscription's delivery fault policy. It applies to attempts from the next claim
     /// on. Out-of-order holds are refused for an ordered subscription, which by definition never reorders.
     pub fn set_webhook_faults(
@@ -634,7 +765,7 @@ impl Exchange {
         let subscription = self
             .subscriptions
             .iter_mut()
-            .find(|s| s.id == subscription_id)
+            .find(|s| s.id == subscription_id && !s.deleted)
             .ok_or(ExchangeError::UnknownSubscription(subscription_id))?;
         if let Some(policy) = &policy {
             policy.validate().map_err(ExchangeError::InvalidWebhook)?;
@@ -715,7 +846,7 @@ impl Exchange {
         let subscription = self
             .subscriptions
             .iter()
-            .find(|s| s.id == subscription_id)
+            .find(|s| s.id == subscription_id && !s.deleted)
             .ok_or(ExchangeError::UnknownSubscription(subscription_id))?;
         let queued = self
             .store
@@ -731,7 +862,7 @@ impl Exchange {
         delivery_ids: &[Uuid],
     ) -> Result<usize, ExchangeError> {
         if let Some(id) = subscription_id
-            && !self.subscriptions.iter().any(|s| s.id == id)
+            && !self.subscriptions.iter().any(|s| s.id == id && !s.deleted)
         {
             return Err(ExchangeError::UnknownSubscription(id));
         }

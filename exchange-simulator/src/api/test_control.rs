@@ -14,10 +14,11 @@ use uuid::Uuid;
 use std::sync::Arc;
 
 use super::model::SubscriptionView;
+use super::webhooks::{DeliveryView, redeliver};
 use super::{ApiError, AppState};
 use crate::config::Config;
 use crate::engine::{ClockChange, ClockState};
-use crate::persistence::{AttemptRow, DeliveryRecord};
+use crate::persistence::AttemptRow;
 use crate::scenario::{Report, Scenario};
 use crate::webhooks::FaultPolicy;
 
@@ -62,37 +63,6 @@ async fn run_scenario(
     Ok(Json(report))
 }
 
-/// A webhook delivery: which event goes to which subscription, and how far it got.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeliveryView {
-    pub delivery_id: Uuid,
-    pub subscription_id: Uuid,
-    pub url: String,
-    pub event_sequence: u64,
-    pub event_id: Uuid,
-    pub event_type: String,
-    pub status: String,
-    pub attempts: u64,
-    pub last_error: Option<String>,
-}
-
-impl From<DeliveryRecord> for DeliveryView {
-    fn from(d: DeliveryRecord) -> Self {
-        Self {
-            delivery_id: d.delivery_id,
-            subscription_id: d.subscription_id,
-            url: d.url,
-            event_sequence: d.event_sequence,
-            event_id: d.event_id,
-            event_type: d.event_type,
-            status: d.status,
-            attempts: d.attempts,
-            last_error: d.last_error,
-        }
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeliveriesQuery {
@@ -108,15 +78,11 @@ async fn deliveries(
     query: Result<Query<DeliveriesQuery>, QueryRejection>,
 ) -> Result<Json<Vec<DeliveryView>>, ApiError> {
     let Query(query) = query?;
-    if let Some(status) = &query.status
-        && !["PENDING", "IN_FLIGHT", "DELIVERED", "DEAD"].contains(&status.as_str())
-    {
-        return Err(ApiError::bad_request(format!(
-            "unknown delivery status {status}"
-        )));
-    }
+    super::webhooks::delivery_status(query.status.as_deref())?;
     let deliveries = state
-        .read(move |store| store.deliveries(query.subscription_id, query.status.as_deref()))
+        .read(move |store| {
+            store.deliveries(query.subscription_id, query.status.as_deref(), 0, u32::MAX)
+        })
         .await?;
     Ok(Json(
         deliveries.into_iter().map(DeliveryView::from).collect(),
@@ -128,26 +94,6 @@ async fn deliveries(
 async fn reset(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
     state.dispatcher.reset().await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RedeliverQuery {
-    /// Redeliver events with a sequence after this one (default 0: all).
-    #[serde(default)]
-    pub after: u64,
-}
-
-/// Queues the subscription's events after `?after=` for delivery again, also those from before it was registered.
-async fn redeliver(
-    State(state): State<AppState>,
-    id: Result<Path<Uuid>, PathRejection>,
-    query: Result<Query<RedeliverQuery>, QueryRejection>,
-) -> Result<Json<Value>, ApiError> {
-    let Path(id) = id?;
-    let Query(query) = query?;
-    let queued = state.dispatcher.redeliver(id, query.after).await?;
-    Ok(Json(serde_json::json!({ "queued": queued })))
 }
 
 #[derive(Debug, Default, Deserialize)]

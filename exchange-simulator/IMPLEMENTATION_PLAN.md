@@ -732,7 +732,7 @@ the order below deliberately puts group commit before sharding.
 | 4.5 ⏭ | Instrument-sharded matching (only if 4.1 shows matching as a bottleneck) | M | **Skipped (D7).** Matching workers per instrument shard in front of the single writer. Measured in 4.1–4.4: matching takes about 0.5 µs of the exchange thread's roughly 46 µs per order; the rest is SQLite writes. Revisit only if a later profile shows matching as the limit. |
 | 4.6 | Containerized benchmark and load report | M | There is no single target machine (D4): deployments are mostly Docker Compose or Kubernetes, and their hardware varies. So the benchmark runs as containers: the service image plus a load-generator container, with explicit CPU and memory limits and a named storage backing (volume or storage class). It ships as a compose profile and as a Kubernetes Job manifest. Each report records its environment: limits, storage, measured fsync latency, and node type where known. It compares `durable`, `fast` and `memory`, with and without outbox and webhooks, across instrument counts. Figures against the 1k–10k target are quoted per environment, never as one universal number. Extended by D7 into the sub-steps below; Docker Compose comes first. |
 | 4.6a ✅ | Webhook subscriptions declared in config | M | `webhooks.subscriptions`: a list of `{ name, url, event_types, secret \| secret_env \| secret_file, ordered, enabled }`. At startup, and after `/test/reset`, the service reconciles them by `name`: creates the missing ones and updates changed ones. Ones removed from the config are disabled, not deleted, so their history stays. Config-declared subscriptions are marked `source: config` and are read-only through the API; API-created ones work as before. A migration adds `name` (unique) and `source`. |
-| 4.6b | Webhook maintenance API | M | Under `/api/webhooks/{id}`: `GET` with delivery stats (pending, in flight, delivered, dead, oldest pending); `PATCH` (url, eventTypes, ordered, enabled); `DELETE` (pending deliveries are dropped, history kept); `POST …/secret` to rotate the secret, with a grace period during which both signatures are sent; `GET …/deliveries?status=` for deliveries and dead letters with their last error; `POST …/redeliver?after=` and `POST …/dead-letters/retry`. The `/test` equivalents stay as aliases. |
+| 4.6b ✅ | Webhook maintenance API | M | Under `/api/webhooks/{id}`: `GET` with delivery stats (pending, in flight, delivered, dead, oldest pending); `PATCH` (url, eventTypes, ordered, enabled); `DELETE` (pending deliveries are dropped, history kept); `POST …/secret` to rotate the secret, with a grace period during which both signatures are sent; `GET …/deliveries?status=` for deliveries and dead letters with their last error; `POST …/redeliver?after=` and `POST …/dead-letters/retry`. The `/test` equivalents stay as aliases. |
 | 4.6c | Usage guide and Compose setup | M | A `docs/` guide for operators and client developers: Compose quick start, configuration reference, writing a webhook receiver (signature check, idempotency by `eventId`, ordering, retries, dead letters, secret rotation), maintenance and troubleshooting, and benchmarking. A runnable Compose example with a sample receiver and config-declared subscriptions. The README stays the API reference and links to the guide. |
 | 4.6d | Containerized benchmark and load report | M | As described for 4.6 above: the bench in a container beside the service, with CPU and memory limits and a named volume, as a Compose profile first and a Kubernetes Job manifest after. The report takes its environment from the container's cgroup limits (added in 4.4), and runs across modes, webhooks on and off, and instrument counts. |
 
@@ -1097,6 +1097,79 @@ per order. Sharding it would not raise throughput.
     out; under Compose, a restart is one command.
   - **Lists cannot be set through `EXCHANGE__…` environment variables** (a limit of the `config` crate), so the
     documented route is a mounted YAML file.
+
+**4.6b — webhook maintenance API ✅ (2026-10-16).**
+- **Delivered** (`api/webhooks.rs`, which also takes over registration and listing from `api/mod.rs`):
+  - **`GET /api/webhooks/{id}`:** the subscription with `deliveries: { pending, inFlight, delivered, dead,
+    oldestUnfinished }` (`Store::delivery_stats`).
+  - **`PATCH /api/webhooks/{id}`:** `url`, `eventTypes`, `ordered`, `enabled`, `paused` (`Exchange::update_webhook`),
+    validated as for `POST`. Unpausing wakes the worker.
+  - **`DELETE /api/webhooks/{id}`:** a soft delete (`deleted` column). The subscription is hidden from the API (unless
+    `?includeDeleted=true`) and treated as unknown by every operation. `wants()` and the claim query skip it, so its
+    pending deliveries and retries stop. Rows stay because deliveries reference them, and deterministic subscription
+    IDs count every subscription ever created.
+  - **`POST /api/webhooks/{id}/secret` `{ secret, graceSeconds }`** (default 3600, at most a week):
+    - The previous secret is kept with an expiry (`previous_secret`, `previous_secret_until`).
+    - The claim query returns it only while it is valid.
+    - The worker then sends `X-Signature: sha256=<new>, sha256=<previous>`.
+  - **Config-driven secret changes** get the same grace (`webhooks.secret_grace_seconds`, default 3600). A restart
+    with an unchanged secret keeps the running grace period rather than starting a new one.
+  - **`GET /api/webhooks/{id}/deliveries?status=&after=&limit=`** (paged, at most 1000), with `nextAttemptAt` and
+    `deliveredAt`.
+  - **`POST /api/webhooks/{id}/dead-letters/retry`** and **`POST /api/webhooks/{id}/redeliver?after=`**. The `/test`
+    routes share the handlers and views.
+  - **Configuration-owned subscriptions:** only `paused` can be changed. Anything else, a delete or a rotation gets
+    `409 managed_by_configuration`, with a message saying to edit the file. The API pause lasts until a restart
+    reapplies the file.
+  - **Migration 011:** `previous_secret`, `previous_secret_until`, `deleted`.
+  - **Docs:** README sections "Maintaining a subscription" and rotation, an updated Python verification example
+    (accepts any listed signature), and the new config key.
+- **Tests:** `tests/webhook_maintenance.rs` (4):
+  - **Dead letters:** two deliveries go dead after five attempts. The stats and `?status=DEAD` show them with the
+    error, and paging by `after` and `limit` works. One is retried by ID and the rest all at once, and a redelivery
+    through the regular API works. Bad status, limit or query keys are `400`; unknown IDs are `404`.
+  - **One subscription changed step by step:**
+    - It is moved, and the failing delivery goes to the new URL.
+    - It is paused: two deliveries are held, then sent in order.
+    - It is narrowed to other event types, then disabled and re-enabled.
+    - Invalid changes are refused and change nothing.
+    - It is deleted while a delivery is mid-retry. That retry never goes out, the subscription is hidden, every
+      operation on it is `404`, and its history is kept.
+  - **Rotation:**
+    - During the grace period both signatures are sent, the new one first.
+    - With `graceSeconds: 0` only the new one is sent.
+    - A 1-second grace expires.
+    - An unsigned subscription becomes signed.
+    - Invalid requests are refused.
+  - **Declared subscriptions:**
+    - URL, enable, delete and rotate requests get `409` naming the subscription.
+    - An API pause holds deliveries until a restart reapplies the configuration.
+    - A secret changed in the configuration signs with both secrets, and a second restart keeps the same grace
+      deadline.
+  - The maintenance, config, webhook and reset suites were repeated five times without failure. All gates pass, e2e
+    included.
+- **Mutation checks**, each made a test fail:
+  - config subscriptions editable;
+  - a config pause refused;
+  - the previous secret never sent;
+  - a grace period that never ends;
+  - retries of a deleted subscription sent;
+  - the grace period restarted on every restart;
+  - deleted subscriptions listed;
+  - only the new signature sent.
+
+  Not caught, as expected: unpausing without waking the worker. The poll interval delivers anyway, so it only adds
+  latency.
+- **Decisions:**
+  - **Rotation sends both signatures in one header** (`sha256=<new>, sha256=<previous>`), the pattern Stripe uses,
+    rather than a second header. Outside a grace period the header is unchanged, so existing receivers are
+    unaffected. Receivers that want to support rotation check every value; the README example does.
+  - **The service does not generate secrets.** The crate has no cryptographic RNG (only `fastrand`), and the
+    consumer must know the secret to verify it anyway. The client supplies it.
+  - **Delete is soft.** A hard delete would have to remove deliveries and attempts, losing history, and would break
+    the deterministic subscription ordinal.
+  - **An API pause on a declared subscription is temporary by design.** It covers incidents without editing files;
+    the file stays the source of truth.
 
 ## Suggested order
 

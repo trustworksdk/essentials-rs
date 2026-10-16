@@ -73,6 +73,21 @@ pub struct DeliveryRecord {
     pub status: String,
     pub attempts: u64,
     pub last_error: Option<String>,
+    /// When the next attempt is due (pending), or the lease ends (in flight).
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+/// One subscription's deliveries by status.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeliveryStats {
+    pub pending: u64,
+    pub in_flight: u64,
+    pub delivered: u64,
+    /// Dead letters.
+    pub dead: u64,
+    /// The event sequence and time of the oldest pending or in-flight delivery: how far behind the consumer is.
+    pub oldest_unfinished: Option<(u64, DateTime<Utc>)>,
 }
 
 /// An order with the timestamps stored alongside it.
@@ -396,8 +411,8 @@ impl Store {
         self.conn
             .prepare_cached(
                 "INSERT INTO webhook_subscriptions (id, url, enabled, event_types, created_at, secret, ordered, name, source,
-                                                    paused)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                                    paused, previous_secret, previous_secret_until, deleted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?
             .execute(params![
                 subscription.id.to_string(),
@@ -410,12 +425,15 @@ impl Store {
                 subscription.name,
                 subscription.source.as_str(),
                 subscription.paused,
+                subscription.previous_secret.as_ref().map(|(secret, _)| secret),
+                subscription.previous_secret.as_ref().map(|(_, until)| timestamp(*until)),
+                subscription.deleted,
             ])
             .map(drop)
     }
 
-    /// Stores a subscription's url, event types, secret, ordering, enabled and paused flags; false when there is no
-    /// such subscription. Its pending deliveries keep their place and go to the new URL; while it is disabled or paused
+    /// Stores a subscription's url, event types, secrets, ordering, and enabled, paused and deleted flags; false when
+    /// there is no such subscription. Its pending deliveries keep their place and go to the new URL; while it is disabled or paused
     /// they wait.
     pub fn update_subscription(&self, subscription: &Subscription) -> rusqlite::Result<bool> {
         let event_types =
@@ -423,7 +441,8 @@ impl Store {
         self.conn
             .prepare_cached(
                 "UPDATE webhook_subscriptions SET url = ?2, enabled = ?3, event_types = ?4, secret = ?5, ordered = ?6,
-                                                 paused = ?7
+                                                 paused = ?7, previous_secret = ?8, previous_secret_until = ?9,
+                                                 deleted = ?10
                  WHERE id = ?1",
             )?
             .execute(params![
@@ -434,6 +453,9 @@ impl Store {
                 subscription.secret,
                 subscription.ordered,
                 subscription.paused,
+                subscription.previous_secret.as_ref().map(|(secret, _)| secret),
+                subscription.previous_secret.as_ref().map(|(_, until)| timestamp(*until)),
+                subscription.deleted,
             ])
             .map(|n| n == 1)
     }
@@ -441,7 +463,8 @@ impl Store {
     pub fn subscriptions(&self) -> rusqlite::Result<Vec<Subscription>> {
         self.conn
             .prepare_cached(
-                "SELECT id, url, enabled, event_types, created_at, secret, ordered, fault_policy, name, source, paused
+                "SELECT id, url, enabled, event_types, created_at, secret, ordered, fault_policy, name, source, paused,
+                        previous_secret, previous_secret_until, deleted
                  FROM webhook_subscriptions ORDER BY created_at, id",
             )?
             .query_map([], |row| {
@@ -463,6 +486,11 @@ impl Store {
                         _ => SubscriptionSource::Api,
                     },
                     paused: row.get(10)?,
+                    previous_secret: match row.get::<_, Option<String>>(11)? {
+                        Some(secret) => Some((secret, parsed(row, 12)?)),
+                        None => None,
+                    },
+                    deleted: row.get(13)?,
                 })
             })?
             .collect()
@@ -527,11 +555,12 @@ impl Store {
         let tx = self.conn.transaction()?;
         let jobs = {
             let mut select = tx.prepare_cached(&format!(
-                "SELECT d.id, d.subscription_id, s.url, d.attempts, {EVENT_COLUMNS}, s.secret, s.fault_policy, d.held
+                "SELECT d.id, d.subscription_id, s.url, d.attempts, {EVENT_COLUMNS}, s.secret, s.fault_policy, d.held,
+                        CASE WHEN s.previous_secret_until > ?1 THEN s.previous_secret END
                  FROM webhook_deliveries d
                  JOIN webhook_subscriptions s ON s.id = d.subscription_id
                  JOIN events e ON e.sequence = d.event_sequence
-                 WHERE d.status IN ('PENDING', 'IN_FLIGHT') AND d.next_attempt_at <= ?1 AND s.enabled = 1 AND s.paused = 0
+                 WHERE d.status IN ('PENDING', 'IN_FLIGHT') AND d.next_attempt_at <= ?1 AND s.enabled = 1 AND s.paused = 0 AND s.deleted = 0
                    AND (s.ordered = 0 OR d.event_sequence = (
                          SELECT MIN(u.event_sequence) FROM webhook_deliveries u
                          WHERE u.subscription_id = d.subscription_id AND u.status IN ('PENDING', 'IN_FLIGHT')))
@@ -549,6 +578,7 @@ impl Store {
                         secret: row.get(14)?,
                         faults: json_column(row, 15)?,
                         held: row.get(16)?,
+                        previous_secret: row.get(17)?,
                         epoch: 0,
                     })
                 })?
@@ -811,22 +841,61 @@ impl Store {
 
     /// Webhook deliveries with their subscription URL and event, in event order, then subscription; optionally only
     /// one subscription's, or only those with one status (e.g. `DEAD`, the dead letters).
+    /// One subscription's deliveries by status, and its oldest unfinished one.
+    pub fn delivery_stats(&self, subscription_id: Uuid) -> rusqlite::Result<DeliveryStats> {
+        let id = subscription_id.to_string();
+        let mut stats = DeliveryStats::default();
+        let mut counts = self.conn.prepare_cached(
+            "SELECT status, COUNT(*) FROM webhook_deliveries WHERE subscription_id = ?1 GROUP BY status",
+        )?;
+        let rows = counts.query_map([&id], |row| {
+            Ok((row.get::<_, String>(0)?, from_sql(row, 1)?))
+        })?;
+        for row in rows {
+            let (status, count) = row?;
+            match status.as_str() {
+                "PENDING" => stats.pending = count,
+                "IN_FLIGHT" => stats.in_flight = count,
+                "DELIVERED" => stats.delivered = count,
+                "DEAD" => stats.dead = count,
+                _ => {}
+            }
+        }
+        stats.oldest_unfinished = self
+            .conn
+            .prepare_cached(
+                "SELECT d.event_sequence, e.occurred_at FROM webhook_deliveries d
+                 JOIN events e ON e.sequence = d.event_sequence
+                 WHERE d.subscription_id = ?1 AND d.status IN ('PENDING', 'IN_FLIGHT')
+                 ORDER BY d.event_sequence LIMIT 1",
+            )?
+            .query_row([&id], |row| Ok((from_sql(row, 0)?, parsed(row, 1)?)))
+            .optional()?;
+        Ok(stats)
+    }
+
+    /// Webhook deliveries in event order: all, or one subscription's, of one status, after an event sequence, at most
+    /// `limit`.
     pub fn deliveries(
         &self,
         subscription_id: Option<Uuid>,
         status: Option<&str>,
+        after: u64,
+        limit: u32,
     ) -> rusqlite::Result<Vec<DeliveryRecord>> {
         self.conn
             .prepare_cached(
                 "SELECT d.id, d.subscription_id, s.url, d.event_sequence, e.event_id, e.event_type, d.status,
-                        d.attempts, d.last_error
+                        d.attempts, d.last_error, d.next_attempt_at, d.delivered_at
                  FROM webhook_deliveries d
                  JOIN webhook_subscriptions s ON s.id = d.subscription_id
                  JOIN events e ON e.sequence = d.event_sequence
                  WHERE (?1 IS NULL OR d.subscription_id = ?1) AND (?2 IS NULL OR d.status = ?2)
-                 ORDER BY d.event_sequence, s.created_at, s.id",
+                   AND d.event_sequence > ?3
+                 ORDER BY d.event_sequence, s.created_at, s.id
+                 LIMIT ?4",
             )?
-            .query_map(params![subscription_id.map(|id| id.to_string()), status], |row| {
+            .query_map(params![subscription_id.map(|id| id.to_string()), status, to_sql(after), limit], |row| {
                 Ok(DeliveryRecord {
                     delivery_id: parsed(row, 0)?,
                     subscription_id: parsed(row, 1)?,
@@ -837,6 +906,14 @@ impl Store {
                     status: row.get(6)?,
                     attempts: from_sql(row, 7)?,
                     last_error: row.get(8)?,
+                    next_attempt_at: row
+                        .get::<_, Option<String>>(9)?
+                        .map(|_| parsed(row, 9))
+                        .transpose()?,
+                    delivered_at: row
+                        .get::<_, Option<String>>(10)?
+                        .map(|_| parsed(row, 10))
+                        .transpose()?,
                 })
             })?
             .collect()

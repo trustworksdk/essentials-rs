@@ -271,12 +271,15 @@ async fn send(
         .header("X-Delivery-Attempt", attempt.to_string());
     if let Some(secret) = &job.secret {
         let timestamp = Utc::now().timestamp();
+        let mut signature = signing::sign(secret, timestamp, body);
+        if let Some(previous) = &job.previous_secret {
+            // During a rotation's grace period: one signature per secret, the current one first.
+            signature.push_str(", ");
+            signature.push_str(&signing::sign(previous, timestamp, body));
+        }
         request = request
             .header(signing::TIMESTAMP_HEADER, timestamp.to_string())
-            .header(
-                signing::SIGNATURE_HEADER,
-                signing::sign(secret, timestamp, body),
-            );
+            .header(signing::SIGNATURE_HEADER, signature);
     }
     Ok(request.body(body.to_vec()).send().await?.status())
 }
