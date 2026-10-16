@@ -91,13 +91,17 @@ async fn run_scenarios(args: &[&str]) -> anyhow::Result<ExitCode> {
     })
 }
 
+/// Service logs go to stdout. The scenario CLI passes a `default_filter` and logs to stderr, since its stdout carries
+/// the reports.
 fn init_tracing(config: &Config, default_filter: Option<&str>) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(default_filter.unwrap_or(&config.logging.filter)));
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    match config.logging.format {
-        LogFormat::Pretty => builder.init(),
-        LogFormat::Json => builder.json().init(),
+    match (config.logging.format, default_filter.is_some()) {
+        (LogFormat::Pretty, false) => builder.init(),
+        (LogFormat::Json, false) => builder.json().init(),
+        (LogFormat::Pretty, true) => builder.with_writer(std::io::stderr).init(),
+        (LogFormat::Json, true) => builder.json().with_writer(std::io::stderr).init(),
     }
 }
 

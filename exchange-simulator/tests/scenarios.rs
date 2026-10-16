@@ -32,6 +32,11 @@ fn examples() -> Vec<PathBuf> {
     files
 }
 
+/// The Milestone 1 acceptance scenario (seed 1).
+fn milestone1() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("scenarios/milestone1-acceptance.yaml")
+}
+
 /// The service's default configuration, as scenarios start from it.
 async fn base_config() -> Config {
     let app = TestApp::start().await;
@@ -118,7 +123,7 @@ async fn a_scenario_gives_the_same_report_and_ids_every_time() {
     let config = base_config().await;
     let text = format!(
         "{}\n  - expect: {{ events: {{ sequence: 1, eventId: \"{}\" }}, count: 1 }}\n",
-        std::fs::read_to_string(&examples()[0]).unwrap().trim_end(),
+        std::fs::read_to_string(milestone1()).unwrap().trim_end(),
         IdScheme::Deterministic { seed: 1 }.event(1)
     );
     let scenario = Scenario::parse(&text).unwrap();
@@ -216,7 +221,7 @@ async fn post_scenario(app: &TestApp, body: &str) -> (StatusCode, Value) {
 #[tokio::test]
 async fn the_api_runs_scenarios_in_a_sandbox() {
     let mut app = TestApp::start().await;
-    let passing = std::fs::read_to_string(&examples()[0]).unwrap();
+    let passing = std::fs::read_to_string(milestone1()).unwrap();
     let (status, report) = post_scenario(&app, &passing).await;
     assert_eq!(
         (status, &report["passed"]),

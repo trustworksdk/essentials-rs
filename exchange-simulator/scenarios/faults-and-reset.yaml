@@ -1,0 +1,31 @@
+name: Delivery faults and reset
+description: >
+  A webhook with a fault policy gets a damaged, duplicated copy of each trade, while the canonical event stays intact.
+  The consumer is unreachable, so this checks what was sent (/test/attempts), not what arrived. A reset then leaves
+  nothing behind.
+seed: 6
+instruments:
+  - { id: ACME, symbol: ACME, currency: DKK, currencyScale: 2 }
+participants:
+  - { id: A, name: Seller }
+  - { id: B, name: Buyer }
+webhooks:
+  # Port 9 (discard) refuses connections here, so every attempt fails and is retried.
+  - { url: "http://127.0.0.1:9/hook", eventTypes: [TradeExecuted],
+      faults: { nulls: { paths: [payload.price] }, invalid: { paths: [payload.quantity] }, duplicateProbability: 1 } }
+steps:
+  - order: { participantId: A, side: SELL, type: LIMIT, priceTicks: 10025, quantity: 10 }
+  - order: { participantId: B, side: BUY, type: LIMIT, priceTicks: 10025, quantity: 10 }
+  # The first attempt went out twice, damaged both times.
+  - expect: { attempts: { eventType: TradeExecuted, attempt: 1, outcome: SENT,
+                          faults: ["null:payload.price", "invalid:payload.quantity", "duplicate"],
+                          body: { payload: { price: null, quantity: "not-a-number" } } },
+              count: 2 }
+  # The canonical event is untouched.
+  - expect: { events: { eventType: TradeExecuted, payload: { price: "100.25", quantity: 10 } }, count: 1 }
+  - set_faults: { url: "http://127.0.0.1:9/hook", faults: null }
+  - reset: {}
+  - expect: { events: {}, count: 0 }
+  - expect: { trades: {}, count: 0 }
+  - expect: { deliveries: {}, count: 0, wait_ms: 0 }
+  - expect: { attempts: {}, count: 0, wait_ms: 0 }

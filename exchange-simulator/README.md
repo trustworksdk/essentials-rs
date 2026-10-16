@@ -509,6 +509,9 @@ curl -X PUT localhost:8080/test/webhooks/$SUBSCRIPTION/faults -H 'content-type: 
   (`X-Event-Id`, `X-Event-Sequence`, …) stay canonical.
 - **What was sent** is in `/test/attempts`: one row per request (a duplicate adds one) and one per hold, with the
   faults applied and, when they changed it, the exact body.
+- **Delays and holds interact:** a delay holds up the worker's whole batch, the recording of a hold included, and a
+  hold counts from when it was decided. So for reordering, make `holdMs` longer than any `delay.ms` on the same
+  service.
 - **Scope:** policies are stored with the subscription and survive restarts. Clear one with `DELETE`. Every attempt
   is recorded, faults or not; the body only when a fault changed it.
 
@@ -519,12 +522,21 @@ cargo test -p exchange-simulator                          # unit, integration an
 cargo test -p exchange-simulator --features e2e --test e2e   # the acceptance test in containers (builds the image)
 ```
 
-`tests/e2e.rs` runs both acceptance scenarios against the real image, with MockServer on one Docker network:
+`tests/e2e.rs` runs the acceptance tests against the real image, with MockServer on one Docker network:
 - **Milestone 1:** registration, the 200/150 trade, the webhook with a stable event ID, a `docker restart` that
   restores the book without repeating events, and a consumer outage whose retries create no trades.
 - **Milestone 2:** combined settlement mode on a virtual clock. `SettlementPending` reaches MockServer, the trade
   survives a `docker restart` mid-lifecycle, a clock advance to T+2 settles it exactly once, and an external report
   is published apart from the simulator's events.
+- **Milestone 3:** the scenario suite through the image's CLI (twice, without network) and through
+  `POST /test/scenarios` on a running container. Every report, event-log fingerprint included, equals the local
+  build's.
+
+`tests/milestone3.rs` holds the Milestone 3 acceptance in process:
+- **The scenario suite:** run twice as separate processes, it gives identical reports.
+- **Faults:** every fault type is visible at a real receiver, while `/api/events` stays byte-identical to a run
+  without subscriptions.
+- **Reset:** it leaves a clean state.
 
 ## Benchmarks
 

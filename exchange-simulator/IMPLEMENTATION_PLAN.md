@@ -362,7 +362,7 @@ random markets; and faults injected into *delivered copies* of events, never int
 | 3.2 ✅ | Random market generator | M | Seeded distributions from plan §6: arrival rate, buy probability, market-order and cancellation probabilities, and price and size distributions per instrument. It generalizes the `bench` workload. Reproducibility comes from the seed plus deterministic sequencing: one generator feeds commands in order, under the virtual clock. |
 | 3.3 ✅ | Delivery fault policies | M | Per-subscription policy, configured under `/test/…` or in a scenario: missing fields, explicit nulls, invalid values (a JSON-path list or a random choice by probability), duplicates, delays, out-of-order (hold and release). Faults apply to the outgoing copy only. A new `webhook_attempts` table records each attempt with the mutation applied, so a test can assert on what was actually sent. |
 | 3.4 ✅ | Reset and replay controls | S | `POST /test/reset` clears all state (test mode only). `POST /test/webhooks/{id}/redeliver?after=` re-enqueues deliveries from a sequence. Dead letters can be listed and retried. |
-| 3.5 | Tests and acceptance | M | A scenario suite in CI: the same file and seed give byte-identical event logs over two runs. Each fault type is visible at the receiver and absent from `/api/events`. Reset gives a clean state. |
+| 3.5 ✅ | Tests and acceptance | M | A scenario suite in CI: the same file and seed give byte-identical event logs over two runs. Each fault type is visible at the receiver and absent from `/api/events`. Reset gives a clean state. |
 
 ### Milestone 3 progress
 
@@ -664,6 +664,58 @@ random markets; and faults injected into *delivered copies* of events, never int
     reset, since startup releases all claims.
 - **Note:** this time the e2e suite took 96 s (17 s before). The result was unchanged; the extra time was most likely
   the image build.
+
+**3.5 — tests and acceptance ✅ (2026-10-16).**
+- **Delivered:**
+  - **`tests/milestone3.rs`**, the acceptance in process:
+    - **The scenario suite:** every file in `scenarios/` is run twice through the CLI, as separate processes, with
+      `--json`. All pass, and the two runs give identical reports, event-log fingerprints included.
+    - **Faults:** seven subscriptions on one deterministic service: clean, `missing`, `nulls`, `invalid`,
+      duplicate, delay and out-of-order, all fed the same two trades.
+      - Each fault is visible at a real receiver: only the price differs for the field faults; the duplicate
+        subscription gets each trade twice; delayed copies arrive at least 300 ms after the clean ones; and the
+        held first trade arrives after the second.
+      - The clean subscription gets the canonical events.
+      - `/api/events` is byte-identical to a reference run with no subscriptions at all, so the faults are absent
+        from the log.
+    - **Reset:** it empties the tables, and the same commands then give the reference log again.
+  - **`scenarios/faults-and-reset.yaml`:** a self-contained fault and reset scenario. Its consumer is unreachable,
+    and it checks the damaged copies in `/test/attempts` against the intact canonical event, then that a reset
+    leaves no events, trades, deliveries or attempts.
+  - **`tests/e2e.rs` `milestone_3_scenarios_in_containers`:**
+    - The image's CLI runs the suite twice, from a read-only mount with `--network none`.
+    - A running container runs each file through `POST /test/scenarios`.
+    - Every report equals the local build's, and the container's own state stays empty.
+  - **The scenario CLI logs to stderr.** Its stdout carries the reports, so `--json` output stays parseable at any
+    `RUST_LOG`. The service still logs to stdout, which the container tests wait on.
+  - README: Testing covers Milestone 3; a fault-injection note explains how delays and holds interact.
+- **Tests:**
+  - The in-process tests above, plus the e2e test.
+  - `tests/scenarios.rs` now names the Milestone 1 file instead of taking the alphabetically first one.
+  - The acceptance and scenario suites were repeated five times without failure.
+- **Mutation checks**, each made an acceptance test fail: random IDs in the sandbox; no delay; no holds; invalid
+  values written as null; a reset that keeps events.
+- **Finding:** a delay holds up its whole delivery batch, and with it the recording of a hold in the same batch.
+  Since a hold counts from its decision, a hold no longer than a concurrent delay has no effect (seen in the
+  acceptance test with 400 ms each). This is documented: make `holdMs` longer than any delay. Running delays outside
+  the batch could be revisited with the group-commit work in 4.2.
+- **Deviation, CI not enabled yet (decision of 2026-10-16):** the repository has no CI. A workflow was drafted but
+  left out on request. Until CI is enabled, the suite runs locally through `cargo test` (`tests/milestone3.rs`) and
+  the e2e tests. A later workflow should run the step gates, `cargo test`, the scenario suite through the CLI, and
+  the e2e tests.
+
+### Milestone 3 status
+
+Steps 3.0–3.5 are done.
+- **Acceptance met** (plan: "the same file and seed give byte-identical event logs over two runs. Each fault type is
+  visible at the receiver and absent from `/api/events`. Reset gives a clean state"). It is checked in process and in
+  containers. CI is not enabled yet, by decision.
+- **Open for later:**
+  - Enabling CI for the scenario suite and the gates.
+  - A price drift (random walk) for random markets.
+  - A forged-signature fault.
+  - The cost of recording every attempt, to be measured in 4.1 and 4.6.
+  - Delays that do not hold up their batch.
 
 ## Milestone 4 — performance
 

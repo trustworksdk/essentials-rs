@@ -4,6 +4,9 @@
 //! A second test runs the Milestone 2 settlement acceptance the same way: combined settlement mode on a virtual
 //! clock, lifecycle events and an external report delivered to MockServer, and a restart mid-lifecycle.
 //!
+//! A third runs the Milestone 3 scenario suite in the image: through its CLI, with no network, twice; and through
+//! `POST /test/scenarios` on a running container. All reports must equal the ones the local build produces.
+//!
 //! Needs Docker. Run with `cargo test -p exchange-simulator --features e2e --test e2e`.
 
 use std::process::Stdio;
@@ -568,4 +571,110 @@ async fn milestone_2_settlement_in_containers() {
         ),
         (&json!("SETTLED"), &json!("SETTLED"))
     );
+}
+
+/// The scenario files, sorted, as paths relative to `scenarios/`.
+fn scenario_names() -> Vec<String> {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/scenarios");
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".yaml"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Runs `exchange-simulator scenario run --json` on every scenario file and returns the reports.
+fn cli_reports(program: &str, prefix: &[&str], dir: &str) -> Value {
+    let files: Vec<String> = scenario_names()
+        .iter()
+        .map(|n| format!("{dir}/{n}"))
+        .collect();
+    let output = std::process::Command::new(program)
+        .args(prefix)
+        .args(["scenario", "run", "--json"])
+        .args(&files)
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run the scenario CLI");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn milestone_3_scenarios_in_containers() {
+    build_image();
+    let local = cli_reports(
+        env!("CARGO_BIN_EXE_exchange-simulator"),
+        &[],
+        concat!(env!("CARGO_MANIFEST_DIR"), "/scenarios"),
+    );
+    assert!(
+        local
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["passed"] == true),
+        "{local}"
+    );
+
+    // The CLI in the image, with the files mounted read-only and no network: twice, byte for byte the same.
+    let mount = format!("{}/scenarios:/scenarios:ro", env!("CARGO_MANIFEST_DIR"));
+    let image = format!("{IMAGE}:{TAG}");
+    let docker = [
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "-v",
+        mount.as_str(),
+        image.as_str(),
+    ];
+    let first = cli_reports("docker", &docker, "/scenarios");
+    let second = cli_reports("docker", &docker, "/scenarios");
+    assert_eq!(first, second, "two runs in the image");
+    assert_eq!(
+        first, local,
+        "the image and the local build agree, event-log fingerprints included"
+    );
+
+    // The API of a running container gives the same reports.
+    let http = Http {
+        client: reqwest::Client::new(),
+    };
+    let service = GenericImage::new(IMAGE, TAG)
+        .with_exposed_port(8080.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("exchange simulator listening"))
+        .with_env_var("EXCHANGE__TEST_CONTROL__ENABLED", "true")
+        .start()
+        .await
+        .expect("start service container");
+    let api = format!(
+        "http://127.0.0.1:{}",
+        service.get_host_port_ipv4(8080).await.unwrap()
+    );
+    for (name, expected) in scenario_names().iter().zip(local.as_array().unwrap()) {
+        let text =
+            std::fs::read_to_string(format!("{}/scenarios/{name}", env!("CARGO_MANIFEST_DIR")))
+                .unwrap();
+        let response = http
+            .client
+            .post(format!("{api}/test/scenarios"))
+            .body(text)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200, "{name}");
+        let report: Value = response.json().await.unwrap();
+        assert_eq!(&report, expected, "{name} over the API");
+    }
+    // The scenarios ran in sandboxes: the service itself is still empty.
+    assert_eq!(http.get(format!("{api}/api/events")).await, json!([]));
 }
