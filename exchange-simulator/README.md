@@ -6,6 +6,9 @@ ticks, keeps SQLite as the authoritative store, and delivers canonical events th
 [`milestone_1_domain_schema_events.md`](milestone_1_domain_schema_events.md), whose "Implementation progress" section
 tracks what is built.
 
+**New here?** The [usage guide](docs/README.md) starts with a Compose example and covers configuration, writing a
+webhook receiver, and operations. This README is the API reference.
+
 ## Running
 
 ```sh

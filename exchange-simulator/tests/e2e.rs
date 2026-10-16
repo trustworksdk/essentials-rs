@@ -7,6 +7,10 @@
 //! A third runs the Milestone 3 scenario suite in the image: through its CLI, with no network, twice; and through
 //! `POST /test/scenarios` on a running container. All reports must equal the ones the local build produces.
 //!
+//! Two more cover the usage guide (step 4.6c): the Compose example in `examples/compose` comes up, delivers signed
+//! webhooks that its receiver verifies, retries through a failing receiver and survives a restart; and the signature
+//! verification snippets in `examples/receivers` pass their self-checks in Python, Node.js and Java.
+//!
 //! Needs Docker. Run with `cargo test -p exchange-simulator --features e2e --test e2e`.
 
 use std::process::Stdio;
@@ -677,4 +681,190 @@ async fn milestone_3_scenarios_in_containers() {
     }
     // The scenarios ran in sandboxes: the service itself is still empty.
     assert_eq!(http.get(format!("{api}/api/events")).await, json!([]));
+}
+
+const EXAMPLES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
+
+/// The Compose example under its own project name and host ports, torn down (volumes included) on drop.
+struct ComposeExample {
+    project: String,
+    exchange_port: u16,
+    receiver_port: u16,
+}
+
+impl ComposeExample {
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn new() -> Self {
+        Self {
+            project: format!("exsim-example-{}", uuid::Uuid::now_v7().simple()),
+            exchange_port: Self::free_port(),
+            receiver_port: Self::free_port(),
+        }
+    }
+
+    fn compose(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("docker")
+            .args(["compose", "-p", &self.project])
+            .args(args)
+            .current_dir(format!("{EXAMPLES}/compose"))
+            .env("EXCHANGE_IMAGE", format!("{IMAGE}:{TAG}"))
+            .env("EXCHANGE_PORT", self.exchange_port.to_string())
+            .env("RECEIVER_PORT", self.receiver_port.to_string())
+            .output()
+            .expect("run docker compose")
+    }
+
+    fn run(&self, args: &[&str]) {
+        let output = self.compose(args);
+        assert!(
+            output.status.success(),
+            "docker compose {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+impl Drop for ComposeExample {
+    fn drop(&mut self) {
+        let _ = self.compose(&["down", "-v", "--remove-orphans"]);
+    }
+}
+
+#[tokio::test]
+async fn the_compose_example_delivers_verified_webhooks() {
+    build_image();
+    let example = ComposeExample::new();
+    example.run(&["up", "-d", "--wait"]);
+    let http = Http {
+        client: reqwest::Client::new(),
+    };
+    let api = format!("http://127.0.0.1:{}", example.exchange_port);
+    let receiver = format!("http://127.0.0.1:{}", example.receiver_port);
+
+    let webhooks = http.get(format!("{api}/api/webhooks")).await;
+    let names: Vec<&str> = webhooks
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["settlement", "orders"], "declared in exchange.yaml");
+    assert!(
+        webhooks
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["signed"] == true && s["source"] == "config")
+    );
+
+    http.post(
+        format!("{api}/api/instruments"),
+        json!({ "id": "ACME", "symbol": "ACME", "mic": "XCSE", "currency": "DKK", "currencyScale": 2 }),
+    )
+    .await;
+    for id in ["A", "B"] {
+        http.post(
+            format!("{api}/api/participants"),
+            json!({ "id": id, "name": id }),
+        )
+        .await;
+    }
+    let order = |participant: &str, side: &str, quantity: u64| {
+        json!({ "instrumentId": "ACME", "participantId": participant, "side": side, "type": "LIMIT",
+                "priceTicks": 10025, "quantity": quantity })
+    };
+    http.post(format!("{api}/api/orders"), order("A", "SELL", 100))
+        .await;
+    http.post(format!("{api}/api/orders"), order("B", "BUY", 40))
+        .await;
+    let received = eventually("verified deliveries", async || {
+        let received = http.get(format!("{receiver}/received")).await;
+        let list = received.as_array()?.clone();
+        (list.len() == 5).then_some(list)
+    })
+    .await;
+    assert!(
+        received.iter().all(|r| r["verified"] == true),
+        "{received:?}"
+    );
+    let trade: Vec<_> = received
+        .iter()
+        .filter(|r| r["hook"] == "settlement")
+        .collect();
+    assert_eq!(trade.len(), 1);
+    assert_eq!(trade[0]["eventType"], "TradeExecuted");
+
+    // The receiver fails for a while: the delivery is retried, and once it is answered with 204 it is not mistaken
+    // for a duplicate.
+    http.post(format!("{receiver}/control?status=503"), json!({}))
+        .await;
+    http.post(format!("{api}/api/orders"), order("A", "SELL", 5))
+        .await;
+    eventually("a failed attempt", async || {
+        let received = http.get(format!("{receiver}/received")).await;
+        (received.as_array()?.len() >= 7).then_some(())
+    })
+    .await;
+    http.post(format!("{receiver}/control?status=204"), json!({}))
+        .await;
+    let last = eventually("the retry accepted", async || {
+        let received = http.get(format!("{receiver}/received")).await;
+        let last = received.as_array()?.last()?.clone();
+        (last["answered"] == 204).then_some(last)
+    })
+    .await;
+    assert!(last["attempt"].as_u64().unwrap() >= 2, "{last}");
+    assert_eq!(last["duplicate"], false);
+
+    // A restart keeps the subscriptions (same IDs: durable volume) and their delivery.
+    let ids = http.get(format!("{api}/api/webhooks")).await;
+    example.run(&["restart", "exchange"]);
+    example.run(&["up", "-d", "--wait"]);
+    // Pooled connections went with the old process.
+    let http = Http {
+        client: reqwest::Client::new(),
+    };
+    assert_eq!(http.get(format!("{api}/api/webhooks")).await, ids);
+    let before = http
+        .get(format!("{receiver}/received"))
+        .await
+        .as_array()
+        .unwrap()
+        .len();
+    http.post(format!("{api}/api/orders"), order("B", "BUY", 1))
+        .await;
+    eventually("delivery after the restart", async || {
+        let received = http.get(format!("{receiver}/received")).await;
+        (received.as_array()?.len() > before).then_some(())
+    })
+    .await;
+}
+
+#[test]
+fn the_signature_snippets_verify_in_their_runtimes() {
+    let source = format!("{EXAMPLES}/receivers:/src:ro");
+    for command in [
+        ["python:3.13-slim", "python", "/src/verify.py"],
+        ["node:24-slim", "node", "/src/verify.mjs"],
+        ["eclipse-temurin:21-jdk", "java", "/src/Verify.java"],
+    ] {
+        let output = std::process::Command::new("docker")
+            .args(["run", "--rm", "--network", "none", "-v", &source])
+            .args(command)
+            .output()
+            .expect("run docker");
+        assert!(
+            output.status.success(),
+            "{command:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

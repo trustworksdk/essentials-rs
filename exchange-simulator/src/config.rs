@@ -551,4 +551,76 @@ webhooks:
             "{missing}"
         );
     }
+
+    /// Every `yaml` block in the usage guide and the README that configures the service (Compose files and scenario
+    /// files are skipped) parses as an overlay on the defaults, so the documented examples stay valid.
+    #[test]
+    fn documented_configuration_examples_parse() {
+        let documents = [
+            ("README.md", include_str!("../README.md")),
+            (
+                "docs/getting-started.md",
+                include_str!("../docs/getting-started.md"),
+            ),
+            (
+                "docs/configuration.md",
+                include_str!("../docs/configuration.md"),
+            ),
+            ("docs/operations.md", include_str!("../docs/operations.md")),
+            (
+                "docs/webhook-receivers.md",
+                include_str!("../docs/webhook-receivers.md"),
+            ),
+            (
+                "examples/compose/exchange.yaml",
+                concat!(
+                    "```yaml\n",
+                    include_str!("../examples/compose/exchange.yaml"),
+                    "```\n"
+                ),
+            ),
+        ];
+        let sections = [
+            "server",
+            "exchange",
+            "events",
+            "webhooks",
+            "ids",
+            "settlement",
+            "clock",
+            "test_control",
+            "database",
+            "logging",
+        ];
+        let mut checked = 0;
+        for (document, text) in documents {
+            for block in text.split("```yaml\n").skip(1) {
+                let block = block.split("```").next().unwrap();
+                let configures = block
+                    .lines()
+                    .any(|line| sections.iter().any(|s| line.starts_with(&format!("{s}:"))));
+                if !configures || block.contains("services:") || block.contains("steps:") {
+                    continue;
+                }
+                let config =
+                    with_overlay(block).unwrap_or_else(|e| panic!("{document}: {e}\n{block}"));
+                for subscription in &config.webhooks.subscriptions {
+                    for event_type in &subscription.event_types {
+                        assert!(
+                            crate::events::EVENT_TYPES.contains(&event_type.as_str()),
+                            "{document}: {} has an unknown event type {event_type}",
+                            subscription.name
+                        );
+                    }
+                    assert!(
+                        subscription.url.starts_with("http"),
+                        "{document}: {}",
+                        subscription.name
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked >= 7, "found {checked} configuration examples");
+    }
 }

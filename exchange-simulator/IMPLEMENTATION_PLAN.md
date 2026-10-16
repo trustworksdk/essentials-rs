@@ -733,7 +733,7 @@ the order below deliberately puts group commit before sharding.
 | 4.6 | Containerized benchmark and load report | M | There is no single target machine (D4): deployments are mostly Docker Compose or Kubernetes, and their hardware varies. So the benchmark runs as containers: the service image plus a load-generator container, with explicit CPU and memory limits and a named storage backing (volume or storage class). It ships as a compose profile and as a Kubernetes Job manifest. Each report records its environment: limits, storage, measured fsync latency, and node type where known. It compares `durable`, `fast` and `memory`, with and without outbox and webhooks, across instrument counts. Figures against the 1k–10k target are quoted per environment, never as one universal number. Extended by D7 into the sub-steps below; Docker Compose comes first. |
 | 4.6a ✅ | Webhook subscriptions declared in config | M | `webhooks.subscriptions`: a list of `{ name, url, event_types, secret \| secret_env \| secret_file, ordered, enabled }`. At startup, and after `/test/reset`, the service reconciles them by `name`: creates the missing ones and updates changed ones. Ones removed from the config are disabled, not deleted, so their history stays. Config-declared subscriptions are marked `source: config` and are read-only through the API; API-created ones work as before. A migration adds `name` (unique) and `source`. |
 | 4.6b ✅ | Webhook maintenance API | M | Under `/api/webhooks/{id}`: `GET` with delivery stats (pending, in flight, delivered, dead, oldest pending); `PATCH` (url, eventTypes, ordered, enabled); `DELETE` (pending deliveries are dropped, history kept); `POST …/secret` to rotate the secret, with a grace period during which both signatures are sent; `GET …/deliveries?status=` for deliveries and dead letters with their last error; `POST …/redeliver?after=` and `POST …/dead-letters/retry`. The `/test` equivalents stay as aliases. |
-| 4.6c | Usage guide and Compose setup | M | A `docs/` guide for operators and client developers: Compose quick start, configuration reference, writing a webhook receiver (signature check, idempotency by `eventId`, ordering, retries, dead letters, secret rotation), maintenance and troubleshooting, and benchmarking. A runnable Compose example with a sample receiver and config-declared subscriptions. The README stays the API reference and links to the guide. |
+| 4.6c ✅ | Usage guide and Compose setup | M | A `docs/` guide for operators and client developers: Compose quick start, configuration reference, writing a webhook receiver (signature check, idempotency by `eventId`, ordering, retries, dead letters, secret rotation), maintenance and troubleshooting, and benchmarking. A runnable Compose example with a sample receiver and config-declared subscriptions. The README stays the API reference and links to the guide. |
 | 4.6d | Containerized benchmark and load report | M | As described for 4.6 above: the bench in a container beside the service, with CPU and memory limits and a named volume, as a Compose profile first and a Kubernetes Job manifest after. The report takes its environment from the container's cgroup limits (added in 4.4), and runs across modes, webhooks on and off, and instrument counts. |
 
 ### Milestone 4 progress
@@ -1170,6 +1170,70 @@ per order. Sharding it would not raise throughput.
     the deterministic subscription ordinal.
   - **An API pause on a declared subscription is temporary by design.** It covers incidents without editing files;
     the file stays the source of truth.
+
+**4.6c — usage guide and Compose setup ✅ (2026-10-16).**
+- **Delivered:**
+  - **`docs/`, the usage guide** (the README stays the API reference and now links to it):
+    - `README.md`: an index.
+    - `getting-started.md`: the Compose example step by step (trade, watch deliveries, watch a retry), then adding the
+      simulator to your own Compose project, including where a consumer's URL points (same network, another project,
+      the host).
+    - `configuration.md`:
+      - how settings are layered, including that the image's environment variables beat the file;
+      - persistence modes;
+      - webhook settings, with a table of how long a consumer may be down for each `max_attempts`;
+      - settlement;
+      - four recipes.
+    - `webhook-receivers.md`:
+      - the delivery contract and five rules for a correct receiver;
+      - verification in Python, Java (with a Spring Boot sketch) and Node.js;
+      - secret rotation for both kinds of subscription;
+      - catching up and replay;
+      - testing with fault injection.
+    - `operations.md`:
+      - declared versus API-created subscriptions, pausing, consumer lag, dead letters and replay;
+      - monitoring, with the series worth an alert;
+      - a troubleshooting table;
+      - backups, upgrades and reset.
+    - `benchmarking.md`: how to measure, a summary of the figures, and the memory-limit caveat (extended in 4.6d).
+  - **`examples/compose`:**
+    - `compose.yaml`: the exchange built from the workspace and a `python:3.13-slim` receiver, one shared Docker
+      secret, a volume, health checks, and `EXCHANGE_PORT`, `RECEIVER_PORT` and `EXCHANGE_IMAGE` overrides.
+    - `exchange.yaml`: declares `settlement` (ordered `TradeExecuted`) and `orders` (the order lifecycle), both
+      signed through `secret_file`.
+    - `receiver.py` (standard library only): it verifies signatures, deduplicates by `eventId`, logs one line per
+      event, and lists what it received at `/received`. It can be switched to fail with `/control?status=`.
+  - **`examples/receivers`:** `verify.py`, `Verify.java` and `verify.mjs`. Each holds the verification function plus
+    a self-check against the signature already pinned in `signing.rs`: a valid signature, a rotation's second value,
+    a changed body, another secret, and an old timestamp.
+- **Tests:**
+  - **`tests/e2e.rs`, the Compose example:** `the_compose_example_delivers_verified_webhooks` runs it under its own
+    project name and ports:
+    - the two declared subscriptions come up signed;
+    - a trade's five events arrive, all verified;
+    - with the receiver failing, the delivery is retried, and once accepted it is not taken for a duplicate;
+    - after a container restart the subscriptions are unchanged and deliveries continue;
+    - `down -v` cleans up.
+  - **`tests/e2e.rs`, the snippets:** `the_signature_snippets_verify_in_their_runtimes` runs the three files in
+    `python:3.13-slim`, `node:24-slim` and `eclipse-temurin:21-jdk` with no network.
+  - **`config::tests::documented_configuration_examples_parse`:** every YAML configuration block in the README, the
+    guide and the example parses as an overlay, with known event types and http URLs (7 blocks).
+  - All relative links and anchors in the README, the guide and the example READMEs were checked with a script. The
+    two new e2e tests passed three runs in total and left no containers or volumes behind.
+- **Mutation checks**, each made a test fail:
+  - the receiver marking retries as duplicates (see Found);
+  - a documented example with an unknown event type;
+  - a documented example with an invalid mode.
+- **Found and fixed:** the first version of the sample receiver remembered an `eventId` on arrival, even when it
+  answered with an error. A retry then counted as a duplicate, and a consumer built the same way would have dropped
+  the retried event. It now records an event only when it acknowledges it. The guide states this as part of rule 2.
+- **Decisions:**
+  - **The demo secret is committed** (`examples/compose/secrets/webhook-secret.txt`), marked as a demo value in the
+    example's README and the compose file. That way `docker compose up` works without setup.
+  - **The receiver uses only Python's standard library** in `python:3.13-slim`, so nothing extra is built.
+  - **Verification code is maintained as runnable files.** The guide quotes them, and the e2e suite runs them, so the
+    documented code is tested code.
+- **Deviation:** none from the 4.6c entry. The Kubernetes Job manifest remains part of 4.6d.
 
 ## Suggested order
 

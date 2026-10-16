@@ -1,0 +1,15 @@
+# Mounted at /etc/exchange/exchange.yaml; EXCHANGE_CONFIG points here. Layered over the built-in defaults
+# (exchange-simulator/config/default.yaml); only what differs needs to be here.
+webhooks:
+  subscriptions:
+    # Trades for settlement, one at a time in sequence order.
+    - name: settlement
+      url: http://receiver:9000/hooks/settlement
+      event_types: [TradeExecuted]
+      secret_file: /run/secrets/webhook_secret
+      ordered: true
+    # The order lifecycle, delivered concurrently.
+    - name: orders
+      url: http://receiver:9000/hooks/orders
+      event_types: [OrderAccepted, OrderRejected, OrderPartiallyFilled, OrderFilled, OrderCancelled]
+      secret_file: /run/secrets/webhook_secret

@@ -1,0 +1,50 @@
+# The exchange simulator with a sample webhook receiver. From this directory:
+#   docker compose up --build -d --wait
+# See README.md for a walkthrough. EXCHANGE_PORT and RECEIVER_PORT change the host ports (8080, 9000).
+name: exchange-example
+
+services:
+  exchange:
+    image: ${EXCHANGE_IMAGE:-exchange-simulator:dev}
+    build:
+      context: ../../..
+      dockerfile: exchange-simulator/Dockerfile
+    ports:
+      - "${EXCHANGE_PORT:-8080}:8080"
+    environment:
+      EXCHANGE_CONFIG: /etc/exchange/exchange.yaml
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./exchange.yaml:/etc/exchange/exchange.yaml:ro
+      # durable mode keeps everything here; without a volume a new container starts empty.
+      - exchange-data:/var/lib/exchange
+    secrets:
+      - webhook_secret
+    depends_on:
+      receiver:
+        condition: service_healthy
+
+  receiver:
+    image: python:3.13-slim
+    command: ["python", "-u", "/app/receiver.py"]
+    environment:
+      WEBHOOK_SECRET_FILE: /run/secrets/webhook_secret
+    volumes:
+      - ./receiver.py:/app/receiver.py:ro
+    ports:
+      - "${RECEIVER_PORT:-9000}:9000"
+    secrets:
+      - webhook_secret
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+secrets:
+  # Shared by both services: the exchange signs with it, the receiver verifies with it. A demo value; change it.
+  webhook_secret:
+    file: ./secrets/webhook-secret.txt
+
+volumes:
+  exchange-data:
