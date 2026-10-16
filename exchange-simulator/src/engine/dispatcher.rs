@@ -43,6 +43,9 @@ enum Request {
     Snapshot(InstrumentId, oneshot::Sender<Option<BookSnapshot>>),
     RegisterWebhook(NewSubscription, Reply<Subscription>),
     SetWebhookFaults(Uuid, Option<FaultPolicy>, Reply<Subscription>),
+    Redeliver(Uuid, u64, Reply<usize>),
+    RetryDeadLetters(Option<Uuid>, Vec<Uuid>, Reply<usize>),
+    Reset(Reply<()>),
     SetInstrumentEnabled(InstrumentId, bool, Reply<Instrument>),
     ClockState(oneshot::Sender<ClockState>),
     SettlementTick(Reply<usize>),
@@ -155,6 +158,31 @@ impl Dispatcher {
     ) -> Result<Subscription, DispatchError> {
         self.call(|reply| Request::SetWebhookFaults(subscription_id, policy, reply))
             .await
+    }
+
+    /// Queues a subscription's events after sequence `after` for delivery again; returns how many.
+    pub async fn redeliver(
+        &self,
+        subscription_id: Uuid,
+        after: u64,
+    ) -> Result<usize, DispatchError> {
+        self.call(|reply| Request::Redeliver(subscription_id, after, reply))
+            .await
+    }
+
+    /// Retries dead-lettered deliveries (all, one subscription's, or the listed ones); returns how many.
+    pub async fn retry_dead_letters(
+        &self,
+        subscription_id: Option<Uuid>,
+        delivery_ids: Vec<Uuid>,
+    ) -> Result<usize, DispatchError> {
+        self.call(|reply| Request::RetryDeadLetters(subscription_id, delivery_ids, reply))
+            .await
+    }
+
+    /// Clears all state (see [`Exchange::reset`]).
+    pub async fn reset(&self) -> Result<(), DispatchError> {
+        self.call(Request::Reset).await
     }
 
     /// Claims up to `limit` due webhook deliveries, leased for `lease`.
@@ -286,6 +314,14 @@ fn handle(exchange: &mut Exchange, request: Request) -> (&'static str, &'static 
             "set_webhook_faults",
             answer(reply, exchange.set_webhook_faults(id, policy)),
         ),
+        Request::Redeliver(id, after, reply) => {
+            ("redeliver", answer(reply, exchange.redeliver(id, after)))
+        }
+        Request::RetryDeadLetters(subscription, ids, reply) => (
+            "retry_dead_letters",
+            answer(reply, exchange.retry_dead_letters(subscription, &ids)),
+        ),
+        Request::Reset(reply) => ("reset", answer(reply, exchange.reset())),
         Request::ClaimDeliveries(limit, lease, reply) => (
             "claim_deliveries",
             answer(reply, exchange.claim_deliveries(limit, lease)),

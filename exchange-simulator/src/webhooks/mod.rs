@@ -72,6 +72,8 @@ pub struct DeliveryJob {
     pub faults: Option<FaultPolicy>,
     /// Whether an out-of-order fault held this delivery back before.
     pub held: bool,
+    /// The exchange's reset epoch at claim time; results from before a reset are dropped.
+    pub epoch: u64,
     pub event: EventEnvelope,
 }
 
@@ -94,6 +96,8 @@ pub enum DeliveryOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeliveryResult {
     pub delivery_id: Uuid,
+    /// The epoch of the claim this result answers (see [`DeliveryJob::epoch`]).
+    pub epoch: u64,
     pub outcome: DeliveryOutcome,
     /// What happened on the wire: one entry per request sent (a duplicate adds one), or one for a hold.
     pub sent: Vec<AttemptRecord>,

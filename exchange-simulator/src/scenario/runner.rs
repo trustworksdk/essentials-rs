@@ -197,11 +197,33 @@ impl Runner {
     }
 
     async fn setup(&mut self, scenario: &Scenario) -> StepReport {
+        let failures = self
+            .register(
+                &scenario.instruments,
+                &scenario.participants,
+                &scenario.webhooks,
+            )
+            .await;
+        StepReport {
+            index: 0,
+            step: "setup".into(),
+            passed: failures.is_empty(),
+            failures,
+        }
+    }
+
+    /// Registers instruments, participants and webhooks (with their fault policies), in that order.
+    async fn register(
+        &mut self,
+        instruments: &[Value],
+        participants: &[Value],
+        webhooks: &[Value],
+    ) -> Vec<String> {
         let mut failures = Vec::new();
         let groups = [
-            ("instrument", "/api/instruments", &scenario.instruments),
-            ("participant", "/api/participants", &scenario.participants),
-            ("webhook", "/api/webhooks", &scenario.webhooks),
+            ("instrument", "/api/instruments", instruments),
+            ("participant", "/api/participants", participants),
+            ("webhook", "/api/webhooks", webhooks),
         ];
         for (kind, uri, bodies) in groups {
             for body in bodies {
@@ -232,12 +254,7 @@ impl Runner {
                 }
             }
         }
-        StepReport {
-            index: 0,
-            step: "setup".into(),
-            passed: failures.is_empty(),
-            failures,
-        }
+        failures
     }
 
     /// Runs one step; returns its description and failures.
@@ -339,6 +356,66 @@ impl Runner {
                 (description, check_response(response, set.expect.as_ref()))
             }
             Step::Market(market) => self.market(market).await,
+            Step::Register(register) => {
+                let description = format!(
+                    "register {} instruments, {} participants, {} webhooks",
+                    register.instruments.len(),
+                    register.participants.len(),
+                    register.webhooks.len()
+                );
+                let failures = self
+                    .register(
+                        &register.instruments,
+                        &register.participants,
+                        &register.webhooks,
+                    )
+                    .await;
+                (description, failures)
+            }
+            Step::Reset(_) => {
+                self.refs.clear();
+                self.instruments.clear();
+                self.webhooks.clear();
+                let response = self.call(Method::POST, "/test/reset", None).await;
+                ("reset".into(), check_response(response, None))
+            }
+            Step::Redeliver(redeliver) => {
+                let description = format!("redeliver {} after {}", redeliver.url, redeliver.after);
+                let Some(id) = self.webhooks.get(&redeliver.url) else {
+                    return (
+                        description,
+                        vec![format!("no webhook registered for {}", redeliver.url)],
+                    );
+                };
+                let uri = format!("/test/webhooks/{id}/redeliver?after={}", redeliver.after);
+                let response = self.call(Method::POST, &uri, None).await;
+                (
+                    description,
+                    check_response(response, redeliver.expect.as_ref()),
+                )
+            }
+            Step::RetryDeadLetters(retry) => {
+                let description = format!(
+                    "retry_dead_letters {}",
+                    retry.url.as_deref().unwrap_or("(all)")
+                );
+                let body = match &retry.url {
+                    Some(url) => match self.webhooks.get(url) {
+                        Some(id) => json!({ "subscriptionId": id }),
+                        None => {
+                            return (
+                                description,
+                                vec![format!("no webhook registered for {url}")],
+                            );
+                        }
+                    },
+                    None => json!({}),
+                };
+                let response = self
+                    .call(Method::POST, "/test/dead-letters/retry", Some(body))
+                    .await;
+                (description, check_response(response, retry.expect.as_ref()))
+            }
             Step::SetFaults(set) => (
                 format!(
                     "set_faults {} {}",

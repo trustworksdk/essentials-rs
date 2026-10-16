@@ -98,6 +98,15 @@ impl VirtualClock {
         Ok(())
     }
 
+    /// Puts the clock at `to`, even backwards, and freezes or runs it. Only for a reset, which clears every state
+    /// stamped with the old readings.
+    pub fn reset(&self, to: DateTime<Utc>, running: bool) {
+        let mut state = self.state.lock().expect("clock lock");
+        state.at_anchor = to;
+        state.anchor = Instant::now();
+        state.running = running;
+    }
+
     /// Stops the clock at its current reading.
     pub fn freeze(&self) {
         let mut state = self.state.lock().expect("clock lock");

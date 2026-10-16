@@ -457,6 +457,7 @@ impl Store {
                         secret: row.get(14)?,
                         faults: json_column(row, 15)?,
                         held: row.get(16)?,
+                        epoch: 0,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -716,8 +717,13 @@ impl Store {
             .collect()
     }
 
-    /// Every webhook delivery with its subscription URL and event, in event order, then subscription.
-    pub fn deliveries(&self) -> rusqlite::Result<Vec<DeliveryRecord>> {
+    /// Webhook deliveries with their subscription URL and event, in event order, then subscription; optionally only
+    /// one subscription's, or only those with one status (e.g. `DEAD`, the dead letters).
+    pub fn deliveries(
+        &self,
+        subscription_id: Option<Uuid>,
+        status: Option<&str>,
+    ) -> rusqlite::Result<Vec<DeliveryRecord>> {
         self.conn
             .prepare_cached(
                 "SELECT d.id, d.subscription_id, s.url, d.event_sequence, e.event_id, e.event_type, d.status,
@@ -725,9 +731,10 @@ impl Store {
                  FROM webhook_deliveries d
                  JOIN webhook_subscriptions s ON s.id = d.subscription_id
                  JOIN events e ON e.sequence = d.event_sequence
+                 WHERE (?1 IS NULL OR d.subscription_id = ?1) AND (?2 IS NULL OR d.status = ?2)
                  ORDER BY d.event_sequence, s.created_at, s.id",
             )?
-            .query_map([], |row| {
+            .query_map(params![subscription_id.map(|id| id.to_string()), status], |row| {
                 Ok(DeliveryRecord {
                     delivery_id: parsed(row, 0)?,
                     subscription_id: parsed(row, 1)?,
@@ -741,6 +748,92 @@ impl Store {
                 })
             })?
             .collect()
+    }
+
+    /// Queues the subscription's events after sequence `after` (of the types it wants) for delivery again, due at
+    /// `now`: existing deliveries start over (pending, no attempts, never held), and events from before the
+    /// subscription existed get a delivery. Returns how many were queued.
+    pub fn redeliver(
+        &mut self,
+        subscription: &Subscription,
+        after: u64,
+        now: DateTime<Utc>,
+        ids: &IdScheme,
+    ) -> rusqlite::Result<usize> {
+        let event_types =
+            serde_json::to_string(&subscription.event_types).expect("strings serialize");
+        let tx = self.conn.transaction()?;
+        let queued = {
+            let sequences = tx
+                .prepare_cached(
+                    "SELECT sequence FROM events
+                     WHERE sequence > ?1 AND event_type IN (SELECT value FROM json_each(?2))
+                     ORDER BY sequence",
+                )?
+                .query_map(params![to_sql(after), event_types], |row| from_sql(row, 0))?
+                .collect::<rusqlite::Result<Vec<u64>>>()?;
+            let mut upsert = tx.prepare_cached(
+                "INSERT INTO webhook_deliveries (id, subscription_id, event_sequence, status, attempts, next_attempt_at)
+                 VALUES (?1, ?2, ?3, 'PENDING', 0, ?4)
+                 ON CONFLICT (subscription_id, event_sequence) DO UPDATE
+                 SET status = 'PENDING', attempts = 0, next_attempt_at = ?4, last_error = NULL, delivered_at = NULL,
+                     held = 0",
+            )?;
+            for sequence in &sequences {
+                upsert.execute(params![
+                    ids.delivery(subscription.id, *sequence).to_string(),
+                    subscription.id.to_string(),
+                    to_sql(*sequence),
+                    timestamp(now),
+                ])?;
+            }
+            sequences.len()
+        };
+        tx.commit()?;
+        Ok(queued)
+    }
+
+    /// Gives dead-lettered deliveries a fresh attempt budget, due at `now`: all of them, one subscription's, or the
+    /// listed ones. Returns how many.
+    pub fn retry_dead_letters(
+        &mut self,
+        subscription_id: Option<Uuid>,
+        delivery_ids: &[Uuid],
+        now: DateTime<Utc>,
+    ) -> rusqlite::Result<usize> {
+        let delivery_ids =
+            serde_json::to_string(&delivery_ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
+                .expect("strings serialize");
+        self.conn
+            .prepare_cached(
+                "UPDATE webhook_deliveries SET status = 'PENDING', attempts = 0, next_attempt_at = ?1, last_error = NULL
+                 WHERE status = 'DEAD' AND (?2 IS NULL OR subscription_id = ?2)
+                   AND (?3 = '[]' OR id IN (SELECT value FROM json_each(?3)))",
+            )?
+            .execute(params![
+                timestamp(now),
+                subscription_id.map(|id| id.to_string()),
+                delivery_ids
+            ])
+    }
+
+    /// Deletes every row of every table, in one transaction: the empty state of a new database (the schema stays).
+    pub fn reset(&mut self) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        // Rows reference each other; checked at commit, when nothing is left.
+        tx.pragma_update(None, "defer_foreign_keys", "ON")?;
+        let tables = tx
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for table in tables {
+            tx.execute(&format!("DELETE FROM \"{table}\""), [])?;
+        }
+        // AUTOINCREMENT counters, so sequences start at 1 again.
+        tx.execute("DELETE FROM sqlite_sequence", [])?;
+        tx.commit()
     }
 
     /// Makes every in-flight delivery due now. Used at startup, when no claim can still be in progress.

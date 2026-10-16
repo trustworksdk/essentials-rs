@@ -361,7 +361,7 @@ random markets; and faults injected into *delivered copies* of events, never int
 | 3.1 ✅ | Scenario DSL and runner | L | YAML: `seed`, `instruments`, `participants`, `subscriptions`, then `steps:` (`order`, `cancel`, `advance_clock`, `expect` on order state, trades, events, book, deliveries). It runs against an in-process service with a virtual clock and deterministic IDs. Per D3, both a CLI (`exchange-simulator scenario run file.yaml`, exit code = verdict) and `POST /test/scenarios` (test control only; returns the verdict and each failed expectation). Both use one runner. Example scenarios go in `scenarios/`. |
 | 3.2 ✅ | Random market generator | M | Seeded distributions from plan §6: arrival rate, buy probability, market-order and cancellation probabilities, and price and size distributions per instrument. It generalizes the `bench` workload. Reproducibility comes from the seed plus deterministic sequencing: one generator feeds commands in order, under the virtual clock. |
 | 3.3 ✅ | Delivery fault policies | M | Per-subscription policy, configured under `/test/…` or in a scenario: missing fields, explicit nulls, invalid values (a JSON-path list or a random choice by probability), duplicates, delays, out-of-order (hold and release). Faults apply to the outgoing copy only. A new `webhook_attempts` table records each attempt with the mutation applied, so a test can assert on what was actually sent. |
-| 3.4 | Reset and replay controls | S | `POST /test/reset` clears all state (test mode only). `POST /test/webhooks/{id}/redeliver?after=` re-enqueues deliveries from a sequence. Dead letters can be listed and retried. |
+| 3.4 ✅ | Reset and replay controls | S | `POST /test/reset` clears all state (test mode only). `POST /test/webhooks/{id}/redeliver?after=` re-enqueues deliveries from a sequence. Dead letters can be listed and retried. |
 | 3.5 | Tests and acceptance | M | A scenario suite in CI: the same file and seed give byte-identical event logs over two runs. Each fault type is visible at the receiver and absent from `/api/events`. Reset gives a clean state. |
 
 ### Milestone 3 progress
@@ -603,6 +603,67 @@ random markets; and faults injected into *delivered copies* of events, never int
 - **Deviation:** the plan says "configured under `/test/…` or in a scenario". Both are there, but the policy lives
   on the subscription itself rather than in a separate test-control store. That way it survives restarts and is
   visible in `GET /api/webhooks`.
+
+**3.4 — reset and replay controls ✅ (2026-10-16).**
+- **Delivered:**
+  - **`POST /test/reset`** (`204`) runs `Exchange::reset` on the exchange thread.
+    - `Store::reset` empties every table found in `sqlite_master`, so tables added later are covered too, plus
+      `sqlite_sequence`. It does this in one transaction with deferred foreign-key checks.
+    - The in-memory state is then as on an empty database: no books, participants or subscriptions, sequences from
+      1, and a fresh settlement simulator with the same policy.
+    - The virtual clock goes back to its first reading, through a new `VirtualClock::reset`, the one way it can move
+      backwards.
+  - **Reset epoch:** a counter that each reset bumps. Delivery jobs and results carry it, and `record_deliveries`
+    drops results claimed before a reset. Without it, a late result could land on a new delivery with the same
+    deterministic ID, and its attempt row would fail the foreign-key check.
+  - **`POST /test/webhooks/{id}/redeliver?after=`** upserts a pending delivery, with no attempts and not held, for
+    every event after `after` of the types the subscription wants. Events from before the subscription existed are
+    included, so this also replays history to a new consumer. It returns `{ queued }` and wakes the worker.
+  - **Dead letters:**
+    - `GET /test/deliveries` gains `subscriptionId` and `status` filters (`status=DEAD` lists the dead letters).
+    - `POST /test/dead-letters/retry` with an optional `{ subscriptionId, deliveryIds }` resets dead deliveries to
+      pending with a fresh attempt budget and returns `{ retried }`.
+  - **Scenario steps:** `reset` (it also forgets order and webhook references), `register` (instruments,
+    participants and webhooks mid-scenario, as in the setup), `redeliver` and `retry_dead_letters`.
+  - A README section on reset and redelivery.
+- **Tests:** `tests/reset.rs` (5):
+  - **Reset:** after a script touching every kind of state (registration, a webhook, a trade, settlement at T+2, an
+    external report), a reset empties every table. The APIs show nothing and the clock is back at its start. Running
+    the same script again gives a byte-identical `/api/events`, and a restart afterwards keeps it.
+  - **Stale results:** a delivery in flight during a reset reaches the consumer, but its result is dropped: only the
+    new attempt is recorded, and the new delivery shows 1 attempt.
+  - **Redelivery:** it covers events from before the subscription and goes out in order. Repeating it from a
+    sequence re-sends only the later events, with fresh attempt counts. A sequence at the end queues nothing. An
+    unknown subscription is `404`, and a bad `after` is `400`.
+  - **Dead letters:** they are listed per status and subscription and retried per subscription, per ID or all.
+    Others stay dead. A bad status is `400`, an unknown subscription `404`, unknown fields `400`, and with test
+    control off it is `404`.
+  - **Scenarios:** one that resets halfway and repeats its first half ends with the same event-log fingerprint as
+    one that ran the first half only. References are forgotten on reset.
+  - The reset, fault and webhook suites were repeated five times without failure.
+- **Mutation checks**, each made a test fail:
+  - stale results kept;
+  - the epoch not advanced;
+  - the autoincrement counter not reset;
+  - the clock not reset;
+  - the settlement simulator kept;
+  - the books kept;
+  - redelivery keeping attempts;
+  - redelivery including `after` itself;
+  - retry touching more than dead letters;
+  - retry ignoring the subscription;
+  - scenario references kept after a reset.
+- **Decisions:**
+  - **A reset clears everything except the configuration.** Subscriptions and their fault policies go too, and the
+    clock goes back to its first reading. Metrics counters are not reset.
+  - **A reset does not interrupt a request in flight,** so the consumer may still get it. Only its result is
+    discarded.
+  - **Redelivery is a fresh delivery** (attempts 0, not held). The old attempts stay in `webhook_attempts`, ordered
+    by their ID.
+  - **No new migration** was needed: the epoch lives in memory, and a restart cannot have claims from before a
+    reset, since startup releases all claims.
+- **Note:** this time the e2e suite took 96 s (17 s before). The result was unchanged; the extra time was most likely
+  the image build.
 
 ## Milestone 4 — performance
 

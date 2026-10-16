@@ -345,10 +345,24 @@ inject delivery faults and run scenarios. They return `404` otherwise.
 | POST | `/test/clock/advance` | `{ "days", "hours", "minutes", "seconds" }` (any, summed, > 0) | Move forward |
 | POST | `/test/clock/set` | `{ "to": "2030-01-07T09:00:00Z" }` | Move to an instant; earlier than now is `409 clock_backwards` |
 | POST | `/test/clock/freeze` / `/test/clock/resume` | – | Stop the clock, or let it run with real time |
-| GET | `/test/deliveries` | – | Every webhook delivery in event order: `deliveryId`, `subscriptionId`, `url`, `eventSequence`, `eventId`, `eventType`, `status`, `attempts`, `lastError` |
+| POST | `/test/reset` | – | `204`: clears all state, as on a new database (see below) |
+| GET | `/test/deliveries?subscriptionId=&status=` | – | Webhook deliveries in event order, optionally one subscription's or one status (`DEAD` lists the dead letters): `deliveryId`, `subscriptionId`, `url`, `eventSequence`, `eventId`, `eventType`, `status`, `attempts`, `lastError` |
+| POST | `/test/webhooks/{id}/redeliver?after=` | – | Queues the subscription's events after sequence `after` (default 0: all) for delivery again: `{ "queued": n }` |
+| POST | `/test/dead-letters/retry` | Optional `{ "subscriptionId", "deliveryIds": [...] }` | Retries dead letters (all, one subscription's, or the listed ones) with a fresh attempt budget: `{ "retried": n }` |
 | PUT / DELETE | `/test/webhooks/{id}/faults` | A fault policy / – | Set or clear the subscription's delivery faults (see Fault injection); returns the subscription |
 | GET | `/test/attempts?subscriptionId=` | – | Every request sent and every hold, oldest first: `deliveryId`, `subscriptionId`, `url`, `eventSequence`, `eventId`, `eventType`, `attempt`, `outcome` (`SENT`\|`HELD`), `faults`, `body` (only when a fault changed it), `httpStatus`, `error`, `at` |
 | POST | `/test/scenarios` | A scenario, YAML or JSON | Runs it in a sandbox (see Scenarios); `200` with the report, `400 invalid_scenario` if it does not parse |
+
+**Reset** empties every table and gives the in-memory state of a new database: no instruments, participants,
+orders, trades, events, subscriptions, deliveries, attempts or settlements. Sequences restart at 1, so with
+deterministic IDs the same commands after a reset give the same log and IDs as on a fresh service. The virtual clock
+goes back to its first reading (the configured `clock.start`, or the time the service started). Only the configuration
+remains, and metrics counters are not reset. A delivery in flight during the reset may still reach its consumer, but
+its result is dropped.
+
+**Redelivery** re-queues events, with sequences after `after` and of the types the subscription wants, as fresh
+deliveries: pending, no attempts so far, due now. Events from before the subscription existed get a delivery too, so
+this also replays history to a new consumer. Deliveries already in flight are sent again.
 
 The `/test/clock` routes change the clock only with `clock.mode: virtual`; with the system clock they return
 `409 clock_not_virtual`.
@@ -402,6 +416,10 @@ steps:
 | `advance_clock: { days, hours, minutes, seconds }` / `set_clock: { to }` | Move the virtual clock |
 | `report_settlement: { execution, expect?, ...body }` | `POST /api/settlements/{executionId}/outcomes` |
 | `set_instrument: { instrument, enabled, expect? }` | `PATCH /api/instruments/{id}` |
+| `register: { instruments, participants, webhooks }` | Registers more, as in the setup (e.g. after a reset) |
+| `reset: {}` | `POST /test/reset`; order and webhook references are forgotten too |
+| `redeliver: { url, after, expect? }` | Redelivers the webhook's events after `after` |
+| `retry_dead_letters: { url?, expect? }` | Retries the webhook's dead letters, or all |
 | `set_faults: { url, faults }` | Set the fault policy of the webhook registered for `url`; `faults: null` clears it |
 | `market: { ...random market }` | A seeded random market; see below |
 | `expect: { order \| book \| settlement: ref, matches }` | `GET` the one resource; it must contain `matches` |

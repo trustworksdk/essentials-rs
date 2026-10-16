@@ -102,6 +102,14 @@ pub enum Step {
     ReportSettlement(ReportStep),
     /// `PATCH /api/instruments/{instrument}`.
     SetInstrument(SetInstrument),
+    /// Registers more instruments, participants and webhooks, as in the setup (e.g. after a reset).
+    Register(Register),
+    /// `POST /test/reset`: clears all state, as on a new database. Order and webhook references are forgotten too.
+    Reset(Empty),
+    /// `POST /test/webhooks/{id}/redeliver?after=`: queues the events after `after` for the webhook at `url` again.
+    Redeliver(Redeliver),
+    /// `POST /test/dead-letters/retry`: retries the dead letters of the webhook at `url`, or all of them.
+    RetryDeadLetters(RetryDeadLetters),
     /// Sets the delivery fault policy of the webhook registered for `url` (`PUT /test/webhooks/{id}/faults`), or
     /// clears it with `faults: null`.
     SetFaults(SetFaults),
@@ -163,6 +171,38 @@ pub struct ReportStep {
     pub expect: Option<ResponseCheck>,
     #[serde(flatten)]
     pub body: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Register {
+    #[serde(default)]
+    pub instruments: Vec<Value>,
+    #[serde(default)]
+    pub participants: Vec<Value>,
+    #[serde(default)]
+    pub webhooks: Vec<Value>,
+}
+
+/// A step without parameters: `reset: {}`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Empty {}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Redeliver {
+    pub url: String,
+    #[serde(default)]
+    pub after: u64,
+    pub expect: Option<ResponseCheck>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryDeadLetters {
+    pub url: Option<String>,
+    pub expect: Option<ResponseCheck>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -276,13 +316,17 @@ steps:
   - report_settlement: { execution: "buy#0", status: SETTLED, reference: r-1 }
   - set_instrument: { instrument: ACME, enabled: false }
   - market: { orders: 10, instruments: [ { id: ACME, price: { mid_ticks: 100 } } ] }
+  - redeliver: { url: "http://x/hook", after: 3 }
+  - retry_dead_letters: {}
+  - reset: {}
+  - register: { participants: [ { id: A, name: Seller } ] }
   - expect: { order: sell, matches: { status: CANCELLED } }
   - expect: { events: { eventType: SettlementCompleted }, count: 1 }
 "#;
         let scenario = Scenario::parse(text).unwrap();
         assert_eq!(
             (scenario.name.as_str(), scenario.seed, scenario.steps.len()),
-            ("partial fill", 7, 10)
+            ("partial fill", 7, 14)
         );
         assert_eq!(scenario.start, default_start());
         let Step::Order(order) = &scenario.steps[1] else {

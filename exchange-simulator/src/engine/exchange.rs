@@ -177,6 +177,10 @@ pub struct Exchange {
     subscriptions: Vec<Subscription>,
     simulation_id: Option<String>,
     delivery_signal: Option<Arc<tokio::sync::Notify>>,
+    /// The virtual clock's first reading and whether it started running: where a reset puts it.
+    clock_start: Option<(DateTime<Utc>, bool)>,
+    /// Counts resets. Delivery claims carry it, so results for deliveries claimed before a reset are dropped.
+    epoch: u64,
 }
 
 impl Exchange {
@@ -215,6 +219,10 @@ impl Exchange {
             None => None,
         };
         let mut clock = options.clock;
+        let clock_start = options
+            .virtual_clock
+            .as_ref()
+            .map(|c| (c.now(), c.is_running()));
         if let Some(virtual_clock) = &options.virtual_clock {
             // Simulated time continues where it was; it never jumps back to the configured start.
             if let Some((stored, running)) = store.virtual_clock()? {
@@ -252,6 +260,8 @@ impl Exchange {
             subscriptions,
             simulation_id: options.simulation_id,
             delivery_signal: options.delivery_signal,
+            clock_start,
+            epoch: 0,
         };
         // Trades committed while the simulator was off (or before it existed) are taken in now, before any command,
         // so intake order does not depend on when a background tick happens to run.
@@ -502,12 +512,86 @@ impl Exchange {
     ) -> Result<Vec<DeliveryJob>, ExchangeError> {
         let now = wall_now();
         let lease_until = now + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
-        Ok(self.store.claim_deliveries(now, lease_until, limit)?)
+        let mut jobs = self.store.claim_deliveries(now, lease_until, limit)?;
+        for job in &mut jobs {
+            job.epoch = self.epoch;
+        }
+        Ok(jobs)
     }
 
+    /// Records delivery results, except those claimed before a reset: their deliveries are gone (or, with
+    /// deterministic IDs, a new delivery may have the same ID).
     pub fn record_deliveries(&mut self, results: &[DeliveryResult]) -> Result<(), ExchangeError> {
         let now = wall_now();
-        Ok(self.store.record_deliveries(results, now)?)
+        let current: Vec<DeliveryResult> = results
+            .iter()
+            .filter(|r| r.epoch == self.epoch)
+            .cloned()
+            .collect();
+        if current.len() < results.len() {
+            tracing::debug!(
+                dropped = results.len() - current.len(),
+                "dropped delivery results claimed before a reset"
+            );
+        }
+        Ok(self.store.record_deliveries(&current, now)?)
+    }
+
+    /// Clears all state: every table emptied, books, participants, subscriptions and the settlement simulator back to
+    /// nothing, sequences starting at 1, and the virtual clock back at its first reading (the configured start, or
+    /// without one the time the service started). The service then behaves
+    /// as on a new database, so a deterministic run after a reset repeats a fresh one, IDs included. Only the
+    /// configuration remains.
+    pub fn reset(&mut self) -> Result<(), ExchangeError> {
+        self.store.reset()?;
+        self.books.clear();
+        self.participants.clear();
+        self.subscriptions.clear();
+        self.last_sequence = 0;
+        self.next_event_sequence = self.store.next_event_sequence()?;
+        if let Some(simulator) = &mut self.settlement {
+            *simulator = SettlementSimulator::new(simulator.policy().clone(), Vec::new(), 0);
+        }
+        if let (Some(clock), Some((start, running))) = (&self.virtual_clock, self.clock_start) {
+            clock.reset(start, running);
+            self.store
+                .save_virtual_clock(clock.now(), clock.is_running())?;
+        }
+        self.epoch += 1;
+        tracing::info!(epoch = self.epoch, "exchange state reset");
+        Ok(())
+    }
+
+    /// Queues the subscription's events after sequence `after` for delivery again (see [`Store::redeliver`]).
+    pub fn redeliver(&mut self, subscription_id: Uuid, after: u64) -> Result<usize, ExchangeError> {
+        let subscription = self
+            .subscriptions
+            .iter()
+            .find(|s| s.id == subscription_id)
+            .ok_or(ExchangeError::UnknownSubscription(subscription_id))?;
+        let queued = self
+            .store
+            .redeliver(subscription, after, wall_now(), &self.ids)?;
+        self.signal_deliveries(queued > 0);
+        Ok(queued)
+    }
+
+    /// Gives dead-lettered deliveries a fresh attempt budget: all, one subscription's, or the listed ones.
+    pub fn retry_dead_letters(
+        &mut self,
+        subscription_id: Option<Uuid>,
+        delivery_ids: &[Uuid],
+    ) -> Result<usize, ExchangeError> {
+        if let Some(id) = subscription_id
+            && !self.subscriptions.iter().any(|s| s.id == id)
+        {
+            return Err(ExchangeError::UnknownSubscription(id));
+        }
+        let retried = self
+            .store
+            .retry_dead_letters(subscription_id, delivery_ids, wall_now())?;
+        self.signal_deliveries(retried > 0);
+        Ok(retried)
     }
 
     /// One settlement simulator step: takes in `TradeExecuted` events past the stored cursor (in pages), then runs
@@ -760,7 +844,12 @@ impl Exchange {
         let delivers = events
             .iter()
             .any(|e| self.subscriptions.iter().any(|s| s.wants(e.event_type)));
-        if delivers && let Some(signal) = &self.delivery_signal {
+        self.signal_deliveries(delivers);
+    }
+
+    /// Wakes the delivery worker when there is something new to deliver.
+    fn signal_deliveries(&self, any: bool) {
+        if any && let Some(signal) = &self.delivery_signal {
             signal.notify_one();
         }
     }

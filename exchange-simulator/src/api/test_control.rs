@@ -3,6 +3,7 @@
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -24,7 +25,10 @@ use crate::webhooks::FaultPolicy;
 pub fn router(state: AppState, config: Arc<Config>) -> Router {
     Router::new()
         .route("/test/scenarios", post(run_scenario))
+        .route("/test/reset", post(reset))
         .route("/test/deliveries", get(deliveries))
+        .route("/test/dead-letters/retry", post(retry_dead_letters))
+        .route("/test/webhooks/{id}/redeliver", post(redeliver))
         .route("/test/attempts", get(attempts))
         .route(
             "/test/webhooks/{id}/faults",
@@ -89,12 +93,87 @@ impl From<DeliveryRecord> for DeliveryView {
     }
 }
 
-/// Every webhook delivery, in event order. Delivery runs on real time, so statuses move without clock changes.
-async fn deliveries(State(state): State<AppState>) -> Result<Json<Vec<DeliveryView>>, ApiError> {
-    let deliveries = state.read(|store| store.deliveries()).await?;
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeliveriesQuery {
+    pub subscription_id: Option<Uuid>,
+    /// `PENDING`, `IN_FLIGHT`, `DELIVERED` or `DEAD` (the dead letters).
+    pub status: Option<String>,
+}
+
+/// Webhook deliveries in event order, optionally one subscription's or one status. Delivery runs on real time, so
+/// statuses move without clock changes.
+async fn deliveries(
+    State(state): State<AppState>,
+    query: Result<Query<DeliveriesQuery>, QueryRejection>,
+) -> Result<Json<Vec<DeliveryView>>, ApiError> {
+    let Query(query) = query?;
+    if let Some(status) = &query.status
+        && !["PENDING", "IN_FLIGHT", "DELIVERED", "DEAD"].contains(&status.as_str())
+    {
+        return Err(ApiError::bad_request(format!(
+            "unknown delivery status {status}"
+        )));
+    }
+    let deliveries = state
+        .read(move |store| store.deliveries(query.subscription_id, query.status.as_deref()))
+        .await?;
     Ok(Json(
         deliveries.into_iter().map(DeliveryView::from).collect(),
     ))
+}
+
+/// Clears all state, as on a new database: instruments, participants, orders, trades, events, subscriptions,
+/// deliveries, settlements; sequences restart at 1 and the virtual clock goes back to its first reading.
+async fn reset(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
+    state.dispatcher.reset().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RedeliverQuery {
+    /// Redeliver events with a sequence after this one (default 0: all).
+    #[serde(default)]
+    pub after: u64,
+}
+
+/// Queues the subscription's events after `?after=` for delivery again, also those from before it was registered.
+async fn redeliver(
+    State(state): State<AppState>,
+    id: Result<Path<Uuid>, PathRejection>,
+    query: Result<Query<RedeliverQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Path(id) = id?;
+    let Query(query) = query?;
+    let queued = state.dispatcher.redeliver(id, query.after).await?;
+    Ok(Json(serde_json::json!({ "queued": queued })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetryRequest {
+    pub subscription_id: Option<Uuid>,
+    #[serde(default)]
+    pub delivery_ids: Vec<Uuid>,
+}
+
+/// Retries dead letters with a fresh attempt budget. An empty body retries all of them; `subscriptionId` and
+/// `deliveryIds` narrow it down.
+async fn retry_dead_letters(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let request: RetryRequest = if body.is_empty() {
+        RetryRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()))?
+    };
+    let retried = state
+        .dispatcher
+        .retry_dead_letters(request.subscription_id, request.delivery_ids)
+        .await?;
+    Ok(Json(serde_json::json!({ "retried": retried })))
 }
 
 /// Sets a subscription's delivery fault policy (see [`crate::webhooks::faults`]); returns the subscription.

@@ -177,6 +177,7 @@ async fn deliver(
         tracing::debug!(delivery = %job.delivery_id, until = %at, "webhook held back by an out-of-order fault");
         return DeliveryResult {
             delivery_id: job.delivery_id,
+            epoch: job.epoch,
             outcome: DeliveryOutcome::Held { at },
             sent: vec![AttemptRecord {
                 attempt,
@@ -247,6 +248,7 @@ async fn deliver(
     }
     DeliveryResult {
         delivery_id: job.delivery_id,
+        epoch: job.epoch,
         outcome,
         sent,
     }
