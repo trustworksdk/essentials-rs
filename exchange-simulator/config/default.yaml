@@ -74,6 +74,9 @@ clock:
   # `start` (default: the real time at first startup), frozen unless `running: true`, and resumes from its last
   # reading after a restart. Webhook delivery scheduling always uses real time.
   mode: "system"
+  # Virtual clock only: simulated seconds per real second while it runs. 1440 makes a day pass in a minute, for
+  # demos that settle T+1 trades within a minute or two. The system clock accepts only 1.
+  speed: 1
 test_control:
   # Mounts /test/... (virtual clock controls). Never enable outside test deployments.
   enabled: false

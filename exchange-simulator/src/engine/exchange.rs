@@ -157,20 +157,23 @@ impl Default for ExchangeOptions {
 }
 
 /// How the exchange tells time, for the test-control API.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClockState {
     pub virtual_clock: bool,
     pub running: bool,
+    /// Simulated seconds per real second while running; 1 for the system clock.
+    pub speed: f64,
     pub now: DateTime<Utc>,
 }
 
 /// A change to the virtual clock.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ClockChange {
     Advance(chrono::Duration),
     Set(DateTime<Utc>),
     Freeze,
     Resume,
+    Speed(f64),
 }
 
 /// The persistence coordinator: owns the order books and the single SQLite writer, and serializes every command.
@@ -202,7 +205,7 @@ pub struct Exchange {
     simulation_id: Option<String>,
     delivery_signal: Option<Arc<tokio::sync::Notify>>,
     /// The virtual clock's first reading and whether it started running: where a reset puts it.
-    clock_start: Option<(DateTime<Utc>, bool)>,
+    clock_start: Option<(DateTime<Utc>, bool, f64)>,
     /// Counts resets. Delivery claims carry it, so results for deliveries claimed before a reset are dropped.
     epoch: u64,
     /// The open commit group: what its commands wrote, reported once the group is durable.
@@ -264,12 +267,17 @@ impl Exchange {
         let clock_start = options
             .virtual_clock
             .as_ref()
-            .map(|c| (c.now(), c.is_running()));
+            .map(|c| (c.now(), c.is_running(), c.speed()));
         if let Some(virtual_clock) = &options.virtual_clock {
-            // Simulated time continues where it was; it never jumps back to the configured start.
+            // Simulated time continues where it was; it never jumps back to the configured start. A running clock's
+            // stored reading is from its last change, so it can be behind what was stamped since (by a lot on a fast
+            // clock): it continues from the latest stamp instead.
             if let Some((stored, running)) = store.virtual_clock()? {
-                if stored > virtual_clock.now() {
-                    virtual_clock.set(stored)?;
+                let latest = store
+                    .latest_clock_stamp()?
+                    .map_or(stored, |at| at.max(stored));
+                if latest > virtual_clock.now() {
+                    virtual_clock.set(latest)?;
                 }
                 if running {
                     virtual_clock.resume()
@@ -829,8 +837,10 @@ impl Exchange {
         if let Some(simulator) = &mut self.settlement {
             *simulator = SettlementSimulator::new(simulator.policy().clone(), Vec::new(), 0);
         }
-        if let (Some(clock), Some((start, running))) = (&self.virtual_clock, self.clock_start) {
-            clock.reset(start, running);
+        if let (Some(clock), Some((start, running, speed))) =
+            (&self.virtual_clock, self.clock_start)
+        {
+            clock.reset(start, running, speed);
             self.store
                 .save_virtual_clock(clock.now(), clock.is_running())?;
         }
@@ -1029,6 +1039,7 @@ impl Exchange {
                 .virtual_clock
                 .as_ref()
                 .is_none_or(VirtualClock::is_running),
+            speed: self.virtual_clock.as_ref().map_or(1.0, VirtualClock::speed),
             now: self.now(),
         }
     }
@@ -1044,6 +1055,7 @@ impl Exchange {
             ClockChange::Set(to) => clock.set(to)?,
             ClockChange::Freeze => clock.freeze(),
             ClockChange::Resume => clock.resume(),
+            ClockChange::Speed(speed) => clock.set_speed(speed)?,
         }
         self.store
             .save_virtual_clock(clock.now(), clock.is_running())?;

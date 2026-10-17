@@ -1,6 +1,7 @@
 //! Clocks. The exchange stamps every domain timestamp (orders, executions, events, settlement dates) from one
-//! [`Clock`]: the system clock in normal operation, or a [`VirtualClock`] that tests and simulations set, advance and
-//! freeze. Webhook delivery scheduling (retries, leases) always uses real time, because it deals with real consumers.
+//! [`Clock`]: the system clock in normal operation, or a [`VirtualClock`] that tests and simulations set, advance,
+//! freeze and speed up. Webhook delivery scheduling (retries, leases, timeouts) always uses real time, because it
+//! deals with real consumers.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -31,17 +32,32 @@ impl Clock for FixedClock {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
 pub enum ClockError {
     #[error("the virtual clock cannot move backwards (now {now}, requested {requested})")]
     Backwards {
         now: DateTime<Utc>,
         requested: DateTime<Utc>,
     },
+    #[error("clock speed must be more than 0 and at most {MAX_SPEED}, got {0}")]
+    Speed(f64),
 }
 
-/// A controllable clock. Frozen, it reads the same instant until set or advanced; running, it moves with real time
-/// from the instant it was last set to. It never moves backwards. Clones share the same state.
+/// The fastest a virtual clock may run: about eleven and a half simulated days per real second.
+pub const MAX_SPEED: f64 = 1_000_000.0;
+
+/// Checks a speed: simulated seconds per real second, more than 0 and at most [`MAX_SPEED`].
+pub fn validate_speed(speed: f64) -> Result<(), ClockError> {
+    if speed > 0.0 && speed <= MAX_SPEED {
+        Ok(())
+    } else {
+        Err(ClockError::Speed(speed))
+    }
+}
+
+/// A controllable clock. Frozen, it reads the same instant until set or advanced; running, it moves from the instant
+/// it was last set to at `speed` simulated seconds per real second (1 is real time). It never moves backwards. Clones
+/// share the same state.
 #[derive(Clone, Debug)]
 pub struct VirtualClock {
     state: Arc<Mutex<State>>,
@@ -53,21 +69,45 @@ struct State {
     at_anchor: DateTime<Utc>,
     anchor: Instant,
     running: bool,
+    speed: f64,
 }
 
 impl VirtualClock {
+    /// A clock at real-time speed.
     pub fn new(start: DateTime<Utc>, running: bool) -> Self {
+        Self::with_speed(start, running, 1.0)
+    }
+
+    /// A clock that runs at `speed`, which must pass [`validate_speed`].
+    pub fn with_speed(start: DateTime<Utc>, running: bool, speed: f64) -> Self {
+        debug_assert!(validate_speed(speed).is_ok(), "speed {speed}");
         Self {
             state: Arc::new(Mutex::new(State {
                 at_anchor: start,
                 anchor: Instant::now(),
                 running,
+                speed,
             })),
         }
     }
 
     pub fn is_running(&self) -> bool {
         self.state.lock().expect("clock lock").running
+    }
+
+    /// Simulated seconds per real second while running.
+    pub fn speed(&self) -> f64 {
+        self.state.lock().expect("clock lock").speed
+    }
+
+    /// Changes the speed from the current reading on; the time already passed is kept.
+    pub fn set_speed(&self, speed: f64) -> Result<(), ClockError> {
+        validate_speed(speed)?;
+        let mut state = self.state.lock().expect("clock lock");
+        state.at_anchor = state.now();
+        state.anchor = Instant::now();
+        state.speed = speed;
+        Ok(())
     }
 
     /// Moves the clock to `to`, which must not be before the current reading.
@@ -98,13 +138,14 @@ impl VirtualClock {
         Ok(())
     }
 
-    /// Puts the clock at `to`, even backwards, and freezes or runs it. Only for a reset, which clears every state
-    /// stamped with the old readings.
-    pub fn reset(&self, to: DateTime<Utc>, running: bool) {
+    /// Puts the clock at `to`, even backwards, and freezes or runs it at `speed`. Only for a reset, which clears
+    /// every state stamped with the old readings.
+    pub fn reset(&self, to: DateTime<Utc>, running: bool, speed: f64) {
         let mut state = self.state.lock().expect("clock lock");
         state.at_anchor = to;
         state.anchor = Instant::now();
         state.running = running;
+        state.speed = speed;
     }
 
     /// Stops the clock at its current reading.
@@ -127,8 +168,15 @@ impl VirtualClock {
 impl State {
     fn now(&self) -> DateTime<Utc> {
         if self.running {
-            let elapsed =
-                chrono::Duration::from_std(self.anchor.elapsed()).unwrap_or(chrono::Duration::MAX);
+            let real = self.anchor.elapsed();
+            let simulated = if self.speed == 1.0 {
+                Some(real)
+            } else {
+                std::time::Duration::try_from_secs_f64(real.as_secs_f64() * self.speed).ok()
+            };
+            let elapsed = simulated
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .unwrap_or(chrono::Duration::MAX);
             self.at_anchor
                 .checked_add_signed(elapsed)
                 .unwrap_or(self.at_anchor)
@@ -193,6 +241,37 @@ mod tests {
         clock.resume();
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(clock.now() > frozen);
+    }
+
+    #[test]
+    fn a_fast_clock_moves_speed_times_real_time_and_keeps_its_reading_on_a_change() {
+        let before = std::time::Instant::now();
+        let clock = VirtualClock::with_speed(start(), true, 3600.0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let moved = clock.now() - start();
+        let real = chrono::Duration::from_std(before.elapsed()).unwrap();
+        assert!(
+            moved >= chrono::Duration::seconds(180) && moved <= real * 3600,
+            "an hour per second: {moved} after {real}"
+        );
+        clock.set_speed(1.0).unwrap();
+        let slowed = clock.now();
+        assert!(slowed - start() >= moved, "the change keeps the reading");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            clock.now() - slowed < chrono::Duration::seconds(5),
+            "real time again"
+        );
+        assert_eq!(clock.speed(), 1.0);
+        for bad in [0.0, -1.0, f64::NAN, MAX_SPEED * 2.0] {
+            assert!(clock.set_speed(bad).is_err(), "{bad}");
+        }
+        assert_eq!(clock.speed(), 1.0);
+        clock.freeze();
+        clock.set_speed(1440.0).unwrap();
+        let frozen = clock.now();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(clock.now(), frozen, "speed does not move a frozen clock");
     }
 
     #[test]

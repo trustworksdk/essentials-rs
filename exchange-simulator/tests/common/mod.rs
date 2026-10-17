@@ -80,6 +80,7 @@ impl TestApp {
                 mode: ClockMode::System,
                 start: None,
                 running: false,
+                speed: 1.0,
             },
             ids: IdsConfig::default(),
             settlement: SettlementConfig::default(),

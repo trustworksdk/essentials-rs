@@ -135,6 +135,31 @@ clock: { mode: virtual, start: "2030-01-07T09:00:00Z" }
 test_control: { enabled: true }        # mounts /test; never expose it outside test deployments
 ```
 
+**Short demo: a simulated day per real minute,** so settlement completes while the audience watches:
+
+```yaml
+clock:
+  mode: virtual
+  start: "2030-01-07T08:00:00Z"        # a Monday morning; any business day works
+  running: true
+  speed: 1440                          # a simulated day per real minute
+settlement:
+  mode: simulated
+  fail_probability: 0.0                # every trade settles, for a clean run
+  delay_probability: 0.0
+```
+
+At this speed a trade made at 09:00 is settled at 00:00 the next day (T+1), about 37 real seconds later; a Friday
+trade settles on Monday, under 3 minutes later. Webhook retries and timeouts stay on real time, so a consumer that
+is briefly down catches up as usual. Points to keep in mind:
+- **Take dates from the events.** A consumer, such as the demo app, must take dates and times from `occurredAt`,
+  `executedAt`, `tradeDate` and `intendedSettlementDate`, never from its own clock, which runs a thousand times
+  slower than the exchange's.
+- **A restart keeps simulated time** (it continues from the latest event) and the configured speed. For a fresh run,
+  remove the database volume, or call `POST /test/reset` where test control is enabled.
+- **To change the speed during a demo**, enable test control and call `POST /test/clock/speed`. A showcase deployment
+  sets `clock.speed` in its configuration instead, so it does not expose `/test`.
+
 **Load test without durability:**
 
 ```yaml

@@ -667,6 +667,29 @@ impl Store {
             .optional()
     }
 
+    /// The latest `occurred_at` of the events the exchange and the simulator stamped from the clock. External
+    /// reports carry the reporter's own time, so they are left out.
+    pub fn latest_clock_stamp(&self) -> rusqlite::Result<Option<DateTime<Utc>>> {
+        let latest: Option<String> = self.conn.query_row(
+            "SELECT MAX(occurred_at) FROM events WHERE source <> ?1",
+            [crate::events::EXTERNAL_SOURCE],
+            |row| row.get(0),
+        )?;
+        latest
+            .map(|text| {
+                DateTime::parse_from_rfc3339(&text)
+                    .map(|at| at.with_timezone(&Utc))
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })
+            })
+            .transpose()
+    }
+
     pub fn save_virtual_clock(&self, now: DateTime<Utc>, running: bool) -> rusqlite::Result<()> {
         self.conn
             .execute(

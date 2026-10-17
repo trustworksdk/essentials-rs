@@ -40,6 +40,7 @@ pub fn router(state: AppState, config: Arc<Config>) -> Router {
         .route("/test/clock/set", post(set))
         .route("/test/clock/freeze", post(freeze))
         .route("/test/clock/resume", post(resume))
+        .route("/test/clock/speed", post(speed))
         .layer(axum::Extension(config))
         .with_state(state)
 }
@@ -217,6 +218,8 @@ pub struct ClockView {
     /// `virtual` or `system`.
     pub mode: &'static str,
     pub running: bool,
+    /// Simulated seconds per real second while running.
+    pub speed: f64,
     pub now: DateTime<Utc>,
 }
 
@@ -229,6 +232,7 @@ impl From<ClockState> for ClockView {
                 "system"
             },
             running: state.running,
+            speed: state.speed,
             now: state.now,
         }
     }
@@ -252,6 +256,13 @@ pub struct AdvanceRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SetRequest {
     pub to: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SpeedRequest {
+    /// Simulated seconds per real second, more than 0 and at most 1000000.
+    pub speed: f64,
 }
 
 async fn clock(State(state): State<AppState>) -> Result<Json<ClockView>, ApiError> {
@@ -292,6 +303,15 @@ async fn freeze(State(state): State<AppState>) -> Result<Json<ClockView>, ApiErr
 
 async fn resume(State(state): State<AppState>) -> Result<Json<ClockView>, ApiError> {
     change(&state, ClockChange::Resume).await
+}
+
+/// Changes how fast the clock runs, from its current reading on. Frozen, it stays frozen at the new speed.
+async fn speed(
+    State(state): State<AppState>,
+    body: Result<Json<SpeedRequest>, JsonRejection>,
+) -> Result<Json<ClockView>, ApiError> {
+    let Json(body) = body?;
+    change(&state, ClockChange::Speed(body.speed)).await
 }
 
 async fn change(state: &AppState, change: ClockChange) -> Result<Json<ClockView>, ApiError> {

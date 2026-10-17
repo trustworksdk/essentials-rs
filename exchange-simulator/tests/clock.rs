@@ -1,5 +1,5 @@
-//! The virtual clock and the test-control API: simulated time stamps the domain, moves only forward, survives
-//! restarts, and is only reachable when test control is enabled.
+//! The virtual clock and the test-control API: simulated time stamps the domain, moves only forward, runs at a
+//! configurable speed, survives restarts, and is only reachable when test control is enabled.
 
 mod common;
 
@@ -151,6 +151,115 @@ async fn a_restart_resumes_simulated_time_instead_of_jumping_back() {
     app.stop().await;
 }
 
+async fn fast_app(speed: f64) -> TestApp {
+    TestApp::start_with(|c| {
+        c.clock.mode = ClockMode::Virtual;
+        c.clock.start = Some(start());
+        c.clock.running = true;
+        c.clock.speed = speed;
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_fast_clock_speeds_up_domain_time_and_its_speed_can_change() {
+    let mut app = fast_app(3600.0).await;
+    let (_, clock) = app.get("/test/clock").await;
+    assert_eq!(
+        (&clock["running"], &clock["speed"]),
+        (&json!(true), &json!(3600.0))
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let (_, clock) = app.get("/test/clock").await;
+    assert!(
+        time(&clock["now"]) - start() >= chrono::Duration::minutes(6),
+        "an hour per real second: {}",
+        clock["now"]
+    );
+
+    let (status, slowed) = app.post("/test/clock/speed", json!({ "speed": 1 })).await;
+    assert_eq!((status, &slowed["speed"]), (StatusCode::OK, &json!(1.0)));
+    assert!(
+        time(&slowed["now"]) >= time(&clock["now"]),
+        "the reading is kept"
+    );
+    for bad in [
+        json!({ "speed": 0 }),
+        json!({ "speed": -1 }),
+        json!({ "speed": 2e6 }),
+    ] {
+        let (status, body) = app.post("/test/clock/speed", bad.clone()).await;
+        assert_eq!(
+            (status, &body["error"]),
+            (StatusCode::BAD_REQUEST, &json!("invalid_clock_speed")),
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        app.post("/test/clock/speed", json!({ "speed": "fast" }))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(app.get("/test/clock").await.1["speed"], 1.0);
+
+    assert_eq!(
+        app.call(Method::POST, "/test/reset", None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        app.get("/test/clock").await.1["speed"],
+        3600.0,
+        "a reset goes back to the configured speed"
+    );
+    app.stop().await;
+}
+
+#[tokio::test]
+async fn a_restart_on_a_fast_clock_continues_from_the_latest_stamp() {
+    // Ten simulated hours per real second: the reading stored at startup is soon far behind.
+    let mut app = fast_app(36_000.0).await;
+    app.seed().await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    app.order("A", "SELL", Some(10025), 20).await;
+    let (_, buy) = app.order("B", "BUY", Some(10025), 10).await;
+    let traded = time(&buy["executions"][0]["executedAt"]);
+    assert!(traded - start() >= chrono::Duration::hours(2), "{traded}");
+
+    app.restart().await;
+    let (_, clock) = app.get("/test/clock").await;
+    assert!(
+        time(&clock["now"]) >= traded,
+        "{} before {traded}",
+        clock["now"]
+    );
+    assert_eq!(clock["speed"], 36_000.0, "the configured speed");
+    let (_, again) = app.order("C", "BUY", Some(10025), 10).await;
+    assert!(time(&again["executions"][0]["executedAt"]) >= traded);
+    app.stop().await;
+}
+
+#[tokio::test]
+async fn startup_refuses_a_speed_it_cannot_honour() {
+    let config = TestApp::start().await.config.clone();
+    for (mode, speed, message) in [
+        (
+            ClockMode::System,
+            1440.0,
+            "clock.speed needs clock.mode: virtual",
+        ),
+        (ClockMode::Virtual, 0.0, "clock speed must be more than 0"),
+    ] {
+        let mut config = config.clone();
+        config.clock.mode = mode;
+        config.clock.speed = speed;
+        let error = exchange_simulator::app::App::start(&config)
+            .err()
+            .expect("refused");
+        assert!(format!("{error:#}").contains(message), "{error:#}");
+    }
+}
+
 #[tokio::test]
 async fn the_system_clock_cannot_be_controlled() {
     let mut app = TestApp::start().await;
@@ -165,6 +274,11 @@ async fn the_system_clock_cannot_be_controlled() {
     assert_eq!(
         (status, &body["error"]),
         (StatusCode::CONFLICT, &json!("clock_not_virtual"))
+    );
+    assert_eq!(clock["speed"], 1.0);
+    assert_eq!(
+        app.post("/test/clock/speed", json!({ "speed": 2 })).await.0,
+        StatusCode::CONFLICT
     );
     app.stop().await;
 }

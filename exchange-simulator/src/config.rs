@@ -187,9 +187,16 @@ pub struct ClockConfig {
     /// Virtual clock only: the first reading. Default: the real time at first startup.
     #[serde(default)]
     pub start: Option<chrono::DateTime<chrono::Utc>>,
-    /// Virtual clock only: start running with real time instead of frozen.
+    /// Virtual clock only: start running instead of frozen.
     #[serde(default)]
     pub running: bool,
+    /// Virtual clock only: simulated seconds per real second while it runs (1440 makes a day pass in a minute).
+    #[serde(default = "real_time")]
+    pub speed: f64,
+}
+
+fn real_time() -> f64 {
+    1.0
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]

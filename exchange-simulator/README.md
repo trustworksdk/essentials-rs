@@ -41,6 +41,7 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `settlement.market_settlement_days` | `{}` | Settlement cycle per market, by MIC, for markets not on `settlement_days`, e.g. `{ XCSE: 2 }` |
 | `clock.mode` | `system` | `virtual` gives a controllable clock for domain time (see Test control) |
 | `clock.start` / `clock.running` | unset / `false` | Virtual clock only: first reading (default: real time at first start); start running instead of frozen |
+| `clock.speed` | `1` | Virtual clock only: simulated seconds per real second while it runs, more than 0 and at most 1000000 (1440: a day a minute). The system clock refuses any other value than 1 |
 | `test_control.enabled` | `false` | Mounts `/test/...`. Never enable outside test deployments |
 | `database.mode` | `durable` | `durable`, `fast` or `memory` (see Persistence modes) |
 | `database.path` | `data/exchange.db` | SQLite file (WAL mode); unused in `memory` mode |
@@ -491,10 +492,11 @@ inject delivery faults and run scenarios. They return `404` otherwise.
 
 | Method | Path | Body | Effect |
 |---|---|---|---|
-| GET | `/test/clock` | – | `{ "mode": "virtual"\|"system", "running", "now" }` |
+| GET | `/test/clock` | – | `{ "mode": "virtual"\|"system", "running", "speed", "now" }` |
 | POST | `/test/clock/advance` | `{ "days", "hours", "minutes", "seconds" }` (any, summed, > 0) | Move forward |
 | POST | `/test/clock/set` | `{ "to": "2030-01-07T09:00:00Z" }` | Move to an instant; earlier than now is `409 clock_backwards` |
-| POST | `/test/clock/freeze` / `/test/clock/resume` | – | Stop the clock, or let it run with real time |
+| POST | `/test/clock/freeze` / `/test/clock/resume` | – | Stop the clock, or let it run at its speed |
+| POST | `/test/clock/speed` | `{ "speed": 1440 }` | Change the speed from the current reading on (a frozen clock stays frozen); out of range is `400 invalid_clock_speed` |
 | POST | `/test/reset` | – | `204`: clears all state, as on a new database (see below) |
 | GET | `/test/deliveries?subscriptionId=&status=` | – | Webhook deliveries in event order, optionally one subscription's or one status (`DEAD` lists the dead letters): `deliveryId`, `subscriptionId`, `url`, `eventSequence`, `eventId`, `eventType`, `status`, `attempts`, `lastError`, `nextAttemptAt`, `deliveredAt`. Across all subscriptions; the regular API has the per-subscription equivalents (Maintaining a subscription) |
 | POST | `/test/webhooks/{id}/redeliver?after=` | – | Queues the subscription's events after sequence `after` (default 0: all) for delivery again: `{ "queued": n }`. Same as `POST /api/webhooks/{id}/redeliver` |
@@ -506,7 +508,8 @@ inject delivery faults and run scenarios. They return `404` otherwise.
 **Reset** empties every table and gives the in-memory state of a new database: no instruments, participants,
 orders, trades, events, subscriptions, deliveries, attempts or settlements. Sequences restart at 1, so with
 deterministic IDs the same commands after a reset give the same log and IDs as on a fresh service. The virtual clock
-goes back to its first reading (the configured `clock.start`, or the time the service started). Only the configuration
+goes back to its first reading (the configured `clock.start`, or the time the service started), and to the configured
+`running` and `speed`. Only the configuration
 remains, and metrics counters are not reset. A delivery in flight during the reset may still reach its consumer, but
 its result is dropped.
 
@@ -518,9 +521,16 @@ The `/test/clock` routes change the clock only with `clock.mode: virtual`; with 
 `409 clock_not_virtual`.
 - **What the virtual clock stamps:** domain time: order `createdAt`/`updatedAt`, `executedAt`, event `occurredAt`,
   and (later) settlement dates.
-- **It never moves backwards.** Its state is stored, so a restart resumes simulated time where it was.
-- **Webhook delivery stays on real time** (retry backoff, leases, `delivered_at`), so jumping the clock forward
-  neither stalls nor duplicates deliveries.
+- **It never moves backwards.** Its state is stored, so a restart resumes simulated time where it was: at the stored
+  reading or the latest event the exchange or the simulator stamped, whichever is later. Running or frozen is kept;
+  the speed is the configured one again (a speed changed through `/test/clock/speed` lasts until a restart or reset).
+- **Speed:** a running virtual clock moves `clock.speed` simulated seconds per real second. Everything on domain time
+  follows: order and event timestamps, T+N business days and weekends. With `speed: 1440`, `running: true` and the
+  T+1 default, a trade made at 09:00 settles at the next midnight, about 37 real seconds later, with no clock calls.
+  The simulator fires due transitions every `settlement.tick_interval_ms` of real time, stamped with their scheduled
+  instant, so a fast clock changes when they are seen, never what they say.
+- **Webhook delivery stays on real time** (retry backoff, leases, timeouts, `delivered_at`), so jumping or speeding
+  the clock neither stalls nor duplicates deliveries.
 
 ## Scenarios
 

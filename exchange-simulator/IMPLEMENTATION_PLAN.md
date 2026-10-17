@@ -1298,6 +1298,50 @@ are small. Then 5.3 and 5.4 when back-office work starts, in the order the demo 
 - **Deviation:** none. The scenario `settlement` section gained `market_settlement_days`, so scenarios can cover the
   new key like every other policy key.
 
+**5.2 — accelerated virtual clock for short demos ✅ done (2026-10-17)**
+- **Delivered:**
+  - `clock.speed`: simulated seconds per real second while the virtual clock runs, default 1, more than 0 and at
+    most 1 000 000. `VirtualClock` keeps the speed in its state; a speed change re-anchors at the current reading,
+    so time already passed is kept, and a frozen clock stays frozen. Speed 1 keeps the exact real-time arithmetic.
+  - Startup refuses an out-of-range speed, and any speed other than 1 with `clock.mode: system`.
+  - Runtime control through test control only (D11): `POST /test/clock/speed { "speed": 1440 }`, `400
+    invalid_clock_speed` out of range, `409 clock_not_virtual` on the system clock. `GET /test/clock` and every clock
+    response report `speed`. A reset goes back to the configured speed.
+  - Scenario sandboxes run at speed 1, whatever the service's configuration (their clock is frozen anyway).
+  - README (keys table, test-control table, a Speed bullet, restart and reset behaviour), `config/default.yaml`, and a
+    "Short demo" recipe in `docs/configuration.md`: `virtual`, `running: true`, `speed: 1440`, simulated settlement;
+    the demo app must take dates from event timestamps, not its own clock.
+  - Nothing else needed to change: order and event stamps, T+N and weekends already come from the exchange clock,
+    and the settlement tick (real time) fires whatever became due, stamped with its scheduled instant. Webhook
+    retries, leases and timeouts were already on real time.
+- **Tests:**
+  - `a_fast_clock_moves_speed_times_real_time_and_keeps_its_reading_on_a_change` (unit): bounds on the reading
+    against real elapsed time × speed, a change keeps the reading, bad speeds refused, speed does not move a frozen
+    clock.
+  - `a_fast_clock_speeds_up_domain_time_and_its_speed_can_change` (API): speed reported, time moves an hour per real
+    second, runtime change, 400s, reset restores the configured speed.
+  - `a_restart_on_a_fast_clock_continues_from_the_latest_stamp`, `startup_refuses_a_speed_it_cannot_honour`, and the
+    system clock refusing a speed change.
+  - `on_a_fast_running_clock_a_t_plus_1_trade_settles_without_clock_calls` (service, 108 000×: Monday 09:00 to Tuesday
+    00:00 in half a second): settles at exactly 00:00, with every event stamp in order.
+  - The clock, settlement-flow and clock unit suites passed 5 repeat runs.
+- **Mutation checks**, each made a test fail: the speed ignored; a speed change without re-anchoring; a reset keeping
+  the runtime speed; recovery ignoring the latest stamp; the system-clock speed check removed.
+- **Found and fixed:** a running virtual clock's stored reading is only written at startup and on clock changes, so
+  after a restart the clock resumed from that stale reading and stamped new events *before* ones already recorded.
+  This was true at speed 1 too (by the real time since the last change), but at 1440× it means hours or days
+  backwards. Recovery now continues from the later of the stored reading and the latest `occurredAt` the exchange
+  or the simulator stamped (`Store::latest_clock_stamp`; external reports carry the reporter's own time and are left
+  out). The mutation check showed the test clock 2 h 22 min backwards without the fix.
+- **Decisions:**
+  - **The speed is configuration, not stored state.** A restart runs at `clock.speed` again; a speed changed through
+    `/test/clock/speed` lasts until a restart or reset. Storing it like `running` would make a changed `clock.speed`
+    silently ignored after a restart, and a showcase deployment (D11: no `/test`) could only undo that by deleting its
+    volume. No migration was needed.
+  - **Upper bound 1 000 000** (about 11.5 simulated days per real second): at that speed a 250 ms settlement tick
+    already spans about three simulated days, so faster runs should use `/test/clock/advance` instead.
+- **Deviation:** none from the 5.2 entry.
+
 ## Suggested order
 
 1. Milestone 1 wrap-up: 1.1 now, then 1.2, then 1.3a–d.

@@ -30,6 +30,12 @@ pub struct App {
 
 impl App {
     pub fn start(config: &Config) -> anyhow::Result<Self> {
+        crate::clock::validate_speed(config.clock.speed).context("clock.speed")?;
+        if config.clock.mode == ClockMode::System && config.clock.speed != 1.0 {
+            anyhow::bail!(
+                "clock.speed needs clock.mode: virtual; the system clock runs at real time"
+            );
+        }
         let busy_timeout = Duration::from_millis(config.database.busy_timeout_ms);
         let mode = config.database.mode;
         let location = match mode {
@@ -74,9 +80,10 @@ impl App {
                 ids: config.ids.scheme(),
                 clock: Box::new(SystemClock),
                 virtual_clock: (config.clock.mode == ClockMode::Virtual).then(|| {
-                    VirtualClock::new(
+                    VirtualClock::with_speed(
                         config.clock.start.unwrap_or_else(chrono::Utc::now),
                         config.clock.running,
+                        config.clock.speed,
                     )
                 }),
                 simulation_id: config.events.simulation_id.clone(),

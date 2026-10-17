@@ -4,6 +4,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+use crate::clock::ClockError;
 use crate::engine::{BookError, DispatchError, ExchangeError};
 
 /// An error response: an HTTP status and a body `{"error": "<code>", "message": "<text>"}`.
@@ -92,6 +93,7 @@ impl From<ExchangeError> for ApiError {
             E::UnknownExecution(_) => (StatusCode::NOT_FOUND, "not_found"),
             E::InvalidReport(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             E::ReportConflict { .. } => (StatusCode::CONFLICT, "report_conflict"),
+            E::Clock(ClockError::Speed(_)) => (StatusCode::BAD_REQUEST, "invalid_clock_speed"),
             E::Clock(_) => (StatusCode::CONFLICT, "clock_backwards"),
             E::Book(_) | E::Storage(_) | E::GroupCommit(_) | E::Settlement(_) => {
                 return Self::internal(error);

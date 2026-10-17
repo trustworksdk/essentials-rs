@@ -119,6 +119,7 @@ fn sandbox_config(scenario: &Scenario, base: &Config, dir: &std::path::Path) -> 
         mode: ClockMode::Virtual,
         start: Some(scenario.start),
         running: false,
+        speed: 1.0,
     };
     config.ids = IdsConfig {
         mode: IdMode::Deterministic,

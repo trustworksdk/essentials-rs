@@ -80,6 +80,41 @@ async fn a_trade_settles_on_t_plus_1_by_default() {
 }
 
 #[tokio::test]
+async fn on_a_fast_running_clock_a_t_plus_1_trade_settles_without_clock_calls() {
+    // 30 simulated hours per real second: Monday 09:00 to Tuesday 00:00 takes half a second.
+    let mut app = TestApp::start_with(simulated(|c| {
+        c.clock.running = true;
+        c.clock.speed = 108_000.0;
+    }))
+    .await;
+    app.seed().await;
+    let execution = trade(&app).await;
+    let completed = wait_for(&app, "SettlementCompleted", 1).await;
+    assert_eq!(completed[0]["occurredAt"], "2030-01-08T00:00:00Z");
+    let executed: chrono::DateTime<chrono::Utc> =
+        execution["executedAt"].as_str().unwrap().parse().unwrap();
+    assert!(
+        executed
+            < "2030-01-08T00:00:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap(),
+        "{executed}"
+    );
+    let events = app.get("/api/events?limit=1000").await.1;
+    let stamps: Vec<&str> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["occurredAt"].as_str().unwrap())
+        .collect();
+    assert!(
+        stamps.is_sorted(),
+        "domain time only moves forward: {stamps:?}"
+    );
+    app.stop().await;
+}
+
+#[tokio::test]
 async fn a_trade_on_a_t_plus_2_market_settles_when_the_clock_gets_there() {
     // ACME trades on XCSE. Lowercase, as an environment variable delivers the key.
     let mut app = TestApp::start_with(simulated(|c| {
