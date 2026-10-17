@@ -152,7 +152,8 @@ impl SettlementSimulator {
     fn intake(&self, trade: &TradeFacts) -> Transition {
         let policy = &self.policy;
         let trade_date = trade.executed_at.date_naive();
-        let isd = add_business_days(trade_date, policy.settlement_days);
+        let settlement_days = policy.settlement_days_for(trade.mic.as_deref());
+        let isd = add_business_days(trade_date, settlement_days);
         let amount = i128::from(trade.price_ticks)
             * i128::from(trade.tick_size_minor)
             * i128::from(trade.quantity);
@@ -193,7 +194,7 @@ impl SettlementSimulator {
             }
             None => (
                 events::SETTLEMENT_PENDING,
-                json!({ "settlementDays": policy.settlement_days }),
+                json!({ "settlementDays": settlement_days }),
             ),
         };
         let event = settlement_event(event_type, &instruction, trade.executed_at, extra);

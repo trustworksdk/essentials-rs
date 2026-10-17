@@ -493,7 +493,7 @@ async fn milestone_2_settlement_in_containers() {
         (&json!("SettlementPending"), &json!("settlement-simulator"))
     );
     assert_eq!(pending["correlationId"], execution_id.as_str());
-    assert_eq!(pending["payload"]["intendedSettlementDate"], "2030-01-09");
+    assert_eq!(pending["payload"]["intendedSettlementDate"], "2030-01-08");
 
     // Restart mid-lifecycle: simulated time and the pending instruction survive.
     let status = tokio::process::Command::new("docker")
@@ -514,16 +514,16 @@ async fn milestone_2_settlement_in_containers() {
         "2030-01-07T09:00:00Z"
     );
 
-    // T+2: advancing the clock settles the trade before the call returns.
+    // T+1: advancing the clock settles the trade before the call returns.
     let advanced = http
-        .post(format!("{api}/test/clock/advance"), json!({ "days": 2 }))
+        .post(format!("{api}/test/clock/advance"), json!({ "days": 1 }))
         .await;
-    assert_eq!(advanced["now"], "2030-01-09T09:00:00Z");
+    assert_eq!(advanced["now"], "2030-01-08T09:00:00Z");
     let completed = http
         .get(format!("{api}/api/events?eventType=SettlementCompleted"))
         .await;
     assert_eq!(completed.as_array().unwrap().len(), 1);
-    assert_eq!(completed[0]["occurredAt"], "2030-01-09T00:00:00Z");
+    assert_eq!(completed[0]["occurredAt"], "2030-01-08T00:00:00Z");
     let pendings = http
         .get(format!("{api}/api/events?eventType=SettlementPending"))
         .await;

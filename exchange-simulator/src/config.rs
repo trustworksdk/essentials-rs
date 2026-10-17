@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::domain::IdentifierPolicy;
@@ -103,6 +104,10 @@ pub struct SettlementConfig {
     pub tick_interval_ms: u64,
     pub seed: u64,
     pub settlement_days: u32,
+    /// Settlement cycles per market (MIC). Keys are matched in uppercase, since environment variables arrive
+    /// lowercased.
+    #[serde(default)]
+    pub market_settlement_days: BTreeMap<String, u32>,
     pub reject_probability: f64,
     pub cancel_probability: f64,
     pub fail_probability: f64,
@@ -126,6 +131,7 @@ impl Default for SettlementConfig {
             tick_interval_ms: 250,
             seed: policy.seed,
             settlement_days: policy.settlement_days,
+            market_settlement_days: policy.market_settlement_days,
             reject_probability: policy.reject_probability,
             cancel_probability: policy.cancel_probability,
             fail_probability: policy.fail_probability,
@@ -145,6 +151,11 @@ impl SettlementConfig {
             SettlementPolicy {
                 seed: self.seed,
                 settlement_days: self.settlement_days,
+                market_settlement_days: self
+                    .market_settlement_days
+                    .iter()
+                    .map(|(mic, days)| (mic.to_ascii_uppercase(), *days))
+                    .collect(),
                 reject_probability: self.reject_probability,
                 cancel_probability: self.cancel_probability,
                 fail_probability: self.fail_probability,
@@ -414,7 +425,7 @@ mod tests {
             ..config.settlement.clone()
         };
         let policy = simulated.simulator_policy().unwrap();
-        assert_eq!((policy.settlement_days, policy.fail_probability), (2, 0.02));
+        assert_eq!((policy.settlement_days, policy.fail_probability), (1, 0.02));
         assert_eq!(policy.validate(), Ok(()));
         let defaults = SettlementConfig::default();
         assert_eq!(
@@ -441,6 +452,35 @@ mod tests {
             .add_source(config::File::from_str(yaml, config::FileFormat::Yaml))
             .build()?
             .try_deserialize()
+    }
+
+    #[test]
+    fn market_settlement_cycles_come_from_the_file_and_the_environment() {
+        let environment = [(
+            "EXCHANGE__SETTLEMENT__MARKET_SETTLEMENT_DAYS__XSTO".to_string(),
+            "3".to_string(),
+        )];
+        let config: Config = config::Config::builder()
+            .add_source(config::File::from_str(DEFAULTS, config::FileFormat::Yaml))
+            .add_source(config::File::from_str(
+                "settlement: { mode: simulated, market_settlement_days: { XCSE: 2 } }",
+                config::FileFormat::Yaml,
+            ))
+            .add_source(
+                config::Environment::with_prefix("EXCHANGE")
+                    .prefix_separator("__")
+                    .separator("__")
+                    .source(Some(environment.into_iter().collect())),
+            )
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        let policy = config.settlement.simulator_policy().unwrap();
+        assert_eq!(policy.validate(), Ok(()));
+        assert_eq!(policy.settlement_days_for(Some("XCSE")), 2);
+        assert_eq!(policy.settlement_days_for(Some("XSTO")), 3);
+        assert_eq!(policy.settlement_days_for(Some("XNYS")), 1);
     }
 
     #[test]

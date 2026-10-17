@@ -83,8 +83,16 @@ downtime, pausing the subscription is better than relying on retries.
 - **`simulated`:** the built-in simulator runs the T+N lifecycle and emits `Settlement*` events.
 - **`both`:** the simulator runs, and your service can also report outcomes back.
 
-The [README's Settlement section](../README.md#settlement) covers the policy keys: probabilities, delays and
-`settlement_days`.
+The cycle is T+1 by default (`settlement_days: 1`). Markets still on another cycle are listed by MIC:
+
+```yaml
+settlement:
+  mode: simulated
+  market_settlement_days: { XCSE: 2, XSTO: 2 }   # T+2 until the EU moves to T+1 on 2027-10-11
+```
+
+The [README's Settlement section](../README.md#settlement) covers the policy keys: probabilities, delays,
+`settlement_days` and `market_settlement_days`.
 
 ## Recipes
 
@@ -108,7 +116,6 @@ webhooks:
 ```yaml
 settlement:
   mode: simulated
-  settlement_days: 2
   fail_probability: 0.05
   delay_probability: 0.10
 webhooks:

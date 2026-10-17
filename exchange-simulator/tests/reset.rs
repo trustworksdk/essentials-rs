@@ -96,7 +96,7 @@ async fn deterministic() -> TestApp {
     .await
 }
 
-/// Registers everything, trades, settles at T+2 and reports an outcome: every kind of state there is.
+/// Registers everything, trades, settles at T+1 and reports an outcome: every kind of state there is.
 async fn script(app: &TestApp, webhook: &str) -> Value {
     app.seed().await;
     let (status, _) = app

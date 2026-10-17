@@ -60,8 +60,32 @@ async fn advance(app: &TestApp, days: u32) {
 }
 
 #[tokio::test]
-async fn a_trade_settles_on_t_plus_2_when_the_clock_gets_there() {
+async fn a_trade_settles_on_t_plus_1_by_default() {
     let mut app = TestApp::start_with(simulated(|_| {})).await;
+    app.seed().await;
+    trade(&app).await;
+    let pending = wait_for(&app, "SettlementPending", 1).await;
+    assert_eq!(
+        pending[0]["payload"]["intendedSettlementDate"],
+        "2030-01-08"
+    );
+    assert_eq!(pending[0]["payload"]["settlementDays"], 1);
+    set_clock(&app, "2030-01-07T23:59:59Z").await;
+    assert!(events(&app, "SettlementCompleted").await.is_empty());
+    set_clock(&app, "2030-01-08T00:00:00Z").await;
+    let completed = events(&app, "SettlementCompleted").await;
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0]["occurredAt"], "2030-01-08T00:00:00Z");
+    app.stop().await;
+}
+
+#[tokio::test]
+async fn a_trade_on_a_t_plus_2_market_settles_when_the_clock_gets_there() {
+    // ACME trades on XCSE. Lowercase, as an environment variable delivers the key.
+    let mut app = TestApp::start_with(simulated(|c| {
+        c.settlement.market_settlement_days = [("xcse".to_string(), 2)].into()
+    }))
+    .await;
     app.seed().await;
     let execution = trade(&app).await;
     let execution_id = execution["executionId"].as_str().unwrap();
@@ -78,6 +102,7 @@ async fn a_trade_settles_on_t_plus_2_when_the_clock_gets_there() {
         "intake is stamped with the trade time"
     );
     assert_eq!(event["payload"]["intendedSettlementDate"], "2030-01-09");
+    assert_eq!(event["payload"]["settlementDays"], 2);
     assert_eq!(event["payload"]["settlementAmount"], "15037.50");
 
     advance(&app, 1).await;
@@ -323,9 +348,9 @@ async fn set_clock(app: &TestApp, to: &str) {
 
 #[tokio::test]
 async fn settlement_happens_exactly_when_the_clock_reaches_the_date_and_skips_weekends() {
-    // Thursday 2030-01-10: T+2 is Monday 2030-01-14.
+    // Friday 2030-01-11: T+1 is Monday 2030-01-14.
     let mut app = TestApp::start_with(simulated(|c| {
-        c.clock.start = Some("2030-01-10T15:00:00Z".parse().unwrap())
+        c.clock.start = Some("2030-01-11T15:00:00Z".parse().unwrap())
     }))
     .await;
     app.seed().await;
@@ -363,14 +388,14 @@ async fn a_settled_trade_is_corrected_on_the_configured_day() {
     app.seed().await;
     trade(&app).await;
     wait_for(&app, "SettlementPending", 1).await;
-    advance(&app, 2).await; // Wednesday: settled
+    advance(&app, 1).await; // Tuesday: settled
     assert_eq!(events(&app, "SettlementCompleted").await.len(), 1);
-    advance(&app, 1).await; // Thursday: not yet
+    advance(&app, 1).await; // Wednesday: not yet
     assert!(events(&app, "SettlementCorrected").await.is_empty());
-    advance(&app, 1).await; // Friday 2030-01-11: ISD + 2 business days
+    advance(&app, 1).await; // Thursday 2030-01-10: ISD + 2 business days
     let corrected = events(&app, "SettlementCorrected").await;
     assert_eq!(corrected.len(), 1);
-    assert_eq!(corrected[0]["occurredAt"], "2030-01-11T00:00:00Z");
+    assert_eq!(corrected[0]["occurredAt"], "2030-01-10T00:00:00Z");
     let payload = &corrected[0]["payload"];
     assert_eq!(payload["previousSettlementAmount"], "15037.50");
     assert!(

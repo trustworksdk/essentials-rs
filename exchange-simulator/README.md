@@ -37,7 +37,8 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `ids.mode` / `ids.seed` | `random` / `0` | `deterministic` makes every ID reproducible from the seed (see Reproducible runs) |
 | `settlement.mode` | `external` | `external`, `simulated` or `both` (see Settlement) |
 | `settlement.tick_interval_ms` | `250` | How often the simulator takes in trades and fires due transitions |
-| `settlement.seed`, `settlement_days`, `*_probability`, `max_delay_days`, `max_delays`, `correction_days` | `1`, `2`, fail 0.02, delay 0.05, others 0, `3`, `2`, `1` | Simulation policy (see Settlement) |
+| `settlement.seed`, `settlement_days`, `*_probability`, `max_delay_days`, `max_delays`, `correction_days` | `1`, `1`, fail 0.02, delay 0.05, others 0, `3`, `2`, `1` | Simulation policy (see Settlement) |
+| `settlement.market_settlement_days` | `{}` | Settlement cycle per market, by MIC, for markets not on `settlement_days`, e.g. `{ XCSE: 2 }` |
 | `clock.mode` | `system` | `virtual` gives a controllable clock for domain time (see Test control) |
 | `clock.start` / `clock.running` | unset / `false` | Virtual clock only: first reading (default: real time at first start); start running instead of frozen |
 | `test_control.enabled` | `false` | Mounts `/test/...`. Never enable outside test deployments |
@@ -409,11 +410,18 @@ Prometheus text format, with these series:
   trade and its intake commit together or not at all. The simulator's position in the event log is stored too.
   Trades committed while it was off (or before it was enabled) are taken in at startup, from the beginning of the
   log.
-- **Lifecycle:** an instruction is `PENDING` until 00:00 UTC on its intended settlement date: T+`settlement_days`
-  business days, Monday to Friday, with no holiday calendars. On that date one draw decides the outcome:
+- **Lifecycle:** an instruction is `PENDING` until 00:00 UTC on its intended settlement date: T+N business days,
+  Monday to Friday, with no holiday calendars. On that date one draw decides the outcome:
   - `CANCELLED`, `FAILED`, or `DELAYED` by 1..=`max_delay_days` business days (at most `max_delays` times),
     according to `cancel_probability`, `fail_probability` and `delay_probability`
   - otherwise `SETTLED`
+
+  N is the instrument's market entry in `market_settlement_days` (matched on its `mic`), or else `settlement_days`,
+  which defaults to 1. T+1 is the cycle in the US, Canada and Mexico since May 2024; the EU, UK and Switzerland move
+  to it on 2027-10-11. Until then a European market can keep T+2 with, for example,
+  `market_settlement_days: { XCSE: 2 }` (or `EXCHANGE__SETTLEMENT__MARKET_SETTLEMENT_DAYS__XCSE=2`). The cycle is
+  chosen at intake and reported as `settlementDays` on `SettlementPending`; changing the configuration does not move
+  instructions already pending.
 
   `reject_probability` rejects at intake. `correct_probability` issues a `SettlementCorrected` `correction_days`
   business days after settlement.
@@ -668,7 +676,7 @@ cargo test -p exchange-simulator --features e2e --test e2e   # the acceptance te
 - **Milestone 1:** registration, the 200/150 trade, the webhook with a stable event ID, a `docker restart` that
   restores the book without repeating events, and a consumer outage whose retries create no trades.
 - **Milestone 2:** combined settlement mode on a virtual clock. `SettlementPending` reaches MockServer, the trade
-  survives a `docker restart` mid-lifecycle, a clock advance to T+2 settles it exactly once, and an external report
+  survives a `docker restart` mid-lifecycle, a clock advance to T+1 settles it exactly once, and an external report
   is published apart from the simulator's events.
 - **Milestone 3:** the scenario suite through the image's CLI (twice, without network) and through
   `POST /test/scenarios` on a running container. Every report, event-log fingerprint included, equals the local

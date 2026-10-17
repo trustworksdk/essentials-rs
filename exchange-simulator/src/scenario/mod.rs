@@ -32,6 +32,8 @@ mod runner;
 pub use matcher::{contains, mismatches};
 pub use runner::{EventLog, Report, StepReport, run};
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -77,6 +79,8 @@ pub struct SettlementSection {
     pub mode: Option<SettlementMode>,
     pub seed: Option<u64>,
     pub settlement_days: Option<u32>,
+    /// Replaces the service's whole per-market table.
+    pub market_settlement_days: Option<BTreeMap<String, u32>>,
     pub reject_probability: Option<f64>,
     pub cancel_probability: Option<f64>,
     pub fail_probability: Option<f64>,

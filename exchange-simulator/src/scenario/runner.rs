@@ -134,6 +134,9 @@ fn sandbox_config(scenario: &Scenario, base: &Config, dir: &std::path::Path) -> 
         macro_rules! apply {
             ($($field:ident),*) => { $(if let Some(value) = section.$field { s.$field = value; })* };
         }
+        if let Some(table) = &section.market_settlement_days {
+            s.market_settlement_days = table.clone();
+        }
         apply!(
             mode,
             seed,

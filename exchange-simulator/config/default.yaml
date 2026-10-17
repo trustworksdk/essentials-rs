@@ -54,7 +54,13 @@ settlement:
   # How often the simulator takes in new trades and fires due transitions (each clock change also does).
   tick_interval_ms: 250
   seed: 1
-  settlement_days: 2
+  # T+N business days (weekends skipped) from the trade date to the intended settlement date. T+1 is the cycle in the
+  # US, Canada and Mexico since May 2024; the EU, UK and Switzerland move to it on 2027-10-11.
+  settlement_days: 1
+  # Markets on another cycle, by MIC (the instrument's `mic`). For example, until 2027-10-11:
+  #   market_settlement_days: { XCSE: 2, XSTO: 2 }
+  # or EXCHANGE__SETTLEMENT__MARKET_SETTLEMENT_DAYS__XCSE=2.
+  market_settlement_days: {}
   reject_probability: 0.0
   cancel_probability: 0.0
   fail_probability: 0.02

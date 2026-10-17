@@ -25,6 +25,7 @@ fn trade(sequence: u64, at: DateTime<Utc>) -> TradeFacts {
         sequence,
         execution_id: Uuid::from_u128(u128::from(sequence)),
         instrument_id: InstrumentId("ACME".into()),
+        mic: None,
         buyer_id: ParticipantId("B".into()),
         seller_id: ParticipantId("A".into()),
         quantity: 150,
@@ -61,7 +62,7 @@ fn policy(adjust: impl FnOnce(&mut SettlementPolicy)) -> SettlementPolicy {
 }
 
 #[test]
-fn a_trade_is_pending_until_t_plus_2_and_then_settles() {
+fn a_trade_is_pending_until_t_plus_1_and_then_settles() {
     let mut sim = SettlementSimulator::new(SettlementPolicy::default(), vec![], 0);
     let intake = step(&mut sim, &[trade(3, monday())], monday());
     assert_eq!(types(&intake), ["SettlementPending"]);
@@ -69,9 +70,9 @@ fn a_trade_is_pending_until_t_plus_2_and_then_settles() {
     assert_eq!(pending.instruction.status, SettlementStatus::Pending);
     assert_eq!(
         pending.instruction.intended_settlement_date,
-        date("2030-01-09")
+        date("2030-01-08")
     );
-    assert_eq!(pending.instruction.due_at, Some(midnight("2030-01-09")));
+    assert_eq!(pending.instruction.due_at, Some(midnight("2030-01-08")));
     assert_eq!(pending.instruction.amount_minor, 1_503_750);
     let event = &pending.event;
     assert_eq!(
@@ -80,16 +81,16 @@ fn a_trade_is_pending_until_t_plus_2_and_then_settles() {
     );
     assert_eq!(event.aggregate_id, Uuid::from_u128(3).to_string());
     assert_eq!(event.payload["settlementAmount"], "15037.50");
-    assert_eq!(event.payload["intendedSettlementDate"], "2030-01-09");
+    assert_eq!(event.payload["intendedSettlementDate"], "2030-01-08");
     assert_eq!(event.payload["tradeDate"], "2030-01-07");
     assert_eq!(sim.cursor(), 3);
 
     assert!(
-        step(&mut sim, &[], midnight("2030-01-09") - Duration::seconds(1))
+        step(&mut sim, &[], midnight("2030-01-08") - Duration::seconds(1))
             .transitions
             .is_empty()
     );
-    let settled = step(&mut sim, &[], midnight("2030-01-09"));
+    let settled = step(&mut sim, &[], midnight("2030-01-08"));
     assert_eq!(types(&settled), ["SettlementCompleted"]);
     let done = &settled.transitions[0];
     assert_eq!(
@@ -98,11 +99,47 @@ fn a_trade_is_pending_until_t_plus_2_and_then_settles() {
     );
     assert_eq!(
         done.event.occurred_at,
-        midnight("2030-01-09"),
+        midnight("2030-01-08"),
         "the scheduled instant, not when it ran"
     );
-    assert_eq!(done.event.payload["settledAt"], "2030-01-09T00:00:00Z");
+    assert_eq!(done.event.payload["settledAt"], "2030-01-08T00:00:00Z");
     assert_eq!(sim.open(), 0);
+}
+
+#[test]
+fn a_market_with_its_own_cycle_keeps_it() {
+    let mut sim = SettlementSimulator::new(
+        policy(|p| p.market_settlement_days = [("XCSE".to_string(), 2)].into()),
+        vec![],
+        0,
+    );
+    let on = |sequence, mic: Option<&str>| TradeFacts {
+        mic: mic.map(str::to_string),
+        ..trade(sequence, monday())
+    };
+    let plan = step(
+        &mut sim,
+        &[on(1, Some("XCSE")), on(2, Some("XNYS")), on(3, None)],
+        monday(),
+    );
+    let cycles: Vec<_> = plan
+        .transitions
+        .iter()
+        .map(|t| {
+            (
+                t.instruction.intended_settlement_date,
+                t.event.payload["settlementDays"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        cycles,
+        [
+            (date("2030-01-09"), 2),
+            (date("2030-01-08"), 1),
+            (date("2030-01-08"), 1)
+        ]
+    );
 }
 
 #[test]
@@ -184,11 +221,11 @@ fn delays_move_the_date_by_business_days_and_are_capped() {
         .collect();
     assert_eq!(
         dates,
-        [date("2030-01-10"), date("2030-01-11"), date("2030-01-11")]
+        [date("2030-01-09"), date("2030-01-10"), date("2030-01-10")]
     );
     assert_eq!(
         plan.transitions[0].event.payload["previousIntendedSettlementDate"],
-        "2030-01-09"
+        "2030-01-08"
     );
     assert_eq!(plan.transitions[0].event.payload["delayBusinessDays"], 1);
     assert_eq!(plan.transitions[2].instruction.attempts, 3);
@@ -200,9 +237,9 @@ fn delays_move_the_date_by_business_days_and_are_capped() {
     assert_eq!(
         stamps,
         [
+            midnight("2030-01-08"),
             midnight("2030-01-09"),
-            midnight("2030-01-10"),
-            midnight("2030-01-11")
+            midnight("2030-01-10")
         ]
     );
 }
@@ -218,12 +255,12 @@ fn a_delay_over_the_weekend_lands_on_a_business_day() {
         vec![],
         0,
     );
-    let thursday: DateTime<Utc> = "2030-01-10T12:00:00Z".parse().unwrap();
-    let intake = step(&mut sim, &[trade(1, thursday)], thursday);
+    let friday: DateTime<Utc> = "2030-01-11T12:00:00Z".parse().unwrap();
+    let intake = step(&mut sim, &[trade(1, friday)], friday);
     assert_eq!(
         intake.transitions[0].instruction.intended_settlement_date,
         date("2030-01-14"),
-        "Thu + 2 = Mon"
+        "Fri + 1 = Mon"
     );
     let plan = step(&mut sim, &[], midnight("2030-01-20"));
     assert_eq!(
@@ -236,15 +273,15 @@ fn a_delay_over_the_weekend_lands_on_a_business_day() {
 fn a_settled_instruction_can_be_corrected_later() {
     let mut sim = SettlementSimulator::new(policy(|p| p.correct_probability = 1.0), vec![], 0);
     step(&mut sim, &[trade(1, monday())], monday());
-    let settled = step(&mut sim, &[], midnight("2030-01-09"));
+    let settled = step(&mut sim, &[], midnight("2030-01-08"));
     assert_eq!(types(&settled), ["SettlementCompleted"]);
     assert_eq!(
         settled.transitions[0].instruction.due_at,
-        Some(midnight("2030-01-10"))
+        Some(midnight("2030-01-09"))
     );
     assert_eq!(sim.open(), 1, "still open: a correction is scheduled");
 
-    let corrected = step(&mut sim, &[], midnight("2030-01-10"));
+    let corrected = step(&mut sim, &[], midnight("2030-01-09"));
     assert_eq!(types(&corrected), ["SettlementCorrected"]);
     let instruction = &corrected.transitions[0].instruction;
     assert_eq!(instruction.status, SettlementStatus::Corrected);

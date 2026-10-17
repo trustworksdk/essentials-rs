@@ -1,12 +1,13 @@
 name: T+2 settlement over a weekend, with an external report
 description: >
-  A Thursday trade settles on Monday (T+2 business days), exactly at 00:00 UTC. An external service reports its own
+  The default cycle is T+1, but this market (XCSE) is configured to keep T+2. A Thursday trade settles on Monday
+  (T+2 business days), exactly at 00:00 UTC. An external service reports its own
   outcome, which stays apart from the simulator's.
 seed: 2
 start: 2030-01-10T15:00:00Z   # Thursday
-settlement: { mode: both, fail_probability: 0, delay_probability: 0 }
+settlement: { mode: both, fail_probability: 0, delay_probability: 0, market_settlement_days: { XCSE: 2 } }
 instruments:
-  - { id: ACME, symbol: ACME, currency: DKK, currencyScale: 2 }
+  - { id: ACME, symbol: ACME, mic: XCSE, currency: DKK, currencyScale: 2 }
 participants:
   - { id: A, name: Seller, settlement: { account: DK-0001 } }
   - { id: B, name: Buyer }

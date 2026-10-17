@@ -5,7 +5,8 @@
 //!
 //! Lifecycle (one seeded draw per decision):
 //! - intake: `REJECTED` (`reject_probability`) or `PENDING`, due at 00:00 UTC on the intended settlement date (ISD),
-//!   T+`settlement_days` business days after the trade date;
+//!   T+N business days after the trade date, where N is the instrument's market (MIC) entry in
+//!   `market_settlement_days`, or else `settlement_days` (default 1, the T+1 cycle);
 //! - at the ISD: `CANCELLED`, `FAILED`, `DELAYED` by 1..=`max_delay_days` business days (at most `max_delays` times,
 //!   then it must resolve), or `SETTLED`;
 //! - a settled instruction is `CORRECTED` `correction_days` business days later with `correct_probability`.
@@ -17,6 +18,8 @@ pub mod calendar;
 mod machine;
 
 pub use machine::{SettlementPlan, SettlementSimulator, Transition};
+
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
@@ -70,7 +73,11 @@ pub struct Instruction {
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub struct SettlementPolicy {
     pub seed: u64,
+    /// The cycle for instruments whose market has no entry in `market_settlement_days`.
     pub settlement_days: u32,
+    /// Cycles per market, keyed by uppercase MIC, e.g. `XCSE: 2` for a market still on T+2.
+    #[serde(default)]
+    pub market_settlement_days: BTreeMap<String, u32>,
     pub reject_probability: f64,
     pub cancel_probability: f64,
     pub fail_probability: f64,
@@ -85,7 +92,8 @@ impl Default for SettlementPolicy {
     fn default() -> Self {
         Self {
             seed: 1,
-            settlement_days: 2,
+            settlement_days: 1,
+            market_settlement_days: BTreeMap::new(),
             reject_probability: 0.0,
             cancel_probability: 0.0,
             fail_probability: 0.0,
@@ -121,10 +129,23 @@ impl SettlementPolicy {
         if self.settlement_days > 30 {
             return Err("settlement_days must be at most 30".into());
         }
+        for (mic, days) in &self.market_settlement_days {
+            crate::domain::validate_mic(mic).map_err(|e| format!("market_settlement_days: {e}"))?;
+            if *days > 30 {
+                return Err(format!("market_settlement_days: {mic} must be at most 30"));
+            }
+        }
         if self.max_delay_days == 0 || self.correction_days == 0 {
             return Err("max_delay_days and correction_days must be at least 1".into());
         }
         Ok(())
+    }
+
+    /// The settlement cycle, in business days, for an instrument on market `mic`.
+    pub fn settlement_days_for(&self, mic: Option<&str>) -> u32 {
+        mic.and_then(|mic| self.market_settlement_days.get(mic))
+            .copied()
+            .unwrap_or(self.settlement_days)
     }
 }
 
@@ -175,6 +196,8 @@ pub struct TradeFacts {
     pub sequence: u64,
     pub execution_id: Uuid,
     pub instrument_id: InstrumentId,
+    /// The instrument's market at execution time, which picks its settlement cycle.
+    pub mic: Option<String>,
     pub buyer_id: ParticipantId,
     pub seller_id: ParticipantId,
     pub quantity: u64,
@@ -206,6 +229,7 @@ impl TradeFacts {
                 .parse()
                 .map_err(|e| format!("executionId: {e}"))?,
             instrument_id: InstrumentId(text("instrumentId")?),
+            mic: p["instrument"]["mic"].as_str().map(str::to_string),
             buyer_id: ParticipantId(text("buyerId")?),
             seller_id: ParticipantId(text("sellerId")?),
             quantity: number("quantity")?,
@@ -280,6 +304,17 @@ mod tests {
     }
 
     #[test]
+    fn the_cycle_is_t_plus_1_unless_the_market_has_its_own() {
+        let policy = SettlementPolicy {
+            market_settlement_days: [("XCSE".to_string(), 2)].into(),
+            ..Default::default()
+        };
+        assert_eq!(policy.settlement_days_for(None), 1);
+        assert_eq!(policy.settlement_days_for(Some("XNYS")), 1);
+        assert_eq!(policy.settlement_days_for(Some("XCSE")), 2);
+    }
+
+    #[test]
     fn policies_are_validated() {
         assert_eq!(SettlementPolicy::default().validate(), Ok(()));
         let bad = |p: SettlementPolicy| p.validate().is_err();
@@ -296,6 +331,14 @@ mod tests {
             settlement_days: 31,
             ..Default::default()
         }));
+        let market = |mic: &str, days: u32| SettlementPolicy {
+            market_settlement_days: [(mic.to_string(), days)].into(),
+            ..Default::default()
+        };
+        assert_eq!(market("XCSE", 2).validate(), Ok(()));
+        assert!(bad(market("XCSE", 31)));
+        assert!(bad(market("xcse", 2)));
+        assert!(bad(market("XCS", 2)));
         assert!(bad(SettlementPolicy {
             correction_days: 0,
             ..Default::default()

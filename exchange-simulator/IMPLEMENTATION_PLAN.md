@@ -1265,6 +1265,39 @@ Clearing obligations are computed from the day's trades, not from stored balance
 **Order within the milestone:** 5.1 and 5.2 first. They help the front-office demo now (short demos that settle) and
 are small. Then 5.3 and 5.4 when back-office work starts, in the order the demo needs them. 5.5 runs alongside.
 
+### Milestone 5 progress
+
+**5.1 — settlement cycle: T+1 by default, per market where it differs ✅ done (2026-10-17)**
+- **Delivered:**
+  - `settlement.settlement_days` defaults to 1 (was 2), in `config/default.yaml` and in `SettlementPolicy::default`.
+  - `settlement.market_settlement_days`: a table by MIC (D12), e.g. `{ XCSE: 2 }`, or
+    `EXCHANGE__SETTLEMENT__MARKET_SETTLEMENT_DAYS__XCSE=2`. Keys are uppercased when the policy is built, because
+    environment variables arrive lowercased. Each key must be a valid MIC and each cycle at most 30 days; startup
+    refuses anything else.
+  - The cycle is chosen at intake from the instrument's `mic` in the `TradeExecuted` snapshot, so it is a function of
+    the event log (reproducible, unaffected by later instrument changes). `SettlementPending.settlementDays` reports
+    the cycle actually applied.
+  - Scenarios can set `settlement.market_settlement_days` too (it replaces the service's table).
+  - README (keys table, Settlement section with the T+1 dates), `docs/configuration.md` (per-market example; the
+    simulated-settlement recipe no longer pins T+2), `config/default.yaml` comments.
+- **Tests:**
+  - `the_cycle_is_t_plus_1_unless_the_market_has_its_own` and MIC/limit validation (unit).
+  - `a_market_with_its_own_cycle_keeps_it` (machine): XCSE at T+2, another MIC and no MIC at T+1.
+  - `config::tests::market_settlement_cycles_come_from_the_file_and_the_environment`: file and environment layers
+    combine, and the lowercased environment key matches.
+  - `a_trade_settles_on_t_plus_1_by_default` and `a_trade_on_a_t_plus_2_market_settles_when_the_clock_gets_there`
+    (service, the latter with a lowercase key).
+  - Updated for T+1: the machine tests (dates one day earlier; the weekend case now trades on a Friday), the weekend
+    and correction flow tests, the Milestone 2 e2e (advance one day), and comments. The `settlement-t-plus-2`
+    scenario now demonstrates the per-market table (`mic: XCSE`, `market_settlement_days: { XCSE: 2 }`) and keeps its
+    dates.
+- **Mutation checks**, each made a test fail: intake ignoring the table; keys not uppercased; the MIC read from the
+  wrong place in the payload.
+- **Decisions:** D9, D11 and D12 settled (see Decisions). The shipped table is empty: XCSE is on T+2 in reality until
+  2027-10-11, but the plan's default is T+1 everywhere, and the configuration comment shows how to keep T+2.
+- **Deviation:** none. The scenario `settlement` section gained `market_settlement_days`, so scenarios can cover the
+  new key like every other policy key.
+
 ## Suggested order
 
 1. Milestone 1 wrap-up: 1.1 now, then 1.2, then 1.3a–d.
@@ -1311,17 +1344,15 @@ Settled on 2026-10-17:
   positions, cash balances, buying power and reconciliation live in the trading demo's event-sourced domain, which is
   the point of the showcase. Clearing obligations are computed from trades, so no simulator keeps a ledger.
 
+Settled on 2026-10-17 (Milestone 5, second round):
+- **D9 — how demo accounts map to exchange participants:** the simulator stays agnostic. Statements (5.3) are per
+  participant, and the demo may map one participant per client account now and a firm clearing member later. The
+  demo's domain must not assume a participant ID is an account ID.
+- **D11 — controlling clock speed at runtime:** through the test-control API only (`/test/clock`). A showcase
+  deployment sets `clock.speed` in its configuration instead of exposing a control switch.
+- **D12 — per-market settlement cycles:** a table per MIC in configuration (`settlement.market_settlement_days`), no
+  instrument field. Cycles are set per market in reality, and instrument payloads stay unchanged.
+
 Still open (Milestone 5):
-- **D9 — how demo accounts map to exchange participants:**
-  - **One participant per client account:** simplest, and enough for the front-office demo.
-  - **The firm as one clearing member:** client trades are booked internally, as at a real broker. Clearinghouse
-    statements then do not match client-level books one to one, which is what makes reconciliation realistic.
-  - Either way the demo's domain should not assume a participant ID is an account ID, so it can change later. This
-    decides the granularity of the 5.3 statements.
 - **D10 — sharing code with the payment gateway:** extract the outbox, webhook delivery, fault and scenario parts
   into a shared crate before 5.4, or let the gateway start as a copy and extract afterwards.
-- **D11 — controlling clock speed at runtime:** through the test-control API only (`/test/clock`, mounted only in
-  test deployments), or through a separate demo-control switch that a showcase deployment can enable without exposing
-  the rest of `/test`.
-- **D12 — per-market settlement cycles (5.1):** an `settlementDays` override per instrument, or a table per MIC in
-  configuration.

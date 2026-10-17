@@ -1,6 +1,6 @@
 name: Random market
 description: >
-  A seeded random market on two instruments for two simulated minutes, with cancellations and T+2 settlement. The
+  A seeded random market on two instruments for two simulated minutes, with cancellations and T+1 settlement. The
   same seed gives the same orders, trades, events and IDs on every run.
 seed: 12345
 settlement: { mode: simulated, fail_probability: 0.1, delay_probability: 0 }
