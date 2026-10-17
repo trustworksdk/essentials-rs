@@ -34,6 +34,17 @@ variables (`__` between levels, e.g. `GATEWAY__SERVER__BIND=0.0.0.0:8081`).
 | `test_control.enabled` | `false` | Mounts `/test`; never in a real deployment |
 | `database.mode`, `path` | `durable`, `data/payment-gateway.db` | `durable`, `fast` or `memory`, as in the exchange simulator |
 
+## API specification
+
+The OpenAPI 3.1 specification is [`openapi.yaml`](openapi.yaml), also served at `GET /openapi.yaml`, with the `/test`
+routes under the `test-control` tag and every event type in its `webhooks` section. `tests/openapi.rs` checks it
+against the service: the documented routes are exactly the mounted ones, every operation is exercised with its
+requests and responses validated, and every event type is emitted and validated. The webhook, clock and reset parts
+are identical to the exchange simulator's specification (checked in its suite).
+
+`GET /health` answers `{"status": "ok", "schemaVersion", "persistence"}`, or `503` with `{"status": "unavailable"}`
+when the database does not answer.
+
 ## Payments
 
 ### `POST /api/payments`

@@ -6,6 +6,8 @@
 pub mod api;
 pub mod calendar;
 pub mod clock;
+#[cfg(feature = "contract")]
+pub mod contract;
 pub mod events;
 pub mod ids;
 pub mod matcher;

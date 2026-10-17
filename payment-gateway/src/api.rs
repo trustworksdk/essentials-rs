@@ -190,6 +190,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        .route("/openapi.yaml", get(openapi))
         .route("/api/payments", post(initiate).get(list_payments))
         .route("/api/payments/{id}", get(payment))
         .route("/api/events", get(events))
@@ -214,15 +215,32 @@ pub fn test_router(state: AppState) -> Router {
         .merge(simulator_kit::api::webhooks::test_router(state))
 }
 
-async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let version = state
-        .read(simulator_kit::persistence::schema_version)
-        .await?;
-    Ok(Json(json!({
-        "status": "ok",
-        "schemaVersion": version,
-        "persistence": state.persistence.as_str(),
-    })))
+/// The OpenAPI specification of this API (`openapi.yaml` in the crate), as served at `GET /openapi.yaml`.
+pub const OPENAPI: &str = include_str!("../openapi.yaml");
+
+async fn openapi() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/yaml")],
+        OPENAPI,
+    )
+}
+
+/// Liveness and readiness: `503` when the database does not answer.
+async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    match state.read(simulator_kit::persistence::schema_version).await {
+        Ok(version) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "schemaVersion": version,
+                "persistence": state.persistence.as_str(),
+            })),
+        ),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "unavailable" })),
+        ),
+    }
 }
 
 async fn metrics(State(state): State<AppState>) -> Result<String, ApiError> {

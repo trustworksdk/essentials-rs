@@ -1560,6 +1560,30 @@ Done on 2026-10-17: 5.1 (T+1, per-market cycles), 5.2 (accelerated clock), 5.3 (
 (`simulator-kit`), 5.4b (payment gateway) and 5.5 (back-office acceptance and guide). Decisions D8–D16 are recorded
 below. Still on hold from Milestone 4: 4.6d (the containerized benchmark), until the user asks for it.
 
+## Beyond the milestones
+
+**OpenAPI specifications ✅ done (2026-10-17, requested by the user)**
+- **Delivered:** `exchange-simulator/openapi.yaml` and `payment-gateway/openapi.yaml`, OpenAPI 3.1, written by hand,
+  served by each service at `GET /openapi.yaml`. Each describes every route, the `/test` routes under a
+  `test-control` tag, every error response, and every event type in the top-level `webhooks` section with its
+  payload schema. Response and event schemas are strict (`additionalProperties`/`unevaluatedProperties: false`).
+  The webhook, clock and reset parts are identical in both documents.
+- **Checks:** `simulator-kit` gains a `contract` feature (dev-dependency only: `jsonschema` =0.58.5, the newest
+  release at least two weeks old, plus `serde-saphyr` and `regex`). Each service's `tests/openapi.rs`:
+  - compares the routes mounted in its sources with the document's operations;
+  - exercises every operation (`uncovered()` must be empty), validating each request expected to succeed and every
+    response, its status included, against the document;
+  - emits every event type and validates each against its `webhooks` schema;
+  - in the exchange's suite, checks the shared paths and components are identical in the two documents.
+  Both documents also pass `openapi-spec-validator` 0.7.1.
+- **Mutation checks**, each made a test fail: a response field renamed; a `TradeExecuted` payload field renamed;
+  an undocumented route; a required payment field dropped; an undocumented status (`202`); the shared part edited in
+  one document only.
+- **Change:** the gateway's `/health` now answers `503 {"status": "unavailable"}` when the database does not answer,
+  as the exchange's does; it was a `500` error before.
+- **Note:** the first build of the contract tests compiles `jsonschema`'s dependencies, which took about ten
+  minutes in the devcontainer.
+
 ## Suggested order
 
 1. Milestone 1 wrap-up: 1.1 now, then 1.2, then 1.3a–d.

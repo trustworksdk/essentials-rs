@@ -115,6 +115,10 @@ answered only after its command is committed, and memory never holds state the d
 
 ## API
 
+The OpenAPI 3.1 specification is [`openapi.yaml`](openapi.yaml), also served at `GET /openapi.yaml`. It describes
+every endpoint, the `/test` routes under the `test-control` tag, and every event type in its `webhooks` section;
+`tests/openapi.rs` checks it against the service (see Testing).
+
 All bodies are JSON with camelCase fields. Errors look like `{"error": "<code>", "message": "..."}`:
 
 | Status | `error` | When |
@@ -206,8 +210,12 @@ order. `limit` is 1–1000 (default 100). `Trade`: `executionId`, `instrumentId`
 
 ### `GET /health`
 
-`{"status": "ok", "schemaVersion": <n>}` (the number of the last applied migration in `migrations/`), or `503` if
-the database does not answer.
+`{"status": "ok", "schemaVersion": <n>, "persistence": "<mode>"}` (`schemaVersion` is the number of the last applied
+migration in `migrations/`), or `503` with `{"status": "unavailable"}` if the database does not answer.
+
+### `GET /openapi.yaml`
+
+This API's OpenAPI 3.1 specification ([`openapi.yaml`](openapi.yaml)), as `application/yaml`.
 
 ### `GET /api/events?after=&limit=&eventType=`
 
@@ -749,6 +757,13 @@ curl -X PUT localhost:8080/test/webhooks/$SUBSCRIPTION/faults -H 'content-type: 
 cargo test -p exchange-simulator                          # unit, integration and HTTP tests; tests/mockserver.rs needs Docker
 cargo test -p exchange-simulator --features e2e --test e2e   # the acceptance test in containers (builds the image)
 ```
+
+`tests/openapi.rs` checks [`openapi.yaml`](openapi.yaml) against the service:
+- the documented routes are exactly the mounted ones;
+- every operation is exercised, and each request and response is validated against the document's schemas (strict:
+  an undocumented field or status fails);
+- every event type is emitted and validated against its schema in the `webhooks` section;
+- the parts shared with the payment gateway's specification (webhooks, clock, reset) are identical.
 
 `tests/e2e.rs` runs the acceptance tests against the real image, with MockServer on one Docker network:
 - **Milestone 1:** registration, the 200/150 trade, the webhook with a stable event ID, a `docker restart` that

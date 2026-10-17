@@ -33,6 +33,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "jso
 uuid = { version = "1.28.0", features = ["v7", "v8", "serde"] }
 
 [dev-dependencies]
+simulator-kit = { path = "../simulator-kit", features = ["contract"] }
 testcontainers-modules = "0.15.0"
 
 [features]

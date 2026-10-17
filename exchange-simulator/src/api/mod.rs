@@ -73,6 +73,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        .route("/openapi.yaml", get(openapi))
         .route(
             "/api/instruments",
             post(register_instrument).get(list_instruments),
@@ -155,6 +156,16 @@ impl simulator_kit::api::webhooks::WebhookBackend for AppState {
     ) -> Result<T, ApiError> {
         AppState::read(self, move |store| query(store.connection())).await
     }
+}
+
+/// The OpenAPI specification of this API (`openapi.yaml` in the crate), as served at `GET /openapi.yaml`.
+pub const OPENAPI: &str = include_str!("../../openapi.yaml");
+
+async fn openapi() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/yaml")],
+        OPENAPI,
+    )
 }
 
 /// Liveness and readiness: the process is up and the database answers.

@@ -24,6 +24,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "jso
 uuid = { version = "1.28.0", features = ["v7", "v8", "serde"] }
 
 [dev-dependencies]
+simulator-kit = { path = "../simulator-kit", features = ["contract"] }
 axum = "0.8.9"
 http-body-util = "0.1.5"
 tower = { version = "0.5.3", features = ["util"] }
