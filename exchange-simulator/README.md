@@ -36,9 +36,11 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `webhooks.secret_grace_seconds` | `3600` | When the configuration changes a declared subscription's secret, how long the previous one keeps signing too |
 | `ids.mode` / `ids.seed` | `random` / `0` | `deterministic` makes every ID reproducible from the seed (see Reproducible runs) |
 | `settlement.mode` | `external` | `external`, `simulated` or `both` (see Settlement) |
-| `settlement.tick_interval_ms` | `250` | How often the simulator takes in trades and fires due transitions |
+| `settlement.tick_interval_ms` | `250` | How often the simulator takes in trades and fires due transitions, and clearing issues due statements |
 | `settlement.seed`, `settlement_days`, `*_probability`, `max_delay_days`, `max_delays`, `correction_days` | `1`, `1`, fail 0.02, delay 0.05, others 0, `3`, `2`, `1` | Simulation policy (see Settlement) |
 | `settlement.market_settlement_days` | `{}` | Settlement cycle per market, by MIC, for markets not on `settlement_days`, e.g. `{ XCSE: 2 }` |
+| `clearing.enabled`, `cutoff`, `time_zone` | `false`, `"17:30"`, `"UTC"` | End-of-day clearing statements at the cutoff, local time in an IANA zone (see Clearing) |
+| `clearing.breaks.seed`, `*_probability`, `max_late_minutes` | `1`, all 0, `60` | Seeded reconciliation breaks: `omit`, `alter`, `phantom`, `late` (see Clearing) |
 | `clock.mode` | `system` | `virtual` gives a controllable clock for domain time (see Test control) |
 | `clock.start` / `clock.running` | unset / `false` | Virtual clock only: first reading (default: real time at first start); start running instead of frozen |
 | `clock.speed` | `1` | Virtual clock only: simulated seconds per real second while it runs, more than 0 and at most 1000000 (1440: a day a minute). The system clock refuses any other value than 1 |
@@ -236,6 +238,8 @@ intake, otherwise 00:00 UTC of the relevant date. Every one carries:
 - `settlementAmount` (decimal string) and `amountMinor`
 - `tradeDate` and `intendedSettlementDate`
 - `status` and `attempt`
+- with clearing enabled, `clearing`: `businessDate`, and for `buyer` and `seller` the `statementId` and
+  `obligationId` the trade appears on (see Clearing)
 
 | Event | Extra payload | Status after |
 |---|---|---|
@@ -247,6 +251,9 @@ intake, otherwise 00:00 UTC of the relevant date. Every one carries:
 | `SettlementCancelled` | `reason`: `SIMULATED_CANCELLATION` | `CANCELLED` |
 | `SettlementOutcomeReported` | `source: "external"`: `reportId`, `status`, `reference`, `reason`, `details`, `receivedAt` (not a lifecycle step of the simulator) | – |
 | `SettlementCorrected` | `reason`: `SIMULATED_CORRECTION`, `previousSettlementAmount`, `previousAmountMinor` (the amount moves by one tick per unit) | `CORRECTED` |
+
+`ClearingStatementIssued` (`source: "clearinghouse"`, aggregate ID the statement ID, correlation ID the participant)
+carries the whole statement, as `GET /api/clearing/statements/{id}` returns it.
 
 Order payloads carry `orderId`, `clientOrderId`, `instrumentId`, `participantId`, `side`, `type`, `priceTicks`, `price`,
 `quantity`, `remainingQuantity`, `filledQuantity`, `status` and `sequence`. Within one command, events come in this
@@ -467,6 +474,63 @@ Everything known about one execution's settlement, side by side:
 
 Simulated instructions in trade order, optionally of one status. `limit` is 1–1000, default 100.
 
+## Clearing
+
+With `clearing.enabled: true`, a clearinghouse issues end-of-day statements on the exchange clock. It plays an outside
+party only (decision D8): it keeps no positions or cash, and computes every statement from the trades alone.
+
+- **When:** at `clearing.cutoff`, local time in `clearing.time_zone` (daylight saving included), Monday to Friday.
+  With `clock.mode: virtual` nothing is issued until simulated time reaches the cutoff, and a clock move issues every
+  cutoff it passes, each in time order with the settlement events around it. A statement's `occurredAt` is its
+  scheduled instant, so on a running clock it can follow events stamped up to one `settlement.tick_interval_ms` after
+  it, as settlement events can. Cutoffs passed while the service was
+  down are issued at startup; a cutoff before clearing was first enabled is not.
+- **Which trades:** a trade's business date is the first business day whose cutoff is after it. Trades after the
+  cutoff, or on a weekend, are on the next business day's statement, and that date is also their trade date: T+N
+  counts from it, in the statement and in the settlement simulator, so nothing settles before the statement that
+  clears it (T+0 aside). Without clearing, the trade date is the UTC date of execution.
+- **What:** one statement per participant that traded since the previous cutoff, ID `CS:<businessDate>:<participant>`:
+  `statementId`, `businessDate`, `participantId`, `timeZone`, `tradesFrom` and `cutoffAt` (the window of execution
+  times, start included), `issuedAt`, then
+  - `trades`: `executionId`, `tradeSequence`, `instrumentId`, `side` (the participant's), `quantity`, `priceTicks`,
+    `currency`, `currencyScale`, `amountMinor`, `amount`, `executedAt`, `tradeDate`, `intendedSettlementDate`,
+    `obligationId`;
+  - `obligations`, one per instrument and intended settlement date, ID `<statementId>:<instrument>:<date>`:
+    `securitiesNet` (units; positive receives, negative delivers), `cashNetMinor` and `cashNet` (positive receives),
+    `currency`, `currencyScale`, `tradeCount`. Across all participants of a day, obligations net to zero.
+- **Settlement references:** with the simulator running, each settlement event's `clearing` field names both sides'
+  statement and obligation, from intake on (the IDs are natural keys, so they are known before the statement is).
+  A delayed settlement keeps its original obligation.
+- **Reconciliation breaks** are opt-in under `clearing.breaks`, seeded and reproducible, like the webhook faults.
+  They change only what a statement says (its obligations net what it lists); the trades, the event log and the
+  settlement simulator never change:
+  - `omit_probability` (per trade line): the trade is left out (`OMITTED_TRADE`);
+  - `alter_probability` (per trade line): its quantity or price is off by one unit or tick (`QUANTITY_CHANGED`,
+    `PRICE_CHANGED`);
+  - `phantom_probability` (per statement with trades): a copy of one of its trades under an execution ID that does
+    not exist (`PHANTOM_TRADE`);
+  - `late_probability` (per statement): issued 1..=`max_late_minutes` minutes of domain time after the cutoff
+    (`LATE_STATEMENT`). Until then it is neither listed nor delivered.
+
+  `GET /test/clearing/breaks` lists what each broken statement says differently, for tests that check a
+  reconciliation finds it.
+
+```yaml
+clearing:
+  enabled: true
+  cutoff: "17:30"
+  time_zone: Europe/Copenhagen
+  breaks: { seed: 7, omit_probability: 0.02, late_probability: 0.1, max_late_minutes: 45 }
+```
+
+### `GET /api/clearing/statements?date=&participant=`
+
+Issued statements, optionally of one business date (`YYYY-MM-DD`) and one participant, in date and participant order.
+
+### `GET /api/clearing/statements/{statementId}`
+
+One issued statement, or `404` (also for a late statement not issued yet).
+
 ## Reproducible runs
 
 With `ids.mode: deterministic`, every ID is a UUIDv8 derived from `ids.seed` and the natural key of what it names:
@@ -497,6 +561,7 @@ inject delivery faults and run scenarios. They return `404` otherwise.
 | POST | `/test/clock/set` | `{ "to": "2030-01-07T09:00:00Z" }` | Move to an instant; earlier than now is `409 clock_backwards` |
 | POST | `/test/clock/freeze` / `/test/clock/resume` | – | Stop the clock, or let it run at its speed |
 | POST | `/test/clock/speed` | `{ "speed": 1440 }` | Change the speed from the current reading on (a frozen clock stays frozen); out of range is `400 invalid_clock_speed` |
+| GET | `/test/clearing/breaks?date=&participant=` | – | Statements with reconciliation breaks, issued or still waiting (late): `statementId`, `businessDate`, `participantId`, `issued`, `issuedAt` (or when it will be), `breaks` [{ `kind`, `executionId`, `canonical`, `reported` }] |
 | POST | `/test/reset` | – | `204`: clears all state, as on a new database (see below) |
 | GET | `/test/deliveries?subscriptionId=&status=` | – | Webhook deliveries in event order, optionally one subscription's or one status (`DEAD` lists the dead letters): `deliveryId`, `subscriptionId`, `url`, `eventSequence`, `eventId`, `eventType`, `status`, `attempts`, `lastError`, `nextAttemptAt`, `deliveredAt`. Across all subscriptions; the regular API has the per-subscription equivalents (Maintaining a subscription) |
 | POST | `/test/webhooks/{id}/redeliver?after=` | – | Queues the subscription's events after sequence `after` (default 0: all) for delivery again: `{ "queued": n }`. Same as `POST /api/webhooks/{id}/redeliver` |
@@ -506,7 +571,8 @@ inject delivery faults and run scenarios. They return `404` otherwise.
 | POST | `/test/scenarios` | A scenario, YAML or JSON | Runs it in a sandbox (see Scenarios); `200` with the report, `400 invalid_scenario` if it does not parse |
 
 **Reset** empties every table and gives the in-memory state of a new database: no instruments, participants,
-orders, trades, events, subscriptions, deliveries, attempts or settlements. Sequences restart at 1, so with
+orders, trades, events, subscriptions, deliveries, attempts, settlements or clearing statements; clearing starts
+again from the clock's new reading. Sequences restart at 1, so with
 deterministic IDs the same commands after a reset give the same log and IDs as on a fresh service. The virtual clock
 goes back to its first reading (the configured `clock.start`, or the time the service started), and to the configured
 `running` and `speed`. Only the configuration
@@ -520,7 +586,7 @@ this also replays history to a new consumer. Deliveries already in flight are se
 The `/test/clock` routes change the clock only with `clock.mode: virtual`; with the system clock they return
 `409 clock_not_virtual`.
 - **What the virtual clock stamps:** domain time: order `createdAt`/`updatedAt`, `executedAt`, event `occurredAt`,
-  and (later) settlement dates.
+  settlement dates and clearing cutoffs.
 - **It never moves backwards.** Its state is stored, so a restart resumes simulated time where it was: at the stored
   reading or the latest event the exchange or the simulator stamped, whichever is later. Running or frozen is kept;
   the speed is the configured one again (a speed changed through `/test/clock/speed` lasts until a restart or reset).

@@ -6,6 +6,7 @@ use chrono::{DateTime, SubsecRound, Utc};
 use uuid::Uuid;
 
 use super::{BookError, BookUpdate, Clock, IdScheme, MatchContext, OrderBook};
+use crate::clearing::{ClearingPolicy, StoredStatement, next_business_day, previous_business_day};
 use crate::clock::{ClockError, SystemClock, VirtualClock};
 use crate::domain::{
     IdentifierPolicy, Instrument, InstrumentError, InstrumentId, Order, OrderStatus, OrderType,
@@ -90,6 +91,8 @@ pub enum ExchangeError {
     Clock(#[from] ClockError),
     #[error("settlement simulation: {0}")]
     Settlement(String),
+    #[error("clearing: {0}")]
+    Clearing(String),
     #[error("settlement mode is simulated; externally reported outcomes are not accepted")]
     ExternalOutcomesDisabled,
     #[error("unknown execution {0}")]
@@ -132,6 +135,8 @@ pub struct ExchangeOptions {
     pub settlement: Option<SettlementPolicy>,
     /// Accepts settlement outcomes reported by an external service (settlement mode `external` or `both`).
     pub external_outcomes: bool,
+    /// Issues end-of-day clearing statements with this policy (`clearing.enabled`).
+    pub clearing: Option<ClearingPolicy>,
     /// Webhook subscriptions declared in configuration, reconciled at recovery and after a reset. Names must be
     /// unique (see [`crate::webhooks::validate_declared`]).
     pub webhooks: Vec<DeclaredSubscription>,
@@ -150,6 +155,7 @@ impl Default for ExchangeOptions {
             delivery_signal: None,
             settlement: None,
             external_outcomes: true,
+            clearing: None,
             webhooks: Vec::new(),
             webhook_secret_grace: chrono::Duration::hours(1),
         }
@@ -201,6 +207,7 @@ pub struct Exchange {
     virtual_clock: Option<VirtualClock>,
     settlement: Option<SettlementSimulator>,
     external_outcomes: bool,
+    clearing: Option<Clearing>,
     subscriptions: Vec<Subscription>,
     simulation_id: Option<String>,
     delivery_signal: Option<Arc<tokio::sync::Notify>>,
@@ -213,6 +220,36 @@ pub struct Exchange {
     /// Webhook subscriptions declared in configuration (see [`Exchange::reconcile_webhooks`]).
     declared_webhooks: Vec<DeclaredSubscription>,
     webhook_secret_grace: chrono::Duration,
+}
+
+/// The clearinghouse: its policy, the last business date whose cutoff was handled, and late statements waiting to be
+/// issued, in issue order.
+struct Clearing {
+    policy: ClearingPolicy,
+    cursor: chrono::NaiveDate,
+    /// The last trade sequence a window took. Exchange stamps never go backwards, so every trade of a later window
+    /// comes after it.
+    after: u64,
+    pending: Vec<StoredStatement>,
+}
+
+impl Clearing {
+    /// When the next statement is due: the next cutoff, or a late statement before it.
+    fn due(&self) -> DateTime<Utc> {
+        let cutoff = self
+            .policy
+            .calendar
+            .cutoff_at(next_business_day(self.cursor));
+        self.pending
+            .first()
+            .map_or(cutoff, |p| p.draft.statement.issued_at.min(cutoff))
+    }
+
+    /// The cursor for a clearinghouse starting at `now`: the business day before the one now belongs to, so the next
+    /// cutoff is the first one after now and no past day is issued.
+    fn first_cursor(policy: &ClearingPolicy, now: DateTime<Utc>) -> chrono::NaiveDate {
+        previous_business_day(policy.calendar.business_date(now))
+    }
 }
 
 /// What one committed command wrote, for metrics and the delivery worker.
@@ -307,6 +344,7 @@ impl Exchange {
             virtual_clock: options.virtual_clock,
             settlement,
             external_outcomes: options.external_outcomes,
+            clearing: None,
             subscriptions,
             simulation_id: options.simulation_id,
             delivery_signal: options.delivery_signal,
@@ -319,9 +357,29 @@ impl Exchange {
         crate::webhooks::validate_declared(&exchange.declared_webhooks)
             .map_err(ExchangeError::InvalidWebhook)?;
         exchange.reconcile_webhooks()?;
+        if let Some(policy) = options.clearing {
+            policy.breaks.validate().map_err(ExchangeError::Clearing)?;
+            let (cursor, after) = match exchange.store.clearing_cursor()? {
+                Some(cursor) => cursor,
+                None => {
+                    let cursor = Clearing::first_cursor(&policy, exchange.now());
+                    exchange.store.save_clearing_cursor(cursor, 0)?;
+                    (cursor, 0)
+                }
+            };
+            let pending = exchange.store.clearing_statements(None, None, true)?;
+            exchange.clearing = Some(Clearing {
+                policy,
+                cursor,
+                after,
+                pending,
+            });
+            exchange.sort_pending();
+        }
         // Trades committed while the simulator was off (or before it existed) are taken in now, before any command,
-        // so intake order does not depend on when a background tick happens to run.
-        exchange.settlement_tick()?;
+        // so intake order does not depend on when a background tick happens to run. Cutoffs passed while the service
+        // was down are issued too.
+        exchange.tick()?;
         Ok(exchange)
     }
 
@@ -844,6 +902,13 @@ impl Exchange {
             self.store
                 .save_virtual_clock(clock.now(), clock.is_running())?;
         }
+        let now = self.now();
+        if let Some(clearing) = &mut self.clearing {
+            clearing.cursor = Clearing::first_cursor(&clearing.policy, now);
+            clearing.after = 0;
+            clearing.pending.clear();
+            self.store.save_clearing_cursor(clearing.cursor, 0)?;
+        }
         self.epoch += 1;
         // Configuration-declared subscriptions come back, as on a new database.
         self.reconcile_webhooks()?;
@@ -883,10 +948,111 @@ impl Exchange {
         Ok(retried)
     }
 
+    /// Everything due by now on domain time, in time order: settlement transitions, and clearing statements at each
+    /// cutoff (and late ones when due). Before each statement, the settlement transitions due by its instant run
+    /// first, so the event log stays in time order across a large clock move. Returns the number of events.
+    pub fn tick(&mut self) -> Result<usize, ExchangeError> {
+        let mut total = 0;
+        loop {
+            let now = self.now();
+            match self.clearing.as_ref().map(Clearing::due) {
+                Some(due) if due <= now => {
+                    total += self.settlement_step(due)?;
+                    total += self.clearing_step(due)?;
+                }
+                _ => return Ok(total + self.settlement_step(now)?),
+            }
+        }
+    }
+
+    /// One clearing step at `at`, the earliest instant something is due: the cutoff's statements (those not drafted
+    /// late are issued at once), and late statements due by `at`. Committed in one transaction, then applied.
+    fn clearing_step(&mut self, at: DateTime<Utc>) -> Result<usize, ExchangeError> {
+        let clearing = self.clearing.as_ref().expect("clearing runs");
+        let date = next_business_day(clearing.cursor);
+        let calendar = clearing.policy.calendar;
+        let mut issue: Vec<StoredStatement> = clearing
+            .pending
+            .iter()
+            .filter(|p| p.draft.statement.issued_at <= at)
+            .cloned()
+            .collect();
+        let mut waiting = Vec::new();
+        let mut cursor = None;
+        if calendar.cutoff_at(date) <= at {
+            let (from, until) = calendar.window(date);
+            let trades = self
+                .store
+                .trades_between(clearing.after, from, until)?
+                .iter()
+                .map(TradeFacts::from_event)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ExchangeError::Clearing)?;
+            for draft in clearing.policy.draft(date, &trades) {
+                let stored = StoredStatement {
+                    draft,
+                    issued: false,
+                    event_sequence: None,
+                };
+                if stored.draft.statement.issued_at <= at {
+                    issue.push(stored);
+                } else {
+                    waiting.push(stored);
+                }
+            }
+            let after = trades.last().map_or(clearing.after, |t| t.sequence);
+            cursor = Some((date, after));
+        }
+        issue.sort_by(|a, b| issue_order(a).cmp(&issue_order(b)));
+        let mut stamped: Vec<NewEvent> = issue
+            .iter()
+            .map(|s| crate::clearing::statement_event(&s.draft.statement))
+            .collect();
+        let next = NewEvent::stamp(&mut stamped, self.next_event_sequence, self.ids);
+        for (statement, event) in issue.iter_mut().zip(&stamped) {
+            statement.issued = true;
+            statement.event_sequence = Some(event.sequence);
+        }
+        let outbox = Outbox {
+            subscriptions: &self.subscriptions,
+            simulation_id: self.simulation_id.as_deref(),
+            ids: self.ids,
+            due: wall_now(),
+        };
+        let rows: Vec<&StoredStatement> = issue.iter().chain(&waiting).collect();
+        self.store
+            .commit_clearing(&stamped, &rows, cursor, outbox)?;
+        self.next_event_sequence = next;
+        for event in &stamped {
+            ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type)
+                .increment(1);
+        }
+        let clearing = self.clearing.as_mut().expect("clearing runs");
+        if let Some((date, after)) = cursor {
+            clearing.cursor = date;
+            clearing.after = after;
+        }
+        clearing
+            .pending
+            .retain(|p| p.draft.statement.issued_at > at);
+        clearing.pending.extend(waiting);
+        self.sort_pending();
+        self.wake_delivery(&stamped);
+        Ok(stamped.len())
+    }
+
+    fn sort_pending(&mut self) {
+        if let Some(clearing) = &mut self.clearing {
+            clearing
+                .pending
+                .sort_by(|a, b| issue_order(a).cmp(&issue_order(b)));
+        }
+    }
+
     /// One settlement simulator step: takes in `TradeExecuted` events past the stored cursor (in pages), then runs
-    /// every lifecycle transition due by now. Each page is committed (instructions, events, outbox, cursor) before it
-    /// is applied. Returns the number of transitions; 0 when the simulator is off.
-    pub fn settlement_tick(&mut self) -> Result<usize, ExchangeError> {
+    /// every lifecycle transition due by `until`. Each page is committed (instructions, events, outbox, cursor)
+    /// before it is applied. Returns the number of transitions; 0 when the simulator is off.
+    fn settlement_step(&mut self, until: DateTime<Utc>) -> Result<usize, ExchangeError> {
         const PAGE: u32 = 500;
         let mut total = 0;
         loop {
@@ -901,8 +1067,7 @@ impl Exchange {
                 .map(TradeFacts::from_event)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(ExchangeError::Settlement)?;
-            let now = self.now();
-            let plan = simulator.plan(&trades, now);
+            let plan = simulator.plan(&trades, until);
             if plan.transitions.is_empty() && plan.cursor == simulator.cursor() {
                 return Ok(total);
             }
@@ -1060,7 +1225,7 @@ impl Exchange {
         self.store
             .save_virtual_clock(clock.now(), clock.is_running())?;
         // Whatever became due by the new time happens before the caller hears back.
-        self.settlement_tick()?;
+        self.tick()?;
         Ok(self.clock_state())
     }
 
@@ -1172,6 +1337,11 @@ impl Exchange {
     fn now(&self) -> DateTime<Utc> {
         self.clock.now().trunc_subsecs(6)
     }
+}
+
+/// Statements are issued in time order, then by statement ID.
+fn issue_order(s: &StoredStatement) -> (DateTime<Utc>, &str) {
+    (s.draft.statement.issued_at, &s.draft.statement.statement_id)
 }
 
 /// Real time, at the precision the database stores, for webhook delivery scheduling.

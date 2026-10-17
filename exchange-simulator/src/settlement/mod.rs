@@ -67,6 +67,8 @@ pub struct Instruction {
     pub due_at: Option<DateTime<Utc>>,
     pub settled_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    /// The clearing statements and obligations it appears on, when clearing runs.
+    pub clearing: Option<crate::clearing::ClearingRefs>,
 }
 
 /// Simulation parameters (`settlement:` in the configuration).
@@ -78,6 +80,9 @@ pub struct SettlementPolicy {
     /// Cycles per market, keyed by uppercase MIC, e.g. `XCSE: 2` for a market still on T+2.
     #[serde(default)]
     pub market_settlement_days: BTreeMap<String, u32>,
+    /// When clearing runs, its calendar: instructions then name the statement and obligation they settle.
+    #[serde(skip)]
+    pub clearing: Option<crate::clearing::ClearingCalendar>,
     pub reject_probability: f64,
     pub cancel_probability: f64,
     pub fail_probability: f64,
@@ -94,6 +99,7 @@ impl Default for SettlementPolicy {
             seed: 1,
             settlement_days: 1,
             market_settlement_days: BTreeMap::new(),
+            clearing: None,
             reject_probability: 0.0,
             cancel_probability: 0.0,
             fail_probability: 0.0,

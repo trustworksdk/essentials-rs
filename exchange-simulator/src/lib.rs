@@ -4,6 +4,7 @@
 
 pub mod api;
 pub mod app;
+pub mod clearing;
 pub mod clock;
 pub mod config;
 pub mod domain;

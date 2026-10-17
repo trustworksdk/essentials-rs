@@ -1,0 +1,53 @@
+name: End-of-day clearing statements
+description: >
+  Two participants trade ACME on Monday. At the 17:30 Copenhagen cutoff (16:30 UTC in winter) each gets one statement
+  with its trades and one net obligation, T+1 for both cash and securities; the obligations net to zero across the
+  two. A trade after the cutoff is dated Tuesday: it appears on Tuesday's statement and settles on Wednesday (T+1).
+  Settlement events name the statement and obligation they settle.
+seed: 5
+start: 2030-01-07T09:00:00Z   # Monday
+settlement: { mode: simulated, fail_probability: 0, delay_probability: 0 }
+clearing: { cutoff: "17:30", time_zone: Europe/Copenhagen }
+instruments:
+  - { id: ACME, symbol: ACME, mic: XCSE, currency: DKK, currencyScale: 2 }
+participants:
+  - { id: A, name: Seller }
+  - { id: B, name: Buyer }
+steps:
+  - order: { participantId: A, side: SELL, type: LIMIT, priceTicks: 10000, quantity: 100 }
+  - order: { as: first, participantId: B, side: BUY, type: LIMIT, priceTicks: 10000, quantity: 60 }
+  - order: { participantId: B, side: BUY, type: LIMIT, priceTicks: 10000, quantity: 40 }
+  - expect: { events: { eventType: SettlementPending,
+                        payload: { clearing: { businessDate: "2030-01-07",
+                                               buyer: { statementId: "CS:2030-01-07:B",
+                                                        obligationId: "CS:2030-01-07:B:ACME:2030-01-08" },
+                                               seller: { statementId: "CS:2030-01-07:A" } } } }, count: 2 }
+  - set_clock: { to: 2030-01-07T16:29:59Z }
+  - expect: { events: { eventType: ClearingStatementIssued }, count: 0 }
+  - set_clock: { to: 2030-01-07T16:30:00Z }
+  - expect: { events: { eventType: ClearingStatementIssued, source: clearinghouse,
+                        occurredAt: "2030-01-07T16:30:00Z" }, count: 2 }
+  - expect: { events: { eventType: ClearingStatementIssued,
+                        payload: { statementId: "CS:2030-01-07:A", participantId: A,
+                                   obligations: [ { obligationId: "CS:2030-01-07:A:ACME:2030-01-08",
+                                                    securitiesNet: -100, cashNetMinor: 1000000, cashNet: "10000.00",
+                                                    tradeCount: 2 } ] } }, count: 1 }
+  - expect: { events: { eventType: ClearingStatementIssued,
+                        payload: { participantId: B,
+                                   obligations: [ { securitiesNet: 100, cashNet: "-10000.00" } ] } }, count: 1 }
+  # After the cutoff: Tuesday's statement.
+  - order: { participantId: A, side: SELL, type: LIMIT, priceTicks: 10100, quantity: 10 }
+  - order: { participantId: B, side: BUY, type: LIMIT, priceTicks: 10100, quantity: 10 }
+  - expect: { events: { eventType: SettlementPending,
+                        payload: { tradeDate: "2030-01-08", intendedSettlementDate: "2030-01-09" } }, count: 1 }
+  - advance_clock: { days: 1 }
+  - expect: { events: { eventType: ClearingStatementIssued,
+                        payload: { statementId: "CS:2030-01-08:B",
+                                   trades: [ { quantity: 10, side: BUY, tradeDate: "2030-01-08",
+                                               intendedSettlementDate: "2030-01-09" } ] } }, count: 1 }
+  - expect: { events: { eventType: SettlementCompleted }, count: 2 }   # Monday's two trades, at Tuesday 00:00
+  - advance_clock: { days: 1 }
+  - expect: { events: { eventType: SettlementCompleted, occurredAt: "2030-01-09T00:00:00Z",
+                        payload: { clearing: { buyer: { statementId: "CS:2030-01-08:B",
+                                                        obligationId: "CS:2030-01-08:B:ACME:2030-01-09" } } } },
+              count: 1 }

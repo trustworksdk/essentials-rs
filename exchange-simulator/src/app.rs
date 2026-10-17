@@ -31,6 +31,7 @@ pub struct App {
 impl App {
     pub fn start(config: &Config) -> anyhow::Result<Self> {
         crate::clock::validate_speed(config.clock.speed).context("clock.speed")?;
+        let clearing = config.clearing_policy().map_err(anyhow::Error::msg)?;
         if config.clock.mode == ClockMode::System && config.clock.speed != 1.0 {
             anyhow::bail!(
                 "clock.speed needs clock.mode: virtual; the system clock runs at real time"
@@ -88,7 +89,11 @@ impl App {
                 }),
                 simulation_id: config.events.simulation_id.clone(),
                 delivery_signal: Some(delivery_signal.clone()),
-                settlement: config.settlement.simulator_policy(),
+                settlement: config.settlement.simulator_policy().map(|mut policy| {
+                    policy.clearing = clearing.as_ref().map(|c| c.calendar);
+                    policy
+                }),
+                clearing: clearing.clone(),
                 external_outcomes: config.settlement.mode != SettlementMode::Simulated,
                 webhooks: config
                     .webhooks
@@ -130,13 +135,9 @@ impl App {
             config.webhooks.worker(),
             stopped.clone(),
         )];
-        if config.settlement.simulator_policy().is_some() {
+        if config.settlement.simulator_policy().is_some() || config.clearing.enabled {
             let interval = Duration::from_millis(config.settlement.tick_interval_ms.max(1));
-            background.push(spawn_settlement_ticker(
-                dispatcher.clone(),
-                interval,
-                stopped,
-            ));
+            background.push(spawn_domain_ticker(dispatcher.clone(), interval, stopped));
             tracing::info!(mode = ?config.settlement.mode, "settlement simulator running");
         }
         let state = AppState::new(dispatcher, Store::new(reader), metrics, mode);
@@ -183,9 +184,9 @@ impl App {
     }
 }
 
-/// Runs a settlement step every `interval` until `stop` turns true or the exchange stops. A full command queue just
+/// Runs everything due on domain time (settlement, clearing) every `interval` until `stop` turns true or the exchange stops. A full command queue just
 /// skips a beat.
-fn spawn_settlement_ticker(
+fn spawn_domain_ticker(
     dispatcher: crate::engine::Dispatcher,
     interval: Duration,
     mut stop: watch::Receiver<bool>,
@@ -199,10 +200,12 @@ fn spawn_settlement_ticker(
             if *stop.borrow() {
                 break;
             }
-            match dispatcher.settlement_tick().await {
+            match dispatcher.tick().await {
                 Ok(_) | Err(crate::engine::DispatchError::Overloaded) => {}
                 Err(crate::engine::DispatchError::Stopped) => break,
-                Err(error) => tracing::error!(%error, "settlement step failed; retrying next tick"),
+                Err(error) => {
+                    tracing::error!(%error, "settlement or clearing step failed; retrying next tick")
+                }
             }
         }
     })

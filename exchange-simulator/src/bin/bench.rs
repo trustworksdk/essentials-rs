@@ -651,6 +651,7 @@ impl Service {
             },
             ids: IdsConfig::default(),
             settlement: SettlementConfig::default(),
+            clearing: Default::default(),
             test_control: TestControlConfig::default(),
             logging: LoggingConfig {
                 filter: "warn".into(),

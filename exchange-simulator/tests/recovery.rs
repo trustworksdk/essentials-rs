@@ -1113,8 +1113,8 @@ fn a_failed_settlement_write_changes_nothing() {
         .connection()
         .execute_batch("DROP TRIGGER fail")
         .unwrap();
-    assert_eq!(exchange.settlement_tick().unwrap(), 1);
-    assert_eq!(exchange.settlement_tick().unwrap(), 0, "and only once");
+    assert_eq!(exchange.tick().unwrap(), 1);
+    assert_eq!(exchange.tick().unwrap(), 0, "and only once");
     let types: Vec<String> = exchange
         .store()
         .events(0, 100, None)
@@ -1304,5 +1304,84 @@ fn a_failed_write_inside_a_group_fails_only_that_command() {
     assert_eq!(
         count(&exchange, "SELECT MAX(sequence) - COUNT(*) FROM events"),
         0
+    );
+}
+
+#[test]
+fn a_trade_after_a_cutoff_not_yet_handled_goes_on_the_next_statement() {
+    use exchange_simulator::clearing::{BreakPolicy, ClearingCalendar, ClearingPolicy};
+    use exchange_simulator::clock::VirtualClock;
+    use exchange_simulator::engine::ClockChange;
+    use exchange_simulator::settlement::SettlementPolicy;
+
+    let db = TempDb::new();
+    let clock = VirtualClock::new("2030-01-07T09:00:00Z".parse().unwrap(), false);
+    let calendar = ClearingCalendar::parse("17:30", "UTC").unwrap();
+    let mut exchange = Exchange::recover(
+        Store::new(persistence::open(db.path(), Duration::from_secs(5)).unwrap()),
+        ExchangeOptions {
+            virtual_clock: Some(clock.clone()),
+            settlement: Some(SettlementPolicy {
+                clearing: Some(calendar),
+                ..SettlementPolicy::default()
+            }),
+            clearing: Some(ClearingPolicy {
+                calendar,
+                breaks: BreakPolicy::default(),
+                cycles: SettlementPolicy::default(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    exchange.register_instrument(acme()).unwrap();
+    for id in ["A", "B"] {
+        exchange.register_participant(participant(id)).unwrap();
+    }
+    processed(exchange.submit(order("A", Side::Sell, Some(10025), 100)));
+    processed(exchange.submit(order("B", Side::Buy, Some(10025), 10)));
+    // A running clock passes the cutoff and a trade commits before the next tick handles it.
+    clock
+        .set("2030-01-07T17:30:00.5Z".parse().unwrap())
+        .unwrap();
+    processed(exchange.submit(order("B", Side::Buy, Some(10025), 20)));
+    assert_eq!(exchange.tick().unwrap(), 2, "Monday's two statements");
+    // One move past Monday's settlement (Tuesday 00:00) and Tuesday's cutoff: they come in time order.
+    exchange
+        .change_clock(ClockChange::Advance(chrono::Duration::days(1)))
+        .unwrap();
+    // (Before them, the racing trade at 17:30:00.5 precedes Monday's statements, which carry their scheduled instant.)
+    let log = exchange.store().events(0, 1000, None).unwrap();
+    let first = log
+        .iter()
+        .position(|e| e.event_type == "ClearingStatementIssued")
+        .unwrap();
+    let stamps: Vec<_> = log[first..]
+        .iter()
+        .map(|e| (e.occurred_at, e.event_type.as_str()))
+        .collect();
+    assert!(stamps.is_sorted_by_key(|(at, _)| *at), "{stamps:#?}");
+    let completed = log
+        .iter()
+        .find(|e| e.event_type == "SettlementCompleted")
+        .unwrap();
+    assert_eq!(
+        completed.occurred_at.to_rfc3339(),
+        "2030-01-08T00:00:00+00:00"
+    );
+    let quantities = |date: &str| -> Vec<u64> {
+        exchange
+            .store()
+            .clearing_statements(Some(date.parse().unwrap()), Some("B"), false)
+            .unwrap()
+            .iter()
+            .flat_map(|s| s.draft.statement.trades.iter().map(|t| t.quantity))
+            .collect()
+    };
+    assert_eq!(quantities("2030-01-07"), [10]);
+    assert_eq!(
+        quantities("2030-01-08"),
+        [20],
+        "the later trade is not lost"
     );
 }

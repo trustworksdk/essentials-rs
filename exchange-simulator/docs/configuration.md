@@ -94,6 +94,24 @@ settlement:
 The [README's Settlement section](../README.md#settlement) covers the policy keys: probabilities, delays,
 `settlement_days` and `market_settlement_days`.
 
+## Clearing
+
+`clearing.enabled: true` adds end-of-day clearing statements: at the cutoff on each business day, one
+`ClearingStatementIssued` per participant that traded, with its trades and net obligations per instrument and
+settlement date. The cutoff is local time in an IANA time zone, so it follows daylight saving:
+
+```yaml
+clearing:
+  enabled: true
+  cutoff: "17:30"
+  time_zone: Europe/Copenhagen
+```
+
+Statements are for reconciling against, so they can be made wrong on purpose. `clearing.breaks` leaves trades out,
+changes a quantity or price by one, adds a trade that does not exist, or issues a statement late, each with a seeded
+probability. Every break is listed under `GET /test/clearing/breaks`. The
+[README's Clearing section](../README.md#clearing) has the statement format and each break.
+
 ## Recipes
 
 A file for each common setup, used with `EXCHANGE_CONFIG`.
@@ -159,6 +177,19 @@ is briefly down catches up as usual. Points to keep in mind:
   remove the database volume, or call `POST /test/reset` where test control is enabled.
 - **To change the speed during a demo**, enable test control and call `POST /test/clock/speed`. A showcase deployment
   sets `clock.speed` in its configuration instead, so it does not expose `/test`.
+
+**Back-office demo: statements to reconcile, with a few breaks.** Add to the short-demo recipe:
+
+```yaml
+clearing:
+  enabled: true
+  cutoff: "17:30"
+  time_zone: Europe/Copenhagen
+  breaks: { seed: 11, omit_probability: 0.05, alter_probability: 0.05, late_probability: 0.2 }
+```
+
+At `speed: 1440` a statement arrives once a simulated business day, about every real minute. Trades after the cutoff
+are dated the next business day, on its statement, and settle T+1 from it.
 
 **Load test without durability:**
 

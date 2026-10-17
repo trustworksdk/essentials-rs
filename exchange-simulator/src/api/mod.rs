@@ -1,6 +1,7 @@
 //! HTTP API. Commands go to the exchange thread through the [`Dispatcher`] and are answered after their commit;
 //! queries of stored state use a separate read-only SQLite connection.
 
+pub mod clearing;
 mod error;
 mod model;
 pub mod settlements;
@@ -89,6 +90,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events", get(list_events))
         .with_state(state.clone())
         .merge(settlements::router(state.clone()))
+        .merge(clearing::router(state.clone()))
         .merge(webhooks::router(state))
 }
 

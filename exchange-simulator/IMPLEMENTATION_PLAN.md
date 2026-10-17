@@ -1259,7 +1259,7 @@ Clearing obligations are computed from the day's trades, not from stored balance
 | 5.1 | Settlement cycle: T+1 by default, per market where it differs | S | `settlement.settlement_days` defaults to 1. T+1 is the cycle in the US, Canada and Mexico since May 2024, and the EU, UK and Switzerland move to it on 2027-10-11. A per-instrument override (`settlementDays` on the instrument, or a per-MIC table in config) lets a market keep T+2, e.g. XCSE until 2027-10-11. Tests and docs that assume T+2 by default are updated. |
 | 5.2 | Accelerated virtual clock for short demos | M | `clock.speed`: simulated seconds per real second while the virtual clock runs (default 1; 1440 makes a day pass in a minute). Everything on domain time follows: order and event timestamps, T+N business days and weekends, and end-of-day cutoffs (5.3). Webhook retries, leases and timeouts stay on real time. With `clock.mode: virtual`, `running: true` and `speed: 1440`, a T+1 trade settles about a minute after it executes, with no clock calls. Speed is also settable at runtime (D11). The guide gets a "demo setup" recipe. The demo app must take dates from event timestamps, not its own clock. |
 | 5.3 | End-of-day clearing statements | L | At a configurable cutoff on the domain clock (e.g. 17:30 in the market's time zone, business days only), one statement per participant: the day's cleared trades, and their net obligations per instrument and settlement date (securities and cash, computed from the trades). Delivered as a webhook event (`ClearingStatementIssued`) and by `GET /api/clearing/statements?date=&participant=` (JSON, maybe CSV). Settlement events reference the statement and obligation they settle. **Reconciliation breaks** are opt-in and seeded, in the style of the webhook faults: a trade left out, a quantity or price changed, a trade that does not exist, or a statement issued late. The canonical trades never change. The granularity depends on D9. |
-| 5.4 | Payment gateway simulator | L | A new workspace member, not a mode of the exchange. **API:** initiate a deposit or withdrawal for an account, with an idempotency key, amount and currency. **Webhooks:** signed `PaymentPending`, then `PaymentCompleted`, `PaymentFailed`, or later `PaymentReturned` (a reversal after completion). **Outcomes:** seeded probabilities and delays on the domain clock. **Statements:** an end-of-day bank statement for reconciliation. It reuses the exchange simulator's outbox, webhook delivery and maintenance, fault injection, scenarios, virtual clock and persistence modes. Where to share that code is D10. |
+| 5.4 | Payment gateway simulator (5.4a: extract the shared crate, D10; 5.4b: the gateway) | L | A new workspace member, not a mode of the exchange. **API:** initiate a deposit or withdrawal for an account, with an idempotency key, amount and currency. **Webhooks:** signed `PaymentPending`, then `PaymentCompleted`, `PaymentFailed`, or later `PaymentReturned` (a reversal after completion). **Outcomes:** seeded probabilities and delays on the domain clock. **Statements:** an end-of-day bank statement for reconciliation. It reuses the exchange simulator's outbox, webhook delivery and maintenance, fault injection, scenarios, virtual clock and persistence modes. Where to share that code is D10. |
 | 5.5 | Tests, acceptance and guide | M | A demo-shaped acceptance on an accelerated clock: deposit, trade, T+1 settlement, statement, reconciliation inputs, a withdrawal, with and without breaks. The guide gets a back-office chapter: how the demo's domain consumes trades, settlements, statements and payments, and what each break looks like. |
 
 **Order within the milestone:** 5.1 and 5.2 first. They help the front-office demo now (short demos that settle) and
@@ -1342,6 +1342,73 @@ are small. Then 5.3 and 5.4 when back-office work starts, in the order the demo 
     already spans about three simulated days, so faster runs should use `/test/clock/advance` instead.
 - **Deviation:** none from the 5.2 entry.
 
+**5.3 — end-of-day clearing statements ✅ done (2026-10-17)**
+- **Delivered:**
+  - `src/clearing`: a clearinghouse with no ledger (D8). `clearing.enabled` (off by default), `cutoff` (`HH:MM`) and
+    `time_zone` (IANA, through `chrono-tz` 0.10.4, which bundles the zone data, so the image needs no tzdata).
+    Cutoffs are business days only and follow daylight saving.
+  - At each cutoff: one statement per participant that traded in the window `[previous business day's cutoff,
+    cutoff)` (D9: per participant, mapping-agnostic). It lists the participant's side of each trade and nets
+    obligations per instrument and intended settlement date: `securitiesNet` and `cashNetMinor`/`cashNet`, positive
+    meaning receive. Across a day, obligations net to zero.
+  - Delivered as `ClearingStatementIssued` (`source: clearinghouse`, aggregate ID the statement ID), through the
+    regular outbox and webhooks. Served by `GET /api/clearing/statements?date=&participant=` and
+    `GET /api/clearing/statements/{id}`.
+  - IDs are natural keys: `CS:<date>:<participant>` and `<statementId>:<instrument>:<settlementDate>`. Settlement
+    events (and `/api/settlements`) carry `clearing: { businessDate, buyer, seller }` with both sides' statement and
+    obligation from intake on, before the statement exists.
+  - Seeded breaks under `clearing.breaks`: `omit`, `alter` (quantity or price ±1), `phantom` (a copy under an
+    execution ID that does not exist) and `late` (1..=`max_late_minutes` of domain time). A broken statement nets what
+    it lists. Trades and the log never change. `GET /test/clearing/breaks` lists each break with the canonical and
+    the reported value, including late statements still waiting.
+  - `Exchange::tick` (was `settlement_tick`) runs everything due on domain time in time order. Before each cutoff
+    or late statement, the settlement transitions due by that instant run first, so a large clock move gives a
+    time-ordered log. Statements carry their scheduled instant, like settlement events.
+  - Persistence (migration 012): `clearing_statements` (body, breaks, issued, event sequence), `clearing_cursor`,
+    and a `clearing` column on settlement instructions. Waiting statements survive restarts. Cutoffs passed while
+    the service was down are issued at startup; a reset starts clearing again from the reset clock.
+  - Scenarios: a `clearing:` section, and `scenarios/clearing-statements.yaml` (now part of the suite and of the e2e
+    run in the image).
+  - README Clearing section (format, breaks, API, test route, keys), `docs/configuration.md` Clearing section and a
+    back-office demo recipe, `config/default.yaml`.
+- **Tests:**
+  - Unit (`clearing::tests`): cutoffs through DST, business-date assignment at the boundary and over weekends and
+    time zones, netting (including zero-sum across participants), references, each break kind with the statement
+    and its record agreeing, seeded reproducibility, validation.
+  - `tests/clearing.rs`: issue exactly at the cutoff, the API and filters, 404/400, the event payload equal to the
+    API, webhook deliveries; a seven-day clock move with settlement in time order (no weekend statements, Friday
+    after the cutoff dated Monday); late and omitted breaks across a restart; a cutoff passed while down issued once;
+    reset; off by default; invalid time zone, cutoff and probability refuse startup.
+  - `tests/recovery.rs`: a trade stamped after a cutoff but committed before the tick that handles it goes on the
+    next statement, and one move past a settlement instant and a cutoff gives events in time order.
+  - The configuration-examples test now covers `clearing:` blocks and validates their policy (11 blocks).
+  - The clearing, checkpoint, scenario and Milestone 3 suites passed 6 repeat runs.
+- **Mutation checks**, each made a test fail: an inclusive cutoff boundary; a window that ignores weekends;
+  statements before the settlement transitions due by their instant; the trade cursor jumping to the latest event;
+  late statements issued early; waiting statements dropped at restart; the cursor not restored; the settlement trade
+  date not following the clearing date; the cash sign flipped; an altered line not repriced.
+- **Found and fixed:**
+  - **A trade after the cutoff settled before its statement.** The first version kept the settlement trade date as
+    the UTC date of execution, so a Monday 18:00 trade was on Tuesday's statement but settled T+1 at Tuesday 00:00,
+    before that statement was issued. The scenario showed it. With clearing enabled, the trade date is now the
+    clearing business date in both places, as at a real exchange, where late trades are dated the next business day.
+    Without clearing nothing changes.
+  - **An index on `events(event_type, occurred_at)` made the hot path slower.** The checkpoint test's WAL bound
+    failed 1 in 8 runs with it and 0 in 8 without. A window now reads events after the last trade sequence the
+    previous window took (a primary-key range), which is correct because exchange stamps never go backwards (5.2).
+- **Decisions:**
+  - **One clearing time zone** for the clearinghouse, not one per market: a single statement per participant per day
+    covers all its markets.
+  - **Statements only for participants that traded in the window.** Participants have no registration time, so
+    "registered by the cutoff" is not reproducible on a running clock.
+  - **Breaks are configuration** (and a scenario section), not a runtime test route like webhook faults: a showcase
+    deployment without `/test` can still have them (D11). Their records are readable under `/test` only.
+  - The ticker that ran only with the simulator now also runs with clearing, at `settlement.tick_interval_ms`.
+- **Deviations:**
+  - **No CSV.** The plan said "JSON, maybe CSV". JSON only for now, since every consumer so far reads the webhook.
+  - **Statements are stamped at their scheduled instant.** On a running clock a statement can follow events
+    stamped up to one tick after it, as settlement events can (documented).
+
 ## Suggested order
 
 1. Milestone 1 wrap-up: 1.1 now, then 1.2, then 1.3a–d.
@@ -1397,6 +1464,8 @@ Settled on 2026-10-17 (Milestone 5, second round):
 - **D12 — per-market settlement cycles:** a table per MIC in configuration (`settlement.market_settlement_days`), no
   instrument field. Cycles are set per market in reality, and instrument payloads stay unchanged.
 
-Still open (Milestone 5):
-- **D10 — sharing code with the payment gateway:** extract the outbox, webhook delivery, fault and scenario parts
-  into a shared crate before 5.4, or let the gateway start as a copy and extract afterwards.
+Settled on 2026-10-17 (Milestone 5, third round):
+- **D10 — sharing code with the payment gateway:** extract a shared crate first. Before 5.4, the outbox, webhook
+  delivery, signing, fault injection and maintenance, the virtual clock and the persistence-mode plumbing move into a
+  new workspace member that both simulators depend on. That refactor is its own step (5.4a, no behaviour change, the
+  exchange's whole suite as its gate); the gateway itself is 5.4b.

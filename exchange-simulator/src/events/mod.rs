@@ -17,8 +17,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const EXCHANGE_SOURCE: &str = "exchange";
 /// ...or the optional settlement simulator (simulated lifecycle events)...
 pub const SETTLEMENT_SOURCE: &str = "settlement-simulator";
-/// ...or an external settlement service reporting outcomes back.
+/// ...or an external settlement service reporting outcomes back...
 pub const EXTERNAL_SOURCE: &str = "external";
+/// ...or the clearinghouse (end-of-day statements).
+pub const CLEARING_SOURCE: &str = "clearinghouse";
 
 pub const ORDER_ACCEPTED: &str = "OrderAccepted";
 pub const ORDER_REJECTED: &str = "OrderRejected";
@@ -36,6 +38,8 @@ pub const SETTLEMENT_CORRECTED: &str = "SettlementCorrected";
 pub const SETTLEMENT_CANCELLED: &str = "SettlementCancelled";
 /// An outcome reported by an external settlement service (`source: "external"`).
 pub const SETTLEMENT_OUTCOME_REPORTED: &str = "SettlementOutcomeReported";
+/// An end-of-day clearing statement for one participant (`source: "clearinghouse"`).
+pub const CLEARING_STATEMENT_ISSUED: &str = "ClearingStatementIssued";
 
 /// Every event type the service emits, for validating subscriptions.
 pub const EVENT_TYPES: &[&str] = &[
@@ -53,6 +57,7 @@ pub const EVENT_TYPES: &[&str] = &[
     SETTLEMENT_CORRECTED,
     SETTLEMENT_CANCELLED,
     SETTLEMENT_OUTCOME_REPORTED,
+    CLEARING_STATEMENT_ISSUED,
 ];
 
 /// Why an order was cancelled, carried in `OrderCancelled` payloads.

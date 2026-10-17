@@ -129,6 +129,19 @@ fn sandbox_config(scenario: &Scenario, base: &Config, dir: &std::path::Path) -> 
     // A scenario declares its own webhooks; the service's real consumers must never receive sandbox events.
     config.webhooks.subscriptions.clear();
     config.events.simulation_id = Some(scenario.name.clone());
+    if let Some(section) = &scenario.clearing {
+        let c = &mut config.clearing;
+        c.enabled = section.enabled.unwrap_or(true);
+        if let Some(cutoff) = &section.cutoff {
+            c.cutoff = cutoff.clone();
+        }
+        if let Some(zone) = &section.time_zone {
+            c.time_zone = zone.clone();
+        }
+        if let Some(breaks) = &section.breaks {
+            c.breaks = breaks.clone();
+        }
+    }
     let s = &mut config.settlement;
     s.seed = scenario.seed;
     if let Some(section) = &scenario.settlement {

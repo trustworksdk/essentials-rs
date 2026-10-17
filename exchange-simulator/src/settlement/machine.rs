@@ -151,7 +151,12 @@ impl SettlementSimulator {
 
     fn intake(&self, trade: &TradeFacts) -> Transition {
         let policy = &self.policy;
-        let trade_date = trade.executed_at.date_naive();
+        // With clearing, a trade after the cutoff or on a weekend is dated the next business day, as on its statement.
+        let trade_date = policy
+            .clearing
+            .map_or(trade.executed_at.date_naive(), |calendar| {
+                calendar.business_date(trade.executed_at)
+            });
         let settlement_days = policy.settlement_days_for(trade.mic.as_deref());
         let isd = add_business_days(trade_date, settlement_days);
         let amount = i128::from(trade.price_ticks)
@@ -178,6 +183,15 @@ impl SettlementSimulator {
             due_at: Some(start_of(isd).max(trade.executed_at)),
             settled_at: None,
             updated_at: trade.executed_at,
+            clearing: policy.clearing.map(|calendar| {
+                calendar.refs(
+                    trade.executed_at,
+                    &trade.instrument_id,
+                    &trade.buyer_id,
+                    &trade.seller_id,
+                    isd,
+                )
+            }),
         };
         let reason = if i64::try_from(amount).is_err() {
             Some("AMOUNT_OUT_OF_RANGE")
@@ -324,6 +338,9 @@ fn settlement_event(
         "status": instruction.status,
         "attempt": instruction.attempts,
     });
+    if let Some(refs) = &instruction.clearing {
+        payload["clearing"] = serde_json::to_value(refs).expect("references serialize");
+    }
     if let (Value::Object(payload), Value::Object(extra)) = (&mut payload, extra) {
         payload.extend(extra);
     }

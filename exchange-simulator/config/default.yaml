@@ -69,6 +69,21 @@ settlement:
   max_delay_days: 3
   max_delays: 2
   correction_days: 1
+clearing:
+  # End-of-day clearing statements: at `cutoff` (local time in `time_zone`) on each business day, one
+  # ClearingStatementIssued per participant that traded since the previous cutoff, with its trades and net obligations
+  # per instrument and settlement date. Off by default. Runs on the domain clock, like settlement.
+  enabled: false
+  cutoff: "17:30"
+  time_zone: "UTC"           # an IANA name, e.g. Europe/Copenhagen
+  # Seeded reconciliation breaks, all off by default. They change what statements say, never the trades.
+  breaks:
+    seed: 1
+    omit_probability: 0.0     # per trade line: left out
+    alter_probability: 0.0    # per trade line: quantity or price off by one
+    phantom_probability: 0.0  # per statement: a trade that does not exist
+    late_probability: 0.0     # per statement: issued 1..max_late_minutes after the cutoff
+    max_late_minutes: 60
 clock:
   # "system": domain time is real time. "virtual": a controllable clock for simulations and tests. It starts at
   # `start` (default: the real time at first startup), frozen unless `running: true`, and resumes from its last

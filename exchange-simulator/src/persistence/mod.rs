@@ -26,6 +26,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/009_delivery_faults.sql"),
     include_str!("../../migrations/010_named_subscriptions.sql"),
     include_str!("../../migrations/011_webhook_maintenance.sql"),
+    include_str!("../../migrations/012_clearing.sql"),
 ];
 
 /// How much of the exchange's state survives what (`database.mode`).
@@ -209,6 +210,8 @@ mod tests {
         assert_eq!(
             tables,
             [
+                "clearing_cursor",
+                "clearing_statements",
                 "consumer_offsets",
                 "events",
                 "executions",

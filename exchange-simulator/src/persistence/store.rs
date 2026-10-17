@@ -3,6 +3,7 @@ use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
+use crate::clearing::{Draft, Statement, StoredStatement};
 use crate::domain::{Execution, Instrument, InstrumentId, Order, Participant, ParticipantId};
 use crate::engine::BookUpdate;
 use crate::events::{self, EventEnvelope, NewEvent};
@@ -764,6 +765,122 @@ impl Store {
         tx.commit()
     }
 
+    /// `TradeExecuted` events after sequence `after` executed in `[from, until)`, in sequence order: one clearing
+    /// window. Reading from `after` (a range of the primary key) keeps it cheap without an index on event times.
+    pub fn trades_between(
+        &self,
+        after: u64,
+        from: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> rusqlite::Result<Vec<EventEnvelope>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {EVENT_COLUMNS} FROM events e
+                 WHERE e.sequence > ?1 AND e.event_type = ?2 AND e.occurred_at >= ?3 AND e.occurred_at < ?4
+                 ORDER BY e.sequence"
+            ))?
+            .query_map(
+                params![
+                    to_sql(after),
+                    events::TRADE_EXECUTED,
+                    timestamp(from),
+                    timestamp(until)
+                ],
+                |row| event_row(row, 0),
+            )?
+            .collect()
+    }
+
+    /// The last business date whose clearing cutoff was handled and the last trade sequence its window took, if
+    /// clearing ever ran.
+    pub fn clearing_cursor(&self) -> rusqlite::Result<Option<(chrono::NaiveDate, u64)>> {
+        self.conn
+            .query_row(
+                "SELECT business_date, after_sequence FROM clearing_cursor WHERE id = 1",
+                [],
+                |row| Ok((parsed(row, 0)?, from_sql(row, 1)?)),
+            )
+            .optional()
+    }
+
+    pub fn save_clearing_cursor(
+        &self,
+        date: chrono::NaiveDate,
+        after: u64,
+    ) -> rusqlite::Result<()> {
+        save_clearing_cursor(&self.conn, date, after)
+    }
+
+    /// Statements, optionally of one business date and one participant, in date and participant order. `pending`
+    /// selects the issued ones (`false`) or the late ones still waiting (`true`).
+    pub fn clearing_statements(
+        &self,
+        date: Option<chrono::NaiveDate>,
+        participant: Option<&str>,
+        pending: bool,
+    ) -> rusqlite::Result<Vec<StoredStatement>> {
+        self.conn
+            .prepare_cached(
+                "SELECT body, breaks, issued, event_sequence FROM clearing_statements
+                 WHERE (?1 IS NULL OR business_date = ?1) AND (?2 IS NULL OR participant_id = ?2) AND issued = ?3
+                 ORDER BY business_date, participant_id",
+            )?
+            .query_map(
+                params![date.map(|d| d.to_string()), participant, !pending],
+                statement_row,
+            )?
+            .collect()
+    }
+
+    pub fn clearing_statement(&self, id: &str) -> rusqlite::Result<Option<StoredStatement>> {
+        self.conn
+            .query_row(
+                "SELECT body, breaks, issued, event_sequence FROM clearing_statements WHERE statement_id = ?1",
+                [id],
+                statement_row,
+            )
+            .optional()
+    }
+
+    /// Writes a clearing step atomically: new and newly issued statements, their events with outbox rows, and the
+    /// cursor.
+    pub fn commit_clearing(
+        &mut self,
+        events: &[NewEvent],
+        statements: &[&StoredStatement],
+        cursor: Option<(chrono::NaiveDate, u64)>,
+        outbox: Outbox<'_>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        write_events(&tx, events, &outbox)?;
+        {
+            let mut upsert = tx.prepare_cached(
+                "INSERT INTO clearing_statements
+                   (statement_id, business_date, participant_id, due_at, issued, event_sequence, body, breaks)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (statement_id) DO UPDATE SET issued = excluded.issued,
+                                                          event_sequence = excluded.event_sequence",
+            )?;
+            for stored in statements {
+                let Draft { statement, breaks } = &stored.draft;
+                upsert.execute(params![
+                    statement.statement_id,
+                    statement.business_date.to_string(),
+                    statement.participant_id.0,
+                    timestamp(statement.issued_at),
+                    stored.issued,
+                    stored.event_sequence.map(to_sql),
+                    serde_json::to_string(statement).expect("a statement serializes"),
+                    serde_json::to_string(breaks).expect("breaks serialize"),
+                ])?;
+            }
+        }
+        if let Some((date, after)) = cursor {
+            save_clearing_cursor(&tx, date, after)?;
+        }
+        tx.commit()
+    }
+
     /// The sequence the next event will get: one past the highest ever assigned (AUTOINCREMENT never reuses one).
     pub fn next_event_sequence(&self) -> rusqlite::Result<u64> {
         self.conn.query_row(
@@ -1148,7 +1265,7 @@ pub(crate) fn write_events(
 fn write_settlement(tx: &Connection, write: &SettlementWrite<'_>) -> rusqlite::Result<()> {
     let mut upsert = tx.prepare_cached(&format!(
         "INSERT INTO settlement_instructions ({INSTRUCTION_COLUMNS})
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
          ON CONFLICT (execution_id) DO UPDATE SET
            intended_settlement_date = excluded.intended_settlement_date, status = excluded.status,
            attempts = excluded.attempts, delays = excluded.delays, due_at = excluded.due_at,
@@ -1176,6 +1293,9 @@ fn write_settlement(tx: &Connection, write: &SettlementWrite<'_>) -> rusqlite::R
             i.due_at.map(timestamp),
             i.settled_at.map(timestamp),
             timestamp(i.updated_at),
+            i.clearing
+                .as_ref()
+                .map(|refs| serde_json::to_string(refs).expect("references serialize")),
         ])?;
     }
     tx.execute(
@@ -1208,7 +1328,7 @@ fn report_row(row: &Row<'_>) -> rusqlite::Result<ExternalReport> {
 
 const INSTRUCTION_COLUMNS: &str = "execution_id, trade_sequence, instrument_id, buyer_id, seller_id, quantity, \
     price_ticks, currency, currency_scale, tick_size_minor, amount_minor, trade_date, intended_settlement_date, status, \
-    attempts, delays, due_at, settled_at, updated_at";
+    attempts, delays, due_at, settled_at, updated_at, clearing";
 
 fn instruction_row(row: &Row<'_>) -> rusqlite::Result<Instruction> {
     let date = |index: usize| -> rusqlite::Result<chrono::NaiveDate> { parsed(row, index) };
@@ -1241,6 +1361,45 @@ fn instruction_row(row: &Row<'_>) -> rusqlite::Result<Instruction> {
         due_at: optional_time(16)?,
         settled_at: optional_time(17)?,
         updated_at: parsed(row, 18)?,
+        clearing: row
+            .get::<_, Option<String>>(19)?
+            .map(|text| {
+                serde_json::from_str(&text).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(19, Type::Text, Box::new(e))
+                })
+            })
+            .transpose()?,
+    })
+}
+
+fn save_clearing_cursor(
+    conn: &Connection,
+    date: chrono::NaiveDate,
+    after: u64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO clearing_cursor (id, business_date, after_sequence) VALUES (1, ?1, ?2)
+         ON CONFLICT (id) DO UPDATE SET business_date = excluded.business_date,
+                                        after_sequence = excluded.after_sequence",
+        params![date.to_string(), to_sql(after)],
+    )
+    .map(drop)
+}
+
+fn statement_row(row: &Row<'_>) -> rusqlite::Result<StoredStatement> {
+    let json = |index: usize| -> rusqlite::Result<String> { row.get(index) };
+    let invalid = |index: usize| {
+        move |e: serde_json::Error| {
+            rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e))
+        }
+    };
+    let statement: Statement = serde_json::from_str(&json(0)?).map_err(invalid(0))?;
+    let breaks = serde_json::from_str(&json(1)?).map_err(invalid(1))?;
+    let sequence: Option<i64> = row.get(3)?;
+    Ok(StoredStatement {
+        draft: Draft { statement, breaks },
+        issued: row.get(2)?,
+        event_sequence: sequence.map(|s| s as u64),
     })
 }
 

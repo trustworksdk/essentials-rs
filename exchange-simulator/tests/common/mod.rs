@@ -84,6 +84,7 @@ impl TestApp {
             },
             ids: IdsConfig::default(),
             settlement: SettlementConfig::default(),
+            clearing: Default::default(),
             test_control: TestControlConfig { enabled: true },
             logging: LoggingConfig {
                 filter: "warn".into(),

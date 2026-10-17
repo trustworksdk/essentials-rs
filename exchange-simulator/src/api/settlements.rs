@@ -45,6 +45,9 @@ pub struct SettlementView {
     pub next_transition_at: Option<DateTime<Utc>>,
     pub settled_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    /// The clearing statements and obligations it appears on, when clearing runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clearing: Option<crate::clearing::ClearingRefs>,
 }
 
 impl From<Instruction> for SettlementView {
@@ -68,6 +71,7 @@ impl From<Instruction> for SettlementView {
             next_transition_at: i.due_at,
             settled_at: i.settled_at,
             updated_at: i.updated_at,
+            clearing: i.clearing,
         }
     }
 }

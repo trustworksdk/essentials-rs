@@ -55,6 +55,8 @@ pub struct Scenario {
     pub start: DateTime<Utc>,
     #[serde(default)]
     pub settlement: Option<SettlementSection>,
+    #[serde(default)]
+    pub clearing: Option<ClearingSection>,
     /// `POST /api/instruments` bodies.
     #[serde(default)]
     pub instruments: Vec<Value>,
@@ -70,6 +72,17 @@ pub struct Scenario {
 /// Monday 2030-01-07 09:00 UTC.
 fn default_start() -> DateTime<Utc> {
     "2030-01-07T09:00:00Z".parse().expect("valid instant")
+}
+
+/// Clearing for the run. The section turns clearing on unless it says `enabled: false`; unset fields keep the
+/// service's configuration, and `breaks` replaces its break policy as a whole.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClearingSection {
+    pub enabled: Option<bool>,
+    pub cutoff: Option<String>,
+    pub time_zone: Option<String>,
+    pub breaks: Option<crate::clearing::BreakPolicy>,
 }
 
 /// Settlement for the run; unset fields keep the service's configuration.

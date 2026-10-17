@@ -25,6 +25,8 @@ pub struct Config {
     pub webhooks: WebhooksConfig,
     pub ids: IdsConfig,
     pub settlement: SettlementConfig,
+    #[serde(default)]
+    pub clearing: ClearingConfig,
     pub clock: ClockConfig,
     pub test_control: TestControlConfig,
     pub database: DatabaseConfig,
@@ -147,7 +149,12 @@ impl Default for SettlementConfig {
 impl SettlementConfig {
     /// The simulator's policy, when this mode runs the simulator.
     pub fn simulator_policy(&self) -> Option<SettlementPolicy> {
-        matches!(self.mode, SettlementMode::Simulated | SettlementMode::Both).then(|| {
+        matches!(self.mode, SettlementMode::Simulated | SettlementMode::Both).then(|| self.policy())
+    }
+
+    /// The configured policy, whether or not the simulator runs: clearing takes the settlement cycles from it.
+    pub fn policy(&self) -> SettlementPolicy {
+        {
             SettlementPolicy {
                 seed: self.seed,
                 settlement_days: self.settlement_days,
@@ -156,6 +163,7 @@ impl SettlementConfig {
                     .iter()
                     .map(|(mic, days)| (mic.to_ascii_uppercase(), *days))
                     .collect(),
+                clearing: None,
                 reject_probability: self.reject_probability,
                 cancel_probability: self.cancel_probability,
                 fail_probability: self.fail_probability,
@@ -165,7 +173,50 @@ impl SettlementConfig {
                 max_delays: self.max_delays,
                 correction_days: self.correction_days,
             }
-        })
+        }
+    }
+}
+
+/// End-of-day clearing statements (`clearing:`), off by default.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClearingConfig {
+    pub enabled: bool,
+    /// Local time of the daily cutoff, `HH:MM`.
+    pub cutoff: String,
+    /// IANA time zone of the cutoff, e.g. `Europe/Copenhagen`.
+    pub time_zone: String,
+    pub breaks: crate::clearing::BreakPolicy,
+}
+
+impl Default for ClearingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cutoff: "17:30".into(),
+            time_zone: "UTC".into(),
+            breaks: crate::clearing::BreakPolicy::default(),
+        }
+    }
+}
+
+impl Config {
+    /// The clearinghouse's policy when clearing is enabled; an error for an invalid cutoff, time zone or break
+    /// policy.
+    pub fn clearing_policy(&self) -> Result<Option<crate::clearing::ClearingPolicy>, String> {
+        if !self.clearing.enabled {
+            return Ok(None);
+        }
+        let calendar = crate::clearing::ClearingCalendar::parse(
+            &self.clearing.cutoff,
+            &self.clearing.time_zone,
+        )?;
+        self.clearing.breaks.validate()?;
+        Ok(Some(crate::clearing::ClearingPolicy {
+            calendar,
+            breaks: self.clearing.breaks.clone(),
+            cycles: self.settlement.policy(),
+        }))
     }
 }
 
@@ -634,6 +685,7 @@ webhooks:
             "webhooks",
             "ids",
             "settlement",
+            "clearing",
             "clock",
             "test_control",
             "database",
@@ -651,6 +703,9 @@ webhooks:
                 }
                 let config =
                     with_overlay(block).unwrap_or_else(|e| panic!("{document}: {e}\n{block}"));
+                config
+                    .clearing_policy()
+                    .unwrap_or_else(|e| panic!("{document}: {e}\n{block}"));
                 for subscription in &config.webhooks.subscriptions {
                     for event_type in &subscription.event_types {
                         assert!(
@@ -668,6 +723,6 @@ webhooks:
                 checked += 1;
             }
         }
-        assert!(checked >= 7, "found {checked} configuration examples");
+        assert!(checked >= 10, "found {checked} configuration examples");
     }
 }

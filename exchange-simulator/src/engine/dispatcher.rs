@@ -54,7 +54,7 @@ enum Request {
     Reset(Reply<()>),
     SetInstrumentEnabled(InstrumentId, bool, Reply<Instrument>),
     ClockState(oneshot::Sender<ClockState>),
-    SettlementTick(Reply<usize>),
+    Tick(Reply<usize>),
     ReportSettlement(NewReport, Reply<(ExternalReport, bool)>),
     ChangeClock(ClockChange, Reply<ClockState>),
     ClaimDeliveries(u32, std::time::Duration, Reply<Vec<DeliveryJob>>),
@@ -80,7 +80,7 @@ impl Request {
             Self::Reset(..) => "reset",
             Self::SetInstrumentEnabled(..) => "set_instrument_enabled",
             Self::ClockState(..) => "clock_state",
-            Self::SettlementTick(..) => "settlement_tick",
+            Self::Tick(..) => "tick",
             Self::ReportSettlement(..) => "report_settlement",
             Self::ChangeClock(..) => "change_clock",
             Self::ClaimDeliveries(..) => "claim_deliveries",
@@ -181,9 +181,10 @@ impl Dispatcher {
             .await
     }
 
-    /// Runs one settlement simulator step; resolves with the number of transitions.
-    pub async fn settlement_tick(&self) -> Result<usize, DispatchError> {
-        self.call(Request::SettlementTick).await
+    /// Runs everything due on domain time (settlement transitions, clearing statements); resolves with the number
+    /// of events.
+    pub async fn tick(&self) -> Result<usize, DispatchError> {
+        self.call(Request::Tick).await
     }
 
     /// Stores an externally reported settlement outcome; `true` when it repeats a stored report.
@@ -486,7 +487,7 @@ fn handle(exchange: &mut Exchange, request: Request) -> &'static str {
         }
         Request::Submit(order, reply) => answer(reply, submit(exchange, order)),
         Request::Cancel(order_id, reply) => answer(reply, cancel(exchange, order_id)),
-        Request::SettlementTick(reply) => answer(reply, exchange.settlement_tick()),
+        Request::Tick(reply) => answer(reply, exchange.tick()),
         Request::ReportSettlement(report, reply) => {
             answer(reply, exchange.report_settlement(report))
         }

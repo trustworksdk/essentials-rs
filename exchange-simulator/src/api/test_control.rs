@@ -35,6 +35,7 @@ pub fn router(state: AppState, config: Arc<Config>) -> Router {
             "/test/webhooks/{id}/faults",
             axum::routing::put(set_faults).delete(clear_faults),
         )
+        .route("/test/clearing/breaks", get(super::clearing::breaks))
         .route("/test/clock", get(clock))
         .route("/test/clock/advance", post(advance))
         .route("/test/clock/set", post(set))
