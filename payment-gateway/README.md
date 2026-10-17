@@ -134,6 +134,13 @@ With `test_control.enabled: true`: `GET /test/clock`, `POST /test/clock/advance`
 routes (`/test/deliveries`, `/test/attempts`, `/test/dead-letters/retry`, `/test/webhooks/{id}/redeliver`,
 `/test/webhooks/{id}/faults`).
 
-## Not yet
+## Running it with the exchange
 
-- A Docker image and a Compose example, and scenarios (D15): with the demo-shaped acceptance in 5.5.
+`payment-gateway/Dockerfile` builds the image from the workspace root (`docker build -f payment-gateway/Dockerfile .`).
+[`exchange-simulator/examples/back-office`](../exchange-simulator/examples/back-office) runs it with the exchange
+simulator on an accelerated clock, and the
+[back-office chapter](../exchange-simulator/docs/back-office.md) of the exchange simulator's guide describes how a
+demo consumes and reconciles both.
+
+There are no gateway scenarios (D15): the back-office acceptance in the exchange simulator's e2e suite covers the two
+services together.

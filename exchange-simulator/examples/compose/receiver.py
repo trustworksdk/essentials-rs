@@ -1,8 +1,9 @@
-"""A sample webhook receiver for the exchange simulator. Standard library only; Python 3.10+.
+"""A sample webhook receiver for the exchange simulator and the payment gateway. Standard library only; Python 3.10+.
 
 POST /hooks/<name>  a delivery: the signature is verified (401 if it fails), duplicates are recognized by eventId,
                     and one line per event is logged. Answers with the configured status (default 204).
-GET  /received      everything received, as JSON.
+GET  /received      everything received, as JSON: per delivery the hook, the event's ID, type and sequence, the
+                    attempt, whether it verified, whether it was a duplicate, the status answered, and the event.
 POST /control?status=503   answer deliveries with this status from now on (to watch retries and dead letters);
                            /control?status=204 restores normal operation.
 GET  /health        200.
@@ -83,6 +84,7 @@ class Handler(BaseHTTPRequestHandler):
                 "verified": verified,
                 "duplicate": duplicate,
                 "answered": STATE["status"],
+                "event": event,
             })
         print(
             f"{name}: #{event['sequence']} {event['eventType']} {event['eventId']}"

@@ -478,6 +478,8 @@ Simulated instructions in trade order, optionally of one status. `limit` is 1–
 
 With `clearing.enabled: true`, a clearinghouse issues end-of-day statements on the exchange clock. It plays an outside
 party only (decision D8): it keeps no positions or cash, and computes every statement from the trades alone.
+How a demo consumes and reconciles these statements, together with the payment gateway's bank statements, is in
+the guide's [Back office](docs/back-office.md) chapter.
 
 - **When:** at `clearing.cutoff`, local time in `clearing.time_zone` (daylight saving included), Monday to Friday.
   With `clock.mode: virtual` nothing is issued until simulated time reaches the cutoff, and a clock move issues every

@@ -229,6 +229,36 @@ mod tests {
     }
 
     #[test]
+    fn the_back_office_example_configuration_is_valid() {
+        let config: Config = config::Config::builder()
+            .add_source(config::File::from_str(DEFAULTS, config::FileFormat::Yaml))
+            .add_source(config::File::from_str(
+                include_str!("../../exchange-simulator/examples/back-office/gateway.yaml"),
+                config::FileFormat::Yaml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(config.clock.mode, ClockMode::Virtual);
+        assert!(config.payment_policy().is_ok());
+        let statements = config.statement_policy().unwrap().unwrap();
+        assert_eq!(statements.opening_balances["DKK"], 100_000_000);
+        // Event types only: the secret file exists in the container.
+        let declared = &config.webhooks.subscriptions[0];
+        assert!(
+            declared
+                .event_types
+                .iter()
+                .all(|t| crate::gateway::EVENT_TYPES.contains(&t.as_str()))
+        );
+        assert_eq!(
+            declared.event_types.len(),
+            crate::gateway::EVENT_TYPES.len()
+        );
+    }
+
+    #[test]
     fn invalid_settings_are_refused() {
         let with = |adjust: fn(&mut Config)| {
             let mut config = Config::defaults();

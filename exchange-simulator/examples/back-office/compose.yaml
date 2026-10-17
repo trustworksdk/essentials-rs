@@ -1,0 +1,75 @@
+# The back-office demo: the exchange simulator (with settlement and clearing), the payment gateway, and a receiver
+# standing in for the demo app. From this directory:
+#   docker compose up --build -d --wait
+#   curl -X POST localhost:8080/test/clock/resume; curl -X POST localhost:8081/test/clock/resume
+# With reconciliation breaks: add -f compose.breaks.yaml to every docker compose command. See README.md.
+# EXCHANGE_PORT, GATEWAY_PORT and RECEIVER_PORT change the host ports (8080, 8081, 9000); SPEED the clock speed.
+name: back-office-demo
+
+services:
+  exchange:
+    image: ${EXCHANGE_IMAGE:-exchange-simulator:dev}
+    build:
+      context: ../../..
+      dockerfile: exchange-simulator/Dockerfile
+    ports:
+      - "${EXCHANGE_PORT:-8080}:8080"
+    environment:
+      EXCHANGE_CONFIG: /etc/exchange/exchange.yaml
+      EXCHANGE__CLOCK__SPEED: ${SPEED:-1440}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./exchange.yaml:/etc/exchange/exchange.yaml:ro
+      - exchange-data:/var/lib/exchange
+    secrets:
+      - webhook_secret
+    depends_on:
+      receiver:
+        condition: service_healthy
+
+  gateway:
+    image: ${GATEWAY_IMAGE:-payment-gateway:dev}
+    build:
+      context: ../../..
+      dockerfile: payment-gateway/Dockerfile
+    ports:
+      - "${GATEWAY_PORT:-8081}:8081"
+    environment:
+      GATEWAY_CONFIG: /etc/gateway/gateway.yaml
+      GATEWAY__CLOCK__SPEED: ${SPEED:-1440}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./gateway.yaml:/etc/gateway/gateway.yaml:ro
+      - gateway-data:/var/lib/gateway
+    secrets:
+      - webhook_secret
+    depends_on:
+      receiver:
+        condition: service_healthy
+
+  # The sample receiver from examples/compose: it verifies every delivery and lists what it got at /received.
+  receiver:
+    image: python:3.13-slim
+    command: ["python", "-u", "/app/receiver.py"]
+    environment:
+      WEBHOOK_SECRET_FILE: /run/secrets/webhook_secret
+    volumes:
+      - ../compose/receiver.py:/app/receiver.py:ro
+    ports:
+      - "${RECEIVER_PORT:-9000}:9000"
+    secrets:
+      - webhook_secret
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+secrets:
+  # Both services sign with it, the receiver verifies with it. The demo value from examples/compose; change it.
+  webhook_secret:
+    file: ../compose/secrets/webhook-secret.txt
+
+volumes:
+  exchange-data:
+  gateway-data:

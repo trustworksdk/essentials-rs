@@ -526,6 +526,14 @@ webhooks:
                 "docs/configuration.md",
                 include_str!("../docs/configuration.md"),
             ),
+            (
+                "examples/back-office/exchange.yaml",
+                concat!(
+                    "```yaml\n",
+                    include_str!("../examples/back-office/exchange.yaml"),
+                    "```\n"
+                ),
+            ),
             ("docs/operations.md", include_str!("../docs/operations.md")),
             (
                 "docs/webhook-receivers.md",
@@ -585,6 +593,6 @@ webhooks:
                 checked += 1;
             }
         }
-        assert!(checked >= 10, "found {checked} configuration examples");
+        assert!(checked >= 13, "found {checked} configuration examples");
     }
 }

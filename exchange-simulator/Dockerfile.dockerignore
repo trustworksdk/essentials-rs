@@ -8,3 +8,4 @@
 **/*.db-wal
 **/*.db-shm
 exchange-simulator/data
+payment-gateway/data

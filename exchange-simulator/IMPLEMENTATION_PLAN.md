@@ -1512,6 +1512,54 @@ are small. Then 5.3 and 5.4 when back-office work starts, in the order the demo 
 - **Deviations:** none from the 5.4 entry and D13–D16. Scenarios are deferred (D15). The Docker image and a
   Compose example move to 5.5, with the demo-shaped acceptance that runs both services.
 
+**5.5 — tests, acceptance and guide ✅ done (2026-10-17)**
+- **Delivered:**
+  - **`payment-gateway/Dockerfile`** (and its `.dockerignore`), the same layout as the exchange's: non-root user, a
+    volume at `/var/lib/gateway`, JSON logs, a health check on `/health`, port 8081.
+  - **`examples/back-office`:** Compose with the exchange (simulated T+1 settlement, clearing at 17:30 Copenhagen time),
+    the gateway (payments that always complete, bank statements at the same cutoff, a DKK opening balance) and the
+    sample receiver, one ordered signed subscription per service. Both clocks start frozen at Monday 08:00 at speed
+    1440 (`SPEED` overrides it) and are resumed together. `compose.breaks.yaml` turns on every break kind in both
+    statements. README with a `curl` walkthrough.
+  - **The sample receiver** now keeps each event's body in `/received`, so a reconciliation can work from what the
+    demo actually received. It stays standard-library only.
+  - **`docs/back-office.md`**, a new guide chapter: the parties and their events, taking dates from events, trading
+    and settlement (T+1, clearing references), reconciling clearing statements (steps, and the D9 mapping question),
+    payments (credit on completion, reserve withdrawals yourself, returns), reconciling bank statements, a table of
+    every break and how it shows, and running the example. Linked from the guide index, the README's Clearing
+    section and the gateway README.
+- **Acceptance:** `the_back_office_demo_reconciles_on_an_accelerated_clock` (`tests/e2e.rs`) builds both images and
+  plays the demo app over two business days at 4320×: six deposits and nine trades on Monday, two withdrawals on
+  Tuesday morning, on the gateway's clock. From the webhooks the receiver got (all verified):
+  - **Without breaks:** reconciling the clearing and bank statements against the trades and payments finds nothing;
+    the day's obligations net to zero; every `SettlementCompleted` is T+1 and names obligations on the statements;
+    Tuesday's bank statement opens at Monday's closing and lists the two withdrawals as debits.
+  - **With breaks:** the reconciliation's findings equal the breaks `/test/clearing/breaks` and
+    `/test/statements/breaks` list, one for one, and each of phantom, late and missing-or-changed occurs in both.
+  - It takes about 95 seconds, images aside. It passed three runs and left no containers or volumes behind; the
+    full e2e suite (6 tests) passed too.
+- **Mutation checks** on the acceptance, each made it fail: the gateway listing withdrawals without their sign (the
+  clean reconciliation finds both Tuesday entries changed); settlement events without their clearing references.
+- **Tests:** the example configurations parse and validate (`exchange.yaml` in the documented-examples test, now
+  13 blocks; `gateway.yaml` in a new gateway test). All relative links and anchors in the docs, READMEs and example
+  READMEs were checked with a script.
+- **Decisions:**
+  - **D15 — no shared scenario runner.** The acceptance runs both services as the demo would, through Compose, and
+    reconciles from the webhooks. A YAML scenario format for two services would add a second way to express the
+    same thing. The exchange keeps its runner, and the gateway has none.
+  - **Separate clocks, resumed together**, not a shared clock service: each simulator stays independent, and
+    the drift (a fraction of a simulated minute) does not matter to reconciliation, which uses each statement's own
+    window.
+  - **Test control is on in the example**, because resuming the clocks and listing breaks need it. The example and
+    its README call it a demo environment.
+- **Deviation:** none from the 5.5 entry. The gateway image and Compose example, moved here from 5.4b, are done.
+
+### Milestone 5 status
+
+Done on 2026-10-17: 5.1 (T+1, per-market cycles), 5.2 (accelerated clock), 5.3 (clearing statements), 5.4a
+(`simulator-kit`), 5.4b (payment gateway) and 5.5 (back-office acceptance and guide). Decisions D8–D16 are recorded
+below. Still on hold from Milestone 4: 4.6d (the containerized benchmark), until the user asks for it.
+
 ## Suggested order
 
 1. Milestone 1 wrap-up: 1.1 now, then 1.2, then 1.3a–d.
@@ -1582,6 +1630,7 @@ Settled on 2026-10-17 (5.4b, the payment gateway):
   from all booked movements (and a configurable opening balance). As with clearing, it is computed from the
   gateway's own payments; there is no separate ledger.
 - **D15 — gateway scenarios:** deferred to 5.5. 5.4b is tested through its API; 5.5's acceptance decides whether a
-  shared scenario runner is worth extracting.
+  shared scenario runner is worth extracting. Settled in 5.5: no shared runner; the back-office acceptance runs both
+  services through Compose.
 - **D16 — statement breaks:** opt-in and seeded, in the clearing style: a movement left out, an amount off by one minor
   unit, a movement that never happened, a statement issued late; listed under `/test`.

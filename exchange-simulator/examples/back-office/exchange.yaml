@@ -1,0 +1,28 @@
+# Mounted at /etc/exchange/exchange.yaml, layered over the built-in defaults.
+clock:
+  # Both services start frozen at the same simulated instant, a Monday morning; resuming both clocks together keeps
+  # them within a fraction of a simulated minute of each other. EXCHANGE__CLOCK__SPEED (SPEED in compose.yaml) sets
+  # the speed: 1440 makes a simulated day pass in a real minute.
+  mode: virtual
+  start: "2030-01-07T08:00:00Z"
+  running: false
+  speed: 1440
+settlement:
+  mode: simulated
+  fail_probability: 0.0
+  delay_probability: 0.0
+clearing:
+  enabled: true
+  cutoff: "17:30"
+  time_zone: Europe/Copenhagen
+# The clock is resumed, and breaks are listed, under /test. This is a demo environment; never expose /test elsewhere.
+test_control:
+  enabled: true
+webhooks:
+  subscriptions:
+    - name: back-office
+      url: http://receiver:9000/hooks/exchange
+      event_types: [TradeExecuted, SettlementPending, SettlementCompleted, SettlementFailed, SettlementDelayed,
+                    SettlementRejected, SettlementCancelled, SettlementCorrected, ClearingStatementIssued]
+      secret_file: /run/secrets/webhook_secret
+      ordered: true
