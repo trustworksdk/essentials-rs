@@ -1235,13 +1235,46 @@ per order. Sharding it would not raise throughput.
     documented code is tested code.
 - **Deviation:** none from the 4.6c entry. The Kubernetes Job manifest remains part of 4.6d.
 
+## Milestone 5 — back-office counterparties (draft, 2026-10-17)
+
+**Context:** the exchange simulator backs a trading demo app. The app is a showcase for an internal CQRS and
+event-sourcing framework: it models a trading account domain with event sourcing. The demo is front office today
+(place orders, see fills, watch settlement). Back-office features will follow: deposits and withdrawals, settlement,
+reconciliation.
+
+**Principle (D8):** the simulators play only the outside parties: exchange, clearinghouse, payment gateway. Client
+cash balances, positions, buying power, and the reconciliation of the firm's books belong to the demo's own
+event-sourced domain; that is what the showcase demonstrates. So no simulator keeps a positions or cash ledger.
+Clearing obligations are computed from the day's trades, not from stored balances.
+
+**Goal:**
+- settlement that completes within a short demo;
+- realistic settlement cycles (T+1 by default, per market where it differs);
+- end-of-day clearing statements to reconcile against;
+- a payment gateway for deposits and withdrawals, with the same character as the exchange: an asynchronous API,
+  signed webhooks, seeded outcomes and faults, the virtual clock.
+
+| # | Step | Size | Delivers |
+|---|---|---|---|
+| 5.1 | Settlement cycle: T+1 by default, per market where it differs | S | `settlement.settlement_days` defaults to 1. T+1 is the cycle in the US, Canada and Mexico since May 2024, and the EU, UK and Switzerland move to it on 2027-10-11. A per-instrument override (`settlementDays` on the instrument, or a per-MIC table in config) lets a market keep T+2, e.g. XCSE until 2027-10-11. Tests and docs that assume T+2 by default are updated. |
+| 5.2 | Accelerated virtual clock for short demos | M | `clock.speed`: simulated seconds per real second while the virtual clock runs (default 1; 1440 makes a day pass in a minute). Everything on domain time follows: order and event timestamps, T+N business days and weekends, and end-of-day cutoffs (5.3). Webhook retries, leases and timeouts stay on real time. With `clock.mode: virtual`, `running: true` and `speed: 1440`, a T+1 trade settles about a minute after it executes, with no clock calls. Speed is also settable at runtime (D11). The guide gets a "demo setup" recipe. The demo app must take dates from event timestamps, not its own clock. |
+| 5.3 | End-of-day clearing statements | L | At a configurable cutoff on the domain clock (e.g. 17:30 in the market's time zone, business days only), one statement per participant: the day's cleared trades, and their net obligations per instrument and settlement date (securities and cash, computed from the trades). Delivered as a webhook event (`ClearingStatementIssued`) and by `GET /api/clearing/statements?date=&participant=` (JSON, maybe CSV). Settlement events reference the statement and obligation they settle. **Reconciliation breaks** are opt-in and seeded, in the style of the webhook faults: a trade left out, a quantity or price changed, a trade that does not exist, or a statement issued late. The canonical trades never change. The granularity depends on D9. |
+| 5.4 | Payment gateway simulator | L | A new workspace member, not a mode of the exchange. **API:** initiate a deposit or withdrawal for an account, with an idempotency key, amount and currency. **Webhooks:** signed `PaymentPending`, then `PaymentCompleted`, `PaymentFailed`, or later `PaymentReturned` (a reversal after completion). **Outcomes:** seeded probabilities and delays on the domain clock. **Statements:** an end-of-day bank statement for reconciliation. It reuses the exchange simulator's outbox, webhook delivery and maintenance, fault injection, scenarios, virtual clock and persistence modes. Where to share that code is D10. |
+| 5.5 | Tests, acceptance and guide | M | A demo-shaped acceptance on an accelerated clock: deposit, trade, T+1 settlement, statement, reconciliation inputs, a withdrawal, with and without breaks. The guide gets a back-office chapter: how the demo's domain consumes trades, settlements, statements and payments, and what each break looks like. |
+
+**Order within the milestone:** 5.1 and 5.2 first. They help the front-office demo now (short demos that settle) and
+are small. Then 5.3 and 5.4 when back-office work starts, in the order the demo needs them. 5.5 runs alongside.
+
 ## Suggested order
 
 1. Milestone 1 wrap-up: 1.1 now, then 1.2, then 1.3a–d.
 2. 2.1 virtual clock and test control. Milestones 2 and 3 both depend on it.
 3. Milestone 2, steps 2.2–2.5.
 4. Milestone 3, steps 3.0–3.5.
-5. Milestone 4, steps 4.1–4.6 (settlement before performance, D4).
+5. Milestone 4, steps 4.1–4.6 (settlement before performance, D4). 4.5 skipped and 4.6 extended (D7). 4.6d (the
+   containerized benchmark) is on hold until the user asks for it.
+6. Milestone 5: 5.1 and 5.2 when the front-office demo needs short settlement cycles; 5.3–5.5 with the demo's
+   back-office features.
 
 ## Decisions
 
@@ -1273,4 +1306,22 @@ Settled on 2026-10-16:
   - Usage documentation is a separate guide under `docs/`; the README stays the API reference (4.6c).
   - 4.5 (instrument-sharded matching) is skipped. 4.1–4.4 showed matching is not the bottleneck.
 
-Still open: none.
+Settled on 2026-10-17:
+- **D8 — what the simulators own:** only the outside parties (exchange, clearinghouse, payment gateway). Client
+  positions, cash balances, buying power and reconciliation live in the trading demo's event-sourced domain, which is
+  the point of the showcase. Clearing obligations are computed from trades, so no simulator keeps a ledger.
+
+Still open (Milestone 5):
+- **D9 — how demo accounts map to exchange participants:**
+  - **One participant per client account:** simplest, and enough for the front-office demo.
+  - **The firm as one clearing member:** client trades are booked internally, as at a real broker. Clearinghouse
+    statements then do not match client-level books one to one, which is what makes reconciliation realistic.
+  - Either way the demo's domain should not assume a participant ID is an account ID, so it can change later. This
+    decides the granularity of the 5.3 statements.
+- **D10 — sharing code with the payment gateway:** extract the outbox, webhook delivery, fault and scenario parts
+  into a shared crate before 5.4, or let the gateway start as a copy and extract afterwards.
+- **D11 — controlling clock speed at runtime:** through the test-control API only (`/test/clock`, mounted only in
+  test deployments), or through a separate demo-control switch that a showcase deployment can enable without exposing
+  the rest of `/test`.
+- **D12 — per-market settlement cycles (5.1):** an `settlementDays` override per instrument, or a table per MIC in
+  configuration.
