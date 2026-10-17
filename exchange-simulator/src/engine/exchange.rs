@@ -14,13 +14,14 @@ use crate::domain::{
 };
 use crate::events::NewEvent;
 use crate::events::{self, Command};
+use crate::ids::ExchangeIds;
 use crate::persistence::{Outbox, SettlementWrite, Store};
 use crate::settlement::{
     ExternalReport, NewReport, SettlementPolicy, SettlementSimulator, TradeFacts,
 };
 use crate::webhooks::{
     DeclaredSubscription, DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription,
-    SubscriptionSource, WebhookChange,
+    WebhookChange, WebhookError, WebhookHub,
 };
 
 /// The settlement simulator's name in `consumer_offsets`.
@@ -117,6 +118,21 @@ pub enum ExchangeError {
     GroupCommit(String),
 }
 
+/// The hub's refusals keep the exchange's own variants (and with them the API's responses); its storage failures are
+/// the exchange's storage failures.
+impl From<WebhookError> for ExchangeError {
+    fn from(error: WebhookError) -> Self {
+        match error {
+            WebhookError::Invalid(message) => Self::InvalidWebhook(message),
+            WebhookError::Unknown(id) => Self::UnknownSubscription(id),
+            WebhookError::ManagedByConfiguration { id, name } => {
+                Self::ManagedByConfiguration { id, name }
+            }
+            WebhookError::Storage(error) => Self::Storage(error),
+        }
+    }
+}
+
 /// Construction-time dependencies of an [`Exchange`]. `Default` gives strict identifiers, UUIDv7 IDs and the
 /// system clock.
 pub struct ExchangeOptions {
@@ -208,7 +224,8 @@ pub struct Exchange {
     settlement: Option<SettlementSimulator>,
     external_outcomes: bool,
     clearing: Option<Clearing>,
-    subscriptions: Vec<Subscription>,
+    /// Webhook subscriptions, declared ones included, and the rules for changing them.
+    webhooks: WebhookHub,
     simulation_id: Option<String>,
     delivery_signal: Option<Arc<tokio::sync::Notify>>,
     /// The virtual clock's first reading and whether it started running: where a reset puts it.
@@ -217,9 +234,6 @@ pub struct Exchange {
     epoch: u64,
     /// The open commit group: what its commands wrote, reported once the group is durable.
     group: Option<Vec<Committed>>,
-    /// Webhook subscriptions declared in configuration (see [`Exchange::reconcile_webhooks`]).
-    declared_webhooks: Vec<DeclaredSubscription>,
-    webhook_secret_grace: chrono::Duration,
 }
 
 /// The clearinghouse: its policy, the last business date whose cutoff was handled, and late statements waiting to be
@@ -286,7 +300,12 @@ impl Exchange {
             .map(|p| (p.id, p.settlement))
             .collect();
         let last_sequence = store.max_sequence()?;
-        let subscriptions = store.subscriptions()?;
+        let webhooks = WebhookHub::load(
+            store.connection(),
+            options.webhooks,
+            options.webhook_secret_grace,
+            events::EVENT_TYPES,
+        )?;
         let released = store.release_claims(wall_now())?;
         let settlement = match options.settlement {
             Some(policy) => {
@@ -345,17 +364,13 @@ impl Exchange {
             settlement,
             external_outcomes: options.external_outcomes,
             clearing: None,
-            subscriptions,
+            webhooks,
             simulation_id: options.simulation_id,
             delivery_signal: options.delivery_signal,
             clock_start,
             epoch: 0,
             group: None,
-            declared_webhooks: options.webhooks,
-            webhook_secret_grace: options.webhook_secret_grace,
         };
-        crate::webhooks::validate_declared(&exchange.declared_webhooks)
-            .map_err(ExchangeError::InvalidWebhook)?;
         exchange.reconcile_webhooks()?;
         if let Some(policy) = options.clearing {
             policy.breaks.validate().map_err(ExchangeError::Clearing)?;
@@ -583,268 +598,65 @@ impl Exchange {
         self.last_sequence
     }
 
-    /// Registers a webhook endpoint for the given event types. It receives events committed from now on; earlier
-    /// events can be replayed from the events API. With a `secret` (16–256 characters) every delivery is signed (see
-    /// [`crate::webhooks::signing`]); with `ordered`, deliveries go out one at a time in sequence order.
+    /// Registers a webhook endpoint for the given event types (see [`WebhookHub::register`]).
     pub fn register_webhook(
         &mut self,
         request: NewSubscription,
     ) -> Result<Subscription, ExchangeError> {
-        let request = validate_subscription(request)?;
-        self.create_webhook(request, None, SubscriptionSource::Api, (true, false))
+        let now = self.now();
+        Ok(self
+            .webhooks
+            .register(self.store.connection(), request, self.ids, now)?)
     }
 
-    /// Stores a new, already validated subscription.
-    fn create_webhook(
-        &mut self,
-        request: NewSubscription,
-        name: Option<String>,
-        source: SubscriptionSource,
-        (enabled, paused): (bool, bool),
-    ) -> Result<Subscription, ExchangeError> {
-        let NewSubscription {
-            url,
-            event_types,
-            secret,
-            ordered,
-        } = request;
-        let subscription = Subscription {
-            id: self.ids.subscription(self.subscriptions.len() as u64 + 1),
-            url,
-            event_types,
-            enabled,
-            created_at: self.now(),
-            secret,
-            ordered,
-            faults: None,
-            name,
-            source,
-            paused,
-            previous_secret: None,
-            deleted: false,
-        };
-        self.store.insert_subscription(&subscription)?;
-        self.subscriptions.push(subscription.clone());
-        Ok(subscription)
-    }
-
-    /// Brings the subscriptions declared in configuration (`webhooks.subscriptions`) into the database, by name:
-    /// creates the missing ones, updates the ones whose url, event types, secret, ordering, enabled or paused flag
-    /// changed,
-    /// and disables configuration-owned ones no longer declared (keeping their history). Subscriptions created through
-    /// the API are left alone. Runs at recovery and after a reset.
+    /// Brings the subscriptions declared in configuration into the database (see [`WebhookHub::reconcile`]). Runs at
+    /// recovery and after a reset.
     fn reconcile_webhooks(&mut self) -> Result<(), ExchangeError> {
-        let declared = self.declared_webhooks.clone();
-        let mut wake = false;
-        for entry in &declared {
-            let wanted =
-                validate_subscription(entry.subscription.clone()).map_err(|e| match e {
-                    ExchangeError::InvalidWebhook(message) => ExchangeError::InvalidWebhook(
-                        format!("webhooks.subscriptions {}: {message}", entry.name),
-                    ),
-                    other => other,
-                })?;
-            let existing = self
-                .subscriptions
-                .iter()
-                .position(|s| s.name.as_deref() == Some(entry.name.as_str()));
-            match existing {
-                None => {
-                    let created = self.create_webhook(
-                        wanted,
-                        Some(entry.name.clone()),
-                        SubscriptionSource::Config,
-                        (entry.enabled, entry.paused),
-                    )?;
-                    tracing::info!(name = %entry.name, id = %created.id, url = %created.url, "webhook subscription created from configuration");
-                    wake |= created.enabled && !created.paused;
-                }
-                Some(index) => {
-                    let current = &self.subscriptions[index];
-                    if current.source != SubscriptionSource::Config {
-                        return Err(ExchangeError::InvalidWebhook(format!(
-                            "webhooks.subscriptions {}: the name belongs to a subscription created through the API",
-                            entry.name
-                        )));
-                    }
-                    let previous_secret = if wanted.secret == current.secret {
-                        current.previous_secret.clone()
-                    } else {
-                        self.grace(current.secret.clone(), wanted.secret.is_some())
-                    };
-                    let updated = Subscription {
-                        url: wanted.url,
-                        event_types: wanted.event_types,
-                        secret: wanted.secret,
-                        ordered: wanted.ordered,
-                        enabled: entry.enabled,
-                        paused: entry.paused,
-                        previous_secret,
-                        ..current.clone()
-                    };
-                    if updated != *current {
-                        self.store.update_subscription(&updated)?;
-                        tracing::info!(name = %entry.name, id = %updated.id, url = %updated.url, enabled = updated.enabled, paused = updated.paused, "webhook subscription updated from configuration");
-                        wake |= updated.enabled && !updated.paused;
-                        self.subscriptions[index] = updated;
-                    }
-                }
-            }
-        }
-        for subscription in &mut self.subscriptions {
-            let still_declared = declared
-                .iter()
-                .any(|d| subscription.name.as_deref() == Some(d.name.as_str()));
-            if subscription.source == SubscriptionSource::Config
-                && subscription.enabled
-                && !still_declared
-            {
-                subscription.enabled = false;
-                self.store.update_subscription(subscription)?;
-                tracing::warn!(name = ?subscription.name, id = %subscription.id, "webhook subscription no longer in the configuration; disabled, its history kept");
-            }
-        }
+        let now = self.now();
+        let wake = self
+            .webhooks
+            .reconcile(self.store.connection(), self.ids, now)?;
         self.signal_deliveries(wake);
         Ok(())
     }
 
-    /// The previous secret to keep signing with after a change away from `old`: for `webhook_secret_grace`, when there
-    /// was an old secret and there still is a new one.
-    fn grace(&self, old: Option<String>, signed: bool) -> Option<(String, DateTime<Utc>)> {
-        old.filter(|_| signed && self.webhook_secret_grace > chrono::Duration::zero())
-            .map(|old| (old, wall_now() + self.webhook_secret_grace))
-    }
-
-    /// The index of a subscription that exists and is not deleted.
-    fn live_subscription(&self, id: Uuid) -> Result<usize, ExchangeError> {
-        self.subscriptions
-            .iter()
-            .position(|s| s.id == id && !s.deleted)
-            .ok_or(ExchangeError::UnknownSubscription(id))
-    }
-
-    /// Refuses to change a configuration-owned subscription through the API.
-    fn api_owned(&self, index: usize) -> Result<(), ExchangeError> {
-        let subscription = &self.subscriptions[index];
-        match subscription.source {
-            SubscriptionSource::Api => Ok(()),
-            SubscriptionSource::Config => Err(ExchangeError::ManagedByConfiguration {
-                id: subscription.id,
-                name: subscription.name.clone().unwrap_or_default(),
-            }),
-        }
-    }
-
-    /// Changes a subscription's URL, event types, ordering, or enabled and paused flags; unset fields stay. Pending
-    /// deliveries keep their place and go to the new URL. A subscription declared in configuration only takes
-    /// `paused`, which lasts until the next restart reapplies the configuration.
+    /// Changes a subscription (see [`WebhookHub::update`]).
     pub fn update_webhook(
         &mut self,
         id: Uuid,
         change: WebhookChange,
     ) -> Result<Subscription, ExchangeError> {
-        let index = self.live_subscription(id)?;
-        let WebhookChange {
-            url,
-            event_types,
-            ordered,
-            enabled,
-            paused,
-        } = change;
-        if url.is_some() || event_types.is_some() || ordered.is_some() || enabled.is_some() {
-            self.api_owned(index)?;
-        }
-        let current = &self.subscriptions[index];
-        let wanted = validate_subscription(NewSubscription {
-            url: url.unwrap_or_else(|| current.url.clone()),
-            event_types: event_types.unwrap_or_else(|| current.event_types.clone()),
-            secret: current.secret.clone(),
-            ordered: ordered.unwrap_or(current.ordered),
-        })?;
-        let updated = Subscription {
-            url: wanted.url,
-            event_types: wanted.event_types,
-            ordered: wanted.ordered,
-            enabled: enabled.unwrap_or(current.enabled),
-            paused: paused.unwrap_or(current.paused),
-            ..current.clone()
-        };
-        if updated != *current {
-            self.store.update_subscription(&updated)?;
-            self.signal_deliveries(updated.enabled && !updated.paused);
-            self.subscriptions[index] = updated;
-        }
-        Ok(self.subscriptions[index].clone())
+        let (subscription, wake) = self.webhooks.update(self.store.connection(), id, change)?;
+        self.signal_deliveries(wake);
+        Ok(subscription)
     }
 
-    /// Deletes a subscription created through the API: it disappears from the API, gets no new deliveries and sends
-    /// none of its pending ones. Its deliveries and attempts stay in the database.
+    /// Deletes a subscription created through the API (see [`WebhookHub::delete`]).
     pub fn delete_webhook(&mut self, id: Uuid) -> Result<(), ExchangeError> {
-        let index = self.live_subscription(id)?;
-        self.api_owned(index)?;
-        let mut deleted = self.subscriptions[index].clone();
-        deleted.deleted = true;
-        self.store.update_subscription(&deleted)?;
-        self.subscriptions[index] = deleted;
-        Ok(())
+        Ok(self.webhooks.delete(self.store.connection(), id)?)
     }
 
-    /// Replaces a subscription's signing secret (API-created subscriptions only). For `grace` the previous secret stays
-    /// valid: deliveries carry signatures under both, so the consumer can switch without rejecting any.
+    /// Replaces a subscription's signing secret (see [`WebhookHub::rotate_secret`]).
     pub fn rotate_webhook_secret(
         &mut self,
         id: Uuid,
         secret: String,
         grace: chrono::Duration,
     ) -> Result<Subscription, ExchangeError> {
-        let index = self.live_subscription(id)?;
-        self.api_owned(index)?;
-        let current = &self.subscriptions[index];
-        let wanted = validate_subscription(NewSubscription {
-            url: current.url.clone(),
-            event_types: current.event_types.clone(),
-            secret: Some(secret),
-            ordered: current.ordered,
-        })?;
-        let previous_secret = current
-            .secret
-            .clone()
-            .filter(|old| Some(old) != wanted.secret.as_ref() && grace > chrono::Duration::zero())
-            .map(|old| (old, wall_now() + grace));
-        let updated = Subscription {
-            secret: wanted.secret,
-            previous_secret,
-            ..current.clone()
-        };
-        self.store.update_subscription(&updated)?;
-        self.subscriptions[index] = updated;
-        Ok(self.subscriptions[index].clone())
+        Ok(self
+            .webhooks
+            .rotate_secret(self.store.connection(), id, secret, grace)?)
     }
 
-    /// Sets (or with `None` clears) a subscription's delivery fault policy. It applies to attempts from the next claim
-    /// on. Out-of-order holds are refused for an ordered subscription, which by definition never reorders.
+    /// Sets (or with `None` clears) a subscription's delivery fault policy (see [`WebhookHub::set_faults`]).
     pub fn set_webhook_faults(
         &mut self,
         subscription_id: Uuid,
         policy: Option<FaultPolicy>,
     ) -> Result<Subscription, ExchangeError> {
-        let subscription = self
-            .subscriptions
-            .iter_mut()
-            .find(|s| s.id == subscription_id && !s.deleted)
-            .ok_or(ExchangeError::UnknownSubscription(subscription_id))?;
-        if let Some(policy) = &policy {
-            policy.validate().map_err(ExchangeError::InvalidWebhook)?;
-            if subscription.ordered && policy.out_of_order.is_some() {
-                return Err(ExchangeError::InvalidWebhook(
-                    "outOfOrder cannot apply to an ordered subscription".into(),
-                ));
-            }
-        }
-        self.store
-            .set_fault_policy(subscription_id, policy.as_ref())?;
-        subscription.faults = policy;
-        Ok(subscription.clone())
+        Ok(self
+            .webhooks
+            .set_faults(self.store.connection(), subscription_id, policy)?)
     }
 
     /// Claims up to `limit` due webhook deliveries, leased for `lease`.
@@ -853,31 +665,16 @@ impl Exchange {
         limit: u32,
         lease: Duration,
     ) -> Result<Vec<DeliveryJob>, ExchangeError> {
-        let now = wall_now();
-        let lease_until = now + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
-        let mut jobs = self.store.claim_deliveries(now, lease_until, limit)?;
-        for job in &mut jobs {
-            job.epoch = self.epoch;
-        }
-        Ok(jobs)
+        Ok(self
+            .webhooks
+            .claim(self.store.connection_mut(), limit, lease, self.epoch)?)
     }
 
-    /// Records delivery results, except those claimed before a reset: their deliveries are gone (or, with
-    /// deterministic IDs, a new delivery may have the same ID).
+    /// Records delivery results, except those claimed before a reset.
     pub fn record_deliveries(&mut self, results: &[DeliveryResult]) -> Result<(), ExchangeError> {
-        let now = wall_now();
-        let current: Vec<DeliveryResult> = results
-            .iter()
-            .filter(|r| r.epoch == self.epoch)
-            .cloned()
-            .collect();
-        if current.len() < results.len() {
-            tracing::debug!(
-                dropped = results.len() - current.len(),
-                "dropped delivery results claimed before a reset"
-            );
-        }
-        Ok(self.store.record_deliveries(&current, now)?)
+        Ok(self
+            .webhooks
+            .record(self.store.connection_mut(), results, self.epoch)?)
     }
 
     /// Clears all state: every table emptied, books, participants, subscriptions and the settlement simulator back to
@@ -889,7 +686,7 @@ impl Exchange {
         self.store.reset()?;
         self.books.clear();
         self.participants.clear();
-        self.subscriptions.clear();
+        self.webhooks.clear();
         self.last_sequence = 0;
         self.next_event_sequence = self.store.next_event_sequence()?;
         if let Some(simulator) = &mut self.settlement {
@@ -916,16 +713,14 @@ impl Exchange {
         Ok(())
     }
 
-    /// Queues the subscription's events after sequence `after` for delivery again (see [`Store::redeliver`]).
+    /// Queues the subscription's events after sequence `after` for delivery again (see [`WebhookHub::redeliver`]).
     pub fn redeliver(&mut self, subscription_id: Uuid, after: u64) -> Result<usize, ExchangeError> {
-        let subscription = self
-            .subscriptions
-            .iter()
-            .find(|s| s.id == subscription_id && !s.deleted)
-            .ok_or(ExchangeError::UnknownSubscription(subscription_id))?;
-        let queued = self
-            .store
-            .redeliver(subscription, after, wall_now(), &self.ids)?;
+        let queued = self.webhooks.redeliver(
+            self.store.connection_mut(),
+            subscription_id,
+            after,
+            self.ids,
+        )?;
         self.signal_deliveries(queued > 0);
         Ok(queued)
     }
@@ -936,14 +731,11 @@ impl Exchange {
         subscription_id: Option<Uuid>,
         delivery_ids: &[Uuid],
     ) -> Result<usize, ExchangeError> {
-        if let Some(id) = subscription_id
-            && !self.subscriptions.iter().any(|s| s.id == id && !s.deleted)
-        {
-            return Err(ExchangeError::UnknownSubscription(id));
-        }
-        let retried = self
-            .store
-            .retry_dead_letters(subscription_id, delivery_ids, wall_now())?;
+        let retried = self.webhooks.retry_dead_letters(
+            self.store.connection_mut(),
+            subscription_id,
+            delivery_ids,
+        )?;
         self.signal_deliveries(retried > 0);
         Ok(retried)
     }
@@ -1014,10 +806,11 @@ impl Exchange {
             statement.event_sequence = Some(event.sequence);
         }
         let outbox = Outbox {
-            subscriptions: &self.subscriptions,
+            subscriptions: self.webhooks.subscriptions(),
             simulation_id: self.simulation_id.as_deref(),
             ids: self.ids,
             due: wall_now(),
+            schema_version: events::SCHEMA_VERSION,
         };
         let rows: Vec<&StoredStatement> = issue.iter().chain(&waiting).collect();
         self.store
@@ -1075,10 +868,11 @@ impl Exchange {
                 plan.transitions.iter().map(|t| t.event.clone()).collect();
             let next = NewEvent::stamp(&mut stamped, self.next_event_sequence, self.ids);
             let outbox = Outbox {
-                subscriptions: &self.subscriptions,
+                subscriptions: self.webhooks.subscriptions(),
                 simulation_id: self.simulation_id.as_deref(),
                 ids: self.ids,
                 due: wall_now(),
+                schema_version: events::SCHEMA_VERSION,
             };
             let write = SettlementWrite {
                 instructions: plan.transitions.iter().map(|t| &t.instruction).collect(),
@@ -1179,10 +973,11 @@ impl Exchange {
             self.ids,
         );
         let outbox = Outbox {
-            subscriptions: &self.subscriptions,
+            subscriptions: self.webhooks.subscriptions(),
             simulation_id: self.simulation_id.as_deref(),
             ids: self.ids,
             due: wall_now(),
+            schema_version: events::SCHEMA_VERSION,
         };
         self.store.commit_report(&stored, &event, outbox)?;
         self.next_event_sequence = next;
@@ -1272,10 +1067,11 @@ impl Exchange {
         };
         let started = std::time::Instant::now();
         let outbox = Outbox {
-            subscriptions: &self.subscriptions,
+            subscriptions: self.webhooks.subscriptions(),
             simulation_id: self.simulation_id.as_deref(),
             ids: self.ids,
             due: wall_now(),
+            schema_version: events::SCHEMA_VERSION,
         };
         let settlement_write = settlement_plan.as_ref().map(|plan| SettlementWrite {
             instructions: plan.transitions.iter().map(|t| &t.instruction).collect(),
@@ -1321,9 +1117,7 @@ impl Exchange {
 
     /// Whether any of `events` has a subscriber.
     fn delivers(&self, events: &[NewEvent]) -> bool {
-        events
-            .iter()
-            .any(|e| self.subscriptions.iter().any(|s| s.wants(e.event_type)))
+        self.webhooks.delivers(events)
     }
 
     /// Wakes the delivery worker when there is something new to deliver.
@@ -1344,10 +1138,7 @@ fn issue_order(s: &StoredStatement) -> (DateTime<Utc>, &str) {
     (s.draft.statement.issued_at, &s.draft.statement.statement_id)
 }
 
-/// Real time, at the precision the database stores, for webhook delivery scheduling.
-fn wall_now() -> DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
-}
+use simulator_kit::clock::wall_now;
 
 /// Every instrument's book, with its active orders restored in acceptance sequence.
 fn load_books(store: &Store) -> Result<HashMap<InstrumentId, OrderBook>, ExchangeError> {
@@ -1363,42 +1154,6 @@ fn load_books(store: &Store) -> Result<HashMap<InstrumentId, OrderBook>, Exchang
         book.restore(order)?;
     }
     Ok(books)
-}
-
-/// Checks a subscription request (http(s) URL, known event types, secret length) and normalizes its event types
-/// (sorted, without duplicates).
-fn validate_subscription(mut request: NewSubscription) -> Result<NewSubscription, ExchangeError> {
-    let parsed = reqwest::Url::parse(&request.url)
-        .map_err(|e| ExchangeError::InvalidWebhook(format!("url: {e}")))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(ExchangeError::InvalidWebhook(
-            "url must be http or https".into(),
-        ));
-    }
-    if request.event_types.is_empty() {
-        return Err(ExchangeError::InvalidWebhook(
-            "eventTypes must not be empty".into(),
-        ));
-    }
-    if let Some(unknown) = request
-        .event_types
-        .iter()
-        .find(|t| !events::EVENT_TYPES.contains(&t.as_str()))
-    {
-        return Err(ExchangeError::InvalidWebhook(format!(
-            "unknown event type {unknown}"
-        )));
-    }
-    if let Some(secret) = &request.secret
-        && !(16..=256).contains(&secret.chars().count())
-    {
-        return Err(ExchangeError::InvalidWebhook(
-            "secret must be 16 to 256 characters".into(),
-        ));
-    }
-    request.event_types.sort();
-    request.event_types.dedup();
-    Ok(request)
 }
 
 fn same_terms(order: &Order, command: &SubmitOrder) -> bool {

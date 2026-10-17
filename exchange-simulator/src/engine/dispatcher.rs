@@ -25,6 +25,35 @@ pub enum DispatchError {
     Exchange(#[from] ExchangeError),
 }
 
+/// The delivery worker claims and records through the exchange thread, the single writer.
+impl simulator_kit::webhooks::DeliveryBackend for Dispatcher {
+    async fn claim(
+        &self,
+        limit: u32,
+        lease: std::time::Duration,
+    ) -> Result<Vec<DeliveryJob>, simulator_kit::webhooks::BackendError> {
+        self.claim_deliveries(limit, lease)
+            .await
+            .map_err(backend_error)
+    }
+
+    async fn record(
+        &self,
+        results: Vec<DeliveryResult>,
+    ) -> Result<(), simulator_kit::webhooks::BackendError> {
+        self.record_deliveries(results).await.map_err(backend_error)
+    }
+}
+
+fn backend_error(error: DispatchError) -> simulator_kit::webhooks::BackendError {
+    use simulator_kit::webhooks::BackendError;
+    match error {
+        DispatchError::Overloaded => BackendError::Overloaded,
+        DispatchError::Stopped => BackendError::Stopped,
+        DispatchError::Exchange(error) => BackendError::Failed(error.to_string()),
+    }
+}
+
 /// Point-in-time view of one instrument's book.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BookSnapshot {
@@ -585,6 +614,23 @@ fn instrument_of(exchange: &Exchange, id: &InstrumentId) -> Instrument {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_delivery_worker_sees_an_overloaded_or_stopped_exchange_as_such() {
+        use simulator_kit::webhooks::BackendError;
+        assert!(matches!(
+            backend_error(DispatchError::Overloaded),
+            BackendError::Overloaded
+        ));
+        assert!(matches!(
+            backend_error(DispatchError::Stopped),
+            BackendError::Stopped
+        ));
+        assert!(matches!(
+            backend_error(DispatchError::Exchange(ExchangeError::ClockNotVirtual)),
+            BackendError::Failed(_)
+        ));
+    }
+
     #[tokio::test]
     async fn a_full_queue_fails_fast_and_a_stopped_thread_reports_stopped() {
         let (tx, rx) = mpsc::channel(1);
@@ -680,6 +726,7 @@ mod tests {
         use super::*;
         use crate::domain::{OrderType, ParticipantId};
         use crate::engine::{ExchangeOptions, FixedClock, IdScheme};
+        use crate::ids::ExchangeIds;
         use crate::persistence::Store;
 
         const IDS: IdScheme = IdScheme::Deterministic { seed: 7 };

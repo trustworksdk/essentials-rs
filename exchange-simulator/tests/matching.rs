@@ -7,6 +7,7 @@ use exchange_simulator::domain::{
 use exchange_simulator::engine::{
     BookError, IdScheme, InvalidOrder, Level, MatchContext, OrderBook, RejectReason,
 };
+use exchange_simulator::ids::ExchangeIds;
 use uuid::Uuid;
 
 fn acme() -> Instrument {

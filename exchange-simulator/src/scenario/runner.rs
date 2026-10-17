@@ -13,11 +13,11 @@ use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
-use super::matcher::{contains, mismatches};
 use super::{Expectation, ResponseCheck, Scenario, Step};
 use crate::app::App;
 use crate::config::{ClockConfig, ClockMode, Config, IdMode, IdsConfig};
 use crate::market::{MarketAction, MarketConfig};
+use simulator_kit::matcher::{contains, mismatches};
 
 /// How long a `deliveries` or `attempts` expectation waits by default for webhook delivery, which runs on real time.
 const DEFAULT_DELIVERY_WAIT_MS: u64 = 5000;

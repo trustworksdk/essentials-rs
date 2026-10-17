@@ -1,76 +1,34 @@
-//! Identifier scheme. `Random` gives time-ordered random UUIDv7s. `Deterministic` derives every ID from a seed and
-//! the natural key of what it names, all of which follow from the order of commands (sequences, ordinals). The same
-//! commands with the same seed therefore produce the same IDs, run after run and across restarts, with no counters
-//! to store.
+//! Identifiers of the exchange's own kinds (orders, executions, settlement reports), derived by the shared
+//! [`IdScheme`] (see `simulator_kit::ids`): the same seed and commands give the same IDs, run after run.
 
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-/// How IDs are made (`ids:` in the configuration).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum IdScheme {
-    /// UUIDv7: unique, time-ordered, different every run.
-    #[default]
-    Random,
-    /// UUIDv8 from SHA-256 of (seed, kind, natural key): reproducible.
-    Deterministic { seed: u64 },
+pub use simulator_kit::ids::IdScheme;
+
+/// The exchange's ID kinds on top of the outbox's (events, deliveries, subscriptions).
+pub trait ExchangeIds {
+    /// An order, by its exchange sequence.
+    fn order(self, sequence: u64) -> Uuid;
+    /// The `fill`-th execution (from 0) of the incoming order with this sequence.
+    fn execution(self, taker_sequence: u64, fill: usize) -> Uuid;
+    /// The `ordinal`-th external settlement report (from 1) for an execution.
+    fn report(self, execution: Uuid, ordinal: u64) -> Uuid;
 }
 
-impl IdScheme {
-    /// An order, by its exchange sequence.
-    pub fn order(self, sequence: u64) -> Uuid {
+impl ExchangeIds for IdScheme {
+    fn order(self, sequence: u64) -> Uuid {
         self.derive(b"order", &[&sequence.to_le_bytes()])
     }
 
-    /// The `fill`-th execution (from 0) of the incoming order with this sequence.
-    pub fn execution(self, taker_sequence: u64, fill: usize) -> Uuid {
+    fn execution(self, taker_sequence: u64, fill: usize) -> Uuid {
         self.derive(
             b"execution",
             &[&taker_sequence.to_le_bytes(), &(fill as u64).to_le_bytes()],
         )
     }
 
-    /// A canonical event, by its sequence in the event log.
-    pub fn event(self, sequence: u64) -> Uuid {
-        self.derive(b"event", &[&sequence.to_le_bytes()])
-    }
-
-    /// The delivery of one event to one subscription.
-    pub fn delivery(self, subscription: Uuid, event_sequence: u64) -> Uuid {
-        self.derive(
-            b"delivery",
-            &[subscription.as_bytes(), &event_sequence.to_le_bytes()],
-        )
-    }
-
-    /// The `ordinal`-th webhook subscription (from 1).
-    pub fn subscription(self, ordinal: u64) -> Uuid {
-        self.derive(b"subscription", &[&ordinal.to_le_bytes()])
-    }
-
-    /// The `ordinal`-th external settlement report (from 1) for an execution.
-    pub fn report(self, execution: Uuid, ordinal: u64) -> Uuid {
+    fn report(self, execution: Uuid, ordinal: u64) -> Uuid {
         self.derive(b"report", &[execution.as_bytes(), &ordinal.to_le_bytes()])
-    }
-
-    fn derive(self, kind: &[u8], parts: &[&[u8]]) -> Uuid {
-        match self {
-            Self::Random => Uuid::now_v7(),
-            Self::Deterministic { seed } => {
-                let mut hash = Sha256::new();
-                hash.update(b"exchange-simulator/ids/v1");
-                hash.update(seed.to_le_bytes());
-                // Length-prefixed, so (kind, parts) boundaries cannot be confused.
-                for part in std::iter::once(kind).chain(parts.iter().copied()) {
-                    hash.update((part.len() as u64).to_le_bytes());
-                    hash.update(part);
-                }
-                let digest = hash.finalize();
-                let mut bytes = [0_u8; 16];
-                bytes.copy_from_slice(&digest[..16]);
-                Uuid::new_v8(bytes)
-            }
-        }
     }
 }
 

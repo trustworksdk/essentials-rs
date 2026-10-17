@@ -1,19 +1,23 @@
 //! Webhook subscriptions and at-least-once delivery from the transactional outbox.
 //!
 //! Every committed event gets one `webhook_deliveries` row per matching subscription, in the same transaction. The
-//! [`DeliveryWorker`] claims due rows through the exchange thread (the single SQLite writer), POSTs the canonical
+//! [`DeliveryWorker`] claims due rows through a [`DeliveryBackend`] (the single SQLite writer), POSTs the canonical
 //! envelope, and records the outcome. A 2xx response is delivered; anything else is retried with exponential backoff
 //! and jitter until `max_attempts`, after which the delivery is dead-lettered. A claim is a lease: if the outcome is
 //! never recorded (crash, shutdown), the delivery becomes due again when the lease expires, and startup releases all
 //! claims. Consumers must therefore deduplicate by `eventId`. Concurrent deliveries may arrive out of order; the
 //! envelope's `sequence` gives the canonical order.
 
+mod config;
 pub mod faults;
+mod hub;
 pub mod signing;
 mod worker;
 
+pub use config::{SubscriptionConfig, WebhooksConfig};
 pub use faults::FaultPolicy;
-pub use worker::{DeliveryWorker, RetryPolicy, WorkerConfig};
+pub use hub::{WebhookError, WebhookHub};
+pub use worker::{BackendError, DeliveryBackend, DeliveryWorker, RetryPolicy, WorkerConfig};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -153,7 +157,7 @@ pub struct DeliveryJob {
     pub faults: Option<FaultPolicy>,
     /// Whether an out-of-order fault held this delivery back before.
     pub held: bool,
-    /// The exchange's reset epoch at claim time; results from before a reset are dropped.
+    /// The service's reset epoch at claim time; results from before a reset are dropped.
     pub epoch: u64,
     pub event: EventEnvelope,
 }

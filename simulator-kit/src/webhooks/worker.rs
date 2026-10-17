@@ -6,7 +6,36 @@ use futures_util::StreamExt;
 use tokio::sync::{Notify, watch};
 
 use super::{AttemptRecord, DeliveryJob, DeliveryOutcome, DeliveryResult, signing};
-use crate::engine::{DispatchError, Dispatcher};
+
+/// Why a backend call failed.
+#[derive(Debug, thiserror::Error)]
+pub enum BackendError {
+    /// The writer's queue is full; the call may be retried shortly.
+    #[error("the service is overloaded; retry later")]
+    Overloaded,
+    /// The writer has stopped: the worker stops too.
+    #[error("the service is not running")]
+    Stopped,
+    #[error("{0}")]
+    Failed(String),
+}
+
+/// Where the worker claims deliveries and records their results: the simulator's single SQLite writer (for the
+/// exchange, its exchange thread through the dispatcher).
+pub trait DeliveryBackend: Send + Sync + 'static {
+    /// Claims up to `limit` due deliveries, leased for `lease`.
+    fn claim(
+        &self,
+        limit: u32,
+        lease: Duration,
+    ) -> impl Future<Output = Result<Vec<DeliveryJob>, BackendError>> + Send;
+
+    /// Records delivery results.
+    fn record(
+        &self,
+        results: Vec<DeliveryResult>,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send;
+}
 
 /// Exponential backoff with jitter, and the attempt budget before a delivery is dead-lettered.
 #[derive(Clone, Debug)]
@@ -72,9 +101,9 @@ impl WorkerConfig {
 pub struct DeliveryWorker;
 
 impl DeliveryWorker {
-    /// Runs until `shutdown` turns true (finishing the batch in hand) or the exchange stops.
+    /// Runs until `shutdown` turns true (finishing the batch in hand) or the backend stops.
     pub fn spawn(
-        dispatcher: Dispatcher,
+        backend: impl DeliveryBackend,
         signal: Arc<Notify>,
         config: WorkerConfig,
         mut shutdown: watch::Receiver<bool>,
@@ -94,9 +123,9 @@ impl DeliveryWorker {
                 if *shutdown.borrow() {
                     break;
                 }
-                match deliver_due(&dispatcher, &client, &config).await {
+                match deliver_due(&backend, &client, &config).await {
                     Ok(()) => {}
-                    Err(DispatchError::Stopped) => break,
+                    Err(BackendError::Stopped) => break,
                     Err(error) => {
                         tracing::warn!(%error, "webhook delivery round failed; retrying on next poll")
                     }
@@ -114,14 +143,12 @@ impl DeliveryWorker {
 
 /// Claims and delivers batches until a claim comes back empty.
 async fn deliver_due(
-    dispatcher: &Dispatcher,
+    backend: &impl DeliveryBackend,
     client: &reqwest::Client,
     config: &WorkerConfig,
-) -> Result<(), DispatchError> {
+) -> Result<(), BackendError> {
     loop {
-        let jobs = dispatcher
-            .claim_deliveries(config.batch_size, config.lease())
-            .await?;
+        let jobs = backend.claim(config.batch_size, config.lease()).await?;
         if jobs.is_empty() {
             return Ok(());
         }
@@ -130,7 +157,7 @@ async fn deliver_due(
             .buffer_unordered(config.concurrency.max(1))
             .collect()
             .await;
-        record(dispatcher, results).await?;
+        record(backend, results).await?;
         // Claim again even after a partial batch: an ordered subscription's next event only becomes eligible once
         // the one before it is recorded. The loop ends when nothing is due.
     }
@@ -139,20 +166,20 @@ async fn deliver_due(
 /// Records results, waiting out a full command queue for a while. If they still cannot be recorded the claims expire
 /// and the deliveries are retried: at-least-once, never lost.
 async fn record(
-    dispatcher: &Dispatcher,
+    backend: &impl DeliveryBackend,
     results: Vec<DeliveryResult>,
-) -> Result<(), DispatchError> {
+) -> Result<(), BackendError> {
     let mut wait = Duration::from_millis(10);
     for _ in 0..10 {
-        match dispatcher.record_deliveries(results.clone()).await {
-            Err(DispatchError::Overloaded) => {
+        match backend.record(results.clone()).await {
+            Err(BackendError::Overloaded) => {
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(Duration::from_secs(1));
             }
             other => return other,
         }
     }
-    Err(DispatchError::Overloaded)
+    Err(BackendError::Overloaded)
 }
 
 async fn deliver(
@@ -332,6 +359,55 @@ mod tests {
         assert_eq!(
             policy.after_failure(3, "x".into()),
             DeliveryOutcome::Dead { error: "x".into() }
+        );
+    }
+
+    /// Answers `record` with `Overloaded` a given number of times, then accepts.
+    struct Busy {
+        overloaded: std::sync::Mutex<u32>,
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl DeliveryBackend for Busy {
+        async fn claim(&self, _: u32, _: Duration) -> Result<Vec<DeliveryJob>, BackendError> {
+            Ok(Vec::new())
+        }
+
+        async fn record(&self, _: Vec<DeliveryResult>) -> Result<(), BackendError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut left = self.overloaded.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                Err(BackendError::Overloaded)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn busy(overloaded: u32) -> Busy {
+        Busy {
+            overloaded: std::sync::Mutex::new(overloaded),
+            calls: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn results_wait_out_an_overloaded_writer_for_a_while() {
+        let backend = busy(3);
+        record(&backend, Vec::new()).await.unwrap();
+        assert_eq!(backend.calls.load(std::sync::atomic::Ordering::Relaxed), 4);
+
+        let backend = busy(u32::MAX);
+        assert!(matches!(
+            record(&backend, Vec::new()).await,
+            Err(BackendError::Overloaded)
+        ));
+        assert_eq!(
+            backend.calls.load(std::sync::atomic::Ordering::Relaxed),
+            10,
+            "then it gives up; the leases expire and the deliveries are retried"
         );
     }
 

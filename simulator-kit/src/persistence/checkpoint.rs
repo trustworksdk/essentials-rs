@@ -41,7 +41,7 @@ pub(crate) fn wal_frames() -> c_int {
 }
 
 /// The writer checkpoints itself once the WAL holds this many times the threshold and little is left to copy.
-pub(crate) const WRITER_FACTOR: c_int = 4;
+pub const WRITER_FACTOR: c_int = 4;
 
 #[derive(Default)]
 struct State {
@@ -63,7 +63,7 @@ struct Shared {
 
 /// A thread that checkpoints the WAL when asked. Requests made while a checkpoint runs are coalesced into one more.
 /// Dropping it stops the thread after its current checkpoint.
-pub(crate) struct Checkpointer {
+pub struct Checkpointer {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
     /// The WAL size, in frames (pages), from which the writer asks for a checkpoint.
@@ -83,7 +83,7 @@ pub(crate) struct Checkpointer {
 
 impl Checkpointer {
     /// Turns off automatic checkpoints on `writer` and starts a checkpointer for the database at `path`.
-    pub(crate) fn start(
+    pub fn start(
         writer: &Connection,
         path: &Path,
         busy_timeout: Duration,
@@ -121,7 +121,7 @@ impl Checkpointer {
     /// Called on the writer's thread after it wrote (outside a transaction): asks for a background checkpoint each
     /// time the WAL has grown by `pages`, and checkpoints on `writer` itself once the WAL is [`WRITER_FACTOR`] times
     /// that and little is left to copy, or twice that regardless (see the module documentation).
-    pub(crate) fn after_write(&self, writer: &Connection) {
+    pub fn after_write(&self, writer: &Connection) {
         let frames = wal_frames();
         ::metrics::gauge!(crate::metrics::WAL_FRAMES).set(f64::from(frames));
         if frames < self.last_frames.get() {
@@ -166,10 +166,11 @@ impl Checkpointer {
     }
 }
 
-#[cfg(test)]
+/// For tests of a store that uses checkpoints.
 impl Checkpointer {
     /// Stops the background thread, as if it had fallen behind for good; requests then do nothing.
-    pub(crate) fn stop_for_test(&mut self) {
+    #[doc(hidden)]
+    pub fn stop_for_test(&mut self) {
         self.shared.state.lock().expect("not poisoned").stop = true;
         self.shared.wake.notify_one();
         if let Some(thread) = self.thread.take() {
@@ -178,7 +179,8 @@ impl Checkpointer {
     }
 
     /// Background checkpoints run so far.
-    pub(crate) fn runs(&self) -> u64 {
+    #[doc(hidden)]
+    pub fn runs(&self) -> u64 {
         self.shared.runs.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -257,7 +259,7 @@ mod tests {
     fn the_writer_trusts_only_background_progress_on_the_current_wal() {
         let dir = std::env::temp_dir().join(format!("exchange-ckpt-{}", uuid::Uuid::now_v7()));
         let path = dir.join("exchange.db");
-        let writer = super::super::open(&path, Duration::from_secs(5)).unwrap();
+        let writer = super::super::open(&path, Duration::from_secs(5), &[]).unwrap();
         let mut checkpointer =
             Checkpointer::start(&writer, &path, Duration::from_secs(5), 100).unwrap();
         checkpointer.stop_for_test();

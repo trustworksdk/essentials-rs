@@ -6,7 +6,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
+use serde::Deserialize;
+
+/// Real time at the precision the database stores (microseconds), for scheduling against real consumers.
+pub fn wall_now() -> DateTime<Utc> {
+    Utc::now().trunc_subsecs(6)
+}
 
 /// Source of the current time.
 pub trait Clock {
@@ -190,6 +196,32 @@ impl Clock for VirtualClock {
     fn now(&self) -> DateTime<Utc> {
         self.state.lock().expect("clock lock").now()
     }
+}
+
+/// The clock settings (`clock:` in a simulator's configuration).
+#[derive(Clone, Debug, Deserialize)]
+pub struct ClockConfig {
+    pub mode: ClockMode,
+    /// Virtual clock only: the first reading. Default: the real time at first startup.
+    #[serde(default)]
+    pub start: Option<chrono::DateTime<chrono::Utc>>,
+    /// Virtual clock only: start running instead of frozen.
+    #[serde(default)]
+    pub running: bool,
+    /// Virtual clock only: simulated seconds per real second while it runs (1440 makes a day pass in a minute).
+    #[serde(default = "real_time")]
+    pub speed: f64,
+}
+
+fn real_time() -> f64 {
+    1.0
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClockMode {
+    System,
+    Virtual,
 }
 
 #[cfg(test)]

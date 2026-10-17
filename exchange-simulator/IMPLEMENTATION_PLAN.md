@@ -1409,6 +1409,53 @@ are small. Then 5.3 and 5.4 when back-office work starts, in the order the demo 
   - **Statements are stamped at their scheduled instant.** On a running clock a statement can follow events
     stamped up to one tick after it, as settlement events can (documented).
 
+**5.4a — extract the shared crate (D10) ✅ done (2026-10-17)**
+- **Delivered:** a new workspace member, `simulator-kit` (with a README), that `exchange-simulator` depends on. No
+  behaviour change. Moved, with history where a file moved whole:
+  - `clock` (the virtual clock, `ClockConfig`, `wall_now`), `rng` (the SplitMix64 `Rng` from `market`), `matcher`
+    (scenario "contains" matching);
+  - `ids`: `IdScheme` with the outbox kinds (event, delivery, subscription) and a public `derive`. The exchange's
+    kinds (order, execution, report) are the `ExchangeIds` extension trait;
+  - `events`: `NewEvent` and `EventEnvelope`. Event types, sources and payloads stay in the exchange;
+  - `persistence`: persistence modes, connection setup, `migrate` over the caller's migration list, background WAL
+    checkpoints, column conversions (`sql`). The exchange keeps its migrations and wrappers with the old signatures;
+  - `outbox`: the SQL for events, subscriptions, deliveries, attempts, redelivery, dead letters and the stored
+    virtual clock, as free functions on a connection, plus `SCHEMA` (the shared tables as they stand). The
+    exchange's `Store` methods delegate, so its call sites did not change;
+  - `webhooks`: types, signing, faults, `WebhooksConfig`, the `DeliveryWorker` over a `DeliveryBackend` trait, and
+    `WebhookHub`, which holds the subscriptions and all their maintenance logic (lifted from `Exchange`: register,
+    reconcile declared ones, update, delete, rotate, faults, claim, record, redeliver, retry);
+  - `api`: `ApiError`, and the `/api/webhooks` and `/test` webhook routes over a `WebhookBackend` trait.
+  - The exchange implements `DeliveryBackend` for its `Dispatcher` and `WebhookBackend` for its `AppState`, and
+    re-exports `clock` and `webhooks` under their old paths. `ExchangeError` keeps its variants: a `WebhookError`
+    converts into them, so every HTTP status, error code and message is unchanged.
+- **Tests:**
+  - The existing suites pass unchanged, apart from imports of the `ExchangeIds` trait in two places: 231 test
+    functions before, 233 run plus the 5 e2e tests now. The e2e run builds the image from the workspace with the
+    new member.
+  - New: `the_migrations_build_the_shared_outbox_schema` (the exchange's migrated tables equal `SCHEMA`, comments and
+    whitespace aside); the kit's ID derivation pinned with a value computed independently in Python, which also
+    reproduces the exchange's existing pin; `SCHEMA` creates usable tables; the worker waits out an overloaded
+    writer and then gives up; the dispatcher reports an overloaded or stopped exchange to the worker as such.
+  - The webhook, fault, maintenance, config, MockServer and checkpoint suites passed 3 repeat runs.
+- **Mutation checks**, each made a test fail: `SCHEMA` drifting from the migrations; a hub refusal mapped to the
+  wrong exchange error; the test webhook routes not mounted; the outbox stamping the wrong schema version; the ID
+  derivation's domain changed; an overloaded exchange reported as a failure; the worker giving up on the first
+  overload. Two of these first survived: the schema-version mutation had been applied to one write path only, and
+  no test covered the worker waiting out an overloaded writer (true before the extraction too). The new tests cover
+  the second.
+- **Decisions:**
+  - **The exchange's hash domains stay** (`exchange-simulator/ids/v1`, `exchange-simulator/faults/v1`), so its IDs and
+    fault streams are unchanged. The gateway shares them; its IDs live in its own database.
+  - **Metric names stay**, `exchange_` prefix included on the checkpoint and persistence-mode gauges, so dashboards
+    keep working. Renaming them would be a behaviour change for a later step.
+  - **Store methods delegate** to the kit instead of the exchange calling the kit directly: no call-site churn.
+  - **The scenario runner stays in the exchange.** Its steps are exchange commands; only the matcher is shared. The
+    gateway's scenarios (5.4b) decide how much of the runner to share.
+  - `/api/webhooks` handlers moved to the kit with the exchange's file (`git mv`).
+- **Deviation:** the D10 entry listed the parts to move; the scenario matcher was added (pure, 100 lines, needed by
+  any simulator's scenarios), and `ClockConfig` and `WebhooksConfig` moved with the clock and webhooks.
+
 ## Suggested order
 
 1. Milestone 1 wrap-up: 1.1 now, then 1.2, then 1.3a–d.

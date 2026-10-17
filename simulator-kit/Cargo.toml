@@ -1,0 +1,28 @@
+[package]
+name = "simulator-kit"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Parts shared by the simulators: clock, SQLite plumbing, event outbox and webhook delivery"
+
+[dependencies]
+axum = "0.8.9"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+futures-util = "0.3.34"
+hmac = "0.13.0"
+metrics = "0.24.6"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "hooks"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tracing = "0.1.44"
+uuid = { version = "1.28.0", features = ["v7", "v8", "serde"] }
+anyhow = "1.0.104"
+fastrand = "2.5.0"
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["macros", "rt", "test-util"] }

@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use super::MatchContext;
 use crate::domain::{Execution, Instrument, InstrumentId, Order, OrderStatus, OrderType, Side};
+use crate::ids::ExchangeIds;
 
 /// Why an order is malformed. These are input errors: such an order is never accepted, sequenced or persisted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]

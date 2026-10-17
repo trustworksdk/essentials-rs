@@ -5,6 +5,11 @@ use std::sync::OnceLock;
 
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
+pub use simulator_kit::metrics::{
+    CHECKPOINT_DURATION, CHECKPOINTS, OUTBOX, PERSISTENCE_MODE, WAL_FRAMES, WEBHOOK_ATTEMPTS,
+    WEBHOOK_DURATION, set_persistence_mode,
+};
+
 /// Commands executed by the exchange thread. Labels: `command`, `outcome` (`ok`, `invalid`, `error`).
 pub const COMMANDS: &str = "exchange_commands_total";
 /// Time the exchange thread spent on one command, matching and commit included. Label: `command`.
@@ -19,13 +24,6 @@ pub const MATCH_DURATION: &str = "exchange_match_duration_seconds";
 /// Time spent making orders and cancellations durable: per commit group, the `COMMIT`; with group commit off, the
 /// whole transaction of one command.
 pub const COMMIT_DURATION: &str = "exchange_commit_duration_seconds";
-/// WAL checkpoints with background checkpointing. Labels: `by` (`background`, or `writer` when the background
-/// checkpoints fell behind) and `outcome` (`complete`, `partial` when frames remained, `error`).
-pub const CHECKPOINTS: &str = "exchange_wal_checkpoints_total";
-/// Duration of one WAL checkpoint with background checkpointing. Label: `by`.
-pub const CHECKPOINT_DURATION: &str = "exchange_wal_checkpoint_duration_seconds";
-/// Frames (pages) in the WAL after the writer's last commit, with background checkpoints.
-pub const WAL_FRAMES: &str = "exchange_wal_frames";
 /// Commands (orders and cancellations) per commit group.
 pub const GROUP_SIZE: &str = "exchange_group_commit_commands";
 /// Commands waiting for the exchange thread.
@@ -38,16 +36,8 @@ pub const EXECUTIONS: &str = "exchange_executions_total";
 pub const TRADED_QUANTITY: &str = "exchange_traded_quantity_total";
 /// Canonical events written. Label: `event_type`.
 pub const EVENTS: &str = "exchange_events_total";
-/// Webhook delivery attempts by outcome (`delivered`, `retry`, `dead`).
-pub const WEBHOOK_ATTEMPTS: &str = "webhook_delivery_attempts_total";
-/// Duration of one webhook HTTP attempt.
-pub const WEBHOOK_DURATION: &str = "webhook_delivery_duration_seconds";
 /// Settlement instructions with a transition still to come.
 pub const SETTLEMENT_OPEN: &str = "settlement_open_instructions";
-/// 1 for the persistence mode the service runs in, 0 for the others. Label: `mode`.
-pub const PERSISTENCE_MODE: &str = "exchange_persistence_mode";
-/// Outbox rows by status (`PENDING`, `IN_FLIGHT`, `DELIVERED`, `DEAD`), read from SQLite at scrape time.
-pub const OUTBOX: &str = "webhook_outbox_deliveries";
 
 const GROUP_BUCKETS: &[f64] = &[
     1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
@@ -77,17 +67,6 @@ pub fn install() -> PrometheusHandle {
             handle
         })
         .clone()
-}
-
-/// Records the persistence mode the service runs in.
-pub fn set_persistence_mode(mode: crate::persistence::PersistenceMode) {
-    for each in crate::persistence::PersistenceMode::ALL {
-        ::metrics::gauge!(PERSISTENCE_MODE, "mode" => each.as_str()).set(if each == mode {
-            1.0
-        } else {
-            0.0
-        });
-    }
 }
 
 fn describe() {

@@ -1,6 +1,10 @@
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use simulator_kit::outbox::{
+    self, AttemptRow, DeliveryRecord, DeliveryStats, EVENT_COLUMNS, Outbox, event_row, write_events,
+};
+use simulator_kit::persistence::sql::{from_sql, parsed, timestamp, to_sql};
 use uuid::Uuid;
 
 use crate::clearing::{Draft, Statement, StoredStatement};
@@ -9,9 +13,7 @@ use crate::engine::BookUpdate;
 use crate::events::{self, EventEnvelope, NewEvent};
 use crate::ids::IdScheme;
 use crate::settlement::{ExternalReport, Instruction, SettlementStatus};
-use crate::webhooks::{
-    DeliveryJob, DeliveryOutcome, DeliveryResult, FaultPolicy, Subscription, SubscriptionSource,
-};
+use crate::webhooks::{DeliveryJob, DeliveryResult, FaultPolicy, Subscription};
 
 /// Repository over the single writer connection. Every state change a matching step produces is written by
 /// [`Store::commit`] in one transaction.
@@ -19,7 +21,7 @@ pub struct Store {
     conn: Connection,
     /// Set when WAL checkpoints run in the background (see [`Store::checkpoint_in_background`]). Declared after
     /// `conn`, so the writer closes first and the checkpointer's connection, the last one, removes the WAL.
-    checkpointer: Option<super::checkpoint::Checkpointer>,
+    checkpointer: Option<simulator_kit::persistence::checkpoint::Checkpointer>,
 }
 
 /// Optional equality filters for listing instruments; unset fields match everything.
@@ -40,55 +42,6 @@ pub struct ExecutionFilter {
     /// Matches executions where the order is the buy or the sell order.
     pub order_id: Option<Uuid>,
     pub limit: u32,
-}
-
-/// A recorded webhook attempt with its delivery's subscription and event.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AttemptRow {
-    pub id: u64,
-    pub delivery_id: Uuid,
-    pub subscription_id: Uuid,
-    pub url: String,
-    pub event_sequence: u64,
-    pub event_id: Uuid,
-    pub event_type: String,
-    pub attempt: u32,
-    pub held: bool,
-    pub faults: Vec<String>,
-    pub body: Option<String>,
-    pub http_status: Option<u16>,
-    pub error: Option<String>,
-    pub at: DateTime<Utc>,
-}
-
-/// A webhook delivery as test control shows it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeliveryRecord {
-    pub delivery_id: Uuid,
-    pub subscription_id: Uuid,
-    pub url: String,
-    pub event_sequence: u64,
-    pub event_id: Uuid,
-    pub event_type: String,
-    /// `PENDING`, `IN_FLIGHT`, `DELIVERED` or `DEAD`.
-    pub status: String,
-    pub attempts: u64,
-    pub last_error: Option<String>,
-    /// When the next attempt is due (pending), or the lease ends (in flight).
-    pub next_attempt_at: Option<DateTime<Utc>>,
-    pub delivered_at: Option<DateTime<Utc>>,
-}
-
-/// One subscription's deliveries by status.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DeliveryStats {
-    pub pending: u64,
-    pub in_flight: u64,
-    pub delivered: u64,
-    /// Dead letters.
-    pub dead: u64,
-    /// The event sequence and time of the oldest pending or in-flight delivery: how far behind the consumer is.
-    pub oldest_unfinished: Option<(u64, DateTime<Utc>)>,
 }
 
 /// An order with the timestamps stored alongside it.
@@ -123,7 +76,7 @@ impl Store {
             return Ok(());
         };
         let path = std::path::PathBuf::from(path);
-        self.checkpointer = Some(super::checkpoint::Checkpointer::start(
+        self.checkpointer = Some(simulator_kit::persistence::checkpoint::Checkpointer::start(
             &self.conn,
             &path,
             busy_timeout,
@@ -133,7 +86,7 @@ impl Store {
     }
 
     /// With background checkpoints, asks for one each time the WAL has grown by the threshold. Once the WAL holds four
-    /// times the threshold, the writer checkpoints itself, which bounds the WAL (see `persistence/checkpoint.rs`). Call it on the writer's thread after writing, outside a
+    /// times the threshold, the writer checkpoints itself, which bounds the WAL (see `simulator_kit::persistence::checkpoint`). Call it on the writer's thread after writing, outside a
     /// transaction; the exchange thread does so after every command or commit group.
     pub fn request_checkpoint_if_due(&self) {
         if let Some(checkpointer) = &self.checkpointer {
@@ -143,6 +96,11 @@ impl Store {
 
     pub fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    /// The writer connection, for shared components that write through it (the webhook hub).
+    pub fn connection_mut(&mut self) -> &mut Connection {
+        &mut self.conn
     }
 
     /// Opens the transaction of a commit group: the [`Store::commit`]s until [`Store::commit_group`] become durable
@@ -394,107 +352,22 @@ impl Store {
         limit: u32,
         event_type: Option<&str>,
     ) -> rusqlite::Result<Vec<EventEnvelope>> {
-        self.conn
-            .prepare_cached(&format!(
-                "SELECT {EVENT_COLUMNS} FROM events e
-                 WHERE e.sequence > ?1 AND (?2 IS NULL OR e.event_type = ?2)
-                 ORDER BY e.sequence LIMIT ?3"
-            ))?
-            .query_map(params![to_sql(after), event_type, limit], |row| {
-                event_row(row, 0)
-            })?
-            .collect()
+        outbox::events(&self.conn, after, limit, event_type)
     }
 
     pub fn insert_subscription(&self, subscription: &Subscription) -> rusqlite::Result<()> {
-        let event_types =
-            serde_json::to_string(&subscription.event_types).expect("strings serialize");
-        self.conn
-            .prepare_cached(
-                "INSERT INTO webhook_subscriptions (id, url, enabled, event_types, created_at, secret, ordered, name, source,
-                                                    paused, previous_secret, previous_secret_until, deleted)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            )?
-            .execute(params![
-                subscription.id.to_string(),
-                subscription.url,
-                subscription.enabled,
-                event_types,
-                timestamp(subscription.created_at),
-                subscription.secret,
-                subscription.ordered,
-                subscription.name,
-                subscription.source.as_str(),
-                subscription.paused,
-                subscription.previous_secret.as_ref().map(|(secret, _)| secret),
-                subscription.previous_secret.as_ref().map(|(_, until)| timestamp(*until)),
-                subscription.deleted,
-            ])
-            .map(drop)
+        outbox::insert_subscription(&self.conn, subscription)
     }
 
     /// Stores a subscription's url, event types, secrets, ordering, and enabled, paused and deleted flags; false when
     /// there is no such subscription. Its pending deliveries keep their place and go to the new URL; while it is disabled or paused
     /// they wait.
     pub fn update_subscription(&self, subscription: &Subscription) -> rusqlite::Result<bool> {
-        let event_types =
-            serde_json::to_string(&subscription.event_types).expect("strings serialize");
-        self.conn
-            .prepare_cached(
-                "UPDATE webhook_subscriptions SET url = ?2, enabled = ?3, event_types = ?4, secret = ?5, ordered = ?6,
-                                                 paused = ?7, previous_secret = ?8, previous_secret_until = ?9,
-                                                 deleted = ?10
-                 WHERE id = ?1",
-            )?
-            .execute(params![
-                subscription.id.to_string(),
-                subscription.url,
-                subscription.enabled,
-                event_types,
-                subscription.secret,
-                subscription.ordered,
-                subscription.paused,
-                subscription.previous_secret.as_ref().map(|(secret, _)| secret),
-                subscription.previous_secret.as_ref().map(|(_, until)| timestamp(*until)),
-                subscription.deleted,
-            ])
-            .map(|n| n == 1)
+        outbox::update_subscription(&self.conn, subscription)
     }
 
     pub fn subscriptions(&self) -> rusqlite::Result<Vec<Subscription>> {
-        self.conn
-            .prepare_cached(
-                "SELECT id, url, enabled, event_types, created_at, secret, ordered, fault_policy, name, source, paused,
-                        previous_secret, previous_secret_until, deleted
-                 FROM webhook_subscriptions ORDER BY created_at, id",
-            )?
-            .query_map([], |row| {
-                let event_types: String = row.get(3)?;
-                Ok(Subscription {
-                    id: parsed(row, 0)?,
-                    url: row.get(1)?,
-                    enabled: row.get(2)?,
-                    event_types: serde_json::from_str(&event_types).map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(e))
-                    })?,
-                    created_at: parsed(row, 4)?,
-                    secret: row.get(5)?,
-                    ordered: row.get(6)?,
-                    faults: json_column(row, 7)?,
-                    name: row.get(8)?,
-                    source: match row.get::<_, String>(9)?.as_str() {
-                        "config" => SubscriptionSource::Config,
-                        _ => SubscriptionSource::Api,
-                    },
-                    paused: row.get(10)?,
-                    previous_secret: match row.get::<_, Option<String>>(11)? {
-                        Some(secret) => Some((secret, parsed(row, 12)?)),
-                        None => None,
-                    },
-                    deleted: row.get(13)?,
-                })
-            })?
-            .collect()
+        outbox::subscriptions(&self.conn)
     }
 
     /// Sets or clears a subscription's fault policy; false when there is no such subscription.
@@ -503,45 +376,12 @@ impl Store {
         subscription_id: Uuid,
         policy: Option<&FaultPolicy>,
     ) -> rusqlite::Result<bool> {
-        let policy = policy.map(|p| serde_json::to_string(p).expect("policies serialize"));
-        self.conn
-            .prepare_cached("UPDATE webhook_subscriptions SET fault_policy = ?2 WHERE id = ?1")?
-            .execute(params![subscription_id.to_string(), policy])
-            .map(|n| n == 1)
+        outbox::set_fault_policy(&self.conn, subscription_id, policy)
     }
 
     /// Recorded webhook attempts, oldest first, optionally for one subscription.
     pub fn attempts(&self, subscription_id: Option<Uuid>) -> rusqlite::Result<Vec<AttemptRow>> {
-        self.conn
-            .prepare_cached(
-                "SELECT a.id, a.delivery_id, d.subscription_id, s.url, d.event_sequence, e.event_id, e.event_type,
-                        a.attempt, a.outcome, a.faults, a.body, a.http_status, a.error, a.at
-                 FROM webhook_attempts a
-                 JOIN webhook_deliveries d ON d.id = a.delivery_id
-                 JOIN webhook_subscriptions s ON s.id = d.subscription_id
-                 JOIN events e ON e.sequence = d.event_sequence
-                 WHERE ?1 IS NULL OR d.subscription_id = ?1
-                 ORDER BY a.id",
-            )?
-            .query_map(params![subscription_id.map(|id| id.to_string())], |row| {
-                Ok(AttemptRow {
-                    id: from_sql(row, 0)?,
-                    delivery_id: parsed(row, 1)?,
-                    subscription_id: parsed(row, 2)?,
-                    url: row.get(3)?,
-                    event_sequence: from_sql(row, 4)?,
-                    event_id: parsed(row, 5)?,
-                    event_type: row.get(6)?,
-                    attempt: row.get(7)?,
-                    held: row.get::<_, String>(8)? == "HELD",
-                    faults: json_column(row, 9)?.unwrap_or_default(),
-                    body: row.get(10)?,
-                    http_status: row.get(11)?,
-                    error: row.get(12)?,
-                    at: parsed(row, 13)?,
-                })
-            })?
-            .collect()
+        outbox::attempts(&self.conn, subscription_id)
     }
 
     /// Claims up to `limit` deliveries that are due at `now` (pending, or in flight with an expired lease), oldest
@@ -553,47 +393,7 @@ impl Store {
         lease_until: DateTime<Utc>,
         limit: u32,
     ) -> rusqlite::Result<Vec<DeliveryJob>> {
-        let tx = self.conn.transaction()?;
-        let jobs = {
-            let mut select = tx.prepare_cached(&format!(
-                "SELECT d.id, d.subscription_id, s.url, d.attempts, {EVENT_COLUMNS}, s.secret, s.fault_policy, d.held,
-                        CASE WHEN s.previous_secret_until > ?1 THEN s.previous_secret END
-                 FROM webhook_deliveries d
-                 JOIN webhook_subscriptions s ON s.id = d.subscription_id
-                 JOIN events e ON e.sequence = d.event_sequence
-                 WHERE d.status IN ('PENDING', 'IN_FLIGHT') AND d.next_attempt_at <= ?1 AND s.enabled = 1 AND s.paused = 0 AND s.deleted = 0
-                   AND (s.ordered = 0 OR d.event_sequence = (
-                         SELECT MIN(u.event_sequence) FROM webhook_deliveries u
-                         WHERE u.subscription_id = d.subscription_id AND u.status IN ('PENDING', 'IN_FLIGHT')))
-                 ORDER BY d.next_attempt_at, d.event_sequence
-                 LIMIT ?2"
-            ))?;
-            let jobs = select
-                .query_map(params![timestamp(now), limit], |row| {
-                    Ok(DeliveryJob {
-                        delivery_id: parsed(row, 0)?,
-                        subscription_id: parsed(row, 1)?,
-                        url: row.get(2)?,
-                        attempts: row.get(3)?,
-                        event: event_row(row, 4)?,
-                        secret: row.get(14)?,
-                        faults: json_column(row, 15)?,
-                        held: row.get(16)?,
-                        previous_secret: row.get(17)?,
-                        epoch: 0,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut lease = tx.prepare_cached(
-                "UPDATE webhook_deliveries SET status = 'IN_FLIGHT', next_attempt_at = ?2 WHERE id = ?1",
-            )?;
-            for job in &jobs {
-                lease.execute(params![job.delivery_id.to_string(), timestamp(lease_until)])?;
-            }
-            jobs
-        };
-        tx.commit()?;
-        Ok(jobs)
+        outbox::claim_deliveries(&mut self.conn, now, lease_until, limit)
     }
 
     /// Records attempt outcomes. Each counts as one attempt, except a hold. Only in-flight deliveries are updated, so a
@@ -604,101 +404,22 @@ impl Store {
         results: &[DeliveryResult],
         now: DateTime<Utc>,
     ) -> rusqlite::Result<()> {
-        let now = timestamp(now);
-        let tx = self.conn.transaction()?;
-        {
-            let mut update = tx.prepare_cached(
-                "UPDATE webhook_deliveries
-                 SET status = ?2, attempts = attempts + 1, next_attempt_at = ?3, last_error = ?4, delivered_at = ?5
-                 WHERE id = ?1 AND status = 'IN_FLIGHT'",
-            )?;
-            let mut hold = tx.prepare_cached(
-                "UPDATE webhook_deliveries SET status = 'PENDING', next_attempt_at = ?2, held = 1
-                 WHERE id = ?1 AND status = 'IN_FLIGHT'",
-            )?;
-            let mut attempt = tx.prepare_cached(
-                "INSERT INTO webhook_attempts (delivery_id, attempt, outcome, faults, body, http_status, error, at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )?;
-            for result in results {
-                let (status, next, error, delivered) = match &result.outcome {
-                    DeliveryOutcome::Delivered => ("DELIVERED", None, None, Some(now.clone())),
-                    DeliveryOutcome::Retry { at, error } => {
-                        ("PENDING", Some(timestamp(*at)), Some(error.as_str()), None)
-                    }
-                    DeliveryOutcome::Dead { error } => ("DEAD", None, Some(error.as_str()), None),
-                    DeliveryOutcome::Held { .. } => ("PENDING", None, None, None),
-                };
-                if let DeliveryOutcome::Held { at } = &result.outcome {
-                    hold.execute(params![result.delivery_id.to_string(), timestamp(*at)])?;
-                } else {
-                    update.execute(params![
-                        result.delivery_id.to_string(),
-                        status,
-                        next,
-                        error,
-                        delivered
-                    ])?;
-                }
-                for sent in &result.sent {
-                    attempt.execute(params![
-                        result.delivery_id.to_string(),
-                        sent.attempt,
-                        if sent.held { "HELD" } else { "SENT" },
-                        serde_json::to_string(&sent.faults).expect("strings serialize"),
-                        sent.body,
-                        sent.http_status,
-                        sent.error,
-                        timestamp(sent.at),
-                    ])?;
-                }
-            }
-        }
-        tx.commit()
+        outbox::record_deliveries(&mut self.conn, results, now)
     }
 
     /// The stored virtual clock reading and whether it was running, if a virtual clock was ever used.
     pub fn virtual_clock(&self) -> rusqlite::Result<Option<(DateTime<Utc>, bool)>> {
-        self.conn
-            .query_row(
-                "SELECT now, running FROM virtual_clock WHERE id = 1",
-                [],
-                |row| Ok((parsed(row, 0)?, row.get(1)?)),
-            )
-            .optional()
+        outbox::virtual_clock(&self.conn)
     }
 
     /// The latest `occurred_at` of the events the exchange and the simulator stamped from the clock. External
     /// reports carry the reporter's own time, so they are left out.
     pub fn latest_clock_stamp(&self) -> rusqlite::Result<Option<DateTime<Utc>>> {
-        let latest: Option<String> = self.conn.query_row(
-            "SELECT MAX(occurred_at) FROM events WHERE source <> ?1",
-            [crate::events::EXTERNAL_SOURCE],
-            |row| row.get(0),
-        )?;
-        latest
-            .map(|text| {
-                DateTime::parse_from_rfc3339(&text)
-                    .map(|at| at.with_timezone(&Utc))
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })
-            })
-            .transpose()
+        outbox::latest_clock_stamp(&self.conn, events::EXTERNAL_SOURCE)
     }
 
     pub fn save_virtual_clock(&self, now: DateTime<Utc>, running: bool) -> rusqlite::Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO virtual_clock (id, now, running) VALUES (1, ?1, ?2)
-                 ON CONFLICT (id) DO UPDATE SET now = excluded.now, running = excluded.running",
-                params![timestamp(now), running],
-            )
-            .map(drop)
+        outbox::save_virtual_clock(&self.conn, now, running)
     }
 
     /// Settlement instructions with a transition still to come, for resuming the simulator.
@@ -883,12 +604,7 @@ impl Store {
 
     /// The sequence the next event will get: one past the highest ever assigned (AUTOINCREMENT never reuses one).
     pub fn next_event_sequence(&self) -> rusqlite::Result<u64> {
-        self.conn.query_row(
-            "SELECT MAX(COALESCE((SELECT MAX(sequence) FROM events), 0),
-                        COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)) + 1",
-            [],
-            |row| from_sql(row, 0),
-        )
+        outbox::next_event_sequence(&self.conn)
     }
 
     /// How many external reports an execution has.
@@ -960,58 +676,19 @@ impl Store {
         aggregate_id: &str,
         source: Option<&str>,
     ) -> rusqlite::Result<Vec<EventEnvelope>> {
-        self.conn
-            .prepare_cached(&format!(
-                "SELECT {EVENT_COLUMNS} FROM events e
-                 WHERE e.aggregate_id = ?1 AND (?2 IS NULL OR e.source = ?2) ORDER BY e.sequence"
-            ))?
-            .query_map(params![aggregate_id, source], |row| event_row(row, 0))?
-            .collect()
+        outbox::events_for(&self.conn, aggregate_id, source)
     }
 
     /// Number of webhook deliveries per status.
     pub fn delivery_counts(&self) -> rusqlite::Result<Vec<(String, u64)>> {
-        self.conn
-            .prepare_cached(
-                "SELECT status, COUNT(*) FROM webhook_deliveries GROUP BY status ORDER BY status",
-            )?
-            .query_map([], |row| Ok((row.get(0)?, from_sql(row, 1)?)))?
-            .collect()
+        outbox::delivery_counts(&self.conn)
     }
 
     /// Webhook deliveries with their subscription URL and event, in event order, then subscription; optionally only
     /// one subscription's, or only those with one status (e.g. `DEAD`, the dead letters).
     /// One subscription's deliveries by status, and its oldest unfinished one.
     pub fn delivery_stats(&self, subscription_id: Uuid) -> rusqlite::Result<DeliveryStats> {
-        let id = subscription_id.to_string();
-        let mut stats = DeliveryStats::default();
-        let mut counts = self.conn.prepare_cached(
-            "SELECT status, COUNT(*) FROM webhook_deliveries WHERE subscription_id = ?1 GROUP BY status",
-        )?;
-        let rows = counts.query_map([&id], |row| {
-            Ok((row.get::<_, String>(0)?, from_sql(row, 1)?))
-        })?;
-        for row in rows {
-            let (status, count) = row?;
-            match status.as_str() {
-                "PENDING" => stats.pending = count,
-                "IN_FLIGHT" => stats.in_flight = count,
-                "DELIVERED" => stats.delivered = count,
-                "DEAD" => stats.dead = count,
-                _ => {}
-            }
-        }
-        stats.oldest_unfinished = self
-            .conn
-            .prepare_cached(
-                "SELECT d.event_sequence, e.occurred_at FROM webhook_deliveries d
-                 JOIN events e ON e.sequence = d.event_sequence
-                 WHERE d.subscription_id = ?1 AND d.status IN ('PENDING', 'IN_FLIGHT')
-                 ORDER BY d.event_sequence LIMIT 1",
-            )?
-            .query_row([&id], |row| Ok((from_sql(row, 0)?, parsed(row, 1)?)))
-            .optional()?;
-        Ok(stats)
+        outbox::delivery_stats(&self.conn, subscription_id)
     }
 
     /// Webhook deliveries in event order: all, or one subscription's, of one status, after an event sequence, at most
@@ -1023,40 +700,7 @@ impl Store {
         after: u64,
         limit: u32,
     ) -> rusqlite::Result<Vec<DeliveryRecord>> {
-        self.conn
-            .prepare_cached(
-                "SELECT d.id, d.subscription_id, s.url, d.event_sequence, e.event_id, e.event_type, d.status,
-                        d.attempts, d.last_error, d.next_attempt_at, d.delivered_at
-                 FROM webhook_deliveries d
-                 JOIN webhook_subscriptions s ON s.id = d.subscription_id
-                 JOIN events e ON e.sequence = d.event_sequence
-                 WHERE (?1 IS NULL OR d.subscription_id = ?1) AND (?2 IS NULL OR d.status = ?2)
-                   AND d.event_sequence > ?3
-                 ORDER BY d.event_sequence, s.created_at, s.id
-                 LIMIT ?4",
-            )?
-            .query_map(params![subscription_id.map(|id| id.to_string()), status, to_sql(after), limit], |row| {
-                Ok(DeliveryRecord {
-                    delivery_id: parsed(row, 0)?,
-                    subscription_id: parsed(row, 1)?,
-                    url: row.get(2)?,
-                    event_sequence: from_sql(row, 3)?,
-                    event_id: parsed(row, 4)?,
-                    event_type: row.get(5)?,
-                    status: row.get(6)?,
-                    attempts: from_sql(row, 7)?,
-                    last_error: row.get(8)?,
-                    next_attempt_at: row
-                        .get::<_, Option<String>>(9)?
-                        .map(|_| parsed(row, 9))
-                        .transpose()?,
-                    delivered_at: row
-                        .get::<_, Option<String>>(10)?
-                        .map(|_| parsed(row, 10))
-                        .transpose()?,
-                })
-            })?
-            .collect()
+        outbox::deliveries(&self.conn, subscription_id, status, after, limit)
     }
 
     /// Queues the subscription's events after sequence `after` (of the types it wants) for delivery again, due at
@@ -1069,37 +713,7 @@ impl Store {
         now: DateTime<Utc>,
         ids: &IdScheme,
     ) -> rusqlite::Result<usize> {
-        let event_types =
-            serde_json::to_string(&subscription.event_types).expect("strings serialize");
-        let tx = self.conn.transaction()?;
-        let queued = {
-            let sequences = tx
-                .prepare_cached(
-                    "SELECT sequence FROM events
-                     WHERE sequence > ?1 AND event_type IN (SELECT value FROM json_each(?2))
-                     ORDER BY sequence",
-                )?
-                .query_map(params![to_sql(after), event_types], |row| from_sql(row, 0))?
-                .collect::<rusqlite::Result<Vec<u64>>>()?;
-            let mut upsert = tx.prepare_cached(
-                "INSERT INTO webhook_deliveries (id, subscription_id, event_sequence, status, attempts, next_attempt_at)
-                 VALUES (?1, ?2, ?3, 'PENDING', 0, ?4)
-                 ON CONFLICT (subscription_id, event_sequence) DO UPDATE
-                 SET status = 'PENDING', attempts = 0, next_attempt_at = ?4, last_error = NULL, delivered_at = NULL,
-                     held = 0",
-            )?;
-            for sequence in &sequences {
-                upsert.execute(params![
-                    ids.delivery(subscription.id, *sequence).to_string(),
-                    subscription.id.to_string(),
-                    to_sql(*sequence),
-                    timestamp(now),
-                ])?;
-            }
-            sequences.len()
-        };
-        tx.commit()?;
-        Ok(queued)
+        outbox::redeliver(&mut self.conn, subscription, after, now, ids)
     }
 
     /// Gives dead-lettered deliveries a fresh attempt budget, due at `now`: all of them, one subscription's, or the
@@ -1110,20 +724,7 @@ impl Store {
         delivery_ids: &[Uuid],
         now: DateTime<Utc>,
     ) -> rusqlite::Result<usize> {
-        let delivery_ids =
-            serde_json::to_string(&delivery_ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
-                .expect("strings serialize");
-        self.conn
-            .prepare_cached(
-                "UPDATE webhook_deliveries SET status = 'PENDING', attempts = 0, next_attempt_at = ?1, last_error = NULL
-                 WHERE status = 'DEAD' AND (?2 IS NULL OR subscription_id = ?2)
-                   AND (?3 = '[]' OR id IN (SELECT value FROM json_each(?3)))",
-            )?
-            .execute(params![
-                timestamp(now),
-                subscription_id.map(|id| id.to_string()),
-                delivery_ids
-            ])
+        outbox::retry_dead_letters(&mut self.conn, subscription_id, delivery_ids, now)
     }
 
     /// Deletes every row of every table, in one transaction: the empty state of a new database (the schema stays).
@@ -1147,59 +748,8 @@ impl Store {
 
     /// Makes every in-flight delivery due now. Used at startup, when no claim can still be in progress.
     pub fn release_claims(&self, now: DateTime<Utc>) -> rusqlite::Result<usize> {
-        self.conn.execute(
-            "UPDATE webhook_deliveries SET status = 'PENDING', next_attempt_at = ?1 WHERE status = 'IN_FLIGHT'",
-            [timestamp(now)],
-        )
+        outbox::release_claims(&self.conn, now)
     }
-}
-
-/// Stored timestamp form: RFC 3339 UTC with microseconds, so text order is time order.
-pub(crate) fn timestamp(at: DateTime<Utc>) -> String {
-    at.to_rfc3339_opts(SecondsFormat::Micros, true)
-}
-
-/// Domain quantities and sequences are `u64` but validated to fit SQLite's signed 64-bit integers.
-fn to_sql(value: u64) -> i64 {
-    i64::try_from(value).expect("domain integers are validated to fit i64")
-}
-
-/// A nullable JSON text column.
-fn json_column<T: serde::de::DeserializeOwned>(
-    row: &Row<'_>,
-    index: usize,
-) -> rusqlite::Result<Option<T>> {
-    let Some(text) = row.get::<_, Option<String>>(index)? else {
-        return Ok(None);
-    };
-    serde_json::from_str(&text)
-        .map(Some)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e)))
-}
-
-fn from_sql(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
-    let value: i64 = row.get(index)?;
-    u64::try_from(value)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, Type::Integer, Box::new(e)))
-}
-
-fn parsed<T>(row: &Row<'_>, index: usize) -> rusqlite::Result<T>
-where
-    T: std::str::FromStr,
-    T::Err: std::error::Error + Send + Sync + 'static,
-{
-    let text: String = row.get(index)?;
-    text.parse()
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e)))
-}
-
-/// Where a transaction's events go out: the subscriptions to queue deliveries for, the run's simulation ID, the ID
-/// scheme for delivery rows, and the real time at which the deliveries become due.
-pub struct Outbox<'a> {
-    pub subscriptions: &'a [Subscription],
-    pub simulation_id: Option<&'a str>,
-    pub ids: IdScheme,
-    pub due: DateTime<Utc>,
 }
 
 /// Settlement work committed together with something else: instructions' new states and the simulator's cursor.
@@ -1207,59 +757,6 @@ pub struct SettlementWrite<'a> {
     pub instructions: Vec<&'a Instruction>,
     pub consumer: &'a str,
     pub cursor: u64,
-}
-
-/// Appends stamped events to the canonical log at their assigned sequences, and queues one pending delivery per event
-/// and interested subscription, inside the caller's transaction.
-pub(crate) fn write_events(
-    tx: &Connection,
-    new_events: &[NewEvent],
-    outbox: &Outbox<'_>,
-) -> rusqlite::Result<()> {
-    let due = timestamp(outbox.due);
-    let mut insert_event = tx.prepare_cached(
-        "INSERT INTO events (sequence, event_id, event_type, schema_version, source, simulation_id, aggregate_id,
-                             correlation_id, payload, occurred_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-    )?;
-    let mut insert_delivery = tx.prepare_cached(
-        "INSERT INTO webhook_deliveries (id, subscription_id, event_sequence, status, attempts, next_attempt_at)
-         VALUES (?1, ?2, ?3, 'PENDING', 0, ?4)",
-    )?;
-    for event in new_events {
-        assert!(
-            event.sequence > 0,
-            "events are stamped before they are written"
-        );
-        insert_event.execute(params![
-            to_sql(event.sequence),
-            event.event_id.to_string(),
-            event.event_type,
-            events::SCHEMA_VERSION,
-            event.source,
-            outbox.simulation_id,
-            event.aggregate_id,
-            event.correlation_id,
-            event.payload.to_string(),
-            timestamp(event.occurred_at),
-        ])?;
-        for subscription in outbox
-            .subscriptions
-            .iter()
-            .filter(|s| s.wants(event.event_type))
-        {
-            insert_delivery.execute(params![
-                outbox
-                    .ids
-                    .delivery(subscription.id, event.sequence)
-                    .to_string(),
-                subscription.id.to_string(),
-                to_sql(event.sequence),
-                due
-            ])?;
-        }
-    }
-    Ok(())
 }
 
 fn write_settlement(tx: &Connection, write: &SettlementWrite<'_>) -> rusqlite::Result<()> {
@@ -1400,28 +897,6 @@ fn statement_row(row: &Row<'_>) -> rusqlite::Result<StoredStatement> {
         draft: Draft { statement, breaks },
         issued: row.get(2)?,
         event_sequence: sequence.map(|s| s as u64),
-    })
-}
-
-const EVENT_COLUMNS: &str = "e.event_id, e.sequence, e.event_type, e.schema_version, e.source, e.simulation_id, \
-                             e.aggregate_id, e.correlation_id, e.occurred_at, e.payload";
-
-/// Reads the [`EVENT_COLUMNS`] starting at column `at`.
-fn event_row(row: &Row<'_>, at: usize) -> rusqlite::Result<EventEnvelope> {
-    let payload: String = row.get(at + 9)?;
-    Ok(EventEnvelope {
-        event_id: parsed(row, at)?,
-        sequence: from_sql(row, at + 1)?,
-        event_type: row.get(at + 2)?,
-        schema_version: row.get(at + 3)?,
-        source: row.get(at + 4)?,
-        simulation_id: row.get(at + 5)?,
-        aggregate_id: row.get(at + 6)?,
-        correlation_id: row.get(at + 7)?,
-        occurred_at: parsed(row, at + 8)?,
-        payload: serde_json::from_str(&payload).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(at + 9, Type::Text, Box::new(e))
-        })?,
     })
 }
 

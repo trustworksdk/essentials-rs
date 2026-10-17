@@ -9,7 +9,8 @@ use crate::domain::IdentifierPolicy;
 use crate::ids::IdScheme;
 pub use crate::persistence::PersistenceMode;
 use crate::settlement::SettlementPolicy;
-use crate::webhooks::{RetryPolicy, WorkerConfig};
+pub use simulator_kit::clock::{ClockConfig, ClockMode};
+pub use simulator_kit::webhooks::{SubscriptionConfig, WebhooksConfig};
 
 const DEFAULTS: &str = include_str!("../config/default.yaml");
 
@@ -232,31 +233,6 @@ pub enum SettlementMode {
     Both,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct ClockConfig {
-    pub mode: ClockMode,
-    /// Virtual clock only: the first reading. Default: the real time at first startup.
-    #[serde(default)]
-    pub start: Option<chrono::DateTime<chrono::Utc>>,
-    /// Virtual clock only: start running instead of frozen.
-    #[serde(default)]
-    pub running: bool,
-    /// Virtual clock only: simulated seconds per real second while it runs (1440 makes a day pass in a minute).
-    #[serde(default = "real_time")]
-    pub speed: f64,
-}
-
-fn real_time() -> f64 {
-    1.0
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ClockMode {
-    System,
-    Virtual,
-}
-
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct TestControlConfig {
     pub enabled: bool,
@@ -266,121 +242,6 @@ pub struct TestControlConfig {
 pub struct EventsConfig {
     /// Stamped on every event as `simulationId`.
     pub simulation_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct WebhooksConfig {
-    pub poll_interval_ms: u64,
-    pub batch_size: u32,
-    pub concurrency: usize,
-    pub request_timeout_ms: u64,
-    pub max_attempts: u32,
-    pub initial_backoff_ms: u64,
-    pub max_backoff_ms: u64,
-    /// Subscriptions declared here are created or updated at startup, by name (see
-    /// [`crate::webhooks::DeclaredSubscription`]).
-    #[serde(default)]
-    pub subscriptions: Vec<SubscriptionConfig>,
-    /// When the configuration changes a declared subscription's secret, how long the previous one stays valid (both
-    /// signatures are sent meanwhile).
-    #[serde(default = "default_secret_grace_seconds")]
-    pub secret_grace_seconds: u64,
-}
-
-fn default_secret_grace_seconds() -> u64 {
-    3600
-}
-
-/// One entry of `webhooks.subscriptions`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct SubscriptionConfig {
-    /// Identifies the subscription across restarts and configuration changes.
-    pub name: String,
-    pub url: String,
-    pub event_types: Vec<String>,
-    /// The signing secret itself. At most one of `secret`, `secret_env` and `secret_file` may be set; with none,
-    /// deliveries are unsigned.
-    #[serde(default)]
-    pub secret: Option<String>,
-    /// The name of an environment variable holding the secret.
-    #[serde(default)]
-    pub secret_env: Option<String>,
-    /// A file holding the secret, e.g. a Docker secret under `/run/secrets`; surrounding whitespace is ignored.
-    #[serde(default)]
-    pub secret_file: Option<String>,
-    #[serde(default)]
-    pub ordered: bool,
-    /// `false` turns it off: no deliveries are recorded for it until it is enabled again.
-    #[serde(default = "enabled_by_default")]
-    pub enabled: bool,
-    /// `true` holds its deliveries: they are recorded and sent, in order, once it is unpaused.
-    #[serde(default)]
-    pub paused: bool,
-}
-
-fn enabled_by_default() -> bool {
-    true
-}
-
-impl SubscriptionConfig {
-    /// The subscription with its secret read from wherever it is configured.
-    pub fn resolve(&self) -> anyhow::Result<crate::webhooks::DeclaredSubscription> {
-        let name = &self.name;
-        let secret = match (&self.secret, &self.secret_env, &self.secret_file) {
-            (None, None, None) => None,
-            (Some(secret), None, None) => Some(secret.clone()),
-            (None, Some(variable), None) => Some(std::env::var(variable).map_err(|_| {
-                anyhow::anyhow!("webhooks.subscriptions {name}: secret_env {variable} is not set")
-            })?),
-            (None, None, Some(file)) => Some(
-                std::fs::read_to_string(file)
-                    .map_err(|e| {
-                        anyhow::anyhow!("webhooks.subscriptions {name}: secret_file {file}: {e}")
-                    })?
-                    .trim()
-                    .to_string(),
-            ),
-            _ => anyhow::bail!(
-                "webhooks.subscriptions {name}: set at most one of secret, secret_env and secret_file"
-            ),
-        };
-        Ok(crate::webhooks::DeclaredSubscription {
-            name: name.clone(),
-            subscription: crate::webhooks::NewSubscription {
-                url: self.url.clone(),
-                event_types: self.event_types.clone(),
-                secret,
-                ordered: self.ordered,
-            },
-            enabled: self.enabled,
-            paused: self.paused,
-        })
-    }
-}
-
-impl WebhooksConfig {
-    /// Every declared subscription, secrets resolved.
-    pub fn declared(&self) -> anyhow::Result<Vec<crate::webhooks::DeclaredSubscription>> {
-        self.subscriptions
-            .iter()
-            .map(SubscriptionConfig::resolve)
-            .collect()
-    }
-
-    pub fn worker(&self) -> WorkerConfig {
-        WorkerConfig {
-            poll_interval: Duration::from_millis(self.poll_interval_ms),
-            batch_size: self.batch_size.max(1),
-            concurrency: self.concurrency.max(1),
-            request_timeout: Duration::from_millis(self.request_timeout_ms),
-            retry: RetryPolicy {
-                max_attempts: self.max_attempts.max(1),
-                initial_backoff: Duration::from_millis(self.initial_backoff_ms),
-                max_backoff: Duration::from_millis(self.max_backoff_ms),
-            },
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

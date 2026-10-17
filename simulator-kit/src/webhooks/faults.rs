@@ -27,7 +27,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::market::Rng;
+use crate::rng::Rng;
 
 /// The longest `delay.ms`: a delayed request holds its slot in the worker's batch, so it must stay well inside the
 /// claim lease.

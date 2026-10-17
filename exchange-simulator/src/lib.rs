@@ -5,7 +5,6 @@
 pub mod api;
 pub mod app;
 pub mod clearing;
-pub mod clock;
 pub mod config;
 pub mod domain;
 pub mod engine;
@@ -16,4 +15,6 @@ pub mod metrics;
 pub mod persistence;
 pub mod scenario;
 pub mod settlement;
-pub mod webhooks;
+
+/// Shared with the other simulators (see `simulator_kit`), re-exported under their old paths.
+pub use simulator_kit::{clock, webhooks};

@@ -6,7 +6,6 @@ mod error;
 mod model;
 pub mod settlements;
 pub mod test_control;
-pub mod webhooks;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -91,7 +90,71 @@ pub fn router(state: AppState) -> Router {
         .with_state(state.clone())
         .merge(settlements::router(state.clone()))
         .merge(clearing::router(state.clone()))
-        .merge(webhooks::router(state))
+        .merge(simulator_kit::api::webhooks::router(state))
+}
+
+/// The shared webhook routes run on the exchange: changes through the dispatcher, queries on the read connection.
+impl simulator_kit::api::webhooks::WebhookBackend for AppState {
+    async fn register(
+        &self,
+        request: crate::webhooks::NewSubscription,
+    ) -> Result<crate::webhooks::Subscription, ApiError> {
+        Ok(self.dispatcher.register_webhook(request).await?)
+    }
+
+    async fn update(
+        &self,
+        id: Uuid,
+        change: crate::webhooks::WebhookChange,
+    ) -> Result<crate::webhooks::Subscription, ApiError> {
+        Ok(self.dispatcher.update_webhook(id, change).await?)
+    }
+
+    async fn delete(&self, id: Uuid) -> Result<(), ApiError> {
+        Ok(self.dispatcher.delete_webhook(id).await?)
+    }
+
+    async fn rotate_secret(
+        &self,
+        id: Uuid,
+        secret: String,
+        grace: chrono::Duration,
+    ) -> Result<crate::webhooks::Subscription, ApiError> {
+        Ok(self
+            .dispatcher
+            .rotate_webhook_secret(id, secret, grace)
+            .await?)
+    }
+
+    async fn set_faults(
+        &self,
+        id: Uuid,
+        policy: Option<crate::webhooks::FaultPolicy>,
+    ) -> Result<crate::webhooks::Subscription, ApiError> {
+        Ok(self.dispatcher.set_webhook_faults(id, policy).await?)
+    }
+
+    async fn redeliver(&self, id: Uuid, after: u64) -> Result<usize, ApiError> {
+        Ok(self.dispatcher.redeliver(id, after).await?)
+    }
+
+    async fn retry_dead_letters(
+        &self,
+        subscription_id: Option<Uuid>,
+        delivery_ids: Vec<Uuid>,
+    ) -> Result<usize, ApiError> {
+        Ok(self
+            .dispatcher
+            .retry_dead_letters(subscription_id, delivery_ids)
+            .await?)
+    }
+
+    async fn read<T: Send + 'static>(
+        &self,
+        query: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,
+    ) -> Result<T, ApiError> {
+        AppState::read(self, move |store| query(store.connection())).await
+    }
 }
 
 /// Liveness and readiness: the process is up and the database answers.

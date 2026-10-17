@@ -26,11 +26,10 @@
 //! References: `as: name` names an order; `name` stands for its order ID and `name#i` for the ID of its `i`-th
 //! execution (from its submit response). `instrumentId` may be left out when the scenario has one instrument.
 
-mod matcher;
 mod runner;
 
-pub use matcher::{contains, mismatches};
 pub use runner::{EventLog, Report, StepReport, run};
+pub use simulator_kit::matcher::{contains, mismatches};
 
 use std::collections::BTreeMap;
 

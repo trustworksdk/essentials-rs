@@ -10,7 +10,6 @@ use crate::domain::{
     Side,
 };
 use crate::engine::{BookSnapshot, Level, RejectReason, SubmitOrder};
-use crate::webhooks::{FaultPolicy, Subscription};
 
 fn one() -> u64 {
     1
@@ -344,65 +343,4 @@ pub struct EventQuery {
     /// 1 to 1000; default 100.
     pub limit: Option<u32>,
     pub event_type: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WebhookRequest {
-    pub url: String,
-    pub event_types: Vec<String>,
-    /// Optional HMAC secret (16–256 characters); when set, every delivery is signed. Never returned.
-    pub secret: Option<String>,
-    /// Deliver one at a time in event sequence order (default false).
-    #[serde(default)]
-    pub ordered: bool,
-}
-
-/// A subscription as the API shows it: the secret is never returned, only whether there is one.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SubscriptionView {
-    pub id: Uuid,
-    pub url: String,
-    pub event_types: Vec<String>,
-    pub enabled: bool,
-    /// Deliveries are recorded but held until it is unpaused.
-    pub paused: bool,
-    pub signed: bool,
-    pub ordered: bool,
-    pub created_at: DateTime<Utc>,
-    /// The delivery fault policy, when test control set one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub faults: Option<FaultPolicy>,
-    /// The name it is declared under in `webhooks.subscriptions`; API-created subscriptions have none.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// `api` or `config`: who owns it.
-    pub source: crate::webhooks::SubscriptionSource,
-    /// After a secret rotation, until when deliveries are also signed with the previous secret.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_secret_valid_until: Option<DateTime<Utc>>,
-    /// Shown only when listing with `includeDeleted=true`.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub deleted: bool,
-}
-
-impl From<Subscription> for SubscriptionView {
-    fn from(s: Subscription) -> Self {
-        Self {
-            id: s.id,
-            url: s.url,
-            event_types: s.event_types,
-            enabled: s.enabled,
-            paused: s.paused,
-            signed: s.secret.is_some(),
-            ordered: s.ordered,
-            created_at: s.created_at,
-            faults: s.faults,
-            name: s.name,
-            source: s.source,
-            previous_secret_valid_until: s.previous_secret.map(|(_, until)| until),
-            deleted: s.deleted,
-        }
-    }
 }
