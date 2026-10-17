@@ -1,0 +1,79 @@
+# Built-in defaults, compiled into the binary. Override with a file named by GATEWAY_CONFIG and/or environment
+# variables prefixed GATEWAY__ with `__` between levels, e.g. GATEWAY__SERVER__BIND=0.0.0.0:9000.
+server:
+  bind: "127.0.0.1:8081"
+payments:
+  # Seeds every outcome, delay and return; the same payments in the same order give the same lifecycle.
+  seed: 1
+  # Accepted currencies and their decimals (minor units).
+  currencies: { DKK: 2, EUR: 2, USD: 2, SEK: 2, NOK: 2, GBP: 2, CHF: 2, JPY: 0 }
+  # Delays are domain time (the clock below), drawn uniformly between min and max seconds.
+  deposit:
+    fail_probability: 0.02
+    min_delay_seconds: 60
+    max_delay_seconds: 1800
+  withdrawal:
+    fail_probability: 0.02
+    min_delay_seconds: 600
+    max_delay_seconds: 14400
+  # A completed payment is returned (reversed) with this probability, 1..=max_return_days business days later.
+  return_probability: 0.01
+  max_return_days: 3
+statement:
+  # The bank's end-of-day statement of the firm's client-money account, one per currency with booked movements, at
+  # `cutoff` (local time in `time_zone`) on business days.
+  enabled: true
+  cutoff: "17:30"
+  time_zone: "UTC"
+  # The firm's account at the bank, printed on every statement.
+  account_iban: "DK5000400440116243"
+  # Balance before the first booked movement, per currency (decimal strings); unset currencies start at 0.
+  opening_balances: {}
+  # Seeded reconciliation breaks, all off by default. They change what statements say, never the payments.
+  breaks:
+    seed: 1
+    omit_probability: 0.0     # per entry: left out
+    alter_probability: 0.0    # per entry: amount off by one minor unit
+    phantom_probability: 0.0  # per statement with entries: an entry for a payment that does not exist
+    late_probability: 0.0     # per statement: issued 1..max_late_minutes after the cutoff
+    max_late_minutes: 60
+  # How often due payment transitions and statements are looked for (each clock change also does).
+  tick_interval_ms: 250
+# events.simulation_id: optional simulation run ID stamped on every event as simulationId. Unset by default.
+events: {}
+webhooks:
+  poll_interval_ms: 250
+  batch_size: 100
+  concurrency: 16
+  request_timeout_ms: 5000
+  max_attempts: 10
+  initial_backoff_ms: 500
+  max_backoff_ms: 300000
+  # Declared subscriptions, created or updated at startup by name, as in the exchange simulator. For example:
+  #   - name: payments
+  #     url: http://demo:8080/webhooks/payments
+  #     event_types: [PaymentPending, PaymentCompleted, PaymentFailed, PaymentReturned, BankStatementIssued]
+  #     secret_env: PAYMENTS_WEBHOOK_SECRET
+  #     ordered: true
+  subscriptions: []
+  secret_grace_seconds: 3600
+ids:
+  # "random": UUIDv7. "deterministic": every ID derived from `seed` and the order of commands.
+  mode: "random"
+  seed: 0
+clock:
+  # "system": domain time is real time. "virtual": controllable (start, running, speed), as in the exchange simulator.
+  mode: "system"
+  speed: 1
+test_control:
+  # Mounts /test/... Never enable outside test deployments.
+  enabled: false
+database:
+  # "durable", "fast" or "memory", as in the exchange simulator.
+  mode: "durable"
+  path: "data/payment-gateway.db"
+  busy_timeout_ms: 5000
+  memory_max_mib: 1024
+logging:
+  filter: "info"
+  format: "pretty"

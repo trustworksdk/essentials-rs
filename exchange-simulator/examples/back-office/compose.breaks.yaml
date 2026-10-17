@@ -1,0 +1,20 @@
+# Reconciliation breaks on both statements: docker compose -f compose.yaml -f compose.breaks.yaml up -d --wait
+# Every statement gets a phantom line and comes late; some lines are left out or changed. Seeded: the same activity
+# gives the same breaks. GET /test/clearing/breaks (exchange) and /test/statements/breaks (gateway) list them.
+services:
+  exchange:
+    environment:
+      EXCHANGE__CLEARING__BREAKS__SEED: "7"
+      EXCHANGE__CLEARING__BREAKS__OMIT_PROBABILITY: "0.2"
+      EXCHANGE__CLEARING__BREAKS__ALTER_PROBABILITY: "0.3"
+      EXCHANGE__CLEARING__BREAKS__PHANTOM_PROBABILITY: "1.0"
+      EXCHANGE__CLEARING__BREAKS__LATE_PROBABILITY: "1.0"
+      EXCHANGE__CLEARING__BREAKS__MAX_LATE_MINUTES: "30"
+  gateway:
+    environment:
+      GATEWAY__STATEMENT__BREAKS__SEED: "7"
+      GATEWAY__STATEMENT__BREAKS__OMIT_PROBABILITY: "0.2"
+      GATEWAY__STATEMENT__BREAKS__ALTER_PROBABILITY: "0.3"
+      GATEWAY__STATEMENT__BREAKS__PHANTOM_PROBABILITY: "1.0"
+      GATEWAY__STATEMENT__BREAKS__LATE_PROBABILITY: "1.0"
+      GATEWAY__STATEMENT__BREAKS__MAX_LATE_MINUTES: "30"

@@ -1,0 +1,199 @@
+# Configuration
+
+## How settings are layered
+
+Three sources, each overriding the one before:
+1. **Built-in defaults:** [`config/default.yaml`](../config/default.yaml), compiled into the binary. It is commented,
+   and it is the complete list of keys.
+2. **A YAML file** named by the `EXCHANGE_CONFIG` environment variable. It only needs the keys that differ.
+3. **Environment variables** `EXCHANGE__<SECTION>__<KEY>`, for example `EXCHANGE__DATABASE__MODE=fast` or
+   `EXCHANGE__WEBHOOKS__MAX_ATTEMPTS=20`. Lists, such as `webhooks.subscriptions`, cannot be set this way; use the
+   file.
+
+`RUST_LOG`, when set, overrides `logging.filter`.
+
+**The image sets three variables, and they beat your file:** `EXCHANGE__SERVER__BIND=0.0.0.0:8080`,
+`EXCHANGE__DATABASE__PATH=/var/lib/exchange/exchange.db` and `EXCHANGE__LOGGING__FORMAT=json`. To change one of these
+in a container, set the variable rather than the file key.
+
+The service checks its configuration at startup and refuses to start, with a message, when something is wrong: an
+invalid webhook declaration, an unreadable secret file, settlement cancel, fail and delay probabilities that add up to more than 1.
+
+The [README's settings table](../README.md#running) gives every key with its default. The sections below are the ones
+that matter in practice.
+
+## Persistence
+
+| Key | Default | |
+|---|---|---|
+| `database.mode` | `durable` | `durable`, `fast` or `memory` |
+| `database.path` | `data/exchange.db` (`/var/lib/exchange/exchange.db` in the image) | unused in `memory` |
+| `database.checkpoint` | `background` | `inline` brings back SQLite's checkpoint inside commits |
+| `database.memory_max_mib` | `4096` | `memory` only |
+
+What each mode survives:
+
+| Mode | Process or container restart | Host crash or power loss |
+|---|---|---|
+| `durable` | everything | everything that was acknowledged |
+| `fast` | everything | all but the last commits; the database is never corrupted |
+| `memory` | nothing | nothing |
+
+- **`durable`** is the right default.
+- **`fast`** is for load tests that still need state across restarts. With group commit on, it gains little over
+  `durable` (see the [benchmarks](../bench/README.md)).
+- **`memory`** is for throughput runs where nothing needs to survive. It needs RAM for about 3–4 KiB per order, and
+  more while the database grows.
+
+The mode shows in `GET /health`, in the `exchange_persistence_mode` metric, and, in `fast` and `memory` mode, in an
+`Exchange-Persistence` header on every response.
+
+**Persistence also depends on where the file lives.** Without a volume, a new container starts empty in any mode. In
+Kubernetes an `emptyDir` is lost when the pod is rescheduled; use a persistent volume.
+
+## Webhooks
+
+| Key | Default | |
+|---|---|---|
+| `webhooks.subscriptions` | `[]` | Subscriptions declared by name; see [Operations](operations.md#declared-or-api-created) |
+| `webhooks.max_attempts` | `10` | Attempts before a delivery is dead-lettered |
+| `webhooks.initial_backoff_ms` / `max_backoff_ms` | `500` / `300000` | The first retry delay; it doubles up to the cap, with jitter |
+| `webhooks.request_timeout_ms` | `5000` | A slower answer counts as a failed attempt |
+| `webhooks.concurrency` / `batch_size` | `16` / `100` | Requests in flight, and deliveries claimed per round |
+| `webhooks.poll_interval_ms` | `250` | How often due retries are looked for (new events are sent at once) |
+| `webhooks.secret_grace_seconds` | `3600` | How long a declared subscription's previous secret keeps signing after the file changes it |
+
+**How long a consumer can be down before deliveries are dead-lettered**, with the default backoff (each wait is drawn
+between half and all of its doubling step, capped at `max_backoff_ms`):
+
+| `max_attempts` | Retries span about |
+|---:|---|
+| 10 (default) | 2–4 minutes |
+| 15 | 14–29 minutes |
+| 20 | 27–54 minutes |
+| 30 | 52–104 minutes |
+
+Dead letters are not lost: they can be retried at any time ([Operations](operations.md#dead-letters)). For planned
+downtime, pausing the subscription is better than relying on retries.
+
+## Settlement
+
+`settlement.mode` decides who settles trades:
+- **`external`** (default): your service settles from the `TradeExecuted` webhook.
+- **`simulated`:** the built-in simulator runs the T+N lifecycle and emits `Settlement*` events.
+- **`both`:** the simulator runs, and your service can also report outcomes back.
+
+The cycle is T+1 by default (`settlement_days: 1`). Markets still on another cycle are listed by MIC:
+
+```yaml
+settlement:
+  mode: simulated
+  market_settlement_days: { XCSE: 2, XSTO: 2 }   # T+2 until the EU moves to T+1 on 2027-10-11
+```
+
+The [README's Settlement section](../README.md#settlement) covers the policy keys: probabilities, delays,
+`settlement_days` and `market_settlement_days`.
+
+## Clearing
+
+`clearing.enabled: true` adds end-of-day clearing statements: at the cutoff on each business day, one
+`ClearingStatementIssued` per participant that traded, with its trades and net obligations per instrument and
+settlement date. The cutoff is local time in an IANA time zone, so it follows daylight saving:
+
+```yaml
+clearing:
+  enabled: true
+  cutoff: "17:30"
+  time_zone: Europe/Copenhagen
+```
+
+Statements are for reconciling against, so they can be made wrong on purpose. `clearing.breaks` leaves trades out,
+changes a quantity or price by one, adds a trade that does not exist, or issues a statement late, each with a seeded
+probability. Every break is listed under `GET /test/clearing/breaks`. The
+[README's Clearing section](../README.md#clearing) has the statement format and each break.
+
+## Recipes
+
+A file for each common setup, used with `EXCHANGE_CONFIG`.
+
+**Integration environment, settlement handled by your service** (the defaults plus your consumers):
+
+```yaml
+webhooks:
+  max_attempts: 20                     # rides out a consumer restart of up to half an hour
+  subscriptions:
+    - name: settlement
+      url: http://settlement-service:8080/webhooks/trades
+      event_types: [TradeExecuted]
+      secret_file: /run/secrets/settlement_webhook_secret
+      ordered: true
+```
+
+**Simulated settlement, for exercising consumers of lifecycle events:**
+
+```yaml
+settlement:
+  mode: simulated
+  fail_probability: 0.05
+  delay_probability: 0.10
+webhooks:
+  subscriptions:
+    - name: lifecycle
+      url: http://ledger:8080/webhooks/settlement
+      event_types: [SettlementPending, SettlementCompleted, SettlementFailed, SettlementDelayed,
+                    SettlementRejected, SettlementCancelled, SettlementCorrected]
+      secret_env: LEDGER_WEBHOOK_SECRET
+```
+
+**Reproducible test runs:** identical IDs and event logs run after run, and time under the test's control:
+
+```yaml
+ids: { mode: deterministic, seed: 42 }
+clock: { mode: virtual, start: "2030-01-07T09:00:00Z" }
+test_control: { enabled: true }        # mounts /test; never expose it outside test deployments
+```
+
+**Short demo: a simulated day per real minute,** so settlement completes while the audience watches:
+
+```yaml
+clock:
+  mode: virtual
+  start: "2030-01-07T08:00:00Z"        # a Monday morning; any business day works
+  running: true
+  speed: 1440                          # a simulated day per real minute
+settlement:
+  mode: simulated
+  fail_probability: 0.0                # every trade settles, for a clean run
+  delay_probability: 0.0
+```
+
+At this speed a trade made at 09:00 is settled at 00:00 the next day (T+1), about 37 real seconds later; a Friday
+trade settles on Monday, under 3 minutes later. Webhook retries and timeouts stay on real time, so a consumer that
+is briefly down catches up as usual. Points to keep in mind:
+- **Take dates from the events.** A consumer, such as the demo app, must take dates and times from `occurredAt`,
+  `executedAt`, `tradeDate` and `intendedSettlementDate`, never from its own clock, which runs a thousand times
+  slower than the exchange's.
+- **A restart keeps simulated time** (it continues from the latest event) and the configured speed. For a fresh run,
+  remove the database volume, or call `POST /test/reset` where test control is enabled.
+- **To change the speed during a demo**, enable test control and call `POST /test/clock/speed`. A showcase deployment
+  sets `clock.speed` in its configuration instead, so it does not expose `/test`.
+
+**Back-office demo: statements to reconcile, with a few breaks.** Add to the short-demo recipe:
+
+```yaml
+clearing:
+  enabled: true
+  cutoff: "17:30"
+  time_zone: Europe/Copenhagen
+  breaks: { seed: 11, omit_probability: 0.05, alter_probability: 0.05, late_probability: 0.2 }
+```
+
+At `speed: 1440` a statement arrives once a simulated business day, about every real minute. Trades after the cutoff
+are dated the next business day, on its statement, and settle T+1 from it.
+
+**Load test without durability:**
+
+```yaml
+database: { mode: memory, memory_max_mib: 8192 }
+exchange: { command_queue_capacity: 20000 }
+```

@@ -1,0 +1,2 @@
+# Local runs keep the SQLite database here (config/default.yaml).
+/data/

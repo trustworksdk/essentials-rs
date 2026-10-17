@@ -1,0 +1,31 @@
+name: T+2 settlement over a weekend, with an external report
+description: >
+  The default cycle is T+1, but this market (XCSE) is configured to keep T+2. A Thursday trade settles on Monday
+  (T+2 business days), exactly at 00:00 UTC. An external service reports its own
+  outcome, which stays apart from the simulator's.
+seed: 2
+start: 2030-01-10T15:00:00Z   # Thursday
+settlement: { mode: both, fail_probability: 0, delay_probability: 0, market_settlement_days: { XCSE: 2 } }
+instruments:
+  - { id: ACME, symbol: ACME, mic: XCSE, currency: DKK, currencyScale: 2 }
+participants:
+  - { id: A, name: Seller, settlement: { account: DK-0001 } }
+  - { id: B, name: Buyer }
+steps:
+  - order: { participantId: A, side: SELL, type: LIMIT, priceTicks: 10025, quantity: 100 }
+  - order: { as: buy, participantId: B, side: BUY, type: LIMIT, priceTicks: 10025, quantity: 100 }
+  - expect: { settlement: "buy#0",
+              matches: { simulated: { status: PENDING, intendedSettlementDate: "2030-01-14" }, external: [] } }
+  - expect: { events: { eventType: TradeExecuted, payload: { sellerSettlement: { account: DK-0001 } } }, count: 1 }
+  - set_clock: { to: 2030-01-13T23:59:59Z }   # Sunday, one second before the settlement date
+  - expect: { events: { eventType: SettlementCompleted }, count: 0 }
+  - set_clock: { to: 2030-01-14T00:00:00Z }
+  - expect: { events: { eventType: SettlementCompleted, occurredAt: "2030-01-14T00:00:00Z",
+                        source: settlement-simulator }, count: 1 }
+  - report_settlement: { execution: "buy#0", status: FAILED, reference: csd-1, reason: late delivery,
+                         expect: { status: 201 } }
+  - report_settlement: { execution: "buy#0", status: FAILED, reference: csd-1, reason: late delivery,
+                         expect: { status: 200, matches: { duplicate: true } } }
+  - expect: { settlement: "buy#0",
+              matches: { simulated: { status: SETTLED }, external: [ { status: FAILED, reference: csd-1 } ] } }
+  - expect: { events: { eventType: SettlementOutcomeReported, source: external }, count: 1 }

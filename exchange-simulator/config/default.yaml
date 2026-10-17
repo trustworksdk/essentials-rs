@@ -1,0 +1,116 @@
+# Built-in defaults, compiled into the binary. Override with a file named by EXCHANGE_CONFIG and/or environment
+# variables prefixed EXCHANGE__ with `__` between levels, e.g. EXCHANGE__SERVER__BIND=0.0.0.0:9000.
+server:
+  bind: "127.0.0.1:8080"
+exchange:
+  # "strict": MIC/ISIN/CUSIP formats and check digits are validated at registration.
+  # "permissive": lengths only, for fixtures that need deliberately invalid identifiers.
+  identifier_policy: "strict"
+  # Commands waiting for the exchange thread. When full, requests fail fast with 503 instead of queueing unbounded.
+  command_queue_capacity: 10000
+  # Orders and cancellations already queued are committed together, up to max_commands per commit, and each caller
+  # is answered after that commit. max_commands: 1 commits every command on its own. max_wait_us > 0 waits that long
+  # for more commands once the queue is empty (more grouping, more latency at low load).
+  group_commit:
+    max_commands: 256
+    max_wait_us: 0
+# events.simulation_id: optional simulation run ID stamped on every event as simulationId, e.g.
+# EXCHANGE__EVENTS__SIMULATION_ID=run-1. Unset by default.
+events: {}
+webhooks:
+  # Look for due deliveries this often when no new event signalled them (this is when retries are picked up).
+  poll_interval_ms: 250
+  batch_size: 100
+  concurrency: 16
+  request_timeout_ms: 5000
+  # Attempts in total, the first included; then the delivery is dead-lettered (status DEAD).
+  max_attempts: 10
+  initial_backoff_ms: 500
+  max_backoff_ms: 300000
+  # Subscriptions declared here are created or updated at startup, by name. Ones removed from this list are disabled,
+  # with their history kept. They are read-only through the API (change them here and restart). For example:
+  #   - name: settlement
+  #     url: http://settlement-service:8080/trades
+  #     event_types: [TradeExecuted]
+  #     secret_env: SETTLEMENT_WEBHOOK_SECRET   # or secret: "...", or secret_file: /run/secrets/settlement
+  #     ordered: true                           # default false
+  #     enabled: true                           # default true; false turns it off (no deliveries recorded)
+  #     paused: false                           # default false; true records deliveries but holds them
+  subscriptions: []
+  # When the configuration changes a declared subscription's secret, deliveries are signed with both the new and the
+  # previous secret for this long, so the consumer can switch without rejecting any.
+  secret_grace_seconds: 3600
+ids:
+  # "random": UUIDv7, different every run. "deterministic": every ID (orders, executions, events, deliveries,
+  # subscriptions, reports) is derived from `seed` and the order of commands, so the same commands give the same IDs
+  # run after run. Use it for reproducible tests and scenarios.
+  mode: "random"
+  seed: 0
+settlement:
+  # "external": no simulation; an external service owns settlement. "simulated": the built-in simulator creates a
+  # settlement instruction per trade and emits Settlement* lifecycle events. "both": simulator plus externally
+  # reported outcomes, kept apart.
+  mode: "external"
+  # How often the simulator takes in new trades and fires due transitions (each clock change also does).
+  tick_interval_ms: 250
+  seed: 1
+  # T+N business days (weekends skipped) from the trade date to the intended settlement date. T+1 is the cycle in the
+  # US, Canada and Mexico since May 2024; the EU, UK and Switzerland move to it on 2027-10-11.
+  settlement_days: 1
+  # Markets on another cycle, by MIC (the instrument's `mic`). For example, until 2027-10-11:
+  #   market_settlement_days: { XCSE: 2, XSTO: 2 }
+  # or EXCHANGE__SETTLEMENT__MARKET_SETTLEMENT_DAYS__XCSE=2.
+  market_settlement_days: {}
+  reject_probability: 0.0
+  cancel_probability: 0.0
+  fail_probability: 0.02
+  delay_probability: 0.05
+  correct_probability: 0.0
+  max_delay_days: 3
+  max_delays: 2
+  correction_days: 1
+clearing:
+  # End-of-day clearing statements: at `cutoff` (local time in `time_zone`) on each business day, one
+  # ClearingStatementIssued per participant that traded since the previous cutoff, with its trades and net obligations
+  # per instrument and settlement date. Off by default. Runs on the domain clock, like settlement.
+  enabled: false
+  cutoff: "17:30"
+  time_zone: "UTC"           # an IANA name, e.g. Europe/Copenhagen
+  # Seeded reconciliation breaks, all off by default. They change what statements say, never the trades.
+  breaks:
+    seed: 1
+    omit_probability: 0.0     # per trade line: left out
+    alter_probability: 0.0    # per trade line: quantity or price off by one
+    phantom_probability: 0.0  # per statement: a trade that does not exist
+    late_probability: 0.0     # per statement: issued 1..max_late_minutes after the cutoff
+    max_late_minutes: 60
+clock:
+  # "system": domain time is real time. "virtual": a controllable clock for simulations and tests. It starts at
+  # `start` (default: the real time at first startup), frozen unless `running: true`, and resumes from its last
+  # reading after a restart. Webhook delivery scheduling always uses real time.
+  mode: "system"
+  # Virtual clock only: simulated seconds per real second while it runs. 1440 makes a day pass in a minute, for
+  # demos that settle T+1 trades within a minute or two. The system clock accepts only 1.
+  speed: 1
+test_control:
+  # Mounts /test/... (virtual clock controls). Never enable outside test deployments.
+  enabled: false
+database:
+  # "durable": every acknowledged command is synced to disk (WAL, synchronous=FULL).
+  # "fast": synced only at checkpoints (synchronous=NORMAL). Survives process and container restarts; a host crash or
+  #   power loss can lose the last commits, but never corrupts the database.
+  # "memory": an in-memory database. Nothing survives the process. path is unused.
+  mode: "durable"
+  path: "data/exchange.db"
+  # memory mode only: the most the database may grow to, in MiB.
+  memory_max_mib: 4096
+  busy_timeout_ms: 5000
+  # "background": a separate connection checkpoints the WAL once it holds checkpoint_pages pages, so no commit waits
+  # for a checkpoint. "inline": SQLite's automatic checkpoint, run inside the commit that crosses 1000 pages.
+  checkpoint: "background"
+  checkpoint_pages: 1000
+logging:
+  # Used when RUST_LOG is unset.
+  filter: "info"
+  # "pretty" or "json".
+  format: "pretty"

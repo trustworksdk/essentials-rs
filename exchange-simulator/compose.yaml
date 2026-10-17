@@ -1,0 +1,16 @@
+# docker compose -f exchange-simulator/compose.yaml up --build
+services:
+  exchange-simulator:
+    build:
+      context: ..
+      dockerfile: exchange-simulator/Dockerfile
+    image: exchange-simulator:dev
+    ports:
+      - "8080:8080"
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - exchange-data:/var/lib/exchange
+
+volumes:
+  exchange-data:

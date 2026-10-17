@@ -1,0 +1,29 @@
+name: Trading rules
+description: Self-trade rejection, market-order remainder, idempotent client order IDs, cancels and a trading halt.
+seed: 3
+instruments:
+  - { id: ACME, symbol: ACME, currency: DKK, currencyScale: 2 }
+participants:
+  - { id: A, name: A }
+  - { id: B, name: B }
+steps:
+  - order: { as: ask, clientOrderId: a-1, participantId: A, side: SELL, type: LIMIT, priceTicks: 10000, quantity: 10 }
+  - order: { clientOrderId: a-1, participantId: A, side: SELL, type: LIMIT, priceTicks: 10000, quantity: 10,
+             expect: { status: 200, matches: { duplicate: true } } }
+  - order: { clientOrderId: a-1, participantId: A, side: SELL, type: LIMIT, priceTicks: 10000, quantity: 11,
+             expect: { status: 409, matches: { error: client_order_id_conflict } } }
+  - order: { participantId: A, side: BUY, type: LIMIT, priceTicks: 10000, quantity: 5,
+             expect: { matches: { order: { status: REJECTED, rejectReason: SELF_TRADE } } } }
+  - order: { participantId: B, side: BUY, type: MARKET, quantity: 25,
+             expect: { matches: { order: { status: CANCELLED, remainingQuantity: 15 }, executions: [ { quantity: 10 } ] } } }
+  - expect: { book: ACME, matches: { bids: [], asks: [] } }
+  - order: { as: resting, participantId: A, side: SELL, type: LIMIT, priceTicks: 10100, quantity: 10 }
+  - set_instrument: { instrument: ACME, enabled: false }
+  - order: { participantId: B, side: BUY, type: LIMIT, priceTicks: 10100, quantity: 10,
+             expect: { matches: { order: { status: REJECTED, rejectReason: INSTRUMENT_DISABLED } } } }
+  - cancel: { order: resting, expect: { matches: { order: { status: CANCELLED } } } }
+  - cancel: { order: resting, expect: { status: 409 } }
+  - set_instrument: { instrument: ACME, enabled: true }
+  - order: { participantId: B, side: BUY, type: LIMIT, priceTicks: 10100, quantity: 10,
+             expect: { matches: { order: { status: OPEN } } } }
+  - expect: { events: { eventType: OrderRejected }, count: 2 }
