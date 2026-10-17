@@ -1456,6 +1456,62 @@ are small. Then 5.3 and 5.4 when back-office work starts, in the order the demo 
 - **Deviation:** the D10 entry listed the parts to move; the scenario matcher was added (pure, 100 lines, needed by
   any simulator's scenarios), and `ClockConfig` and `WebhooksConfig` moved with the clock and webhooks.
 
+**5.4b — payment gateway simulator ✅ done (2026-10-17)**
+- **Delivered:** a new workspace member, `payment-gateway` (with a README), built on `simulator-kit`.
+  - **API:** `POST /api/payments` (`idempotencyKey`, `type` `DEPOSIT`/`WITHDRAWAL`, the demo's opaque `accountId`, the
+    counterparty `bankAccount` with a mod-97-checked IBAN, `amount` as a decimal string, `currency`, `reference`);
+    a repeated key with the same details returns the payment with `duplicate: true`, with different details `409
+    idempotency_conflict`. `GET /api/payments/{id}`, `GET /api/payments?accountId=&status=&after=&limit=`,
+    `GET /api/events`, `/health`, `/metrics`.
+  - **Lifecycle:** `PENDING`, then after a seeded delay per type (domain time) `COMPLETED`, booked on the firm's
+    account, or `FAILED` with a reason. A completed payment may be `RETURNED` 1..=`max_return_days` business days
+    later, which books the reversal. Draws are a function of the seed and the payment's sequence.
+  - **Events:** `PaymentPending`, `PaymentCompleted`, `PaymentFailed`, `PaymentReturned` (`source:
+    payment-gateway`) and `BankStatementIssued` (`source: bank`), in the shared envelope and outbox.
+  - **Statements (D14):** at the cutoff on business days, one per currency the account has booked anything in,
+    `BS:<date>:<currency>`: entries with end-to-end IDs (the idempotency keys), opening balance (configured plus all
+    earlier bookings), credits, debits, closing balance. Payment transitions due by a cutoff run before it, as in the
+    exchange's clearing.
+  - **Breaks (D16):** omitted entry, amount off by one minor unit, phantom entry, late statement; seeded, listed under
+    `/test/statements/breaks`. A broken statement is consistent with itself; the next day opens at the true balance.
+  - **Shared parts:** webhooks and their maintenance API, signing, faults, declared subscriptions, the virtual clock
+    with speed, persistence modes and deterministic IDs all come from the kit. `/test` has the clock routes, reset,
+    statement breaks and the kit's webhook test routes.
+  - **Kit additions:** `calendar` (business days, and the cutoff calendar that was the exchange's
+    `ClearingCalendar`, now a type alias there) and `rng::draw` (moved from the exchange's settlement module). The
+    exchange re-exports both; its error messages are unchanged.
+- **Tests:** 28 in the gateway:
+  - unit tests for IBANs, amounts, currencies, the lifecycle (delays, credits and debits, returns on business days,
+    failure rates, seeding), statements (balances, directions, each break, no sign change), and configuration;
+  - `tests/payments.rs`: pending then completed on the clock, idempotency, validation, failures and returns, a
+    restart, deterministic IDs giving the same log twice (and in time order over a week), signed webhooks verified
+    on the raw body plus maintenance, clock/reset/health, invalid configuration;
+  - `tests/statements.rs`: balances carried from day to day and a second currency, returns as reversals over a week
+    in time order (Copenhagen cutoff, Friday after the cutoff dated Monday), late and broken statements across a
+    restart, statements off, reset.
+  - The gateway suite passed 5 repeat runs; all 261 tests of the three crates pass, and the exchange e2e passed
+    after the kit changes.
+- **Mutation checks**, each made a test fail: the opening balance ignoring earlier bookings; a statement before the
+  transitions due by its cutoff; a transition page spanning more than a day; idempotency ignoring the amount;
+  withdrawals credited; IBANs unchecked; late statements lost at restart; failures never drawn.
+- **Found and fixed:**
+  - **Events could leave time order when a payment takes over a day.** A page of due transitions could create a
+    return due before later items of the same page (for example, a three-day withdrawal and a deposit returned the
+    next day). Pages now span less than a day: a return is at least a business day after its completion, so it
+    always falls after the page. `a_return_due_before_a_slow_payment_completes_comes_first_in_the_log` covers it.
+  - Two test mistakes, fixed in the tests: a signature checked against re-serialized JSON (receivers must verify
+    the raw body, as the guide says), and a Friday payment placed before the Copenhagen cutoff.
+- **Decisions:**
+  - **One writer behind a mutex** instead of the exchange's dispatcher thread: the gateway has no hot path or group
+    commit, so commands and ticks run on the gateway under a lock, off the async runtime.
+  - **No balance checks** on withdrawals. Whether a client may withdraw is the demo's decision (D8).
+  - **Statements per currency**, from the first booking in it. A currency with no movements that day still gets its
+    statement, because a bank statement shows the balance.
+  - **WAL checkpoints stay SQLite's automatic ones** (no `database.checkpoint` setting): the gateway writes little.
+  - Payment IDs come from the kit's `derive` with the kind `payment`.
+- **Deviations:** none from the 5.4 entry and D13–D16. Scenarios are deferred (D15). The Docker image and a
+  Compose example move to 5.5, with the demo-shaped acceptance that runs both services.
+
 ## Suggested order
 
 1. Milestone 1 wrap-up: 1.1 now, then 1.2, then 1.3a–d.
@@ -1516,3 +1572,16 @@ Settled on 2026-10-17 (Milestone 5, third round):
   delivery, signing, fault injection and maintenance, the virtual clock and the persistence-mode plumbing move into a
   new workspace member that both simulators depend on. That refactor is its own step (5.4a, no behaviour change, the
   exchange's whole suite as its gate); the gateway itself is 5.4b.
+
+Settled on 2026-10-17 (5.4b, the payment gateway):
+- **D13 — accounts:** a payment carries the demo's opaque `accountId` (never assumed to mean anything) and the
+  counterparty's `bankAccount` (`iban`, `holderName`). There is no registration step; IBAN check digits are
+  validated.
+- **D14 — bank statement:** the bank's end-of-day statement of the firm's client-money account, per currency: every
+  movement booked that day (deposit credits, withdrawal debits, returns), with opening and closing balances derived
+  from all booked movements (and a configurable opening balance). As with clearing, it is computed from the
+  gateway's own payments; there is no separate ledger.
+- **D15 — gateway scenarios:** deferred to 5.5. 5.4b is tested through its API; 5.5's acceptance decides whether a
+  shared scenario runner is worth extracting.
+- **D16 — statement breaks:** opt-in and seeded, in the clearing style: a movement left out, an amount off by one minor
+  unit, a movement that never happened, a statement issued late; listed under `/test`.

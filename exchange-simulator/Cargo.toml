@@ -12,7 +12,6 @@ simulator-kit = { path = "../simulator-kit" }
 anyhow = "1.0.104"
 axum = "0.8.9"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
-chrono-tz = { version = "0.10.4", default-features = false, features = ["std"] }
 config = { version = "0.15.27", default-features = false, features = ["yaml"] }
 fastrand = "2.5.0"
 futures-util = "0.3.34"

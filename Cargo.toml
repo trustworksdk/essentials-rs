@@ -5,6 +5,7 @@ resolver = "3"
 members = [
     "durable-queues-rs",
     "exchange-simulator",
+    "payment-gateway",
     "simulator-kit",
 ]
 

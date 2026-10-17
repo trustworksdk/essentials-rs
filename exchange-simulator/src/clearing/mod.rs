@@ -18,82 +18,20 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
-use chrono_tz::Tz;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::domain::{InstrumentId, ParticipantId};
 use crate::events::{self, NewEvent};
-use crate::settlement::calendar::{add_business_days, is_business_day};
+use crate::settlement::calendar::add_business_days;
 use crate::settlement::{SettlementPolicy, TradeFacts, draw, format_amount};
 
-/// When statements are issued: `cutoff` local time in `time_zone`, on business days (Monday to Friday, D2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ClearingCalendar {
-    pub cutoff: NaiveTime,
-    pub time_zone: Tz,
-}
+/// When statements are issued: the clearinghouse's cutoff calendar (see [`simulator_kit::calendar::CutoffCalendar`]).
+pub type ClearingCalendar = simulator_kit::calendar::CutoffCalendar;
 
-impl ClearingCalendar {
-    /// Parses `cutoff` as `HH:MM` (or `HH:MM:SS`) and `time_zone` as an IANA name such as `Europe/Copenhagen`.
-    pub fn parse(cutoff: &str, time_zone: &str) -> Result<Self, String> {
-        let cutoff = NaiveTime::parse_from_str(cutoff, "%H:%M")
-            .or_else(|_| NaiveTime::parse_from_str(cutoff, "%H:%M:%S"))
-            .map_err(|_| format!("clearing.cutoff must be HH:MM, got {cutoff:?}"))?;
-        let time_zone = time_zone
-            .parse()
-            .map_err(|_| format!("clearing.time_zone is not a known time zone: {time_zone:?}"))?;
-        Ok(Self { cutoff, time_zone })
-    }
-
-    /// The instant of `date`'s cutoff. A cutoff that falls in a daylight-saving gap moves an hour later.
-    pub fn cutoff_at(&self, date: NaiveDate) -> DateTime<Utc> {
-        let local = date.and_time(self.cutoff);
-        self.time_zone
-            .from_local_datetime(&local)
-            .earliest()
-            .or_else(|| {
-                self.time_zone
-                    .from_local_datetime(&(local + chrono::Duration::hours(1)))
-                    .earliest()
-            })
-            .expect("a local time an hour after a gap exists")
-            .with_timezone(&Utc)
-    }
-
-    /// The business date whose statement a trade executed at `at` appears on.
-    pub fn business_date(&self, at: DateTime<Utc>) -> NaiveDate {
-        let local = at.with_timezone(&self.time_zone).date_naive();
-        if is_business_day(local) && at < self.cutoff_at(local) {
-            local
-        } else {
-            next_business_day(local)
-        }
-    }
-
-    /// The trades on `date`'s statement executed in `[from, until)`: from the previous business day's cutoff to this
-    /// one's.
-    pub fn window(&self, date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
-        (
-            self.cutoff_at(previous_business_day(date)),
-            self.cutoff_at(date),
-        )
-    }
-}
-
-pub fn next_business_day(date: NaiveDate) -> NaiveDate {
-    add_business_days(date.succ_opt().expect("date in range"), 0)
-}
-
-pub fn previous_business_day(date: NaiveDate) -> NaiveDate {
-    let mut current = date.pred_opt().expect("date in range");
-    while !is_business_day(current) {
-        current = current.pred_opt().expect("date in range");
-    }
-    current
-}
+pub use simulator_kit::calendar::{next_business_day, previous_business_day};
 
 pub fn statement_id(date: NaiveDate, participant: &ParticipantId) -> String {
     format!("CS:{date}:{}", participant.0)
@@ -489,29 +427,27 @@ pub struct PartyRef {
     pub obligation_id: String,
 }
 
-impl ClearingCalendar {
-    /// The references for a trade executed at `executed_at` that settles on `settles`.
-    pub fn refs(
-        &self,
-        executed_at: DateTime<Utc>,
-        instrument: &InstrumentId,
-        buyer: &ParticipantId,
-        seller: &ParticipantId,
-        settles: NaiveDate,
-    ) -> ClearingRefs {
-        let date = self.business_date(executed_at);
-        let party = |participant: &ParticipantId| {
-            let statement_id = statement_id(date, participant);
-            PartyRef {
-                obligation_id: obligation_id(&statement_id, instrument, settles),
-                statement_id,
-            }
-        };
-        ClearingRefs {
-            business_date: date,
-            buyer: party(buyer),
-            seller: party(seller),
+/// The references for a trade executed at `executed_at` that settles on `settles`.
+pub fn refs(
+    calendar: &ClearingCalendar,
+    executed_at: DateTime<Utc>,
+    instrument: &InstrumentId,
+    buyer: &ParticipantId,
+    seller: &ParticipantId,
+    settles: NaiveDate,
+) -> ClearingRefs {
+    let date = calendar.business_date(executed_at);
+    let party = |participant: &ParticipantId| {
+        let statement_id = statement_id(date, participant);
+        PartyRef {
+            obligation_id: obligation_id(&statement_id, instrument, settles),
+            statement_id,
         }
+    };
+    ClearingRefs {
+        business_date: date,
+        buyer: party(buyer),
+        seller: party(seller),
     }
 }
 
@@ -544,61 +480,6 @@ mod tests {
 
     fn copenhagen() -> ClearingCalendar {
         ClearingCalendar::parse("17:30", "Europe/Copenhagen").unwrap()
-    }
-
-    #[test]
-    fn cutoffs_follow_the_local_time_zone_through_daylight_saving() {
-        let calendar = copenhagen();
-        assert_eq!(
-            calendar.cutoff_at(d("2030-01-07")),
-            at("2030-01-07T16:30:00Z")
-        );
-        assert_eq!(
-            calendar.cutoff_at(d("2030-07-01")),
-            at("2030-07-01T15:30:00Z")
-        );
-        assert!(ClearingCalendar::parse("25:00", "UTC").is_err());
-        assert!(ClearingCalendar::parse("17:30", "Mars/Olympus").is_err());
-        assert_eq!(
-            ClearingCalendar::parse("17:30:15", "UTC").unwrap().cutoff,
-            NaiveTime::from_hms_opt(17, 30, 15).unwrap()
-        );
-    }
-
-    #[test]
-    fn a_trade_belongs_to_the_first_business_day_whose_cutoff_is_after_it() {
-        let calendar = copenhagen();
-        // Monday 2030-01-07; the cutoff is 16:30 UTC.
-        assert_eq!(
-            calendar.business_date(at("2030-01-07T09:00:00Z")),
-            d("2030-01-07")
-        );
-        assert_eq!(
-            calendar.business_date(at("2030-01-07T16:29:59Z")),
-            d("2030-01-07")
-        );
-        assert_eq!(
-            calendar.business_date(at("2030-01-07T16:30:00Z")),
-            d("2030-01-08")
-        );
-        // Friday after the cutoff, and the weekend, go to Monday.
-        assert_eq!(
-            calendar.business_date(at("2030-01-11T17:00:00Z")),
-            d("2030-01-14")
-        );
-        assert_eq!(
-            calendar.business_date(at("2030-01-12T12:00:00Z")),
-            d("2030-01-14")
-        );
-        // 23:30 UTC on Sunday is already Monday in Copenhagen, before its cutoff.
-        assert_eq!(
-            calendar.business_date(at("2030-01-13T23:30:00Z")),
-            d("2030-01-14")
-        );
-        assert_eq!(
-            calendar.window(d("2030-01-14")),
-            (at("2030-01-11T16:30:00Z"), at("2030-01-14T16:30:00Z"))
-        );
     }
 
     fn trade(sequence: u64, buyer: &str, seller: &str, quantity: u64, price: i64) -> TradeFacts {
@@ -690,7 +571,8 @@ mod tests {
 
     #[test]
     fn settlement_references_name_the_statement_and_obligation() {
-        let refs = copenhagen().refs(
+        let refs = refs(
+            &copenhagen(),
             at("2030-01-07T17:00:00Z"),
             &InstrumentId("ACME".into()),
             &ParticipantId("B".into()),

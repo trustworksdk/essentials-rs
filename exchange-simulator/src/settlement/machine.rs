@@ -184,7 +184,8 @@ impl SettlementSimulator {
             settled_at: None,
             updated_at: trade.executed_at,
             clearing: policy.clearing.map(|calendar| {
-                calendar.refs(
+                crate::clearing::refs(
+                    &calendar,
                     trade.executed_at,
                     &trade.instrument_id,
                     &trade.buyer_id,

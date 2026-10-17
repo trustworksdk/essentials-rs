@@ -794,7 +794,6 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
- "chrono-tz",
  "config",
  "fastrand",
  "futures-util",
@@ -1961,6 +1960,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
+name = "payment-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "config",
+ "http-body-util",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "simulator-kit",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2813,6 +2835,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "chrono-tz",
  "fastrand",
  "futures-util",
  "hmac",

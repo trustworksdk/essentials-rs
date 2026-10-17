@@ -1,0 +1,29 @@
+[package]
+name = "payment-gateway"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Payment gateway simulator: deposits and withdrawals with signed webhooks and end-of-day bank statements"
+
+[dependencies]
+simulator-kit = { path = "../simulator-kit" }
+anyhow = "1.0.104"
+axum = "0.8.9"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+config = { version = "0.15.27", default-features = false, features = ["yaml"] }
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+rusqlite = { version = "0.39.0", features = ["bundled", "hooks"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1.28.0", features = ["v7", "v8", "serde"] }
+
+[dev-dependencies]
+axum = "0.8.9"
+http-body-util = "0.1.5"
+tower = { version = "0.5.3", features = ["util"] }

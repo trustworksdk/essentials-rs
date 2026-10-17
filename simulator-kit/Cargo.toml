@@ -22,6 +22,7 @@ tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "s
 tracing = "0.1.44"
 uuid = { version = "1.28.0", features = ["v7", "v8", "serde"] }
 anyhow = "1.0.104"
+chrono-tz = { version = "0.10.4", default-features = false, features = ["std"] }
 fastrand = "2.5.0"
 
 [dev-dependencies]

@@ -1,4 +1,4 @@
-//! Seeded randomness.
+//! Seeded randomness: a stream ([`Rng`]) and stateless draws ([`draw`]).
 
 /// SplitMix64: small, fast and fully specified here, so streams never change with a dependency upgrade.
 #[derive(Clone, Debug)]
@@ -38,4 +38,16 @@ impl Rng {
         let v = self.unit();
         (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
     }
+}
+
+/// A uniform draw in [0, 1) that depends only on its inputs (SplitMix64 over a mix of them).
+pub fn draw(seed: u64, sequence: u64, attempt: u32, purpose: u64) -> f64 {
+    fn mix(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    let x = mix(mix(mix(seed) ^ sequence) ^ (u64::from(attempt) << 8 | purpose));
+    (x >> 11) as f64 / (1_u64 << 53) as f64
 }

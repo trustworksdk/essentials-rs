@@ -4,6 +4,7 @@
 //! payloads; `exchange-simulator` is the first user, the payment gateway the second.
 
 pub mod api;
+pub mod calendar;
 pub mod clock;
 pub mod events;
 pub mod ids;

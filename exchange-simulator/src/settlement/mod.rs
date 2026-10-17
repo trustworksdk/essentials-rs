@@ -14,7 +14,7 @@
 //! Draws are a pure function of (`seed`, the trade's event sequence, the attempt, the decision), so outcomes do not
 //! depend on processing order, tick timing or restarts, and events carry the scheduled instant as `occurredAt`.
 
-pub mod calendar;
+pub use simulator_kit::calendar;
 mod machine;
 
 pub use machine::{SettlementPlan, SettlementSimulator, Transition};
@@ -269,17 +269,7 @@ pub fn format_amount(minor: i64, scale: u8) -> String {
     )
 }
 
-/// A uniform draw in [0, 1) that depends only on its inputs (SplitMix64 over a mix of them).
-pub(crate) fn draw(seed: u64, sequence: u64, attempt: u32, purpose: u64) -> f64 {
-    fn mix(mut z: u64) -> u64 {
-        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    let x = mix(mix(mix(seed) ^ sequence) ^ (u64::from(attempt) << 8 | purpose));
-    (x >> 11) as f64 / (1_u64 << 53) as f64
-}
+pub(crate) use simulator_kit::rng::draw;
 
 #[cfg(test)]
 mod tests {

@@ -211,7 +211,8 @@ impl Config {
         let calendar = crate::clearing::ClearingCalendar::parse(
             &self.clearing.cutoff,
             &self.clearing.time_zone,
-        )?;
+        )
+        .map_err(|e| format!("clearing.{e}"))?;
         self.clearing.breaks.validate()?;
         Ok(Some(crate::clearing::ClearingPolicy {
             calendar,
