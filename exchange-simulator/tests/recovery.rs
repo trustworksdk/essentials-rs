@@ -59,6 +59,7 @@ fn acme() -> Instrument {
         tick_size_minor: 1,
         lot_size: 1,
         enabled: true,
+        reference_symbol: None,
     }
 }
 
@@ -664,8 +665,8 @@ fn events_and_webhook_deliveries_commit_or_roll_back_with_the_trade() {
     assert_eq!(count(&exchange, "SELECT COUNT(*) FROM orders"), 1);
     assert_eq!(
         count(&exchange, "SELECT COUNT(*) FROM events"),
-        1,
-        "only the first order's OrderAccepted"
+        2,
+        "InstrumentListed and only the first order's OrderAccepted"
     );
     assert_eq!(
         count(&exchange, "SELECT COUNT(*) FROM webhook_deliveries"),
@@ -683,6 +684,7 @@ fn events_and_webhook_deliveries_commit_or_roll_back_with_the_trade() {
     assert_eq!(
         types,
         [
+            "InstrumentListed",
             "OrderAccepted",
             "OrderAccepted",
             "TradeExecuted",
@@ -844,10 +846,10 @@ fn an_ordered_subscription_has_one_delivery_in_flight_in_sequence_order() {
     let first = store.claim_deliveries(at(0), at(10), 100).unwrap();
     assert_eq!(
         of(&first, unordered.id),
-        [1, 2, 3],
-        "unordered: everything due at once"
+        [2, 3, 4],
+        "unordered: everything due at once (sequence 1 is InstrumentListed)"
     );
-    assert_eq!(of(&first, ordered.id), [1], "ordered: only the oldest");
+    assert_eq!(of(&first, ordered.id), [2], "ordered: only the oldest");
     assert!(
         store
             .claim_deliveries(at(1), at(10), 100)
@@ -874,7 +876,7 @@ fn an_ordered_subscription_has_one_delivery_in_flight_in_sequence_order() {
     );
 
     let again = store.claim_deliveries(at(20), at(30), 100).unwrap();
-    assert_eq!(of(&again, ordered.id), [1], "the head is retried first");
+    assert_eq!(of(&again, ordered.id), [2], "the head is retried first");
     record(
         &mut store,
         again
@@ -889,7 +891,7 @@ fn an_ordered_subscription_has_one_delivery_in_flight_in_sequence_order() {
     let next = store.claim_deliveries(at(21), at(30), 100).unwrap();
     assert_eq!(
         of(&next, ordered.id),
-        [2],
+        [3],
         "after a dead letter, delivery continues with the next event"
     );
     record(
@@ -905,7 +907,7 @@ fn an_ordered_subscription_has_one_delivery_in_flight_in_sequence_order() {
             &store.claim_deliveries(at(22), at(30), 100).unwrap(),
             ordered.id
         ),
-        [3]
+        [4]
     );
 }
 

@@ -1605,7 +1605,40 @@ then 6.11, 6.12, 6.13–6.14.
 
 ### Milestone 6 progress
 
-Not started.
+**6.1 — instruments in configuration, instrument events ✅ done (2026-10-18)**
+- **Delivered:**
+  - `instruments:` in the config file: the fields of `POST /api/instruments` in snake_case, IDs unique.
+    `Exchange::reconcile_instruments` runs at recovery and after a reset, after the declared webhook subscriptions,
+    so a declared subscription receives the listings.
+  - `referenceSymbol` on instruments: optional, 1 to 64 printable ASCII characters without spaces (`BINANCE:BTCUSDT`
+    fits). Migration 013 adds the column. Accepted by `POST /api/instruments`, the config and
+    `PATCH /api/instruments/{id}`.
+  - The PATCH body now takes `enabled`, `referenceSymbol`, or both; absent fields stay, `null` clears the reference
+    symbol, an empty body is a `400`. `Exchange::update_instrument` takes an `InstrumentChange`.
+  - `InstrumentListed` and `InstrumentUpdated` (`source: exchange`, aggregate ID the instrument ID, no correlation ID).
+    Each is committed in one transaction with the instrument row and its webhook deliveries. The payload is the whole
+    instrument after the change; `InstrumentUpdated` adds `changes`, the wire names of the fields that changed.
+  - `openapi.yaml`, the README and `docs/configuration.md` (a new Instruments section) are updated.
+  - New suite `tests/instruments.rs` (6 tests), domain unit tests for the reference symbol and `InstrumentChange`.
+- **Decisions:**
+  - **Configuration wins at each start**, as for declared subscriptions (4.6a). A declared instrument can still be
+    changed through the API (unlike a declared subscription, which is read-only there), since scenarios and SR-11
+    need runtime changes. The next start restores the configured values, with an `InstrumentUpdated`.
+  - **Fields other than `enabled` and `reference_symbol` never change once listed.** A declared value that differs
+    from the listed instrument stops startup with an error naming the field. Changing a tick or lot size under
+    resting orders would corrupt them.
+  - **An instrument removed from the configuration stays listed.** Orders and trades refer to it; disabling it
+    silently would be a surprise. Delisting can come later if the demo needs it.
+  - **A change that alters nothing publishes nothing.** `PATCH {"enabled": true}` on an enabled instrument answers
+    `200` with no event, so the log holds only facts.
+- **Deviation:** the plan's 6.1 row also stored `priceSource` and `liquidity`. They are left to 6.2 and 6.7, which
+  give them real types; an opaque placeholder could not be described by the strict OpenAPI schemas.
+- **Consequence for existing tests:** every test that registers an instrument now has an `InstrumentListed` at
+  sequence 1. Five tests that counted events or delivery sequences were adjusted (`recovery.rs` ×2, `webhooks.rs`,
+  `scenarios.rs`, `openapi.rs`, the last now exercises real changes so `InstrumentUpdated` occurs).
+- **Mutation checks**, each made a test fail: configuration not winning over an API change; immutable fields not
+  checked; reset not relisting declared instruments; a no-op change publishing; instruments reconciled before
+  webhook subscriptions; a payload field renamed; the reference symbol not read back from storage.
 
 ## Beyond the milestones
 

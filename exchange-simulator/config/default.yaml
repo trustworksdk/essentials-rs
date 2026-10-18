@@ -40,6 +40,20 @@ webhooks:
   # When the configuration changes a declared subscription's secret, deliveries are signed with both the new and the
   # previous secret for this long, so the consumer can switch without rejecting any.
   secret_grace_seconds: 3600
+# Instruments listed at startup, and again after POST /test/reset, with an InstrumentListed event each: the fields of
+# POST /api/instruments in snake_case. A listed one whose enabled or reference_symbol differs is updated
+# (InstrumentUpdated), so the configuration wins over API changes at each start. Its other fields cannot change once
+# listed: a difference stops startup. Instruments removed from this list stay listed. For example:
+#   - id: AAPL
+#     symbol: AAPL
+#     mic: XNAS
+#     currency: USD
+#     currency_scale: 2
+#     tick_size_minor: 1      # default 1
+#     lot_size: 1             # default 1
+#     enabled: true           # default true
+#     reference_symbol: AAPL  # optional: the symbol a price source quotes it under
+instruments: []
 ids:
   # "random": UUIDv7, different every run. "deterministic": every ID (orders, executions, events, deliveries,
   # subscriptions, reports) is derived from `seed` and the order of commands, so the same commands give the same IDs

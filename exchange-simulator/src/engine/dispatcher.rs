@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{
     BookUpdate, ClockChange, ClockState, Exchange, ExchangeError, Level, SubmitOrder, SubmitOutcome,
 };
-use crate::domain::{Instrument, InstrumentId, Participant, Side};
+use crate::domain::{Instrument, InstrumentChange, InstrumentId, Participant, Side};
 use crate::settlement::{ExternalReport, NewReport};
 use crate::webhooks::{
     DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription, WebhookChange,
@@ -81,7 +81,7 @@ enum Request {
     Redeliver(Uuid, u64, Reply<usize>),
     RetryDeadLetters(Option<Uuid>, Vec<Uuid>, Reply<usize>),
     Reset(Reply<()>),
-    SetInstrumentEnabled(InstrumentId, bool, Reply<Instrument>),
+    UpdateInstrument(InstrumentId, InstrumentChange, Reply<Instrument>),
     ClockState(oneshot::Sender<ClockState>),
     Tick(Reply<usize>),
     ReportSettlement(NewReport, Reply<(ExternalReport, bool)>),
@@ -107,7 +107,7 @@ impl Request {
             Self::Redeliver(..) => "redeliver",
             Self::RetryDeadLetters(..) => "retry_dead_letters",
             Self::Reset(..) => "reset",
-            Self::SetInstrumentEnabled(..) => "set_instrument_enabled",
+            Self::UpdateInstrument(..) => "update_instrument",
             Self::ClockState(..) => "clock_state",
             Self::Tick(..) => "tick",
             Self::ReportSettlement(..) => "report_settlement",
@@ -233,12 +233,13 @@ impl Dispatcher {
         self.call(|reply| Request::ChangeClock(change, reply)).await
     }
 
-    pub async fn set_instrument_enabled(
+    /// Changes a listed instrument (see [`Exchange::update_instrument`]).
+    pub async fn update_instrument(
         &self,
         id: InstrumentId,
-        enabled: bool,
+        change: InstrumentChange,
     ) -> Result<Instrument, DispatchError> {
-        self.call(|reply| Request::SetInstrumentEnabled(id, enabled, reply))
+        self.call(|reply| Request::UpdateInstrument(id, change, reply))
             .await
     }
 
@@ -525,8 +526,8 @@ fn handle(exchange: &mut Exchange, request: Request) -> &'static str {
             "ok"
         }
         Request::ChangeClock(change, reply) => answer(reply, exchange.change_clock(change)),
-        Request::SetInstrumentEnabled(id, enabled, reply) => {
-            answer(reply, exchange.set_instrument_enabled(&id, enabled))
+        Request::UpdateInstrument(id, change, reply) => {
+            answer(reply, exchange.update_instrument(&id, &change))
         }
         Request::RegisterWebhook(request, reply) => {
             answer(reply, exchange.register_webhook(request))
@@ -767,6 +768,7 @@ mod tests {
                 tick_size_minor: 1,
                 lot_size: 1,
                 enabled: true,
+                reference_symbol: None,
             }
         }
 

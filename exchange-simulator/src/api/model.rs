@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::{
-    Execution, Instrument, InstrumentId, Order, OrderStatus, OrderType, Participant, ParticipantId,
-    Side,
+    Execution, Instrument, InstrumentChange, InstrumentId, Order, OrderStatus, OrderType,
+    Participant, ParticipantId, Side,
 };
 use crate::engine::{BookSnapshot, Level, RejectReason, SubmitOrder};
 
@@ -19,11 +19,33 @@ fn yes() -> bool {
     true
 }
 
-/// `PATCH /api/instruments/{id}`: the fields that may change after registration.
+/// `PATCH /api/instruments/{id}`: the fields that may change after registration. Absent fields stay as they are;
+/// `"referenceSymbol": null` clears the reference symbol.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InstrumentPatch {
-    pub enabled: bool,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default, deserialize_with = "present")]
+    pub reference_symbol: Option<Option<String>>,
+}
+
+impl From<InstrumentPatch> for InstrumentChange {
+    fn from(p: InstrumentPatch) -> Self {
+        Self {
+            enabled: p.enabled,
+            reference_symbol: p.reference_symbol,
+        }
+    }
+}
+
+/// Tells a field given as `null` (`Some(None)`) from an absent one (`None`, through `#[serde(default)]`).
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,6 +65,7 @@ pub struct InstrumentRequest {
     /// Default true.
     #[serde(default = "yes")]
     pub enabled: bool,
+    pub reference_symbol: Option<String>,
 }
 
 impl From<InstrumentRequest> for Instrument {
@@ -58,6 +81,7 @@ impl From<InstrumentRequest> for Instrument {
             tick_size_minor: r.tick_size_minor,
             lot_size: r.lot_size,
             enabled: r.enabled,
+            reference_symbol: r.reference_symbol,
         }
     }
 }
@@ -77,6 +101,7 @@ pub struct InstrumentView {
     pub tick_size: String,
     pub lot_size: u64,
     pub enabled: bool,
+    pub reference_symbol: Option<String>,
 }
 
 impl From<&Instrument> for InstrumentView {
@@ -93,6 +118,7 @@ impl From<&Instrument> for InstrumentView {
             tick_size: i.ticks_to_price(1),
             lot_size: i.lot_size,
             enabled: i.enabled,
+            reference_symbol: i.reference_symbol.clone(),
         }
     }
 }

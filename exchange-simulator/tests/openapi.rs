@@ -216,15 +216,13 @@ async fn every_operation_and_event_matches_the_document() {
     assert_eq!(status, 400);
     expect(a, s, 200, M::GET, "/api/instruments?mic=XCSE", None).await;
     expect(a, s, 400, M::GET, "/api/instruments?colour=red", None).await;
-    expect(
-        a,
-        s,
-        200,
-        M::PATCH,
-        "/api/instruments/ACME",
-        Some(json!({ "enabled": true })),
-    )
-    .await;
+    for patch in [
+        json!({ "enabled": false }),
+        json!({ "enabled": true, "referenceSymbol": "ACME.CO" }),
+        json!({ "referenceSymbol": null }),
+    ] {
+        expect(a, s, 200, M::PATCH, "/api/instruments/ACME", Some(patch)).await;
+    }
     expect(
         a,
         s,

@@ -27,6 +27,10 @@ pub const ORDER_PARTIALLY_FILLED: &str = "OrderPartiallyFilled";
 pub const ORDER_FILLED: &str = "OrderFilled";
 pub const ORDER_CANCELLED: &str = "OrderCancelled";
 pub const TRADE_EXECUTED: &str = "TradeExecuted";
+/// An instrument was listed, through the API or from configuration.
+pub const INSTRUMENT_LISTED: &str = "InstrumentListed";
+/// A listed instrument changed (trading enabled or disabled, reference symbol).
+pub const INSTRUMENT_UPDATED: &str = "InstrumentUpdated";
 
 pub const SETTLEMENT_PENDING: &str = "SettlementPending";
 pub const SETTLEMENT_COMPLETED: &str = "SettlementCompleted";
@@ -48,6 +52,8 @@ pub const EVENT_TYPES: &[&str] = &[
     ORDER_FILLED,
     ORDER_CANCELLED,
     TRADE_EXECUTED,
+    INSTRUMENT_LISTED,
+    INSTRUMENT_UPDATED,
     SETTLEMENT_PENDING,
     SETTLEMENT_COMPLETED,
     SETTLEMENT_FAILED,
@@ -70,6 +76,46 @@ pub use simulator_kit::events::{EventEnvelope, NewEvent};
 pub enum Command {
     Submit,
     Cancel,
+}
+
+/// `InstrumentListed` (no `changes`) or `InstrumentUpdated` with the wire names of the fields that changed. The payload
+/// is the whole instrument after the change, as `GET /api/instruments` shows it. Unstamped, like [`for_update`]'s.
+pub fn instrument_event(
+    instrument: &Instrument,
+    changes: Option<&[&'static str]>,
+    now: DateTime<Utc>,
+) -> NewEvent {
+    let mut payload = json!({
+        "instrumentId": instrument.id,
+        "symbol": instrument.symbol,
+        "mic": instrument.mic,
+        "isin": instrument.isin,
+        "cusip": instrument.cusip,
+        "currency": instrument.currency,
+        "currencyScale": instrument.currency_scale,
+        "tickSizeMinor": instrument.tick_size_minor,
+        "tickSize": instrument.ticks_to_price(1),
+        "lotSize": instrument.lot_size,
+        "enabled": instrument.enabled,
+        "referenceSymbol": instrument.reference_symbol,
+    });
+    if let Some(changes) = changes {
+        payload["changes"] = json!(changes);
+    }
+    NewEvent {
+        event_id: Uuid::nil(),
+        sequence: 0,
+        event_type: if changes.is_some() {
+            INSTRUMENT_UPDATED
+        } else {
+            INSTRUMENT_LISTED
+        },
+        source: EXCHANGE_SOURCE,
+        aggregate_id: instrument.id.0.clone(),
+        correlation_id: None,
+        occurred_at: now,
+        payload,
+    }
 }
 
 /// The events a committed update produces, in this order:

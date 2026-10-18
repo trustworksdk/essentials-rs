@@ -32,6 +32,41 @@ pub struct Instrument {
     pub lot_size: u64,
     /// Whether the instrument trades. Orders for a disabled instrument are rejected; cancels still work.
     pub enabled: bool,
+    /// The symbol a price source quotes this instrument under (e.g. `AAPL`), which may differ from `symbol`.
+    pub reference_symbol: Option<String>,
+}
+
+/// A change to a listed instrument: only trading status and the reference symbol may change after listing. `None`
+/// leaves a field as it is; `reference_symbol: Some(None)` clears the reference symbol.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InstrumentChange {
+    pub enabled: Option<bool>,
+    pub reference_symbol: Option<Option<String>>,
+}
+
+impl InstrumentChange {
+    /// Whether the change names no field.
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none() && self.reference_symbol.is_none()
+    }
+
+    /// Applies the change and returns the wire names of the fields whose value it changed, in a fixed order.
+    pub fn apply(&self, instrument: &mut Instrument) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        if let Some(enabled) = self.enabled
+            && enabled != instrument.enabled
+        {
+            instrument.enabled = enabled;
+            changed.push("enabled");
+        }
+        if let Some(reference_symbol) = &self.reference_symbol
+            && *reference_symbol != instrument.reference_symbol
+        {
+            instrument.reference_symbol = reference_symbol.clone();
+            changed.push("referenceSymbol");
+        }
+        changed
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -42,6 +77,8 @@ pub enum InstrumentError {
     Currency,
     #[error("currency_scale must be between 0 and 9")]
     CurrencyScale,
+    #[error("reference_symbol must be 1 to 64 printable ASCII characters without spaces")]
+    ReferenceSymbol,
     #[error("{0} must be between 1 and {max}", max = i64::MAX)]
     NotPositive(&'static str),
     #[error(transparent)]
@@ -85,6 +122,11 @@ impl Instrument {
             if value == 0 || i64::try_from(value).is_err() {
                 return Err(InstrumentError::NotPositive(name));
             }
+        }
+        if let Some(symbol) = &self.reference_symbol
+            && (!(1..=64).contains(&symbol.len()) || !symbol.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            return Err(InstrumentError::ReferenceSymbol);
         }
         let checks: [(Option<&String>, Validator, &'static str, usize); 3] = [
             (self.mic.as_ref(), validate_mic, "MIC", 4),
@@ -182,6 +224,7 @@ mod tests {
             tick_size_minor: 1,
             lot_size: 1,
             enabled: true,
+            reference_symbol: None,
         }
     }
 
@@ -220,6 +263,56 @@ mod tests {
             zero_lot.validate(IdentifierPolicy::Strict),
             Err(InstrumentError::NotPositive("lot_size"))
         );
+    }
+
+    #[test]
+    fn reference_symbols_are_short_printable_and_without_spaces() {
+        for ok in ["AAPL", "BINANCE:BTCUSDT", "OANDA:EUR_USD", &"X".repeat(64)] {
+            let listed = Instrument {
+                reference_symbol: Some(ok.to_string()),
+                ..acme()
+            };
+            assert_eq!(listed.validate(IdentifierPolicy::Strict), Ok(()), "{ok}");
+        }
+        for bad in ["", "A B", "AAPL\n", "ÆØÅ", &"X".repeat(65)] {
+            let listed = Instrument {
+                reference_symbol: Some(bad.to_string()),
+                ..acme()
+            };
+            assert_eq!(
+                listed.validate(IdentifierPolicy::Permissive),
+                Err(InstrumentError::ReferenceSymbol),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_change_reports_only_the_fields_whose_value_changed() {
+        let mut instrument = acme();
+        let unchanged = InstrumentChange {
+            enabled: Some(true),
+            reference_symbol: Some(None),
+        };
+        assert!(unchanged.apply(&mut instrument).is_empty());
+        let change = InstrumentChange {
+            enabled: Some(false),
+            reference_symbol: Some(Some("ACME.CO".into())),
+        };
+        assert_eq!(
+            change.apply(&mut instrument),
+            ["enabled", "referenceSymbol"]
+        );
+        assert!(!instrument.enabled);
+        assert_eq!(instrument.reference_symbol.as_deref(), Some("ACME.CO"));
+        let clear = InstrumentChange {
+            reference_symbol: Some(None),
+            ..Default::default()
+        };
+        assert_eq!(clear.apply(&mut instrument), ["referenceSymbol"]);
+        assert_eq!(instrument.reference_symbol, None);
+        assert!(InstrumentChange::default().is_empty());
+        assert!(!clear.is_empty());
     }
 
     #[test]

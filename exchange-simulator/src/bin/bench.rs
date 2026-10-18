@@ -173,6 +173,7 @@ fn acme() -> Instrument {
         tick_size_minor: 1,
         lot_size: 1,
         enabled: true,
+        reference_symbol: None,
     }
 }
 
@@ -624,6 +625,7 @@ impl Service {
                 group_commit: options.group_commit,
             },
             events: EventsConfig::default(),
+            instruments: Vec::new(),
             webhooks: WebhooksConfig {
                 subscriptions: Vec::new(),
                 secret_grace_seconds: 3600,

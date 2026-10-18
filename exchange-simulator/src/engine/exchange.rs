@@ -9,8 +9,8 @@ use super::{BookError, BookUpdate, Clock, IdScheme, MatchContext, OrderBook};
 use crate::clearing::{ClearingPolicy, StoredStatement, next_business_day, previous_business_day};
 use crate::clock::{ClockError, SystemClock, VirtualClock};
 use crate::domain::{
-    IdentifierPolicy, Instrument, InstrumentError, InstrumentId, Order, OrderStatus, OrderType,
-    Participant, ParticipantId, Side,
+    IdentifierPolicy, Instrument, InstrumentChange, InstrumentError, InstrumentId, Order,
+    OrderStatus, OrderType, Participant, ParticipantId, Side,
 };
 use crate::events::NewEvent;
 use crate::events::{self, Command};
@@ -64,6 +64,13 @@ pub enum ExchangeError {
     DuplicateInstrument(InstrumentId),
     #[error("symbol {symbol} is already listed on {mic}")]
     DuplicateListing { mic: String, symbol: String },
+    #[error(
+        "instruments {id}: {field} differs from the listed instrument; only enabled and reference_symbol can change"
+    )]
+    DeclaredInstrumentConflict {
+        id: InstrumentId,
+        field: &'static str,
+    },
     #[error("participant {0} already exists")]
     DuplicateParticipant(ParticipantId),
     #[error(
@@ -158,6 +165,9 @@ pub struct ExchangeOptions {
     pub webhooks: Vec<DeclaredSubscription>,
     /// How long a declared subscription's previous secret stays valid after the configuration changes it.
     pub webhook_secret_grace: chrono::Duration,
+    /// Instruments declared in configuration, listed or updated at recovery and after a reset, in this order. IDs
+    /// must be unique (see [`crate::config::InstrumentConfig`]).
+    pub instruments: Vec<Instrument>,
 }
 
 impl Default for ExchangeOptions {
@@ -174,6 +184,7 @@ impl Default for ExchangeOptions {
             clearing: None,
             webhooks: Vec::new(),
             webhook_secret_grace: chrono::Duration::hours(1),
+            instruments: Vec::new(),
         }
     }
 }
@@ -234,6 +245,8 @@ pub struct Exchange {
     epoch: u64,
     /// The open commit group: what its commands wrote, reported once the group is durable.
     group: Option<Vec<Committed>>,
+    /// Instruments declared in configuration.
+    declared_instruments: Vec<Instrument>,
 }
 
 /// The clearinghouse: its policy, the last business date whose cutoff was handled, and late statements waiting to be
@@ -370,8 +383,10 @@ impl Exchange {
             clock_start,
             epoch: 0,
             group: None,
+            declared_instruments: options.instruments,
         };
         exchange.reconcile_webhooks()?;
+        exchange.reconcile_instruments()?;
         if let Some(policy) = options.clearing {
             policy.breaks.validate().map_err(ExchangeError::Clearing)?;
             let (cursor, after) = match exchange.store.clearing_cursor()? {
@@ -398,6 +413,7 @@ impl Exchange {
         Ok(exchange)
     }
 
+    /// Lists an instrument and publishes `InstrumentListed`.
     pub fn register_instrument(&mut self, instrument: Instrument) -> Result<(), ExchangeError> {
         instrument.validate(self.identifier_policy)?;
         if self.books.contains_key(&instrument.id) {
@@ -414,10 +430,7 @@ impl Exchange {
                 symbol: instrument.symbol,
             });
         }
-        self.store.insert_instrument(&instrument)?;
-        self.books
-            .insert(instrument.id.clone(), OrderBook::new(instrument));
-        Ok(())
+        self.commit_instrument(instrument, None)
     }
 
     /// Switches trading in an instrument on or off, durably, and returns the updated instrument.
@@ -426,13 +439,113 @@ impl Exchange {
         id: &InstrumentId,
         enabled: bool,
     ) -> Result<Instrument, ExchangeError> {
-        let book = self
+        self.update_instrument(
+            id,
+            &InstrumentChange {
+                enabled: Some(enabled),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Changes a listed instrument and returns it. A change that alters a value publishes `InstrumentUpdated` with the
+    /// fields it changed; one that alters nothing publishes nothing.
+    pub fn update_instrument(
+        &mut self,
+        id: &InstrumentId,
+        change: &InstrumentChange,
+    ) -> Result<Instrument, ExchangeError> {
+        let mut instrument = self
             .books
-            .get_mut(id)
-            .ok_or_else(|| ExchangeError::UnknownInstrument(id.clone()))?;
-        self.store.set_instrument_enabled(id, enabled)?;
-        book.set_enabled(enabled);
-        Ok(book.instrument().clone())
+            .get(id)
+            .ok_or_else(|| ExchangeError::UnknownInstrument(id.clone()))?
+            .instrument()
+            .clone();
+        let changes = change.apply(&mut instrument);
+        if changes.is_empty() {
+            return Ok(instrument);
+        }
+        instrument.validate(self.identifier_policy)?;
+        self.commit_instrument(instrument.clone(), Some(&changes))?;
+        Ok(instrument)
+    }
+
+    /// Writes a new (`changes: None`) or changed instrument with its event, then applies it to memory.
+    fn commit_instrument(
+        &mut self,
+        instrument: Instrument,
+        changes: Option<&[&'static str]>,
+    ) -> Result<(), ExchangeError> {
+        let mut event = events::instrument_event(&instrument, changes, self.now());
+        let next = NewEvent::stamp(
+            std::slice::from_mut(&mut event),
+            self.next_event_sequence,
+            self.ids,
+        );
+        let outbox = Outbox {
+            subscriptions: self.webhooks.subscriptions(),
+            simulation_id: self.simulation_id.as_deref(),
+            ids: self.ids,
+            due: wall_now(),
+            schema_version: events::SCHEMA_VERSION,
+        };
+        self.store
+            .commit_instrument(&instrument, changes.is_none(), &event, outbox)?;
+        self.next_event_sequence = next;
+        ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type).increment(1);
+        match self.books.get_mut(&instrument.id) {
+            Some(book) => book.set_instrument(instrument),
+            None => {
+                self.books
+                    .insert(instrument.id.clone(), OrderBook::new(instrument));
+            }
+        }
+        self.wake_delivery(std::slice::from_ref(&event));
+        Ok(())
+    }
+
+    /// Brings the instruments declared in configuration into the registry. Runs at recovery and after a reset, after
+    /// the declared webhook subscriptions, so they receive the events. A missing instrument is listed; a listed one
+    /// whose `enabled` or `reference_symbol` differs is updated, so configuration wins over API changes, as for
+    /// subscriptions. Any other difference fails: those fields never change once listed. Instruments no longer
+    /// declared stay listed, since orders and trades refer to them.
+    fn reconcile_instruments(&mut self) -> Result<(), ExchangeError> {
+        for declared in self.declared_instruments.clone() {
+            let Some(book) = self.books.get(&declared.id) else {
+                tracing::info!(id = %declared.id.0, "instrument listed from configuration");
+                self.register_instrument(declared)?;
+                continue;
+            };
+            let listed = book.instrument();
+            let fixed = [
+                ("symbol", listed.symbol == declared.symbol),
+                ("mic", listed.mic == declared.mic),
+                ("isin", listed.isin == declared.isin),
+                ("cusip", listed.cusip == declared.cusip),
+                ("currency", listed.currency == declared.currency),
+                (
+                    "currency_scale",
+                    listed.currency_scale == declared.currency_scale,
+                ),
+                (
+                    "tick_size_minor",
+                    listed.tick_size_minor == declared.tick_size_minor,
+                ),
+                ("lot_size", listed.lot_size == declared.lot_size),
+            ];
+            if let Some((field, _)) = fixed.iter().find(|(_, same)| !same) {
+                return Err(ExchangeError::DeclaredInstrumentConflict {
+                    id: declared.id,
+                    field,
+                });
+            }
+            let change = InstrumentChange {
+                enabled: Some(declared.enabled),
+                reference_symbol: Some(declared.reference_symbol.clone()),
+            };
+            self.update_instrument(&declared.id, &change)?;
+        }
+        Ok(())
     }
 
     pub fn register_participant(&mut self, participant: Participant) -> Result<(), ExchangeError> {
@@ -707,8 +820,9 @@ impl Exchange {
             self.store.save_clearing_cursor(clearing.cursor, 0)?;
         }
         self.epoch += 1;
-        // Configuration-declared subscriptions come back, as on a new database.
+        // Configuration-declared subscriptions and instruments come back, as on a new database.
         self.reconcile_webhooks()?;
+        self.reconcile_instruments()?;
         tracing::info!(epoch = self.epoch, "exchange state reset");
         Ok(())
     }

@@ -120,41 +120,40 @@ impl Store {
     }
 
     pub fn insert_instrument(&self, instrument: &Instrument) -> rusqlite::Result<()> {
-        self.conn
-            .prepare_cached(
-                "INSERT INTO instruments (id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor,
-                                          lot_size, enabled)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        insert_instrument(&self.conn, instrument)
+    }
+
+    /// Lists a new instrument (`insert`) or stores a listed one's changeable fields, together with its event, in one
+    /// transaction.
+    pub fn commit_instrument(
+        &mut self,
+        instrument: &Instrument,
+        insert: bool,
+        event: &NewEvent,
+        outbox: Outbox<'_>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        if insert {
+            insert_instrument(&tx, instrument)?;
+        } else {
+            tx.prepare_cached(
+                "UPDATE instruments SET enabled = ?2, reference_symbol = ?3 WHERE id = ?1",
             )?
             .execute(params![
                 instrument.id.0,
-                instrument.symbol,
-                instrument.mic,
-                instrument.isin,
-                instrument.cusip,
-                instrument.currency,
-                instrument.currency_scale,
-                to_sql(instrument.tick_size_minor),
-                to_sql(instrument.lot_size),
                 instrument.enabled,
-            ])
-            .map(drop)
-    }
-
-    pub fn set_instrument_enabled(
-        &self,
-        id: &InstrumentId,
-        enabled: bool,
-    ) -> rusqlite::Result<usize> {
-        self.conn
-            .prepare_cached("UPDATE instruments SET enabled = ?2 WHERE id = ?1")?
-            .execute(params![id.0, enabled])
+                instrument.reference_symbol
+            ])?;
+        }
+        write_events(&tx, std::slice::from_ref(event), &outbox)?;
+        tx.commit()
     }
 
     pub fn instruments(&self, filter: &InstrumentFilter) -> rusqlite::Result<Vec<Instrument>> {
         self.conn
             .prepare_cached(
-                "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size, enabled
+                "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size, enabled,
+                        reference_symbol
                  FROM instruments
                  WHERE (?1 IS NULL OR symbol = ?1) AND (?2 IS NULL OR mic = ?2)
                    AND (?3 IS NULL OR isin = ?3) AND (?4 IS NULL OR cusip = ?4)
@@ -167,7 +166,8 @@ impl Store {
     pub fn instrument(&self, id: &InstrumentId) -> rusqlite::Result<Option<Instrument>> {
         self.conn
             .prepare_cached(
-                "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size, enabled
+                "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size, enabled,
+                        reference_symbol
                  FROM instruments WHERE id = ?1",
             )?
             .query_row([&id.0], instrument_row)
@@ -912,7 +912,30 @@ fn instrument_row(row: &Row<'_>) -> rusqlite::Result<Instrument> {
         tick_size_minor: from_sql(row, 7)?,
         lot_size: from_sql(row, 8)?,
         enabled: row.get(9)?,
+        reference_symbol: row.get(10)?,
     })
+}
+
+fn insert_instrument(conn: &Connection, instrument: &Instrument) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO instruments (id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size,
+                                  enabled, reference_symbol)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )?
+    .execute(params![
+        instrument.id.0,
+        instrument.symbol,
+        instrument.mic,
+        instrument.isin,
+        instrument.cusip,
+        instrument.currency,
+        instrument.currency_scale,
+        to_sql(instrument.tick_size_minor),
+        to_sql(instrument.lot_size),
+        instrument.enabled,
+        instrument.reference_symbol,
+    ])
+    .map(drop)
 }
 
 fn order_record(row: &Row<'_>) -> rusqlite::Result<OrderRecord> {

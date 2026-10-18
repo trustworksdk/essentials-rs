@@ -463,7 +463,7 @@ steps:
   - expect: { deliveries: {}, all: true, wait_ms: 50 }
   - order: { participantId: A, side: SELL, type: LIMIT, priceTicks: 100, quantity: 5 }
   - order: { participantId: B, side: BUY, type: LIMIT, priceTicks: 99, quantity: 5 }
-  - expect: { events: { eventType: OrderAccepted }, all: true }
+  - expect: { events: { source: exchange }, all: true }
   - expect: { events: { payload: { side: SELL } }, all: true }
 "#;
     let report = scenario::run(&Scenario::parse(text).unwrap(), &base_config().await)
@@ -484,7 +484,7 @@ steps:
             ),
             (
                 5,
-                vec!["expected all events to match, 1 of 2 do".to_string()]
+                vec!["expected all events to match, 1 of 3 do".to_string()]
             )
         ],
         "{}",

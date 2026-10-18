@@ -119,6 +119,14 @@ impl OrderBook {
         self.version += 1;
     }
 
+    /// Replaces the instrument with a changed listing of the same ID (trading status, reference symbol). Updates
+    /// planned before the change become stale.
+    pub fn set_instrument(&mut self, instrument: Instrument) {
+        debug_assert_eq!(instrument.id, self.instrument.id);
+        self.instrument = instrument;
+        self.version += 1;
+    }
+
     /// Checks an incoming order's shape against the instrument, without consulting book state.
     pub fn validate(&self, order: &Order) -> Result<(), BookError> {
         if order.instrument_id != self.instrument.id {

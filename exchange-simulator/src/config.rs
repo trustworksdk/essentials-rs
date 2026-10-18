@@ -24,6 +24,9 @@ pub struct Config {
     #[serde(default)]
     pub events: EventsConfig,
     pub webhooks: WebhooksConfig,
+    /// Instruments listed at startup and after a reset (plan item 6.1).
+    #[serde(default)]
+    pub instruments: Vec<InstrumentConfig>,
     pub ids: IdsConfig,
     pub settlement: SettlementConfig,
     #[serde(default)]
@@ -202,6 +205,22 @@ impl Default for ClearingConfig {
 }
 
 impl Config {
+    /// The declared instruments, in order; an error when an ID is declared twice. Field values are validated when
+    /// the exchange lists them, as for the API.
+    pub fn declared_instruments(&self) -> Result<Vec<crate::domain::Instrument>, String> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.instruments
+            .iter()
+            .map(|c| {
+                if seen.insert(c.id.as_str()) {
+                    Ok(c.into())
+                } else {
+                    Err(format!("instruments: {} is declared twice", c.id))
+                }
+            })
+            .collect()
+    }
+
     /// The clearinghouse's policy when clearing is enabled; an error for an invalid cutoff, time zone or break
     /// policy.
     pub fn clearing_policy(&self) -> Result<Option<crate::clearing::ClearingPolicy>, String> {
@@ -232,6 +251,56 @@ pub enum SettlementMode {
     Simulated,
     /// The simulator and externally reported outcomes, side by side.
     Both,
+}
+
+/// An instrument declared in configuration: the fields of `POST /api/instruments`, in snake_case.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentConfig {
+    pub id: String,
+    pub symbol: String,
+    #[serde(default)]
+    pub mic: Option<String>,
+    #[serde(default)]
+    pub isin: Option<String>,
+    #[serde(default)]
+    pub cusip: Option<String>,
+    pub currency: String,
+    pub currency_scale: u8,
+    #[serde(default = "one")]
+    pub tick_size_minor: u64,
+    #[serde(default = "one")]
+    pub lot_size: u64,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub reference_symbol: Option<String>,
+}
+
+fn one() -> u64 {
+    1
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl From<&InstrumentConfig> for crate::domain::Instrument {
+    fn from(c: &InstrumentConfig) -> Self {
+        Self {
+            id: crate::domain::InstrumentId(c.id.clone()),
+            symbol: c.symbol.clone(),
+            mic: c.mic.clone(),
+            isin: c.isin.clone(),
+            cusip: c.cusip.clone(),
+            currency: c.currency.clone(),
+            currency_scale: c.currency_scale,
+            tick_size_minor: c.tick_size_minor,
+            lot_size: c.lot_size,
+            enabled: c.enabled,
+            reference_symbol: c.reference_symbol.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

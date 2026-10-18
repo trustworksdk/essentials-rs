@@ -102,6 +102,7 @@ impl App {
                 webhook_secret_grace: chrono::Duration::seconds(
                     i64::try_from(config.webhooks.secret_grace_seconds).unwrap_or(i64::MAX / 1000),
                 ),
+                instruments: config.declared_instruments().map_err(anyhow::Error::msg)?,
             },
         )
         .context("recovering order books")?;

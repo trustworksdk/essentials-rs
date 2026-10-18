@@ -75,6 +75,7 @@ fn trade(exchange: &mut Exchange) {
             tick_size_minor: 1,
             lot_size: 1,
             enabled: true,
+            reference_symbol: None,
         })
         .unwrap();
     for id in ["A", "B"] {

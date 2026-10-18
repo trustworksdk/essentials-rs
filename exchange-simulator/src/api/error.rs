@@ -48,7 +48,12 @@ impl From<ExchangeError> for ApiError {
             E::ReportConflict { .. } => (StatusCode::CONFLICT, "report_conflict"),
             E::Clock(ClockError::Speed(_)) => (StatusCode::BAD_REQUEST, "invalid_clock_speed"),
             E::Clock(_) => (StatusCode::CONFLICT, "clock_backwards"),
-            E::Book(_) | E::Storage(_) | E::GroupCommit(_) | E::Settlement(_) | E::Clearing(_) => {
+            E::Book(_)
+            | E::Storage(_)
+            | E::GroupCommit(_)
+            | E::Settlement(_)
+            | E::Clearing(_)
+            | E::DeclaredInstrumentConflict { .. } => {
                 return Self::internal(error);
             }
         };

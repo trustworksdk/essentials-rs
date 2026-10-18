@@ -125,8 +125,11 @@ paths:
     patch:
       tags: [instruments]
       operationId: updateInstrument
-      summary: Enable or disable trading
-      description: Resting orders stay; cancellations keep working while an instrument is disabled.
+      summary: Enable or disable trading, or change the reference symbol
+      description: |
+        Give at least one field; absent fields stay as they are. A change that alters a value publishes
+        `InstrumentUpdated`. Resting orders stay; cancellations keep working while an instrument is disabled.
+        Instruments declared in configuration can be changed too, but the configuration wins again at the next start.
       parameters:
         - { $ref: "#/components/parameters/InstrumentIdPath" }
       requestBody:
@@ -136,9 +139,14 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [enabled]
+              minProperties: 1
               properties:
                 enabled: { type: boolean }
+                referenceSymbol:
+                  type: [string, "null"]
+                  minLength: 1
+                  maxLength: 64
+                  description: "`null` clears it."
       responses:
         "200":
           description: The instrument after the change.
@@ -827,6 +835,18 @@ webhooks:
       operationId: onTradeExecuted
       requestBody: { $ref: "#/components/requestBodies/TradeExecutedEvent" }
       responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
+  InstrumentListed:
+    post:
+      summary: An instrument was listed, through the API or from configuration (also after a reset)
+      operationId: onInstrumentListed
+      requestBody: { $ref: "#/components/requestBodies/InstrumentListedEvent" }
+      responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
+  InstrumentUpdated:
+    post:
+      summary: A listed instrument changed; `changes` names the fields
+      operationId: onInstrumentUpdated
+      requestBody: { $ref: "#/components/requestBodies/InstrumentUpdatedEvent" }
+      responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
   SettlementPending:
     post:
       summary: A settlement instruction was created
@@ -962,6 +982,10 @@ components:
       content: { application/json: { schema: { $ref: "#/components/schemas/OrderCancelledEvent" } } }
     TradeExecutedEvent:
       content: { application/json: { schema: { $ref: "#/components/schemas/TradeExecutedEvent" } } }
+    InstrumentListedEvent:
+      content: { application/json: { schema: { $ref: "#/components/schemas/InstrumentListedEvent" } } }
+    InstrumentUpdatedEvent:
+      content: { application/json: { schema: { $ref: "#/components/schemas/InstrumentUpdatedEvent" } } }
     SettlementPendingEvent:
       content: { application/json: { schema: { $ref: "#/components/schemas/SettlementPendingEvent" } } }
     SettlementCompletedEvent:
@@ -1031,10 +1055,16 @@ components:
         tickSizeMinor: { type: integer, minimum: 1, default: 1, description: One tick in minor currency units. }
         lotSize: { type: integer, minimum: 1, default: 1 }
         enabled: { type: boolean, default: true }
+        referenceSymbol:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 64
+          description: The symbol a price source quotes the instrument under (e.g. `AAPL`), if it differs from `symbol`.
     Instrument:
       type: object
       additionalProperties: false
-      required: [id, symbol, mic, isin, cusip, currency, currencyScale, tickSizeMinor, tickSize, lotSize, enabled]
+      required: [id, symbol, mic, isin, cusip, currency, currencyScale, tickSizeMinor, tickSize, lotSize, enabled,
+                 referenceSymbol]
       properties:
         id: { type: string }
         symbol: { type: string }
@@ -1047,6 +1077,7 @@ components:
         tickSize: { $ref: "#/components/schemas/Amount" }
         lotSize: { type: integer }
         enabled: { type: boolean }
+        referenceSymbol: { type: [string, "null"] }
     Participant:
       type: object
       additionalProperties: false
@@ -1355,7 +1386,7 @@ components:
 
     EventType:
       enum: [OrderAccepted, OrderRejected, OrderPartiallyFilled, OrderFilled, OrderCancelled, TradeExecuted,
-             SettlementPending, SettlementCompleted, SettlementFailed, SettlementRejected, SettlementDelayed,
+             InstrumentListed, InstrumentUpdated, SettlementPending, SettlementCompleted, SettlementFailed, SettlementRejected, SettlementDelayed,
              SettlementCorrected, SettlementCancelled, SettlementOutcomeReported, ClearingStatementIssued]
     EventEnvelope:
       type: object
@@ -1429,6 +1460,24 @@ components:
         currencyScale: { type: integer }
         tickSizeMinor: { type: integer }
         executedAt: { $ref: "#/components/schemas/Timestamp" }
+    InstrumentEventPayload:
+      type: object
+      required: [instrumentId, symbol, mic, isin, cusip, currency, currencyScale, tickSizeMinor, tickSize, lotSize,
+                 enabled, referenceSymbol]
+      description: The whole instrument after the change, as `GET /api/instruments` shows it.
+      properties:
+        instrumentId: { type: string }
+        symbol: { type: string }
+        mic: { type: [string, "null"] }
+        isin: { type: [string, "null"] }
+        cusip: { type: [string, "null"] }
+        currency: { type: string }
+        currencyScale: { type: integer }
+        tickSizeMinor: { type: integer }
+        tickSize: { $ref: "#/components/schemas/Amount" }
+        lotSize: { type: integer }
+        enabled: { type: boolean }
+        referenceSymbol: { type: [string, "null"] }
     SettlementPayloadBase:
       type: object
       required: [executionId, tradeSequence, instrumentId, buyerId, sellerId, quantity, priceTicks, currency,
@@ -1498,6 +1547,32 @@ components:
         eventType: { const: TradeExecuted }
         source: { const: exchange }
         payload: { $ref: "#/components/schemas/TradeExecutedPayload" }
+    InstrumentListedEvent:
+      allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
+      properties:
+        eventType: { const: InstrumentListed }
+        source: { const: exchange }
+        correlationId: { const: null }
+        payload:
+          allOf: [{ $ref: "#/components/schemas/InstrumentEventPayload" }]
+          unevaluatedProperties: false
+    InstrumentUpdatedEvent:
+      allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
+      properties:
+        eventType: { const: InstrumentUpdated }
+        source: { const: exchange }
+        correlationId: { const: null }
+        payload:
+          allOf: [{ $ref: "#/components/schemas/InstrumentEventPayload" }]
+          required: [changes]
+          properties:
+            changes:
+              type: array
+              minItems: 1
+              uniqueItems: true
+              items: { enum: [enabled, referenceSymbol] }
+              description: The fields whose value changed.
+          unevaluatedProperties: false
     SettlementPendingEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
       properties:

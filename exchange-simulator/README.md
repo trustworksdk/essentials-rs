@@ -135,12 +135,18 @@ All bodies are JSON with camelCase fields. Errors look like `{"error": "<code>",
 
 ```json
 { "id": "ACME", "symbol": "ACME", "mic": "XCSE", "isin": "DK0010274414", "cusip": null,
-  "currency": "DKK", "currencyScale": 2, "tickSizeMinor": 1, "lotSize": 1, "enabled": true }
+  "currency": "DKK", "currencyScale": 2, "tickSizeMinor": 1, "lotSize": 1, "enabled": true,
+  "referenceSymbol": null }
 ```
 
 `mic`, `isin`, `cusip` are optional; `tickSizeMinor` and `lotSize` default to 1, and `enabled` to `true`. `id` is the immutable key that
 orders reference. `(mic, symbol)` must be unique when `mic` is given; ISIN and CUSIP may be shared by several
-listings. Returns `201` with the instrument, plus `tickSize` as a decimal string.
+listings. `referenceSymbol` (optional, 1 to 64 printable characters without spaces) is the symbol a price source
+quotes the instrument under, e.g. `AAPL`, when it differs from `symbol`. Returns `201` with the instrument, plus
+`tickSize` as a decimal string, and publishes `InstrumentListed`.
+
+Instruments can also be declared in configuration (`instruments:`, see
+[Configuration](docs/configuration.md#instruments)); they are listed at startup and again after a reset.
 
 ### `GET /api/instruments?symbol=&mic=&isin=&cusip=`
 
@@ -148,14 +154,17 @@ All filters are optional and combined with AND. External identifiers can match s
 
 ### `PATCH /api/instruments/{id}`
 
-`{ "enabled": false }` halts trading and `{ "enabled": true }` resumes it. It returns `200` with the instrument, or
-`404` for an unknown ID; `enabled` is the only field that can change. While an instrument is disabled:
+Changes `enabled`, `referenceSymbol`, or both; absent fields stay as they are, `"referenceSymbol": null` clears it,
+and an empty body is a `400`. `{ "enabled": false }` halts trading and `{ "enabled": true }` resumes it. It returns
+`200` with the instrument, or `404` for an unknown ID; no other field can change. A change that alters a value
+publishes `InstrumentUpdated`; one that alters nothing publishes nothing. A declared instrument can be changed too,
+but the configuration wins again at the next start. While an instrument is disabled:
 - **Orders are recorded rejections:** every new order is sequenced and stored with status `REJECTED` and
   `rejectReason: "INSTRUMENT_DISABLED"`, and an `OrderRejected` event is emitted (`201`, like a self-trade).
 - **Cancels keep working.**
 - **Resting orders stay** on the book, and trade again once the instrument is re-enabled.
 
-The flag survives restarts. Switching it emits no event (there is no instrument-status event type yet).
+The flag survives restarts.
 
 ### `POST /api/participants`
 
@@ -262,6 +271,11 @@ intake, otherwise 00:00 UTC of the relevant date. Every one carries:
 
 `ClearingStatementIssued` (`source: "clearinghouse"`, aggregate ID the statement ID, correlation ID the participant)
 carries the whole statement, as `GET /api/clearing/statements/{id}` returns it.
+
+`InstrumentListed` and `InstrumentUpdated` (`source: "exchange"`, aggregate ID the instrument ID, no correlation ID)
+carry the whole instrument after the change, as `GET /api/instruments` shows it, with `instrumentId` for `id`.
+`InstrumentUpdated` adds `changes`, the fields whose value changed (`enabled`, `referenceSymbol`). Every listing is an
+event, declared instruments included, so a consumer learns the instruments from the log alone.
 
 Order payloads carry `orderId`, `clientOrderId`, `instrumentId`, `participantId`, `side`, `type`, `priceTicks`, `price`,
 `quantity`, `remainingQuantity`, `filledQuantity`, `status` and `sequence`. Within one command, events come in this

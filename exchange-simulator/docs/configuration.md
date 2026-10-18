@@ -51,6 +51,33 @@ The mode shows in `GET /health`, in the `exchange_persistence_mode` metric, and,
 **Persistence also depends on where the file lives.** Without a volume, a new container starts empty in any mode. In
 Kubernetes an `emptyDir` is lost when the pod is rescheduled; use a persistent volume.
 
+## Instruments
+
+Instruments can be declared in the configuration file, so the market exists before any client connects. Each entry
+has the fields of `POST /api/instruments`, in snake_case:
+
+```yaml
+instruments:
+  - id: AAPL
+    symbol: AAPL
+    mic: XNAS
+    currency: USD
+    currency_scale: 2
+    tick_size_minor: 1        # default 1
+    lot_size: 1               # default 1
+    enabled: true             # default true
+    reference_symbol: AAPL    # optional: the symbol a price source quotes it under
+```
+
+- **At startup**, after the declared webhook subscriptions, each missing instrument is listed (`InstrumentListed`).
+  A listed one whose `enabled` or `reference_symbol` differs is updated (`InstrumentUpdated`), so the configuration
+  wins over API changes at each start. Its other fields never change once listed: a difference stops startup with
+  an error naming the field.
+- **After `POST /test/reset`** the declared instruments are listed again, with their events, as on a new database.
+- **Removed from the list**, an instrument stays listed, since orders and trades refer to it.
+- IDs must be unique, and values are validated as for the API (under `exchange.identifier_policy`).
+- API-registered instruments keep working alongside declared ones.
+
 ## Webhooks
 
 | Key | Default | |

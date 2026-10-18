@@ -22,7 +22,7 @@ use uuid::Uuid;
 pub use error::ApiError;
 pub use model::*;
 
-use crate::domain::{Instrument, InstrumentId, Participant};
+use crate::domain::{Instrument, InstrumentChange, InstrumentId, Participant};
 use crate::engine::{DispatchError, Dispatcher, ExchangeError, SubmitOutcome};
 use crate::events::EventEnvelope;
 use crate::persistence::{ExecutionFilter, InstrumentFilter, PersistenceMode, Store};
@@ -235,16 +235,23 @@ async fn list_instruments(
     Ok(Json(instruments.iter().map(InstrumentView::from).collect()))
 }
 
-/// Changes an instrument's trading status. Resting orders stay; cancels keep working while it is disabled.
+/// Changes an instrument's trading status or reference symbol. Resting orders stay; cancels keep working while it is
+/// disabled.
 async fn update_instrument(
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Result<Json<InstrumentPatch>, JsonRejection>,
 ) -> Result<Json<InstrumentView>, ApiError> {
     let Json(patch) = body?;
+    let change = InstrumentChange::from(patch);
+    if change.is_empty() {
+        return Err(ApiError::bad_request(
+            "give at least one of enabled, referenceSymbol",
+        ));
+    }
     let instrument = state
         .dispatcher
-        .set_instrument_enabled(InstrumentId(id), patch.enabled)
+        .update_instrument(InstrumentId(id), change)
         .await
         .map_err(|error| match error {
             DispatchError::Exchange(ExchangeError::UnknownInstrument(id)) => {
