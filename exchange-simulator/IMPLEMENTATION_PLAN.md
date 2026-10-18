@@ -1560,6 +1560,53 @@ Done on 2026-10-17: 5.1 (T+1, per-market cycles), 5.2 (accelerated clock), 5.3 (
 (`simulator-kit`), 5.4b (payment gateway) and 5.5 (back-office acceptance and guide). Decisions D8–D16 are recorded
 below. Still on hold from Milestone 4: 4.6d (the containerized benchmark), until the user asks for it.
 
+## Milestone 6 — a live market for the trading demo (draft, 2026-10-18)
+
+**Context:** the trading demo is expanding. Its requirements on the simulators are in
+[`SIMULATOR_REQUIREMENTS.md`](SIMULATOR_REQUIREMENTS.md) (SR-1 to SR-28). Decisions cited there as D3, D8, D10, D18 and
+D20 are the **demo's** decisions, not this plan's; this plan writes them demo-D3, demo-D8 and so on.
+
+**Principle:** the demo never pushes prices into the exchange. The exchange produces a reference price per instrument,
+quotes around it with a built-in liquidity provider, and publishes market data that the demo consumes, as a broker
+consumes an exchange feed. Every new behaviour is off by default (price source `none`, no liquidity, no sessions), so
+existing tests, scenarios and deployments are unchanged.
+
+**Goal:**
+- a market with prices and depth before any client connects (fixed, synthetic, replayed or live Finnhub prices);
+- a counterparty for the demo's orders, since all of them come from one participant (demo-D8);
+- a live market-data feed, and durable end-of-day facts (closing prices, business day closed) in the event log;
+- the exchange's clock observable and controllable without test control, and followed by the payment gateway.
+
+Every step that adds a route or an event also updates `openapi.yaml`; the contract tests (`tests/openapi.rs`) enforce
+it.
+
+| # | Step | Demo phase | Size | Delivers |
+|---|---|---|---|---|
+| 6.1 | Instruments in configuration, instrument events | 0 | M | **SR-5, SR-28.** `instruments:` in the config file, reconciled at startup by id the way webhook subscriptions are (4.6a), and restored by `POST /test/reset`. New instrument fields `referenceSymbol`, `priceSource` and `liquidity` (the last two are stored here and used from 6.2 and 6.7), accepted by the API as well. `InstrumentListed` (all of `Instrument`) for every listing, declared ones included, and `InstrumentUpdated` for every change, `enabled` included. |
+| 6.2 | Price sources: `none`, `fixed`, `synthetic` | 0 | M | **SR-1, SR-3.** A reference price per instrument from a pluggable source, with a global default and per-instrument overrides. `synthetic` is a seeded geometric Brownian motion on simulated time (initial price, drift, volatility, tick interval), rounded to the tick size and never at or below zero, built on `simulator-kit::rng`. Changing `priceSource` through `PATCH /api/instruments/{id}` takes effect without a restart. The reference price is readable from a first cut of `GET /api/marketdata[/{id}]` (reference price, source kind, `sourceTimestamp`), which 6.8 completes. Reference ticks are not events. |
+| 6.3 | Participant filter on webhook subscriptions | 0 | S | **SR-19.** An optional `participants` list on a subscription, in config and through the API. Order lifecycle events go out only for those participants' orders; trade, settlement and clearing events when either side is listed. Events without a participant (instrument, clock, end-of-day) always go out. |
+| 6.4 | Operator clock API, `ClockChanged` | 1 | M | **SR-24, SR-25, D17.** `GET /api/clock` (`mode`, `running`, `speed`, `now`), always mounted. Speed, freeze and resume under `/api/clock`, behind `clock.operator_control` and independent of `test_control.enabled`; `set`, `advance` and `reset` stay under `/test`. A `ClockChanged` event (`mode`, `running`, `speed`, `now`, `effectiveAt` in real time) for every speed change, freeze, resume and set, from either API. Built in `simulator-kit`, so the gateway gets it too. |
+| 6.5 | `BusinessDayClosed` | 1 | S | **SR-26.** At the clearing cutoff of every business day, `businessDate`, `cutoffAt` and `nextBusinessDate`, also on days without trades and whether or not `clearing.enabled` is on. Ordered before that day's `ClearingStatementIssued` (and `ClosingPriceIssued`, 6.11). Days skipped by a clock jump each get their event, in order. |
+| 6.6 | Payment gateway for the demo | 2 | M | **SR-21, SR-22, SR-27.** USD is already accepted; the example and Compose configs gain a USD opening balance. Forced outcomes under test control (`completed`, `failed` with a reason, `returned` after a delay) for one payment, through `POST /test/payments/{id}/outcome` (D20). `clock.mode: follow`: the gateway reads the exchange's `GET /api/clock` at startup and follows its `ClockChanged` events. SR-23 (memory mode) is already done: the gateway has `durable`, `fast` and `memory` since 5.4b. |
+| 6.7 | Liquidity provider | 3 | L | **SR-6, SR-7, SR-8, SR-10, D18.** A participant created by the simulator (`LP` by default), quoting a ladder around the reference price per instrument: `levels`, `spread_bps`, `level_step_ticks`, `level_quantity` (optionally growing with depth), `requote_threshold_ticks`. Prices rounded away from the reference price. Re-quoting happens atomically inside the exchange thread. Refill after `refill_delay` (simulated time); inventory skew by `skew_bps_per_lot`; at `max_inventory` the side that would increase it is not quoted. It never trades with itself. `liquidity.emit_order_events` (default off) keeps its order lifecycle out of the event log and webhooks; its trades, settlement and clearing are always emitted. Metrics for quotes, re-quotes and fills. |
+| 6.8 | Market-data snapshot and stream | 3 | L | **SR-12, SR-13.** The full snapshot: reference price and staleness, best bid and ask with quantity, last trade, session volume, a per-instrument `mdSequence`. Server-sent events at `GET /api/marketdata/stream?instruments=`: `quote`, `trade` (anonymous prints) and `reference`, each with `mdSequence`, conflated per instrument and kind to `conflation_interval_ms`. The exchange thread publishes into a bounded, conflating channel and never waits on a consumer; a consumer that falls behind is conflated harder, then closed. Not in the event log, not on webhooks. |
+| 6.9 | Finnhub source, stale policy | 3 | L | **SR-2, SR-9, D19.** The trades websocket per `referenceSymbol`, seeded and refreshed from the REST quote endpoint. The key from a secret file or environment variable, never logged, returned or used in a metric label. Reconnect with backoff and jitter, re-subscribe after reconnect; a source that is down never stops the exchange. Ticks applied at the virtual clock's time with the provider's `sourceTimestamp`, conflated to `max_updates_per_second`. Prices older than `stale_after` are marked stale; the provider keeps, widens or pulls its ladder per instrument (SR-9). Symbol and call limits are checked at startup where possible, else logged and counted. Tests run against a local mock websocket and REST server, never the real network. |
+| 6.10 | Trading sessions, time in force | 3 | M | **SR-16, SR-17.** Opening and closing times per MIC in local time on business days (`none`, always open, stays the default). Outside a session new orders are rejected with `MARKET_CLOSED`, and the provider applies its closed-market policy. `timeInForce`: `DAY` (default when sessions are on), `GTC`, `IOC`. `DAY` orders open at the close get `OrderExpired`; an `IOC` remainder is cancelled with `IOC_REMAINDER`. |
+| 6.11 | `ClosingPriceIssued` | 4 | S | **SR-14.** At the cutoff, after `BusinessDayClosed`, one event per traded instrument: `instrumentId`, `businessDate`, `closingPrice` (last trade, else the reference price), `basis` (`LAST_TRADE` or `REFERENCE`) and the day's volume. Reproducible: two seeded synthetic runs give a byte-identical event log, closing prices included (the SR-3 acceptance). |
+| 6.12 | Liquidity runtime control | 5 | M | **SR-11.** `GET /api/liquidity[/{instrumentId}]` (settings, inventory, current ladder, source, staleness) and `PATCH /api/liquidity/{instrumentId}` for any setting, the price source and `mode` (`on`/`off`) included. A scenario step for it, so scenarios can drain liquidity, widen spreads, or switch an instrument from `finnhub` to `synthetic` at the close. |
+| 6.13 | Replay source and recorder | 6 | M | **SR-4.** Replays `(timestamp, referenceSymbol, price, volume)` rows (CSV or JSON lines) on the virtual clock, offset to the clock's start, optionally looping. In `finnhub` mode an optional recorder appends every applied tick in the replay format. Recordings stay local and are gitignored; vendor data is never committed. |
+| 6.14 | Market-data metrics, load profile with the provider | 6 | M | **SR-15, SR-20.** Per-instrument reference updates, staleness, subscribers, messages sent and conflated, streams closed for back-pressure; source health (connected, reconnects, rate-limit hits). A bench run with the provider on and a replayed source, reporting order-ack latency with and without the provider at the same client order rate. |
+
+**Not planned:** SR-18 (FX reference rates) is marked LATER and waits for the demo's FX phase.
+
+**Order within the milestone:** by demo phase, as in the table: 6.1–6.3, then 6.4–6.5, then 6.6, then 6.7–6.10
+(6.7 and 6.8 before 6.9, so the provider and the feed are tested on synthetic prices before a live source is added),
+then 6.11, 6.12, 6.13–6.14.
+
+### Milestone 6 progress
+
+Not started.
+
 ## Beyond the milestones
 
 **OpenAPI specifications ✅ done (2026-10-17, requested by the user)**
@@ -1594,6 +1641,7 @@ below. Still on hold from Milestone 4: 4.6d (the containerized benchmark), until
    containerized benchmark) is on hold until the user asks for it.
 6. Milestone 5: 5.1 and 5.2 when the front-office demo needs short settlement cycles; 5.3–5.5 with the demo's
    back-office features.
+7. Milestone 6, in the trading demo's phase order (6.1–6.14).
 
 ## Decisions
 
@@ -1634,7 +1682,7 @@ Settled on 2026-10-17 (Milestone 5, second round):
 - **D9 — how demo accounts map to exchange participants:** the simulator stays agnostic. Statements (5.3) are per
   participant, and the demo may map one participant per client account now and a firm clearing member later. The
   demo's domain must not assume a participant ID is an account ID.
-- **D11 — controlling clock speed at runtime:** through the test-control API only (`/test/clock`). A showcase
+- **D11 — controlling clock speed at runtime:** superseded by D17 (2026-10-18). Was: through the test-control API only (`/test/clock`). A showcase
   deployment sets `clock.speed` in its configuration instead of exposing a control switch.
 - **D12 — per-market settlement cycles:** a table per MIC in configuration (`settlement.market_settlement_days`), no
   instrument field. Cycles are set per market in reality, and instrument payloads stay unchanged.
@@ -1658,3 +1706,19 @@ Settled on 2026-10-17 (5.4b, the payment gateway):
   services through Compose.
 - **D16 — statement breaks:** opt-in and seeded, in the clearing style: a movement left out, an amount off by one minor
   unit, a movement that never happened, a statement issued late; listed under `/test`.
+
+Settled on 2026-10-18 (Milestone 6, accepted as proposed):
+- **D17 — clock control outside test control (supersedes D11):** SR-24 asks a showcase deployment to change speed
+  without exposing reset and fault injection, which D11 cannot give. `GET /api/clock` is always mounted;
+  speed, freeze and resume are also under `/api/clock`, behind a separate `clock.operator_control` switch (default
+  off); `set`, `advance` and `reset` stay test-only. The `/test/clock` routes stay as they are.
+- **D18 — the provider's orders and recovery:** with `emit_order_events` off, the provider's orders are not in the
+  event log, so a restart cannot restore its ladder. After recovery or reset the provider re-quotes from the
+  current reference price, with its inventory recomputed from its trades. Re-quoting is a pure function of the
+  reference price, inventory and settings, so seeded runs stay reproducible (D6).
+- **D19 — Finnhub access:** automated tests use a local mock of the websocket and REST endpoints only. Manual
+  acceptance of SR-2 needs a key from the user, and the free-tier limits must be checked against Finnhub's current
+  terms before the defaults are set.
+- **D20 — forcing a payment outcome:** `POST /test/payments/{id}/outcome` rather than a test-only header on
+  `POST /api/payments`, so the payment API and its OpenAPI description carry nothing test-only, and a test can force
+  the outcome of a payment it did not create.
