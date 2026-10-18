@@ -174,6 +174,7 @@ fn acme() -> Instrument {
         lot_size: 1,
         enabled: true,
         reference_symbol: None,
+        price_source: None,
     }
 }
 
@@ -626,6 +627,7 @@ impl Service {
             },
             events: EventsConfig::default(),
             instruments: Vec::new(),
+            price_sources: Default::default(),
             webhooks: WebhooksConfig {
                 subscriptions: Vec::new(),
                 secret_grace_seconds: 3600,

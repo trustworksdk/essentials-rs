@@ -30,6 +30,8 @@ tags:
   - name: trades
   - name: events
     description: The canonical event log, replayable by sequence.
+  - name: market-data
+    description: Reference prices from each instrument's price source.
   - name: settlements
     description: The settlement simulator's instructions and externally reported outcomes.
   - name: clearing
@@ -125,7 +127,7 @@ paths:
     patch:
       tags: [instruments]
       operationId: updateInstrument
-      summary: Enable or disable trading, or change the reference symbol
+      summary: Enable or disable trading, or change the reference symbol or price source
       description: |
         Give at least one field; absent fields stay as they are. A change that alters a value publishes
         `InstrumentUpdated`. Resting orders stay; cancellations keep working while an instrument is disabled.
@@ -147,6 +149,9 @@ paths:
                   minLength: 1
                   maxLength: 64
                   description: "`null` clears it."
+                priceSource:
+                  oneOf: [{ $ref: "#/components/schemas/PriceSource" }, { type: "null" }]
+                  description: Replaces the instrument's own price source and restarts it; `null` falls back to the default.
       responses:
         "200":
           description: The instrument after the change.
@@ -234,6 +239,35 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /api/marketdata:
+    get:
+      tags: [market-data]
+      operationId: listMarketData
+      summary: Every instrument's market data, in instrument ID order
+      responses:
+        "200":
+          description: Market data per instrument.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/MarketData" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /api/marketdata/{instrumentId}:
+    get:
+      tags: [market-data]
+      operationId: marketData
+      summary: One instrument's market data
+      parameters:
+        - { name: instrumentId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The instrument's market data.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MarketData" }
+        "404": { $ref: "#/components/responses/NotFound" }
         "503": { $ref: "#/components/responses/Unavailable" }
   /api/orderbooks/{instrumentId}:
     get:
@@ -1060,11 +1094,14 @@ components:
           minLength: 1
           maxLength: 64
           description: The symbol a price source quotes the instrument under (e.g. `AAPL`), if it differs from `symbol`.
+        priceSource:
+          oneOf: [{ $ref: "#/components/schemas/PriceSource" }, { type: "null" }]
+          description: The instrument's own price source; absent or `null` takes `price_sources.default`.
     Instrument:
       type: object
       additionalProperties: false
       required: [id, symbol, mic, isin, cusip, currency, currencyScale, tickSizeMinor, tickSize, lotSize, enabled,
-                 referenceSymbol]
+                 referenceSymbol, priceSource]
       properties:
         id: { type: string }
         symbol: { type: string }
@@ -1078,6 +1115,46 @@ components:
         lotSize: { type: integer }
         enabled: { type: boolean }
         referenceSymbol: { type: [string, "null"] }
+        priceSource: { oneOf: [{ $ref: "#/components/schemas/PriceSource" }, { type: "null" }] }
+    PriceSource:
+      type: object
+      additionalProperties: false
+      description: |
+        A reference-price source. Every field is optional: missing ones come from `price_sources.default`, field by
+        field, then the built-in defaults (kind `none`, drift 0, volatility 0.2, a step a second). Fields the kind does
+        not use are ignored. Prices are decimal strings in major units, on the instrument's tick grid.
+      properties:
+        kind:
+          enum: [none, fixed, synthetic]
+          description: "`none`: no reference price. `fixed`: `price`. `synthetic`: a seeded geometric Brownian motion."
+        price: { $ref: "#/components/schemas/Amount" }
+        initialPrice:
+          $ref: "#/components/schemas/Amount"
+          description: Where a synthetic walk starts. Left out on a switch to `synthetic`, the current reference price, which is then stored here.
+        drift: { type: number, description: Annualized drift μ (a year of 365.25 simulated days). }
+        volatility: { type: number, minimum: 0, description: Annualized volatility σ. }
+        tickIntervalMs: { type: integer, minimum: 100, maximum: 86400000, description: Simulated milliseconds per step. }
+        seed: { type: integer, minimum: 0, description: Left out, derived from `price_sources.seed` and the instrument ID. }
+    MarketData:
+      type: object
+      additionalProperties: false
+      required: [instrumentId, reference]
+      properties:
+        instrumentId: { type: string }
+        reference:
+          description: "`null` when the price source is `none`."
+          oneOf:
+            - { type: "null" }
+            - type: object
+              additionalProperties: false
+              required: [price, priceTicks, source, sourceTimestamp]
+              properties:
+                price: { $ref: "#/components/schemas/Amount" }
+                priceTicks: { type: integer, minimum: 1 }
+                source: { enum: [fixed, synthetic] }
+                sourceTimestamp:
+                  $ref: "#/components/schemas/Timestamp"
+                  description: When the price was produced, on the exchange's clock.
     Participant:
       type: object
       additionalProperties: false
@@ -1463,7 +1540,7 @@ components:
     InstrumentEventPayload:
       type: object
       required: [instrumentId, symbol, mic, isin, cusip, currency, currencyScale, tickSizeMinor, tickSize, lotSize,
-                 enabled, referenceSymbol]
+                 enabled, referenceSymbol, priceSource]
       description: The whole instrument after the change, as `GET /api/instruments` shows it.
       properties:
         instrumentId: { type: string }
@@ -1478,6 +1555,7 @@ components:
         lotSize: { type: integer }
         enabled: { type: boolean }
         referenceSymbol: { type: [string, "null"] }
+        priceSource: { oneOf: [{ $ref: "#/components/schemas/PriceSource" }, { type: "null" }] }
     SettlementPayloadBase:
       type: object
       required: [executionId, tradeSequence, instrumentId, buyerId, sellerId, quantity, priceTicks, currency,
@@ -1570,7 +1648,7 @@ components:
               type: array
               minItems: 1
               uniqueItems: true
-              items: { enum: [enabled, referenceSymbol] }
+              items: { enum: [enabled, referenceSymbol, priceSource] }
               description: The fields whose value changed.
           unevaluatedProperties: false
     SettlementPendingEvent:

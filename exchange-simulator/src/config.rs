@@ -27,6 +27,9 @@ pub struct Config {
     /// Instruments listed at startup and after a reset (plan item 6.1).
     #[serde(default)]
     pub instruments: Vec<InstrumentConfig>,
+    /// Reference prices (plan item 6.2).
+    #[serde(default)]
+    pub price_sources: PriceSourcesConfig,
     pub ids: IdsConfig,
     pub settlement: SettlementConfig,
     #[serde(default)]
@@ -253,6 +256,25 @@ pub enum SettlementMode {
     Both,
 }
 
+/// Defaults for instruments' price sources (see [`crate::pricing`]).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceSourcesConfig {
+    /// The base of each instrument's derived synthetic seed.
+    #[serde(default)]
+    pub seed: u64,
+    /// What an instrument's own price source leaves out, field by field.
+    #[serde(default)]
+    pub default: crate::pricing::PriceSourceSpec,
+}
+
+impl PriceSourcesConfig {
+    pub fn sources(&self) -> Result<crate::pricing::PriceSources, String> {
+        crate::pricing::PriceSources::new(self.default.clone(), self.seed)
+            .map_err(|e| format!("price_sources.default: {e}"))
+    }
+}
+
 /// An instrument declared in configuration: the fields of `POST /api/instruments`, in snake_case.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -275,6 +297,9 @@ pub struct InstrumentConfig {
     pub enabled: bool,
     #[serde(default)]
     pub reference_symbol: Option<String>,
+    /// The instrument's own price source; fields left out come from `price_sources.default`.
+    #[serde(default)]
+    pub price_source: Option<crate::pricing::PriceSourceSpec>,
 }
 
 fn one() -> u64 {
@@ -299,6 +324,7 @@ impl From<&InstrumentConfig> for crate::domain::Instrument {
             lot_size: c.lot_size,
             enabled: c.enabled,
             reference_symbol: c.reference_symbol.clone(),
+            price_source: c.price_source.clone(),
         }
     }
 }
@@ -433,6 +459,51 @@ mod tests {
             "Default matches config/default.yaml"
         );
         assert!(!config.test_control.enabled);
+    }
+
+    #[test]
+    fn instruments_and_price_sources_read_in_snake_case() {
+        let config = with_overlay(
+            r#"
+price_sources:
+  seed: 7
+  default: { kind: synthetic, volatility: 0.3, tick_interval_ms: 500 }
+instruments:
+  - id: AAPL
+    symbol: AAPL
+    mic: XNAS
+    currency: USD
+    currency_scale: 2
+    reference_symbol: AAPL
+    price_source: { initial_price: "187.50" }
+  - id: MSFT
+    symbol: MSFT
+    currency: USD
+    currency_scale: 2
+    price_source: { kind: fixed, price: "410.00" }
+"#,
+        )
+        .unwrap();
+        let instruments = config.declared_instruments().unwrap();
+        let aapl = instruments[0].price_source.as_ref().unwrap();
+        assert_eq!(aapl.initial_price.as_deref(), Some("187.50"));
+        assert_eq!(instruments[0].reference_symbol.as_deref(), Some("AAPL"));
+        let msft = instruments[1].price_source.as_ref().unwrap();
+        assert_eq!(msft.kind, Some(crate::pricing::PriceSourceKind::Fixed));
+        assert_eq!(config.price_sources.seed, 7);
+        assert_eq!(config.price_sources.default.tick_interval_ms, Some(500));
+        config.price_sources.sources().unwrap();
+
+        let invalid = with_overlay("price_sources: { default: { volatility: -1 } }").unwrap();
+        assert_eq!(
+            invalid.price_sources.sources().unwrap_err(),
+            "price_sources.default: priceSource.volatility must not be negative"
+        );
+        assert!(
+            with_overlay("instruments: [ { id: A, symbol: A, currency: USD, currency_scale: 2, colour: red } ]")
+                .is_err(),
+            "unknown fields are rejected"
+        );
     }
 
     fn with_overlay(yaml: &str) -> Result<Config, config::ConfigError> {

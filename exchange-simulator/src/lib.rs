@@ -13,6 +13,7 @@ pub mod ids;
 pub mod market;
 pub mod metrics;
 pub mod persistence;
+pub mod pricing;
 pub mod scenario;
 pub mod settlement;
 

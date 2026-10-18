@@ -1640,6 +1640,47 @@ then 6.11, 6.12, 6.13–6.14.
   checked; reset not relisting declared instruments; a no-op change publishing; instruments reconciled before
   webhook subscriptions; a payload field renamed; the reference symbol not read back from storage.
 
+**6.2 — price sources `none`, `fixed`, `synthetic` ✅ done (2026-10-18)**
+- **Delivered:**
+  - `src/pricing`: `PriceSourceSpec` (the configured source, every field optional) and `PriceSources`, the running
+    sources the exchange owns. `priceSource` on instruments: API (`POST`, `PATCH`, responses), configuration and the
+    instrument events, and `changes` can name `priceSource`. `price_sources.seed` and `price_sources.default` in the
+    configuration.
+  - `synthetic`: a seeded geometric Brownian motion, stepped on a grid of `tickIntervalMs` (at least 100) from the
+    instant the source was set. Prices are rounded to the nearest tick, never below one; the walk itself is not
+    rounded.
+  - Migration 014 stores the instrument's own source (JSON) and when it started (`price_source_since`). Recovery
+    restarts each source with its stored start, and recomputes the walk from it.
+  - `GET /api/marketdata` and `GET /api/marketdata/{instrumentId}`: the reference price, its source kind and
+    `sourceTimestamp`, through the exchange thread (a read request).
+  - A declared instrument whose listing or update fails now stops startup with an error naming it
+    (`ExchangeError::DeclaredInstrument`).
+  - `openapi.yaml`, the README (a Price sources section and the market-data routes), `docs/configuration.md` and
+    `config/default.yaml`.
+  - Tests: `tests/price_sources.rs` (6), unit tests in `src/pricing` (8) and a YAML config test.
+- **Decisions:**
+  - **The walk is independent of when it is read.** It is stepped one interval at a time, catching up on every read,
+    so a `GET` (or none) never changes the path. Aggregating a gap into one draw would be faster but would make the
+    path depend on the reads. Measured cost: 30 simulated days of one-second steps, 2.6 million steps, takes about
+    50 ms per instrument in a release build.
+  - **`drift` and `volatility` are annualized**, over a year of 365.25 simulated days, the usual GBM convention.
+  - **Defaults merge field by field.** `price_sources.default` can set the kind and walk parameters once; each
+    instrument then needs only its `initial_price`. Fields a kind does not use are ignored, so switching kinds
+    needs no clean-up.
+  - **A switch to `synthetic` with no initial price continues from the current reference price**, which is stored as
+    the source's `initialPrice`, so the walk reproduces after a restart. With no current price either, it is a `400`.
+  - **Seeds derive from `price_sources.seed` and the instrument ID** (FNV-1a), so adding an instrument changes no
+    other instrument's path.
+  - **Reference ticks are not events**, as planned. They are not in the log, so the event log of a reproducible run
+    is unchanged until closing prices (6.11).
+  - `Instrument` loses `Eq` (the spec holds `f64`s); nothing relied on it.
+- **Deviation:** none from the 6.2 row.
+- **Note:** a changed `price_sources.default` applies at the next start, and the walks that rely on it are recomputed
+  from their start with the new parameters, so their prices jump. Documented in the configuration guide.
+- **Mutation checks**, each made a test fail: catching up in one aggregated draw (a path that depends on reads); the
+  source's start not used at recovery; a switch to `synthetic` not filling the initial price; the default ignored;
+  no one-tick floor; a seed that ignores the instrument; `priceSource` missing from the event payload.
+
 ## Beyond the milestones
 
 **OpenAPI specifications ✅ done (2026-10-17, requested by the user)**

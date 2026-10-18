@@ -67,16 +67,41 @@ instruments:
     lot_size: 1               # default 1
     enabled: true             # default true
     reference_symbol: AAPL    # optional: the symbol a price source quotes it under
+    price_source: { kind: synthetic, initial_price: "187.50" }   # optional; see Price sources
 ```
 
 - **At startup**, after the declared webhook subscriptions, each missing instrument is listed (`InstrumentListed`).
-  A listed one whose `enabled` or `reference_symbol` differs is updated (`InstrumentUpdated`), so the configuration
+  A listed one whose `enabled`, `reference_symbol` or `price_source` differs is updated (`InstrumentUpdated`), so the configuration
   wins over API changes at each start. Its other fields never change once listed: a difference stops startup with
   an error naming the field.
 - **After `POST /test/reset`** the declared instruments are listed again, with their events, as on a new database.
 - **Removed from the list**, an instrument stays listed, since orders and trades refer to it.
 - IDs must be unique, and values are validated as for the API (under `exchange.identifier_policy`).
 - API-registered instruments keep working alongside declared ones.
+
+## Price sources
+
+Each instrument's reference price comes from its price source: `none` (the default), `fixed` or `synthetic`. The
+[README](../README.md#price-sources) describes each kind and the synthetic walk. Fields an instrument's
+`price_source` leaves out come from `price_sources.default`, so a market of synthetic instruments is set once:
+
+```yaml
+price_sources:
+  seed: 0                    # base of each instrument's derived synthetic seed
+  default:
+    kind: synthetic
+    drift: 0.0               # annualized
+    volatility: 0.3          # annualized
+    tick_interval_ms: 1000   # simulated time per step, at least 100
+instruments:
+  - { id: AAPL, symbol: AAPL, mic: XNAS, currency: USD, currency_scale: 2, price_source: { initial_price: "187.50" } }
+  - { id: MSFT, symbol: MSFT, mic: XNAS, currency: USD, currency_scale: 2, price_source: { initial_price: "410.00" } }
+```
+
+A source that cannot resolve stops startup with an error naming the instrument, e.g. a `synthetic` default with no
+`initial_price`. A changed default applies at the next start to the instruments that rely on it, and their walks are
+recomputed from when their source was set, with the new parameters, so their reference prices jump. Change an
+instrument's own `price_source` instead to restart its walk from the current time.
 
 ## Webhooks
 

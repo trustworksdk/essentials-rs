@@ -124,11 +124,12 @@ impl Store {
     }
 
     /// Lists a new instrument (`insert`) or stores a listed one's changeable fields, together with its event, in one
-    /// transaction.
+    /// transaction. `price_source_since` is stored when the price source (re)started.
     pub fn commit_instrument(
         &mut self,
         instrument: &Instrument,
         insert: bool,
+        price_source_since: Option<DateTime<Utc>>,
         event: &NewEvent,
         outbox: Outbox<'_>,
     ) -> rusqlite::Result<()> {
@@ -137,23 +138,47 @@ impl Store {
             insert_instrument(&tx, instrument)?;
         } else {
             tx.prepare_cached(
-                "UPDATE instruments SET enabled = ?2, reference_symbol = ?3 WHERE id = ?1",
+                "UPDATE instruments SET enabled = ?2, reference_symbol = ?3, price_source = ?4 WHERE id = ?1",
             )?
             .execute(params![
                 instrument.id.0,
                 instrument.enabled,
-                instrument.reference_symbol
+                instrument.reference_symbol,
+                price_source_json(instrument),
             ])?;
+        }
+        if let Some(since) = price_source_since {
+            set_price_source_since(&tx, &instrument.id, since)?;
         }
         write_events(&tx, std::slice::from_ref(event), &outbox)?;
         tx.commit()
+    }
+
+    /// When each instrument's price source started; instruments listed before 6.2 have none.
+    pub fn price_source_since(
+        &self,
+    ) -> rusqlite::Result<std::collections::HashMap<InstrumentId, DateTime<Utc>>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT id, price_source_since FROM instruments WHERE price_source_since IS NOT NULL",
+        )?;
+        let rows =
+            statement.query_map([], |row| Ok((InstrumentId(row.get(0)?), parsed(row, 1)?)))?;
+        rows.collect()
+    }
+
+    pub fn save_price_source_since(
+        &self,
+        id: &InstrumentId,
+        since: DateTime<Utc>,
+    ) -> rusqlite::Result<()> {
+        set_price_source_since(&self.conn, id, since)
     }
 
     pub fn instruments(&self, filter: &InstrumentFilter) -> rusqlite::Result<Vec<Instrument>> {
         self.conn
             .prepare_cached(
                 "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size, enabled,
-                        reference_symbol
+                        reference_symbol, price_source
                  FROM instruments
                  WHERE (?1 IS NULL OR symbol = ?1) AND (?2 IS NULL OR mic = ?2)
                    AND (?3 IS NULL OR isin = ?3) AND (?4 IS NULL OR cusip = ?4)
@@ -167,7 +192,7 @@ impl Store {
         self.conn
             .prepare_cached(
                 "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size, enabled,
-                        reference_symbol
+                        reference_symbol, price_source
                  FROM instruments WHERE id = ?1",
             )?
             .query_row([&id.0], instrument_row)
@@ -913,14 +938,39 @@ fn instrument_row(row: &Row<'_>) -> rusqlite::Result<Instrument> {
         lot_size: from_sql(row, 8)?,
         enabled: row.get(9)?,
         reference_symbol: row.get(10)?,
+        price_source: row
+            .get::<_, Option<String>>(11)?
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(11, Type::Text, Box::new(e))
+                })
+            })
+            .transpose()?,
     })
+}
+
+fn price_source_json(instrument: &Instrument) -> Option<String> {
+    instrument
+        .price_source
+        .as_ref()
+        .map(|spec| serde_json::to_string(spec).expect("a price source serializes"))
+}
+
+fn set_price_source_since(
+    conn: &Connection,
+    id: &InstrumentId,
+    since: DateTime<Utc>,
+) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE instruments SET price_source_since = ?2 WHERE id = ?1")?
+        .execute(params![id.0, timestamp(since)])
+        .map(drop)
 }
 
 fn insert_instrument(conn: &Connection, instrument: &Instrument) -> rusqlite::Result<()> {
     conn.prepare_cached(
         "INSERT INTO instruments (id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size,
-                                  enabled, reference_symbol)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                  enabled, reference_symbol, price_source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?
     .execute(params![
         instrument.id.0,
@@ -934,6 +984,7 @@ fn insert_instrument(conn: &Connection, instrument: &Instrument) -> rusqlite::Re
         to_sql(instrument.lot_size),
         instrument.enabled,
         instrument.reference_symbol,
+        price_source_json(instrument),
     ])
     .map(drop)
 }

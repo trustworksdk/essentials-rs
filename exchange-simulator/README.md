@@ -136,14 +136,15 @@ All bodies are JSON with camelCase fields. Errors look like `{"error": "<code>",
 ```json
 { "id": "ACME", "symbol": "ACME", "mic": "XCSE", "isin": "DK0010274414", "cusip": null,
   "currency": "DKK", "currencyScale": 2, "tickSizeMinor": 1, "lotSize": 1, "enabled": true,
-  "referenceSymbol": null }
+  "referenceSymbol": null, "priceSource": { "kind": "fixed", "price": "100.25" } }
 ```
 
 `mic`, `isin`, `cusip` are optional; `tickSizeMinor` and `lotSize` default to 1, and `enabled` to `true`. `id` is the immutable key that
 orders reference. `(mic, symbol)` must be unique when `mic` is given; ISIN and CUSIP may be shared by several
 listings. `referenceSymbol` (optional, 1 to 64 printable characters without spaces) is the symbol a price source
 quotes the instrument under, e.g. `AAPL`, when it differs from `symbol`. Returns `201` with the instrument, plus
-`tickSize` as a decimal string, and publishes `InstrumentListed`.
+`tickSize` as a decimal string, and publishes `InstrumentListed`. `priceSource` (optional) is the instrument's own
+price source; see [Price sources](#price-sources).
 
 Instruments can also be declared in configuration (`instruments:`, see
 [Configuration](docs/configuration.md#instruments)); they are listed at startup and again after a reset.
@@ -154,8 +155,9 @@ All filters are optional and combined with AND. External identifiers can match s
 
 ### `PATCH /api/instruments/{id}`
 
-Changes `enabled`, `referenceSymbol`, or both; absent fields stay as they are, `"referenceSymbol": null` clears it,
-and an empty body is a `400`. `{ "enabled": false }` halts trading and `{ "enabled": true }` resumes it. It returns
+Changes `enabled`, `referenceSymbol`, `priceSource`, or any of them; absent fields stay as they are, `null` clears
+`referenceSymbol` or `priceSource` (which then falls back to the default), and an empty body is a `400`. A new
+`priceSource` restarts the source at once. `{ "enabled": false }` halts trading and `{ "enabled": true }` resumes it. It returns
 `200` with the instrument, or `404` for an unknown ID; no other field can change. A change that alters a value
 publishes `InstrumentUpdated`; one that alters nothing publishes nothing. A declared instrument can be changed too,
 but the configuration wins again at the next start. While an instrument is disabled:
@@ -210,6 +212,49 @@ Cancels the remaining quantity of an `OPEN` or `PARTIALLY_FILLED` order. Returns
 
 Levels are listed best first. `enabled` shows whether the instrument is trading. `lastSequence` is the sequence of the
 last order processed before the snapshot.
+
+### Price sources
+
+Each instrument has a price source that produces its **reference price**, the price the built-in liquidity provider
+will quote around and the market data publishes. The demo never pushes prices into the exchange; it reads them.
+
+| `kind` | Produces | Fields |
+|---|---|---|
+| `none` | No reference price; the instrument trades only on client orders (the default) | – |
+| `fixed` | A constant price | `price` |
+| `synthetic` | A seeded geometric Brownian motion on simulated time | `initialPrice`, `drift`, `volatility`, `tickIntervalMs`, `seed` |
+
+```json
+"priceSource": { "kind": "synthetic", "initialPrice": "187.50", "drift": 0.05, "volatility": 0.3,
+                 "tickIntervalMs": 1000 }
+```
+
+- **Defaults:** fields an instrument leaves out come from `price_sources.default` in the configuration, field by
+  field, then from the built-in defaults: kind `none`, drift 0, volatility 0.2, a step a second. A configuration that
+  sets `default: { kind: synthetic, volatility: 0.3 }` needs only an `initialPrice` per instrument.
+- **The synthetic walk** steps on a grid of `tickIntervalMs` of simulated time, starting when the source was set. Each
+  step multiplies the price by `exp((μ − σ²/2)Δt + σ√Δt·Z)`, with `drift` μ and `volatility` σ annualized (a year of
+  365.25 simulated days). Prices are rounded to the nearest tick and never fall below one tick.
+- **Reproducible:** the path depends only on the parameters, the seed and when the source was set, never on when it
+  is read. With deterministic IDs and a virtual clock, two runs give the same prices, across restarts and resets.
+  `seed` defaults to one derived from `price_sources.seed` and the instrument ID.
+- **Runtime changes:** `PATCH /api/instruments/{id}` with a new `priceSource` restarts the source without a restart of
+  the service. A switch to `synthetic` with no `initialPrice` continues from the current reference price, which is
+  stored as its `initialPrice`.
+- **Clock jumps** catch the walk up step by step on the exchange thread: about 50 ms per instrument for 30 simulated
+  days of one-second steps. `tickIntervalMs` is at least 100.
+
+### `GET /api/marketdata` and `GET /api/marketdata/{instrumentId}`
+
+```json
+{ "instrumentId": "AAPL",
+  "reference": { "price": "187.52", "priceTicks": 18752, "source": "synthetic",
+                 "sourceTimestamp": "2030-01-07T09:01:30Z" } }
+```
+
+Each instrument's market data, in instrument ID order; `404` for an unknown instrument. `reference` is `null` for a
+`none` source. `sourceTimestamp` is when the price was produced, on the exchange's clock: when a fixed source was set,
+or the synthetic step's grid time. Best bid and ask, the last trade and a stream follow in a later step.
 
 ### `GET /api/trades?instrumentId=&participantId=&orderId=&limit=`
 

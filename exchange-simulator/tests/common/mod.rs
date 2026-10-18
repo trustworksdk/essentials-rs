@@ -69,6 +69,7 @@ impl TestApp {
             events: EventsConfig::default(),
             webhooks: webhooks_config(),
             instruments: Vec::new(),
+            price_sources: Default::default(),
             database: DatabaseConfig {
                 mode: Default::default(),
                 memory_max_mib: 1024,

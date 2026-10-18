@@ -93,6 +93,7 @@ fn the_document_describes_exactly_the_mounted_routes() {
         include_str!("../src/api/mod.rs"),
         include_str!("../src/api/settlements.rs"),
         include_str!("../src/api/clearing.rs"),
+        include_str!("../src/api/market_data.rs"),
         include_str!("../src/api/test_control.rs"),
         include_str!("../../simulator-kit/src/api/webhooks.rs"),
     ];
@@ -223,6 +224,22 @@ async fn every_operation_and_event_matches_the_document() {
     ] {
         expect(a, s, 200, M::PATCH, "/api/instruments/ACME", Some(patch)).await;
     }
+    let synthetic = json!({ "id": "SYN", "symbol": "SYN", "currency": "USD", "currencyScale": 2,
+        "priceSource": { "kind": "synthetic", "initialPrice": "100.00", "drift": 0.05, "volatility": 0.4,
+                         "tickIntervalMs": 1000, "seed": 3 } });
+    expect(a, s, 201, M::POST, "/api/instruments", Some(synthetic)).await;
+    expect(
+        a,
+        s,
+        200,
+        M::PATCH,
+        "/api/instruments/ACME",
+        Some(json!({ "priceSource": { "kind": "fixed", "price": "100.25" } })),
+    )
+    .await;
+    expect(a, s, 200, M::GET, "/api/marketdata", None).await;
+    expect(a, s, 200, M::GET, "/api/marketdata/SYN", None).await;
+    expect(a, s, 404, M::GET, "/api/marketdata/NOPE", None).await;
     expect(
         a,
         s,

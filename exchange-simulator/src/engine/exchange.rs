@@ -16,6 +16,7 @@ use crate::events::NewEvent;
 use crate::events::{self, Command};
 use crate::ids::ExchangeIds;
 use crate::persistence::{Outbox, SettlementWrite, Store};
+use crate::pricing::{PriceSourceError, PriceSources, Reference};
 use crate::settlement::{
     ExternalReport, NewReport, SettlementPolicy, SettlementSimulator, TradeFacts,
 };
@@ -65,12 +66,20 @@ pub enum ExchangeError {
     #[error("symbol {symbol} is already listed on {mic}")]
     DuplicateListing { mic: String, symbol: String },
     #[error(
-        "instruments {id}: {field} differs from the listed instrument; only enabled and reference_symbol can change"
+        "instruments {id}: {field} differs from the listed instrument; only enabled, reference_symbol and \
+         price_source can change"
     )]
     DeclaredInstrumentConflict {
         id: InstrumentId,
         field: &'static str,
     },
+    #[error("instruments {id}: {error}")]
+    DeclaredInstrument {
+        id: InstrumentId,
+        error: Box<ExchangeError>,
+    },
+    #[error(transparent)]
+    PriceSource(#[from] PriceSourceError),
     #[error("participant {0} already exists")]
     DuplicateParticipant(ParticipantId),
     #[error(
@@ -168,6 +177,8 @@ pub struct ExchangeOptions {
     /// Instruments declared in configuration, listed or updated at recovery and after a reset, in this order. IDs
     /// must be unique (see [`crate::config::InstrumentConfig`]).
     pub instruments: Vec<Instrument>,
+    /// What an instrument's own price source leaves out, and the base of derived synthetic seeds.
+    pub price_sources: PriceSources,
 }
 
 impl Default for ExchangeOptions {
@@ -185,6 +196,8 @@ impl Default for ExchangeOptions {
             webhooks: Vec::new(),
             webhook_secret_grace: chrono::Duration::hours(1),
             instruments: Vec::new(),
+            price_sources: PriceSources::new(Default::default(), 0)
+                .expect("the empty default is valid"),
         }
     }
 }
@@ -247,6 +260,8 @@ pub struct Exchange {
     group: Option<Vec<Committed>>,
     /// Instruments declared in configuration.
     declared_instruments: Vec<Instrument>,
+    /// Every listed instrument's running price source.
+    prices: PriceSources,
 }
 
 /// The clearinghouse: its policy, the last business date whose cutoff was handled, and late statements waiting to be
@@ -384,7 +399,9 @@ impl Exchange {
             epoch: 0,
             group: None,
             declared_instruments: options.instruments,
+            prices: options.price_sources,
         };
+        exchange.start_price_sources()?;
         exchange.reconcile_webhooks()?;
         exchange.reconcile_instruments()?;
         if let Some(policy) = options.clearing {
@@ -430,7 +447,8 @@ impl Exchange {
                 symbol: instrument.symbol,
             });
         }
-        self.commit_instrument(instrument, None)
+        let mut instrument = instrument;
+        self.commit_instrument(&mut instrument, None)
     }
 
     /// Switches trading in an instrument on or off, durably, and returns the updated instrument.
@@ -466,17 +484,25 @@ impl Exchange {
             return Ok(instrument);
         }
         instrument.validate(self.identifier_policy)?;
-        self.commit_instrument(instrument.clone(), Some(&changes))?;
+        self.commit_instrument(&mut instrument, Some(&changes))?;
         Ok(instrument)
     }
 
-    /// Writes a new (`changes: None`) or changed instrument with its event, then applies it to memory.
+    /// Writes a new (`changes: None`) or changed instrument with its event, then applies it to memory. A new price
+    /// source is prepared first (see [`PriceSources::prepare`]), so the instrument stored and published is the one
+    /// whose source then starts, with its grid at now.
     fn commit_instrument(
         &mut self,
-        instrument: Instrument,
+        instrument: &mut Instrument,
         changes: Option<&[&'static str]>,
     ) -> Result<(), ExchangeError> {
-        let mut event = events::instrument_event(&instrument, changes, self.now());
+        let now = self.now();
+        let restarts = changes.is_none_or(|c| c.contains(&"priceSource"));
+        if restarts {
+            let current = self.prices.reference(&instrument.id, now);
+            self.prices.prepare(instrument, current)?;
+        }
+        let mut event = events::instrument_event(instrument, changes, now);
         let next = NewEvent::stamp(
             std::slice::from_mut(&mut event),
             self.next_event_sequence,
@@ -489,15 +515,23 @@ impl Exchange {
             due: wall_now(),
             schema_version: events::SCHEMA_VERSION,
         };
-        self.store
-            .commit_instrument(&instrument, changes.is_none(), &event, outbox)?;
+        self.store.commit_instrument(
+            instrument,
+            changes.is_none(),
+            restarts.then_some(now),
+            &event,
+            outbox,
+        )?;
         self.next_event_sequence = next;
         ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type).increment(1);
+        if restarts {
+            self.prices.start(instrument, now)?;
+        }
         match self.books.get_mut(&instrument.id) {
-            Some(book) => book.set_instrument(instrument),
+            Some(book) => book.set_instrument(instrument.clone()),
             None => {
                 self.books
-                    .insert(instrument.id.clone(), OrderBook::new(instrument));
+                    .insert(instrument.id.clone(), OrderBook::new(instrument.clone()));
             }
         }
         self.wake_delivery(std::slice::from_ref(&event));
@@ -506,14 +540,22 @@ impl Exchange {
 
     /// Brings the instruments declared in configuration into the registry. Runs at recovery and after a reset, after
     /// the declared webhook subscriptions, so they receive the events. A missing instrument is listed; a listed one
-    /// whose `enabled` or `reference_symbol` differs is updated, so configuration wins over API changes, as for
-    /// subscriptions. Any other difference fails: those fields never change once listed. Instruments no longer
-    /// declared stay listed, since orders and trades refer to them.
+    /// whose `enabled`, `reference_symbol` or `price_source` differs is updated, so configuration wins over API
+    /// changes, as for subscriptions. Any other difference fails: those fields never change once listed. Instruments
+    /// no longer declared stay listed, since orders and trades refer to them.
     fn reconcile_instruments(&mut self) -> Result<(), ExchangeError> {
         for declared in self.declared_instruments.clone() {
+            let id = declared.id.clone();
+            let wrap = |error| match error {
+                error @ ExchangeError::Storage(_) => error,
+                error => ExchangeError::DeclaredInstrument {
+                    id: id.clone(),
+                    error: Box::new(error),
+                },
+            };
             let Some(book) = self.books.get(&declared.id) else {
                 tracing::info!(id = %declared.id.0, "instrument listed from configuration");
-                self.register_instrument(declared)?;
+                self.register_instrument(declared).map_err(wrap)?;
                 continue;
             };
             let listed = book.instrument();
@@ -542,10 +584,64 @@ impl Exchange {
             let change = InstrumentChange {
                 enabled: Some(declared.enabled),
                 reference_symbol: Some(declared.reference_symbol.clone()),
+                price_source: Some(declared.price_source.clone()),
             };
-            self.update_instrument(&declared.id, &change)?;
+            self.update_instrument(&declared.id, &change)
+                .map_err(wrap)?;
         }
         Ok(())
+    }
+
+    /// Starts every listed instrument's price source at recovery, each with its grid where it was. An instrument with
+    /// no stored start (listed before price sources existed) starts now, and that is stored.
+    fn start_price_sources(&mut self) -> Result<(), ExchangeError> {
+        let mut since = self.store.price_source_since()?;
+        let now = self.now();
+        let mut instruments: Vec<Instrument> = self
+            .books
+            .values()
+            .map(|b| b.instrument().clone())
+            .collect();
+        instruments.sort_by(|a, b| a.id.cmp(&b.id));
+        for instrument in instruments {
+            let at = match since.remove(&instrument.id) {
+                Some(at) => at,
+                None => {
+                    self.store.save_price_source_since(&instrument.id, now)?;
+                    now
+                }
+            };
+            self.prices.start(&instrument, at).map_err(|error| {
+                ExchangeError::DeclaredInstrument {
+                    id: instrument.id.clone(),
+                    error: Box::new(error.into()),
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Every listed instrument with its reference price now, in ID order (or only `id`'s).
+    pub fn references(
+        &mut self,
+        id: Option<&InstrumentId>,
+    ) -> Vec<(Instrument, Option<Reference>)> {
+        let now = self.now();
+        let mut instruments: Vec<Instrument> = self
+            .books
+            .values()
+            .map(|b| b.instrument())
+            .filter(|i| id.is_none_or(|id| *id == i.id))
+            .cloned()
+            .collect();
+        instruments.sort_by(|a, b| a.id.cmp(&b.id));
+        instruments
+            .into_iter()
+            .map(|i| {
+                let reference = self.prices.reference(&i.id, now);
+                (i, reference)
+            })
+            .collect()
     }
 
     pub fn register_participant(&mut self, participant: Participant) -> Result<(), ExchangeError> {
@@ -798,6 +894,7 @@ impl Exchange {
     pub fn reset(&mut self) -> Result<(), ExchangeError> {
         self.store.reset()?;
         self.books.clear();
+        self.prices.clear();
         self.participants.clear();
         self.webhooks.clear();
         self.last_sequence = 0;

@@ -39,7 +39,8 @@ impl From<ExchangeError> for ApiError {
             E::InvalidClientOrderId
             | E::InvalidParticipant(_)
             | E::InvalidWebhook(_)
-            | E::Instrument(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
+            | E::Instrument(_)
+            | E::PriceSource(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             E::Book(BookError::Invalid(_)) => (StatusCode::BAD_REQUEST, "invalid_order"),
             E::ClockNotVirtual => (StatusCode::CONFLICT, "clock_not_virtual"),
             E::ExternalOutcomesDisabled => (StatusCode::CONFLICT, "external_outcomes_disabled"),
@@ -53,7 +54,8 @@ impl From<ExchangeError> for ApiError {
             | E::GroupCommit(_)
             | E::Settlement(_)
             | E::Clearing(_)
-            | E::DeclaredInstrumentConflict { .. } => {
+            | E::DeclaredInstrumentConflict { .. }
+            | E::DeclaredInstrument { .. } => {
                 return Self::internal(error);
             }
         };

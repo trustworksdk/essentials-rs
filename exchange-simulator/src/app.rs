@@ -103,6 +103,7 @@ impl App {
                     i64::try_from(config.webhooks.secret_grace_seconds).unwrap_or(i64::MAX / 1000),
                 ),
                 instruments: config.declared_instruments().map_err(anyhow::Error::msg)?,
+                price_sources: config.price_sources.sources().map_err(anyhow::Error::msg)?,
             },
         )
         .context("recovering order books")?;

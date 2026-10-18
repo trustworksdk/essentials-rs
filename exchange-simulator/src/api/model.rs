@@ -10,6 +10,7 @@ use crate::domain::{
     Participant, ParticipantId, Side,
 };
 use crate::engine::{BookSnapshot, Level, RejectReason, SubmitOrder};
+use crate::pricing::{PriceSourceSpec, Reference};
 
 fn one() -> u64 {
     1
@@ -28,6 +29,8 @@ pub struct InstrumentPatch {
     pub enabled: Option<bool>,
     #[serde(default, deserialize_with = "present")]
     pub reference_symbol: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    pub price_source: Option<Option<PriceSourceSpec>>,
 }
 
 impl From<InstrumentPatch> for InstrumentChange {
@@ -35,6 +38,7 @@ impl From<InstrumentPatch> for InstrumentChange {
         Self {
             enabled: p.enabled,
             reference_symbol: p.reference_symbol,
+            price_source: p.price_source,
         }
     }
 }
@@ -66,6 +70,7 @@ pub struct InstrumentRequest {
     #[serde(default = "yes")]
     pub enabled: bool,
     pub reference_symbol: Option<String>,
+    pub price_source: Option<PriceSourceSpec>,
 }
 
 impl From<InstrumentRequest> for Instrument {
@@ -82,6 +87,7 @@ impl From<InstrumentRequest> for Instrument {
             lot_size: r.lot_size,
             enabled: r.enabled,
             reference_symbol: r.reference_symbol,
+            price_source: r.price_source,
         }
     }
 }
@@ -102,6 +108,7 @@ pub struct InstrumentView {
     pub lot_size: u64,
     pub enabled: bool,
     pub reference_symbol: Option<String>,
+    pub price_source: Option<PriceSourceSpec>,
 }
 
 impl From<&Instrument> for InstrumentView {
@@ -119,6 +126,7 @@ impl From<&Instrument> for InstrumentView {
             lot_size: i.lot_size,
             enabled: i.enabled,
             reference_symbol: i.reference_symbol.clone(),
+            price_source: i.price_source.clone(),
         }
     }
 }
@@ -369,4 +377,38 @@ pub struct EventQuery {
     /// 1 to 1000; default 100.
     pub limit: Option<u32>,
     pub event_type: Option<String>,
+}
+
+/// `GET /api/marketdata`: an instrument's market data. For now its reference price; the order book's best prices
+/// and the last trade join it with the market-data channel (plan item 6.8).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDataView {
+    pub instrument_id: InstrumentId,
+    /// `null` when the instrument's price source is `none`.
+    pub reference: Option<ReferenceView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceView {
+    pub price: String,
+    pub price_ticks: i64,
+    /// The price source's kind.
+    pub source: &'static str,
+    pub source_timestamp: DateTime<Utc>,
+}
+
+impl MarketDataView {
+    pub fn new(instrument: &Instrument, reference: Option<Reference>) -> Self {
+        Self {
+            instrument_id: instrument.id.clone(),
+            reference: reference.map(|r| ReferenceView {
+                price: instrument.ticks_to_price(r.ticks),
+                price_ticks: r.ticks,
+                source: r.kind.as_str(),
+                source_timestamp: r.source_timestamp,
+            }),
+        }
+    }
 }

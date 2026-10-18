@@ -98,6 +98,7 @@ pub fn instrument_event(
         "lotSize": instrument.lot_size,
         "enabled": instrument.enabled,
         "referenceSymbol": instrument.reference_symbol,
+        "priceSource": instrument.price_source,
     });
     if let Some(changes) = changes {
         payload["changes"] = json!(changes);

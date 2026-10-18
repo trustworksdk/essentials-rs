@@ -2,6 +2,7 @@ use super::InstrumentId;
 use super::identifiers::{
     IdentifierError, check_length, validate_cusip, validate_isin, validate_mic,
 };
+use crate::pricing::PriceSourceSpec;
 
 type Validator = fn(&str) -> Result<(), IdentifierError>;
 
@@ -19,7 +20,7 @@ pub enum IdentifierPolicy {
 /// A tradable listing. `symbol` is scoped by `mic`; ISIN and CUSIP identify the security and may be shared by several
 /// listings. Prices are integer ticks of `tick_size_minor` minor currency units, where a major unit has
 /// `currency_scale` decimal places (100.25 DKK with scale 2 and tick 1 is 10025 ticks).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Instrument {
     pub id: InstrumentId,
     pub symbol: String,
@@ -34,20 +35,23 @@ pub struct Instrument {
     pub enabled: bool,
     /// The symbol a price source quotes this instrument under (e.g. `AAPL`), which may differ from `symbol`.
     pub reference_symbol: Option<String>,
+    /// The instrument's own price source; `None` takes `price_sources.default` (see [`crate::pricing`]).
+    pub price_source: Option<PriceSourceSpec>,
 }
 
-/// A change to a listed instrument: only trading status and the reference symbol may change after listing. `None`
-/// leaves a field as it is; `reference_symbol: Some(None)` clears the reference symbol.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// A change to a listed instrument: only trading status, the reference symbol and the price source may change after
+/// listing. `None` leaves a field as it is; `Some(None)` clears an optional one.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct InstrumentChange {
     pub enabled: Option<bool>,
     pub reference_symbol: Option<Option<String>>,
+    pub price_source: Option<Option<PriceSourceSpec>>,
 }
 
 impl InstrumentChange {
     /// Whether the change names no field.
     pub fn is_empty(&self) -> bool {
-        self.enabled.is_none() && self.reference_symbol.is_none()
+        self.enabled.is_none() && self.reference_symbol.is_none() && self.price_source.is_none()
     }
 
     /// Applies the change and returns the wire names of the fields whose value it changed, in a fixed order.
@@ -64,6 +68,12 @@ impl InstrumentChange {
         {
             instrument.reference_symbol = reference_symbol.clone();
             changed.push("referenceSymbol");
+        }
+        if let Some(price_source) = &self.price_source
+            && *price_source != instrument.price_source
+        {
+            instrument.price_source = price_source.clone();
+            changed.push("priceSource");
         }
         changed
     }
@@ -225,6 +235,7 @@ mod tests {
             lot_size: 1,
             enabled: true,
             reference_symbol: None,
+            price_source: None,
         }
     }
 
@@ -293,11 +304,13 @@ mod tests {
         let unchanged = InstrumentChange {
             enabled: Some(true),
             reference_symbol: Some(None),
+            price_source: Some(None),
         };
         assert!(unchanged.apply(&mut instrument).is_empty());
         let change = InstrumentChange {
             enabled: Some(false),
             reference_symbol: Some(Some("ACME.CO".into())),
+            price_source: None,
         };
         assert_eq!(
             change.apply(&mut instrument),

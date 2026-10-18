@@ -3,6 +3,7 @@
 
 pub mod clearing;
 mod error;
+pub mod market_data;
 mod model;
 pub mod settlements;
 pub mod test_control;
@@ -91,6 +92,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state.clone())
         .merge(settlements::router(state.clone()))
         .merge(clearing::router(state.clone()))
+        .merge(market_data::router(state.clone()))
         .merge(simulator_kit::api::webhooks::router(state))
 }
 

@@ -23,6 +23,7 @@ fn declared(id: &str, mic: &str) -> InstrumentConfig {
         lot_size: 1,
         enabled: true,
         reference_symbol: Some(id.into()),
+        price_source: None,
     }
 }
 
@@ -84,10 +85,10 @@ async fn declared_instruments_are_listed_at_startup_with_an_event_each() {
         json!([
             { "id": "AAPL", "symbol": "AAPL", "mic": "XNAS", "isin": null, "cusip": null, "currency": "USD",
               "currencyScale": 2, "tickSizeMinor": 1, "tickSize": "0.01", "lotSize": 1, "enabled": true,
-              "referenceSymbol": "AAPL" },
+              "referenceSymbol": "AAPL", "priceSource": null },
             { "id": "MSFT", "symbol": "MSFT", "mic": "XNAS", "isin": null, "cusip": null, "currency": "USD",
               "currencyScale": 2, "tickSizeMinor": 1, "tickSize": "0.01", "lotSize": 1, "enabled": true,
-              "referenceSymbol": "MSFT" }
+              "referenceSymbol": "MSFT", "priceSource": null }
         ])
     );
     let all = events(&app).await;
@@ -104,7 +105,7 @@ async fn declared_instruments_are_listed_at_startup_with_an_event_each() {
         all[0]["payload"],
         json!({ "instrumentId": "AAPL", "symbol": "AAPL", "mic": "XNAS", "isin": null, "cusip": null,
                 "currency": "USD", "currencyScale": 2, "tickSizeMinor": 1, "tickSize": "0.01", "lotSize": 1,
-                "enabled": true, "referenceSymbol": "AAPL" })
+                "enabled": true, "referenceSymbol": "AAPL", "priceSource": null })
     );
     // The declared subscription exists before the instruments are listed, so it has their deliveries.
     assert_eq!(app.count("SELECT COUNT(*) FROM webhook_deliveries"), 2);
@@ -189,8 +190,8 @@ async fn a_declared_field_that_cannot_change_stops_startup() {
     let error = App::start(&config).err().expect("startup fails");
     assert!(
         format!("{error:#}").contains(
-            "instruments AAPL: tick_size_minor differs from the listed instrument; only enabled and \
-             reference_symbol can change"
+            "instruments AAPL: tick_size_minor differs from the listed instrument; only enabled, \
+             reference_symbol and price_source can change"
         ),
         "{error:#}"
     );
@@ -279,7 +280,7 @@ async fn api_listings_and_changes_are_events() {
         .post(
             "/api/instruments",
             json!({ "id": "AAPL", "symbol": "AAPL", "mic": "XNAS", "currency": "USD", "currencyScale": 2,
-                    "referenceSymbol": "AAPL" }),
+                    "referenceSymbol": "AAPL", "priceSource": null }),
         )
         .await;
     assert_eq!(

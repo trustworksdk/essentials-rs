@@ -8,6 +8,7 @@ use super::{
     BookUpdate, ClockChange, ClockState, Exchange, ExchangeError, Level, SubmitOrder, SubmitOutcome,
 };
 use crate::domain::{Instrument, InstrumentChange, InstrumentId, Participant, Side};
+use crate::pricing::Reference;
 use crate::settlement::{ExternalReport, NewReport};
 use crate::webhooks::{
     DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription, WebhookChange,
@@ -55,7 +56,7 @@ fn backend_error(error: DispatchError) -> simulator_kit::webhooks::BackendError 
 }
 
 /// Point-in-time view of one instrument's book.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BookSnapshot {
     pub instrument: Instrument,
     pub bids: Vec<Level>,
@@ -82,6 +83,10 @@ enum Request {
     RetryDeadLetters(Option<Uuid>, Vec<Uuid>, Reply<usize>),
     Reset(Reply<()>),
     UpdateInstrument(InstrumentId, InstrumentChange, Reply<Instrument>),
+    References(
+        Option<InstrumentId>,
+        oneshot::Sender<Vec<(Instrument, Option<Reference>)>>,
+    ),
     ClockState(oneshot::Sender<ClockState>),
     Tick(Reply<usize>),
     ReportSettlement(NewReport, Reply<(ExternalReport, bool)>),
@@ -108,6 +113,7 @@ impl Request {
             Self::RetryDeadLetters(..) => "retry_dead_letters",
             Self::Reset(..) => "reset",
             Self::UpdateInstrument(..) => "update_instrument",
+            Self::References(..) => "references",
             Self::ClockState(..) => "clock_state",
             Self::Tick(..) => "tick",
             Self::ReportSettlement(..) => "report_settlement",
@@ -231,6 +237,14 @@ impl Dispatcher {
 
     pub async fn change_clock(&self, change: ClockChange) -> Result<ClockState, DispatchError> {
         self.call(|reply| Request::ChangeClock(change, reply)).await
+    }
+
+    /// Every listed instrument with its reference price now (or only `id`'s), in ID order.
+    pub async fn references(
+        &self,
+        id: Option<InstrumentId>,
+    ) -> Result<Vec<(Instrument, Option<Reference>)>, DispatchError> {
+        self.ask(|reply| Request::References(id, reply)).await
     }
 
     /// Changes a listed instrument (see [`Exchange::update_instrument`]).
@@ -529,6 +543,10 @@ fn handle(exchange: &mut Exchange, request: Request) -> &'static str {
         Request::UpdateInstrument(id, change, reply) => {
             answer(reply, exchange.update_instrument(&id, &change))
         }
+        Request::References(id, reply) => {
+            let _ = reply.send(exchange.references(id.as_ref()));
+            "ok"
+        }
         Request::RegisterWebhook(request, reply) => {
             answer(reply, exchange.register_webhook(request))
         }
@@ -769,6 +787,7 @@ mod tests {
                 lot_size: 1,
                 enabled: true,
                 reference_symbol: None,
+                price_source: None,
             }
         }
 
