@@ -128,6 +128,17 @@ between half and all of its doubling step, capped at `max_backoff_ms`):
 Dead letters are not lost: they can be retried at any time ([Operations](operations.md#dead-letters)). For planned
 downtime, pausing the subscription is better than relying on retries.
 
+**Two demo stacks on one exchange:** give each stack's subscription a `participants` filter, so it receives only its
+own participants' order, trade, settlement and clearing events (and every event that involves no participant, such as
+instrument listings). The [README](../README.md#post-apiwebhooks) has the exact rules.
+
+```yaml
+webhooks:
+  subscriptions:
+    - { name: stack-a, url: "http://demo-a:8080/exchange", event_types: [TradeExecuted, OrderAccepted], participants: [DEMO-A] }
+    - { name: stack-b, url: "http://demo-b:8080/exchange", event_types: [TradeExecuted, OrderAccepted], participants: [DEMO-B] }
+```
+
 ## Settlement
 
 `settlement.mode` decides who settles trades:

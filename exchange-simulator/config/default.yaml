@@ -36,6 +36,7 @@ webhooks:
   #     ordered: true                           # default false
   #     enabled: true                           # default true; false turns it off (no deliveries recorded)
   #     paused: false                           # default false; true records deliveries but holds them
+  #     participants: [A, B]                    # optional: only these participants' events, plus events of none
   subscriptions: []
   # When the configuration changes a declared subscription's secret, deliveries are signed with both the new and the
   # previous secret for this long, so the consumer can switch without rejecting any.

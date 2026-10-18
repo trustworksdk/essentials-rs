@@ -1579,10 +1579,12 @@ components:
     SettlementOutcomeReportedPayload:
       type: object
       additionalProperties: false
-      required: [reportId, executionId, status, reference, reason, details, receivedAt]
+      required: [reportId, executionId, buyerId, sellerId, status, reference, reason, details, receivedAt]
       properties:
         reportId: { type: string, format: uuid }
         executionId: { type: string, format: uuid }
+        buyerId: { type: string, description: The execution's buyer. }
+        sellerId: { type: string, description: The execution's seller. }
         status: { $ref: "#/components/schemas/SettlementStatus" }
         reference: { type: [string, "null"] }
         reason: { type: [string, "null"] }
@@ -1758,6 +1760,7 @@ components:
           description: Known event types of this service; duplicates are removed.
         secret: { type: [string, "null"], minLength: 16, maxLength: 256, description: When set, every delivery is signed. Never returned. }
         ordered: { type: boolean, default: false, description: One delivery at a time, in event sequence order. }
+        participants: { $ref: "#/components/schemas/ParticipantFilter" }
     WebhookUpdate:
       type: object
       additionalProperties: false
@@ -1769,6 +1772,18 @@ components:
         ordered: { type: [boolean, "null"] }
         enabled: { type: [boolean, "null"] }
         paused: { type: [boolean, "null"] }
+        participants:
+          oneOf: [{ $ref: "#/components/schemas/ParticipantFilter" }, { type: "null" }]
+          description: "`null` removes the filter."
+    ParticipantFilter:
+      type: array
+      minItems: 1
+      maxItems: 100
+      items: { type: string, minLength: 1, maxLength: 64 }
+      description: |
+        Exchange only; the payment gateway refuses it. The subscription receives only events involving one of these
+        participants (an order's participant, either side of a trade, settlement or outcome report, a statement's
+        participant), plus events that involve none, such as instrument events. Duplicates are removed.
     SecretRotation:
       type: object
       additionalProperties: false
@@ -1795,6 +1810,7 @@ components:
         source: { enum: [api, config] }
         previousSecretValidUntil: { $ref: "#/components/schemas/Timestamp" }
         deleted: { const: true, description: Shown only when listing with `includeDeleted=true`. }
+        participants: { $ref: "#/components/schemas/ParticipantFilter" }
     Subscription:
       allOf: [{ $ref: "#/components/schemas/SubscriptionFields" }]
       unevaluatedProperties: false

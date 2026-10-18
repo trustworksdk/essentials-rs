@@ -607,6 +607,7 @@ webhooks:
             ordered: false,
             enabled: true,
             paused: false,
+            participants: None,
         };
         let secret = |entry: SubscriptionConfig| entry.resolve().map(|d| d.subscription.secret);
         assert_eq!(secret(base.clone()).unwrap(), None);

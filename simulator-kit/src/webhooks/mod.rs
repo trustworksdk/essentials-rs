@@ -54,7 +54,15 @@ pub struct Subscription {
     /// Deleted through the API: kept for its history, but hidden, receiving nothing and sending nothing.
     #[serde(skip_serializing)]
     pub deleted: bool,
+    /// Only events involving one of these participants, plus events that involve none (see [`Parties`]); `None`
+    /// receives every event of its types.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participants: Option<Vec<String>>,
 }
+
+/// The participants an event involves, from its type and payload: the order's participant, both sides of a trade.
+/// A service that has no participants passes none to [`WebhookHub::load`], and then refuses participant filters.
+pub type Parties = fn(&str, &serde_json::Value) -> Vec<String>;
 
 /// Who owns a subscription.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -113,7 +121,8 @@ pub fn validate_declared(declared: &[DeclaredSubscription]) -> Result<(), String
     Ok(())
 }
 
-/// A change to a subscription (`PATCH /api/webhooks/{id}`); `None` leaves a field as it is.
+/// A change to a subscription (`PATCH /api/webhooks/{id}`); `None` leaves a field as it is, and
+/// `participants: Some(None)` removes the filter.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WebhookChange {
     pub url: Option<String>,
@@ -121,6 +130,7 @@ pub struct WebhookChange {
     pub ordered: Option<bool>,
     pub enabled: Option<bool>,
     pub paused: Option<bool>,
+    pub participants: Option<Option<Vec<String>>>,
 }
 
 /// A request to register a subscription.
@@ -133,11 +143,26 @@ pub struct NewSubscription {
     /// At most one delivery in flight, in sequence order. A failing delivery blocks later ones until it is delivered
     /// or dead-lettered; after a dead letter delivery continues with the next event.
     pub ordered: bool,
+    /// Only events involving one of these participants (1 to 100 IDs), plus events that involve none.
+    pub participants: Option<Vec<String>>,
 }
 
 impl Subscription {
-    pub fn wants(&self, event_type: &str) -> bool {
-        self.enabled && !self.deleted && self.event_types.iter().any(|t| t == event_type)
+    /// Whether it receives an event of `event_type` involving `parties`.
+    pub fn wants(&self, event_type: &str, parties: &[String]) -> bool {
+        self.enabled
+            && !self.deleted
+            && self.event_types.iter().any(|t| t == event_type)
+            && self.involves(parties)
+    }
+
+    /// Whether its participant filter lets through an event involving `parties`: no filter, an event that involves
+    /// no participant, or one of the listed participants among them.
+    pub fn involves(&self, parties: &[String]) -> bool {
+        match &self.participants {
+            None => true,
+            Some(listed) => parties.is_empty() || parties.iter().any(|p| listed.contains(p)),
+        }
     }
 }
 

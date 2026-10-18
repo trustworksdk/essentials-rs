@@ -793,6 +793,7 @@ mod tests {
             ordered: false,
             enabled: true,
             paused: false,
+            participants: None,
         }];
         let scenario: Scenario =
             serde_saphyr::from_str("name: s\nseed: 1\nstart: 2030-01-07T09:00:00Z\nsteps: []\n")

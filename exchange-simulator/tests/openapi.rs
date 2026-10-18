@@ -188,6 +188,7 @@ async fn every_operation_and_event_matches_the_document() {
             ordered: false,
             enabled: true,
             paused: false,
+            participants: None,
         });
     })
     .await;

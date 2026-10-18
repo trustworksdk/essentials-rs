@@ -311,7 +311,7 @@ intake, otherwise 00:00 UTC of the relevant date. Every one carries:
 | `SettlementCompleted` | `settledAt` | `SETTLED` |
 | `SettlementFailed` | `reason`: `SIMULATED_FAILURE` | `FAILED` |
 | `SettlementCancelled` | `reason`: `SIMULATED_CANCELLATION` | `CANCELLED` |
-| `SettlementOutcomeReported` | `source: "external"`: `reportId`, `status`, `reference`, `reason`, `details`, `receivedAt` (not a lifecycle step of the simulator) | – |
+| `SettlementOutcomeReported` | `source: "external"`: `reportId`, `buyerId`, `sellerId`, `status`, `reference`, `reason`, `details`, `receivedAt` (not a lifecycle step of the simulator) | – |
 | `SettlementCorrected` | `reason`: `SIMULATED_CORRECTION`, `previousSettlementAmount`, `previousAmountMinor` (the amount moves by one tick per unit) | `CORRECTED` |
 
 `ClearingStatementIssued` (`source: "clearinghouse"`, aggregate ID the statement ID, correlation ID the participant)
@@ -336,6 +336,16 @@ declared in configuration also show their `name`, with `source: "config"`. The U
 types must be ones listed above. `secret` is optional (16–256 characters). When it is given, deliveries are signed. It
 is never returned; responses show `signed: true` instead. A subscription receives events committed after it was registered; replay earlier events with
 `/api/events`.
+
+**Participant filter:** `"participants": ["A", "B"]` (1 to 100 participant IDs; shown in responses when set) narrows
+a subscription to those participants, so two independent demo stacks can share one exchange:
+- order events (`OrderAccepted`, `OrderRejected`, fills, `OrderCancelled`) only for orders of a listed participant;
+- `TradeExecuted`, settlement events (`SettlementOutcomeReported` included) and `ClearingStatementIssued` when either
+  side, or the statement's participant, is listed;
+- events that involve no participant, such as `InstrumentListed`, always.
+
+Redelivery applies the same filter. `PATCH /api/webhooks/{id}` with `"participants": null` removes it. The payment
+gateway has no participants and refuses the field.
 
 Delivery is a `POST` of the event envelope with headers `X-Event-Id`, `X-Event-Type`, `X-Event-Sequence`,
 `X-Subscription-Id` and `X-Delivery-Attempt`.

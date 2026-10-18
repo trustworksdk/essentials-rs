@@ -172,6 +172,7 @@ impl Gateway {
             options.webhooks,
             options.webhook_secret_grace,
             EVENT_TYPES,
+            None,
         )?;
         let mut clock = options.clock;
         let clock_start = options
@@ -355,6 +356,7 @@ impl Gateway {
             ids: self.ids,
             due: wall_now(),
             schema_version: SCHEMA_VERSION,
+            parties: None,
         };
         store::commit_payments(&mut self.conn, payments, bookings, events, outbox)?;
         self.next_event_sequence = next;
@@ -472,6 +474,7 @@ impl Gateway {
             ids: self.ids,
             due: wall_now(),
             schema_version: SCHEMA_VERSION,
+            parties: None,
         };
         let rows: Vec<&StoredStatement> = issue.iter().chain(&waiting).collect();
         store::commit_statements(&mut self.conn, &rows, cursor, &events, outbox)?;

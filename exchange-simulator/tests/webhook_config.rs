@@ -75,6 +75,7 @@ fn declared(name: &str, url: &str, event_types: &[&str]) -> SubscriptionConfig {
         ordered: false,
         enabled: true,
         paused: false,
+        participants: None,
     }
 }
 

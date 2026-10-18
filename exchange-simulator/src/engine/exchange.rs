@@ -333,6 +333,7 @@ impl Exchange {
             options.webhooks,
             options.webhook_secret_grace,
             events::EVENT_TYPES,
+            Some(events::parties),
         )?;
         let released = store.release_claims(wall_now())?;
         let settlement = match options.settlement {
@@ -514,6 +515,7 @@ impl Exchange {
             ids: self.ids,
             due: wall_now(),
             schema_version: events::SCHEMA_VERSION,
+            parties: self.webhooks.parties(),
         };
         self.store.commit_instrument(
             instrument,
@@ -1022,6 +1024,7 @@ impl Exchange {
             ids: self.ids,
             due: wall_now(),
             schema_version: events::SCHEMA_VERSION,
+            parties: self.webhooks.parties(),
         };
         let rows: Vec<&StoredStatement> = issue.iter().chain(&waiting).collect();
         self.store
@@ -1084,6 +1087,7 @@ impl Exchange {
                 ids: self.ids,
                 due: wall_now(),
                 schema_version: events::SCHEMA_VERSION,
+                parties: self.webhooks.parties(),
             };
             let write = SettlementWrite {
                 instructions: plan.transitions.iter().map(|t| &t.instruction).collect(),
@@ -1131,9 +1135,9 @@ impl Exchange {
                 "details must be a JSON object of at most {MAX_SETTLEMENT_BYTES} bytes"
             )));
         }
-        if !self.store.execution_exists(report.execution_id)? {
+        let Some((buyer_id, seller_id)) = self.store.execution_parties(report.execution_id)? else {
             return Err(ExchangeError::UnknownExecution(report.execution_id));
-        }
+        };
         if let Some(reference) = &report.reference
             && let Some(existing) = self
                 .store
@@ -1171,6 +1175,8 @@ impl Exchange {
             payload: serde_json::json!({
                 "reportId": stored.id,
                 "executionId": stored.execution_id,
+                "buyerId": buyer_id,
+                "sellerId": seller_id,
                 "status": stored.status,
                 "reference": stored.reference,
                 "reason": stored.reason,
@@ -1189,6 +1195,7 @@ impl Exchange {
             ids: self.ids,
             due: wall_now(),
             schema_version: events::SCHEMA_VERSION,
+            parties: self.webhooks.parties(),
         };
         self.store.commit_report(&stored, &event, outbox)?;
         self.next_event_sequence = next;
@@ -1283,6 +1290,7 @@ impl Exchange {
             ids: self.ids,
             due: wall_now(),
             schema_version: events::SCHEMA_VERSION,
+            parties: self.webhooks.parties(),
         };
         let settlement_write = settlement_plan.as_ref().map(|plan| SettlementWrite {
             instructions: plan.transitions.iter().map(|t| &t.instruction).collect(),

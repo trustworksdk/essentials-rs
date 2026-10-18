@@ -65,6 +65,16 @@ pub const EVENT_TYPES: &[&str] = &[
     CLEARING_STATEMENT_ISSUED,
 ];
 
+/// The participants an event involves, for webhook participant filters: the `participantId` of order events and
+/// clearing statements, the `buyerId` and `sellerId` of trades and settlement events. Instrument events involve none.
+pub fn parties(_event_type: &str, payload: &Value) -> Vec<String> {
+    ["participantId", "buyerId", "sellerId"]
+        .iter()
+        .filter_map(|field| payload.get(field).and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Why an order was cancelled, carried in `OrderCancelled` payloads.
 pub const CANCEL_MARKET_REMAINDER: &str = "MARKET_REMAINDER";
 pub const CANCEL_REQUESTED: &str = "REQUESTED";

@@ -95,6 +95,7 @@ async fn register<B: WebhookBackend>(
             event_types: body.event_types,
             secret: body.secret,
             ordered: body.ordered,
+            participants: body.participants,
         })
         .await?;
     Ok((
@@ -202,6 +203,18 @@ struct UpdateRequest {
     ordered: Option<bool>,
     enabled: Option<bool>,
     paused: Option<bool>,
+    /// `null` removes the filter.
+    #[serde(default, deserialize_with = "present")]
+    participants: Option<Option<Vec<String>>>,
+}
+
+/// Tells a field given as `null` (`Some(None)`) from an absent one (`None`, through `#[serde(default)]`).
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 async fn update<B: WebhookBackend>(
@@ -220,6 +233,7 @@ async fn update<B: WebhookBackend>(
                 ordered: body.ordered,
                 enabled: body.enabled,
                 paused: body.paused,
+                participants: body.participants,
             },
         )
         .await?;
@@ -411,6 +425,9 @@ pub struct WebhookRequest {
     /// Deliver one at a time in event sequence order (default false).
     #[serde(default)]
     pub ordered: bool,
+    /// Only events involving one of these participants, plus events that involve none (exchange only).
+    #[serde(default)]
+    pub participants: Option<Vec<String>>,
 }
 
 /// A subscription as the API shows it: the secret is never returned, only whether there is one.
@@ -440,6 +457,9 @@ pub struct SubscriptionView {
     /// Shown only when listing with `includeDeleted=true`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub deleted: bool,
+    /// The participant filter, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participants: Option<Vec<String>>,
 }
 
 impl From<Subscription> for SubscriptionView {
@@ -458,6 +478,7 @@ impl From<Subscription> for SubscriptionView {
             source: s.source,
             previous_secret_valid_until: s.previous_secret.map(|(_, until)| until),
             deleted: s.deleted,
+            participants: s.participants,
         }
     }
 }

@@ -28,7 +28,7 @@ variables (`__` between levels, e.g. `GATEWAY__SERVER__BIND=0.0.0.0:8081`).
 | `statement.opening_balances` | `{}` | Balance before the first booking per currency, e.g. `{ DKK: "250000.00" }` |
 | `statement.breaks.*` | all 0 | Seeded reconciliation breaks (see Statements) |
 | `statement.tick_interval_ms` | `250` | How often due transitions and statements are looked for |
-| `webhooks.*` | as in the exchange simulator | Delivery timing and declared subscriptions |
+| `webhooks.*` | as in the exchange simulator | Delivery timing and declared subscriptions; a `participants` filter is refused, since payments have no participants |
 | `ids.mode` / `ids.seed` | `random` / `0` | `deterministic` makes every ID reproducible |
 | `clock.mode`, `start`, `running`, `speed` | `system` | As in the exchange simulator; `speed: 1440` makes a day pass in a minute |
 | `test_control.enabled` | `false` | Mounts `/test`; never in a real deployment |

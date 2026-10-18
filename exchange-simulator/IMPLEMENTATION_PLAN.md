@@ -1681,6 +1681,40 @@ then 6.11, 6.12, 6.13–6.14.
   source's start not used at recovery; a switch to `synthetic` not filling the initial price; the default ignored;
   no one-tick floor; a seed that ignores the instrument; `priceSource` missing from the event payload.
 
+**6.3 — participant filter on webhook subscriptions ✅ done (2026-10-18)**
+- **Delivered:**
+  - `participants` on subscriptions (1 to 100 IDs, sorted, without duplicates): `POST` and `PATCH /api/webhooks`
+    (`null` removes it), declared subscriptions (`participants:` under `webhooks.subscriptions`), and responses
+    when set. Built in `simulator-kit`, so both services share the code and the documented schema
+    (`ParticipantFilter`).
+  - The kit learns an event's participants from a function the service passes to `WebhookHub::load` (`Parties`).
+    The fan-out (`write_events`), the delivery wake-up and redelivery all apply the filter. A subscription receives
+    an event when it has no filter, when the event involves no participant, or when a listed participant is among
+    the event's.
+  - The exchange's function reads the payload's `participantId`, `buyerId` and `sellerId`. That covers order events,
+    trades, settlement events and clearing statements. `SettlementOutcomeReported` gains `buyerId` and `sellerId`, so
+    an outcome report reaches the stacks of the execution's two sides.
+  - The payment gateway passes no function and refuses a filter with a `400`; payments have no participants.
+  - Storage: the `participants` column on `webhook_subscriptions`, as `simulator_kit::outbox::PARTICIPANT_FILTER`.
+    The gateway runs it as its migration 3; the exchange as migration 015, a file with the same statement, which the
+    shared-schema test keeps equal.
+  - Both `openapi.yaml` documents (the shared webhook part stays identical), the README, the configuration guide
+    (a two-stack recipe), `config/default.yaml` and the gateway README.
+  - Tests: `tests/participant_filter.rs` (3) and a gateway test.
+- **Decisions:**
+  - **Order events follow the order's own participant only.** A filter for A receives A's `OrderAccepted` and
+    fills, and the `TradeExecuted` with B, but not B's order events, as SR-19 states.
+  - **Events that involve no participant always pass** (instrument events now; the clock and end-of-day events of
+    6.4 and 6.5 later), so each stack still learns the market's shared facts.
+  - **The filter is read from the stored payload at redelivery**, so no participant column is needed on `events`.
+    The function is pure, so fan-out and redelivery always agree.
+  - **A declared subscription's filter is owned by the configuration**, like its other fields (`409` through the
+    API).
+- **Deviation:** none from the 6.3 row. The `SettlementOutcomeReported` payload change is additive.
+- **Mutation checks**, each made a test fail: events involving no participant filtered out; the filter ignored;
+  redelivery ignoring the filter; trades' sides not read; the outcome report without `buyerId`; the gateway
+  accepting a filter; a declared filter not reconciled; `PATCH` ignoring `participants`.
+
 ## Beyond the milestones
 
 **OpenAPI specifications ✅ done (2026-10-17, requested by the user)**

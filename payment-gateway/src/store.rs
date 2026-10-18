@@ -16,6 +16,7 @@ use crate::statement::{BookedMovement, Draft, StoredStatement};
 pub const MIGRATIONS: &[&str] = &[
     simulator_kit::outbox::SCHEMA,
     include_str!("../migrations/002_payments.sql"),
+    simulator_kit::outbox::PARTICIPANT_FILTER,
 ];
 
 const PAYMENT_COLUMNS: &str = "id, sequence, idempotency_key, type, account_id, iban, holder_name, amount_minor, \

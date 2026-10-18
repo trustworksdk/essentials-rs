@@ -641,10 +641,12 @@ impl Store {
         )
     }
 
-    pub fn execution_exists(&self, id: Uuid) -> rusqlite::Result<bool> {
+    /// The buyer and seller of an execution; `None` when there is no such execution.
+    pub fn execution_parties(&self, id: Uuid) -> rusqlite::Result<Option<(String, String)>> {
         self.conn
-            .prepare_cached("SELECT 1 FROM executions WHERE id = ?1")?
-            .exists([id.to_string()])
+            .prepare_cached("SELECT buyer_id, seller_id FROM executions WHERE id = ?1")?
+            .query_row([id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
     }
 
     pub fn report_by_reference(
@@ -738,7 +740,14 @@ impl Store {
         now: DateTime<Utc>,
         ids: &IdScheme,
     ) -> rusqlite::Result<usize> {
-        outbox::redeliver(&mut self.conn, subscription, after, now, ids)
+        outbox::redeliver(
+            &mut self.conn,
+            subscription,
+            after,
+            now,
+            ids,
+            Some(events::parties),
+        )
     }
 
     /// Gives dead-lettered deliveries a fresh attempt budget, due at `now`: all of them, one subscription's, or the

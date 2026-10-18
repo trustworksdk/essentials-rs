@@ -39,6 +39,7 @@ fn with_declared(c: &mut Config) {
         ordered: true,
         enabled: true,
         paused: true,
+        participants: None,
     });
 }
 

@@ -28,6 +28,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/012_clearing.sql"),
     include_str!("../../migrations/013_instrument_reference_symbol.sql"),
     include_str!("../../migrations/014_price_sources.sql"),
+    include_str!("../../migrations/015_webhook_participant_filter.sql"),
 ];
 
 /// A fresh name for an in-memory exchange database (see [`simulator_kit::persistence::memory_location`]).
@@ -77,10 +78,14 @@ mod tests {
         let exchange = memory();
         let shared = Connection::open_in_memory().unwrap();
         shared.execute_batch(simulator_kit::outbox::SCHEMA).unwrap();
+        shared
+            .execute_batch(simulator_kit::outbox::PARTICIPANT_FILTER)
+            .unwrap();
         assert_eq!(
             simulator_kit::outbox::shared_schema(&exchange).unwrap(),
             simulator_kit::outbox::shared_schema(&shared).unwrap(),
-            "the exchange's events, webhook and virtual clock tables differ from simulator_kit::outbox::SCHEMA"
+            "the exchange's events, webhook and virtual clock tables differ from simulator_kit::outbox::SCHEMA and \
+             PARTICIPANT_FILTER"
         );
     }
 

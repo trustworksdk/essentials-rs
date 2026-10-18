@@ -10,8 +10,8 @@ use rusqlite::Connection;
 use uuid::Uuid;
 
 use super::{
-    DeclaredSubscription, DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription,
-    SubscriptionSource, WebhookChange, validate_declared,
+    DeclaredSubscription, DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Parties,
+    Subscription, SubscriptionSource, WebhookChange, validate_declared,
 };
 use crate::clock::wall_now;
 use crate::events::NewEvent;
@@ -43,6 +43,8 @@ pub struct WebhookHub {
     secret_grace: chrono::Duration,
     /// The event types a subscription may ask for.
     event_types: &'static [&'static str],
+    /// The participants an event involves; `None` when the service has none, and refuses participant filters.
+    parties: Option<Parties>,
 }
 
 impl WebhookHub {
@@ -52,6 +54,7 @@ impl WebhookHub {
         declared: Vec<DeclaredSubscription>,
         secret_grace: chrono::Duration,
         event_types: &'static [&'static str],
+        parties: Option<Parties>,
     ) -> Result<Self, WebhookError> {
         validate_declared(&declared).map_err(WebhookError::Invalid)?;
         Ok(Self {
@@ -59,7 +62,13 @@ impl WebhookHub {
             declared,
             secret_grace,
             event_types,
+            parties,
         })
+    }
+
+    /// How the service finds the participants an event involves, for [`outbox::Outbox::parties`].
+    pub fn parties(&self) -> Option<Parties> {
+        self.parties
     }
 
     /// Every subscription, deleted ones included, in creation order.
@@ -69,9 +78,14 @@ impl WebhookHub {
 
     /// Whether any of `events` has a subscriber.
     pub fn delivers(&self, events: &[NewEvent]) -> bool {
-        events
-            .iter()
-            .any(|e| self.subscriptions.iter().any(|s| s.wants(e.event_type)))
+        events.iter().any(|e| {
+            let parties = self
+                .parties
+                .map_or_else(Vec::new, |f| f(e.event_type, &e.payload));
+            self.subscriptions
+                .iter()
+                .any(|s| s.wants(e.event_type, &parties))
+        })
     }
 
     /// Forgets every subscription, for a reset that emptied the tables.
@@ -105,6 +119,28 @@ impl WebhookHub {
             return Err(WebhookError::Invalid(
                 "secret must be 16 to 256 characters".into(),
             ));
+        }
+        if let Some(participants) = &mut request.participants {
+            if self.parties.is_none() {
+                return Err(WebhookError::Invalid(
+                    "participants: this service has no participants to filter by".into(),
+                ));
+            }
+            if participants.is_empty() || participants.len() > 100 {
+                return Err(WebhookError::Invalid(
+                    "participants must list 1 to 100 participant IDs".into(),
+                ));
+            }
+            if participants
+                .iter()
+                .any(|p| p.trim().is_empty() || p.chars().count() > 64)
+            {
+                return Err(WebhookError::Invalid(
+                    "participants: each ID must be 1 to 64 characters and not blank".into(),
+                ));
+            }
+            participants.sort();
+            participants.dedup();
         }
         request.event_types.sort();
         request.event_types.dedup();
@@ -150,6 +186,7 @@ impl WebhookHub {
             event_types,
             secret,
             ordered,
+            participants,
         } = request;
         let subscription = Subscription {
             id: ids.subscription(self.subscriptions.len() as u64 + 1),
@@ -165,6 +202,7 @@ impl WebhookHub {
             paused,
             previous_secret: None,
             deleted: false,
+            participants,
         };
         outbox::insert_subscription(conn, &subscription)?;
         self.subscriptions.push(subscription.clone());
@@ -172,7 +210,7 @@ impl WebhookHub {
     }
 
     /// Brings the subscriptions declared in configuration into the database, by name: creates the missing ones,
-    /// updates the ones whose url, event types, secret, ordering, enabled or paused flag changed, and disables
+    /// updates the ones whose url, event types, secret, ordering, participants, enabled or paused flag changed, and disables
     /// configuration-owned ones no longer declared (keeping their history). Subscriptions created through the API
     /// are left alone. Returns whether a subscription may have deliveries to send now.
     pub fn reconcile(
@@ -229,6 +267,7 @@ impl WebhookHub {
                         event_types: wanted.event_types,
                         secret: wanted.secret,
                         ordered: wanted.ordered,
+                        participants: wanted.participants,
                         enabled: entry.enabled,
                         paused: entry.paused,
                         previous_secret,
@@ -303,8 +342,14 @@ impl WebhookHub {
             ordered,
             enabled,
             paused,
+            participants,
         } = change;
-        if url.is_some() || event_types.is_some() || ordered.is_some() || enabled.is_some() {
+        if url.is_some()
+            || event_types.is_some()
+            || ordered.is_some()
+            || enabled.is_some()
+            || participants.is_some()
+        {
             self.api_owned(index)?;
         }
         let current = &self.subscriptions[index];
@@ -313,12 +358,14 @@ impl WebhookHub {
             event_types: event_types.unwrap_or_else(|| current.event_types.clone()),
             secret: current.secret.clone(),
             ordered: ordered.unwrap_or(current.ordered),
+            participants: participants.unwrap_or_else(|| current.participants.clone()),
         })?;
         let current = &self.subscriptions[index];
         let updated = Subscription {
             url: wanted.url,
             event_types: wanted.event_types,
             ordered: wanted.ordered,
+            participants: wanted.participants,
             enabled: enabled.unwrap_or(current.enabled),
             paused: paused.unwrap_or(current.paused),
             ..current.clone()
@@ -361,6 +408,7 @@ impl WebhookHub {
             event_types: current.event_types.clone(),
             secret: Some(secret),
             ordered: current.ordered,
+            participants: current.participants.clone(),
         })?;
         let current = &self.subscriptions[index];
         let previous_secret = current
@@ -464,6 +512,7 @@ impl WebhookHub {
             after,
             wall_now(),
             &ids,
+            self.parties,
         )?)
     }
 
