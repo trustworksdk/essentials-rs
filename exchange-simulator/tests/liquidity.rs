@@ -418,3 +418,30 @@ async fn the_provider_clears_like_any_participant() {
     assert_eq!(securities, 0);
     app.stop().await;
 }
+
+#[tokio::test]
+async fn the_market_data_shows_what_the_provider_did_as_soon_as_it_quoted() {
+    // Without ticks, the only quotes are those the commands cause.
+    let mut app = TestApp::start_with(|c| {
+        market(spec(|_| {}))(c);
+        c.settlement.tick_interval_ms = 3_600_000;
+    })
+    .await;
+    let (_, md) = app.get("/api/marketdata/ACME").await;
+    assert_eq!(md["liquidity"], "quoting");
+    assert_eq!(md["bestAsk"]["priceTicks"], 10_010);
+    let (status, _) = app
+        .call(
+            Method::PATCH,
+            "/api/instruments/ACME",
+            Some(json!({ "liquidity": { "mode": "off" } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, md) = app.get("/api/marketdata/ACME").await;
+    assert_eq!(
+        (&md["liquidity"], &md["bestAsk"]),
+        (&json!("off"), &Value::Null)
+    );
+    app.stop().await;
+}

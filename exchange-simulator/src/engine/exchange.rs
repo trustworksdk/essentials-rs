@@ -15,8 +15,9 @@ use crate::domain::{
 use crate::events::NewEvent;
 use crate::events::{self, Command};
 use crate::ids::ExchangeIds;
+use crate::liquidity::{LiquiditySettings, StalePolicy};
 use crate::persistence::{Outbox, SettlementWrite, Store};
-use crate::pricing::{PriceSourceError, PriceSources};
+use crate::pricing::{PriceSourceError, PriceSources, Reference};
 use crate::settlement::{
     ExternalReport, NewReport, SettlementPolicy, SettlementSimulator, TradeFacts,
 };
@@ -294,6 +295,10 @@ struct Quoting {
     quoted_at: Option<i64>,
     /// When it last traded, until the ladder is refilled.
     filled_at: Option<DateTime<Utc>>,
+    /// Whether the reference price was stale when the current ladder was quoted (or pulled).
+    quoted_stale: bool,
+    /// What it is doing, as the market data shows it (see [`Exchange::liquidity_state`]); `None` reads `off`.
+    state: Option<&'static str>,
 }
 
 /// Business days and the last one closed with `BusinessDayClosed`.
@@ -583,7 +588,11 @@ impl Exchange {
             liquidity.validate()?;
         }
         let now = self.now();
-        let restarts = changes.is_none_or(|c| c.contains(&"priceSource"));
+        // A live source streams its reference symbol, so a new one restarts it too.
+        let restarts = changes.is_none_or(|c| {
+            c.contains(&"priceSource")
+                || (c.contains(&"referenceSymbol") && self.prices.is_live(instrument))
+        });
         if restarts {
             let current = self.prices.reference(&instrument.id, now);
             self.prices.prepare(instrument, current)?;
@@ -761,14 +770,11 @@ impl Exchange {
             return Ok(());
         };
         let instrument = book.instrument().clone();
+        let mut settings = self
+            .liquidity_settings(&instrument)
+            .expect("checked by the caller");
         let provider = self.provider.as_ref().expect("checked by the caller");
         let lp = provider.policy.participant.clone();
-        let settings = instrument
-            .liquidity
-            .clone()
-            .unwrap_or_default()
-            .or(&provider.policy.default)
-            .resolve();
         let state = provider.quoting.get(id).cloned().unwrap_or_default();
         let mut resting: Vec<Order> = book
             .orders()
@@ -777,11 +783,18 @@ impl Exchange {
             .collect();
         resting.sort_by_key(|o| o.sequence);
         let reference = match (settings.mode, instrument.enabled) {
-            (crate::liquidity::LiquidityMode::On, true) => {
-                self.prices.reference(id, now).map(|r| r.ticks)
-            }
+            (crate::liquidity::LiquidityMode::On, true) => self.prices.reference(id, now),
             _ => None,
         };
+        let shown = Self::liquidity_state(&settings, &instrument, reference.as_ref());
+        // SR-9: a stale price is quoted as it is (keep), with a wider spread (widen), or not at all (pull).
+        let stale = reference.is_some_and(|r| r.stale);
+        if stale && settings.stale_policy == StalePolicy::Widen {
+            settings.spread_bps *= settings.stale_widen_factor;
+        }
+        let reference = reference
+            .filter(|r| !(r.stale && settings.stale_policy == StalePolicy::Pull))
+            .map(|r| r.ticks);
         let lot = instrument.lot_size;
         let wanted =
             reference.map(|r| settings.ladder(r, state.inventory / lot.max(1) as i64, lot));
@@ -790,12 +803,14 @@ impl Exchange {
             (Some(_), None) => true,
             (Some(r), Some(quoted)) => {
                 (r - quoted).abs() >= i64::from(settings.requote_threshold_ticks)
+                    || stale != state.quoted_stale
                     || state.filled_at.is_some_and(|at| {
                         now >= at + chrono::Duration::milliseconds(settings.refill_delay_ms as i64)
                     })
             }
         };
         if !due {
+            self.quoting(id).state = Some(shown);
             return Ok(());
         }
         let wanted = wanted.unwrap_or_default();
@@ -827,16 +842,56 @@ impl Exchange {
                 .increment(1);
             ::metrics::counter!(crate::metrics::LIQUIDITY_QUOTES).increment(wanted.len() as u64);
         }
-        let quoting = self
-            .provider
+        let quoting = self.quoting(id);
+        quoting.quoted_at = reference;
+        quoting.filled_at = None;
+        quoting.quoted_stale = stale;
+        quoting.state = Some(shown);
+        Ok(())
+    }
+
+    fn quoting(&mut self, id: &InstrumentId) -> &mut Quoting {
+        self.provider
             .as_mut()
             .expect("checked by the caller")
             .quoting
             .entry(id.clone())
-            .or_default();
-        quoting.quoted_at = reference;
-        quoting.filled_at = None;
-        Ok(())
+            .or_default()
+    }
+
+    /// The provider's settings for `instrument`, resolved; `None` when there is no provider.
+    fn liquidity_settings(&self, instrument: &Instrument) -> Option<LiquiditySettings> {
+        let provider = self.provider.as_ref()?;
+        Some(
+            instrument
+                .liquidity
+                .clone()
+                .unwrap_or_default()
+                .or(&provider.policy.default)
+                .resolve(),
+        )
+    }
+
+    /// What the provider does in an instrument, for the market data: `off` (mode off or trading disabled),
+    /// `no-reference`, `quoting`, or under a stale price its policy: `kept`, `widened` or `pulled`. Recorded when it
+    /// quotes, so the snapshot never shows a state whose ladder is not in the book yet.
+    fn liquidity_state(
+        settings: &LiquiditySettings,
+        instrument: &Instrument,
+        reference: Option<&Reference>,
+    ) -> &'static str {
+        if settings.mode == crate::liquidity::LiquidityMode::Off || !instrument.enabled {
+            return "off";
+        }
+        match reference {
+            None => "no-reference",
+            Some(r) if r.stale => match settings.stale_policy {
+                StalePolicy::Keep => "kept",
+                StalePolicy::Widen => "widened",
+                StalePolicy::Pull => "pulled",
+            },
+            Some(_) => "quoting",
+        }
     }
 
     /// Cancels the provider's resting orders and places `wanted`, bids then asks, best first.
@@ -882,8 +937,15 @@ impl Exchange {
                 let reference = self.prices.reference(&id, now);
                 let (best_bid, best_ask) = self.top_of_book(&id);
                 let state = self.market_data.get(&id).cloned().unwrap_or_default();
+                let instrument = self.books[&id].instrument().clone();
                 crate::market_data::Snapshot {
-                    instrument: self.books[&id].instrument().clone(),
+                    liquidity: self
+                        .provider
+                        .as_ref()
+                        .and_then(|p| p.quoting.get(&id))
+                        .and_then(|q| q.state)
+                        .unwrap_or("off"),
+                    instrument,
                     md_sequence: state.md_sequence,
                     reference,
                     best_bid,

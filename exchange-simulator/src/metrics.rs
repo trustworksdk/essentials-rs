@@ -48,6 +48,14 @@ pub const MARKET_DATA_MESSAGES: &str = "exchange_market_data_messages_total";
 pub const MARKET_DATA_CATCH_UPS: &str = "exchange_market_data_catch_ups_total";
 /// Market-data streams closed because their subscriber fell behind the buffer.
 pub const MARKET_DATA_STREAMS_CLOSED: &str = "exchange_market_data_streams_closed_total";
+/// 1 while the live price feed's websocket is connected, else 0.
+pub const PRICE_FEED_CONNECTED: &str = "exchange_price_feed_connected";
+/// Times the live price feed's connection ended and was retried.
+pub const PRICE_FEED_RECONNECTS: &str = "exchange_price_feed_reconnects_total";
+/// Prices received from the live feed. Label: `via` (`websocket` or `rest`).
+pub const PRICE_FEED_UPDATES: &str = "exchange_price_feed_updates_total";
+/// REST quote calls. Label: `outcome` (`ok`, `no_quote`, `throttled`, `rate_limited`, `error`).
+pub const PRICE_FEED_REST_CALLS: &str = "exchange_price_feed_rest_calls_total";
 /// Settlement instructions with a transition still to come.
 pub const SETTLEMENT_OPEN: &str = "settlement_open_instructions";
 

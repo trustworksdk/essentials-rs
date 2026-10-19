@@ -14,6 +14,8 @@ services:
     environment:
       EXCHANGE_CONFIG: /etc/exchange/exchange.yaml
       RUST_LOG: ${RUST_LOG:-info}
+      # Live prices (price source kind finnhub): taken from the host's environment; empty means no feed.
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
     volumes:
       - ./exchange.yaml:/etc/exchange/exchange.yaml:ro
       # durable mode keeps everything here; without a volume a new container starts empty.

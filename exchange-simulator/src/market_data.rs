@@ -66,6 +66,8 @@ pub struct Snapshot {
     pub last_trade: Option<Print>,
     /// Traded quantity on the current business date.
     pub session_volume: u64,
+    /// What the liquidity provider is doing (see `Exchange::liquidity_state`).
+    pub liquidity: &'static str,
 }
 
 /// What the exchange keeps per instrument: what it last published, and the trades since.
@@ -161,6 +163,7 @@ impl Snapshot {
             "bestAsk": top_json(i, self.best_ask),
             "lastTrade": self.last_trade.as_ref().map(|p| print_json(i, p)),
             "sessionVolume": self.session_volume,
+            "liquidity": self.liquidity,
         })
     }
 }

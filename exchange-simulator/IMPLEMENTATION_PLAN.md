@@ -1914,6 +1914,71 @@ then 6.11, 6.12, 6.13–6.14.
   - Reviewing the group path showed the feed published before `commit_group`, so a failed commit's trades would
     have been streamed. Fixed as above, with a test and two more mutations.
 
+**6.9 — Finnhub source, stale policy ✅ done (2026-10-19)**
+- **Delivered:**
+  - `src/pricing/finnhub`: the feed task. It connects to the trades websocket (`{ws_url}/?token=`), subscribes and
+    unsubscribes as the wanted symbols change, seeds every newly subscribed symbol from the REST quote endpoint
+    (`X-Finnhub-Token` header), and refreshes any symbol quiet for `refresh_after_ms`. A batch of trades gives each
+    symbol its latest trade. It reconnects with exponential backoff, each wait a random 50–100 % of the
+    step, resetting after a connection that lasted, and subscribes everything again. REST calls are limited per
+    sliding minute; HTTP 429, an unknown symbol (`c: 0`) and other failures are logged and counted, never fatal.
+    `ApiKey` has a redacted `Debug` and scrubs the key from every logged error.
+  - `PriceSourceKind::Finnhub`. The symbol is `referenceSymbol`, else `symbol`. `LiveFeed` is shared with the
+    exchange: the latest price per symbol behind a mutex, plus the wanted set, which `PriceSources` keeps equal to
+    the running live sources' symbols. The exchange adopts a new price at most `max_updates_per_second` times per
+    instrument (the latest wins), rounds it to the tick, and marks the reference stale when nothing has arrived for
+    `stale_after_ms` of real time. `sourceTimestamp` is the provider's.
+  - SR-9: liquidity settings `stalePolicy` (`keep`, `widen`, `pull`; default `pull`) and `staleWidenFactor` (1–100,
+    default 2). A change in staleness is a reason to re-quote. The snapshot's new `liquidity` field (`off`,
+    `no-reference`, `quoting`, `kept`, `widened`, `pulled`) shows what the provider did when it last quoted.
+  - Changing `referenceSymbol` restarts a live source (only a live one; a synthetic walk keeps its path).
+  - `price_sources.finnhub` in the configuration; the feed runs only with a key (`api_key_file`, else
+    `FINNHUB_API_KEY`). Metrics:
+    `exchange_price_feed_connected`, `_reconnects_total`, `_updates_total{via}`, `_rest_calls_total{outcome}`.
+  - New dependency `tokio-tungstenite` 0.30.0 (2026-07-11), with `rustls-tls-webpki-roots`. The service's normal
+    dependencies enable only rustls's aws-lc backend, so `wss://` needs no explicit crypto provider.
+  - `openapi.yaml`, the README (Finnhub live prices, stale policy), the configuration guide, `config/default.yaml`.
+  - Tests: `tests/finnhub.rs` (8) against a local websocket and REST mock that checks the key as Finnhub does
+    (D19), unit tests in `src/pricing/finnhub` (2). `tests/openapi.rs` now sends every liquidity field.
+- **Decisions:**
+  - **Free-tier limits** checked on 2026-10-19 against Finnhub's pricing page (D19): 60 REST calls a minute and 50
+    websocket symbols, plus a 30 calls/second cap on all plans. They are the defaults for `rest_calls_per_minute`
+    and `max_symbols`. The free tier is for personal, non-commercial use; the README and configuration guide say so.
+  - **Staleness measures the source, not the market.** It is real time since anything arrived, websocket or REST.
+    In a closed market the REST refresh keeps a price fresh while its `sourceTimestamp` stays at the last trade, so
+    `stale_after_ms` must be longer than `refresh_after_ms` (checked at startup).
+  - **Detectable limits are refused.** Exceeding `max_symbols`, or a `finnhub` source without a key, is a startup
+    error for a declared instrument and a `400` from the API. Two instruments may share a symbol. The REST rate is
+    only known at run time: skipped, logged, counted.
+  - **The exchange never waits on the feed.** It reads the shared latest price on its own schedule, as for synthetic
+    prices, so conflation and staleness are decided on the exchange thread.
+  - **The key arrives as `FINNHUB_API_KEY`** (user decision, 2026-10-19): both `compose.yaml` and
+    `examples/compose/compose.yaml` pass it through from the host's environment, empty when unset, which reads as
+    no key. `api_key_file` stays as the alternative and wins when set. The environment lookup is a parameter of
+    `FinnhubConfig::live_with`, so a unit test covers it without touching the process environment.
+  - **`stalePolicy` defaults to `pull`**, the conservative choice: no quotes around a price nobody can vouch for.
+  - **`liquidity` in the market data is recorded when the provider quotes**, not computed when the snapshot is read.
+    Computing it showed `quoting` before the ladder was in the book; the tests caught that.
+- **Changes outside the step:**
+  - `openapi.yaml` declared the liquidity `mode` as `enum: [on, off]`, which YAML reads as booleans, so a client
+    validating against the document would refuse `"mode": "on"`. Quoted, and the contract test now sends liquidity.
+  - The dispatcher test `queue_wait_and_acknowledgement_latency_are_measured_from_enqueueing` asserted
+    `ack >= wait + duration`. It failed twice in this step's runs: the caller records the acknowledgement once the
+    reply wakes it, while the exchange thread records the duration after sending it. It now asserts `ack >= wait`.
+- **Mutation checks**, each made a test fail: conflation ignored; never stale; no REST seed for a new subscription;
+  no refresh of quiet symbols; no REST rate limit; REST without the key header; unwanted symbols recorded; the key
+  not redacted; the symbol limit unchecked; `stale_after_ms` not checked against `refresh_after_ms`; a new
+  `referenceSymbol` not restarting the source; `widen` ignored; `pull` ignored; a change in staleness not causing a
+  re-quote; the provider's state not recorded at its quote; the liquidity `mode` enum unquoted again. Four first
+  survived and exposed gaps:
+  - The mock accepted any token. It now checks the key as Finnhub does (401, or a refused handshake).
+  - The quiet-symbol check fires at once on connect and seeded every symbol, so the explicit seed was never tested.
+    It matters for a symbol added later; the `referenceSymbol` test now runs with a 15 s check interval.
+  - No test changed the REST quote under a silent websocket (a closed market). One does now.
+  - With ticks running, the next tick recorded the provider's state anyway. A test without ticks reads the snapshot
+    right after the first quote.
+- **Not done here:** manual acceptance of SR-2 against the real Finnhub needs a key from the user (D19).
+
 ## Beyond the milestones
 
 **OpenAPI specifications ✅ done (2026-10-17, requested by the user)**

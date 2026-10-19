@@ -345,12 +345,164 @@ pub struct PriceSourcesConfig {
     /// What an instrument's own price source leaves out, field by field.
     #[serde(default)]
     pub default: crate::pricing::PriceSourceSpec,
+    /// The Finnhub live source (plan item 6.9).
+    #[serde(default)]
+    pub finnhub: FinnhubConfig,
 }
 
 impl PriceSourcesConfig {
     pub fn sources(&self) -> Result<crate::pricing::PriceSources, String> {
         crate::pricing::PriceSources::new(self.default.clone(), self.seed)
             .map_err(|e| format!("price_sources.default: {e}"))
+    }
+}
+
+/// The Finnhub live source (see [`crate::pricing::finnhub`]). It runs when an API key is found: in the environment
+/// variable `FINNHUB_API_KEY` (how the compose files deliver it), or in the file `api_key_file`, which wins when set. The limits default to Finnhub's free tier
+/// (checked 2026-10-19: 60 REST calls a minute, 50 websocket symbols).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinnhubConfig {
+    #[serde(default)]
+    pub api_key_file: Option<String>,
+    #[serde(default = "finnhub_ws_url")]
+    pub ws_url: String,
+    #[serde(default = "finnhub_rest_url")]
+    pub rest_url: String,
+    /// Real time without an update after which a reference price is stale.
+    #[serde(default = "finnhub_stale_after_ms")]
+    pub stale_after_ms: u64,
+    /// Real time without an update after which a symbol is refreshed over REST.
+    #[serde(default = "finnhub_refresh_after_ms")]
+    pub refresh_after_ms: u64,
+    /// Reference price updates adopted per instrument and second, at most; the latest price wins.
+    #[serde(default = "finnhub_max_updates_per_second")]
+    pub max_updates_per_second: u32,
+    #[serde(default = "finnhub_max_symbols")]
+    pub max_symbols: usize,
+    #[serde(default = "finnhub_rest_calls_per_minute")]
+    pub rest_calls_per_minute: u32,
+    #[serde(default = "finnhub_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    #[serde(default = "finnhub_reconnect_initial_ms")]
+    pub reconnect_initial_ms: u64,
+    #[serde(default = "finnhub_reconnect_max_ms")]
+    pub reconnect_max_ms: u64,
+}
+
+fn finnhub_ws_url() -> String {
+    "wss://ws.finnhub.io".into()
+}
+fn finnhub_rest_url() -> String {
+    "https://finnhub.io/api/v1".into()
+}
+fn finnhub_stale_after_ms() -> u64 {
+    120_000
+}
+fn finnhub_refresh_after_ms() -> u64 {
+    60_000
+}
+fn finnhub_max_updates_per_second() -> u32 {
+    4
+}
+fn finnhub_max_symbols() -> usize {
+    50
+}
+fn finnhub_rest_calls_per_minute() -> u32 {
+    60
+}
+fn finnhub_request_timeout_ms() -> u64 {
+    10_000
+}
+fn finnhub_reconnect_initial_ms() -> u64 {
+    1_000
+}
+fn finnhub_reconnect_max_ms() -> u64 {
+    60_000
+}
+
+impl Default for FinnhubConfig {
+    fn default() -> Self {
+        Self {
+            api_key_file: None,
+            ws_url: finnhub_ws_url(),
+            rest_url: finnhub_rest_url(),
+            stale_after_ms: finnhub_stale_after_ms(),
+            refresh_after_ms: finnhub_refresh_after_ms(),
+            max_updates_per_second: finnhub_max_updates_per_second(),
+            max_symbols: finnhub_max_symbols(),
+            rest_calls_per_minute: finnhub_rest_calls_per_minute(),
+            request_timeout_ms: finnhub_request_timeout_ms(),
+            reconnect_initial_ms: finnhub_reconnect_initial_ms(),
+            reconnect_max_ms: finnhub_reconnect_max_ms(),
+        }
+    }
+}
+
+/// A live source ready to run: what the exchange reads, and what the feed task needs.
+pub struct LiveConfig {
+    pub source: crate::pricing::LiveSource,
+    pub settings: crate::pricing::finnhub::FeedSettings,
+    pub key: crate::pricing::finnhub::ApiKey,
+}
+
+impl FinnhubConfig {
+    /// The live source, or `None` when no API key is found. A key file that cannot be read, or settings that
+    /// contradict each other, are errors.
+    pub fn live(&self) -> Result<Option<LiveConfig>, String> {
+        self.live_with(|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::live`] with `env` for the environment.
+    fn live_with(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<LiveConfig>, String> {
+        let key = match &self.api_key_file {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("price_sources.finnhub.api_key_file {path}: {e}"))?,
+            ),
+            None => env("FINNHUB_API_KEY"),
+        };
+        let Some(key) = key.and_then(crate::pricing::finnhub::ApiKey::new) else {
+            return Ok(None);
+        };
+        if self.max_updates_per_second == 0
+            || self.rest_calls_per_minute == 0
+            || self.max_symbols == 0
+        {
+            return Err(
+                "price_sources.finnhub: max_updates_per_second, rest_calls_per_minute and max_symbols must be at least 1"
+                    .into(),
+            );
+        }
+        if self.stale_after_ms <= self.refresh_after_ms {
+            return Err(
+                "price_sources.finnhub.stale_after_ms must be longer than refresh_after_ms, or a closed market's prices \
+                 go stale between refreshes"
+                    .into(),
+            );
+        }
+        let ms = Duration::from_millis;
+        Ok(Some(LiveConfig {
+            source: crate::pricing::LiveSource {
+                feed: Default::default(),
+                stale_after: ms(self.stale_after_ms),
+                min_interval: Duration::from_secs(1) / self.max_updates_per_second,
+                max_symbols: self.max_symbols,
+            },
+            settings: crate::pricing::finnhub::FeedSettings {
+                ws_url: self.ws_url.clone(),
+                rest_url: self.rest_url.clone(),
+                refresh_after: ms(self.refresh_after_ms),
+                rest_calls_per_minute: self.rest_calls_per_minute,
+                request_timeout: ms(self.request_timeout_ms),
+                reconnect_initial: ms(self.reconnect_initial_ms.max(1)),
+                reconnect_max: ms(self.reconnect_max_ms.max(self.reconnect_initial_ms.max(1))),
+            },
+            key,
+        }))
     }
 }
 
@@ -495,6 +647,37 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_finnhub_key_comes_from_the_environment_unless_a_file_is_named() {
+        let finnhub = FinnhubConfig::default();
+        let env = |key: &'static str| {
+            move |name: &str| (name == "FINNHUB_API_KEY").then(|| key.to_string())
+        };
+        assert!(
+            finnhub.live_with(env("from-env")).unwrap().is_some(),
+            "compose passes it as FINNHUB_API_KEY"
+        );
+        assert!(
+            finnhub.live_with(env("")).unwrap().is_none(),
+            "compose passes an unset variable as empty"
+        );
+        assert!(finnhub.live_with(|_| None).unwrap().is_none());
+
+        let dir = std::env::temp_dir().join(format!("exchange-sim-key-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("key");
+        std::fs::write(&file, "").unwrap();
+        let from_file = FinnhubConfig {
+            api_key_file: Some(file.display().to_string()),
+            ..Default::default()
+        };
+        assert!(
+            from_file.live_with(env("from-env")).unwrap().is_none(),
+            "a named file wins, even when empty"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn defaults_parse() {

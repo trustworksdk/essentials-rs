@@ -10,10 +10,17 @@
 //!   catches up step by step. Published prices are rounded to the nearest tick and never below one tick; the walk
 //!   itself is not rounded.
 //!
+//! - `finnhub`: live trade prices for the instrument's `referenceSymbol` (else its `symbol`), streamed by
+//!   [`finnhub`]. A new price is adopted at most `max_updates_per_second` times a second, the latest winning; the
+//!   reference price is stale once nothing has arrived for `stale_after_ms` of real time. Its `sourceTimestamp` is
+//!   the provider's. Live prices are not reproducible.
+//!
 //! An instrument's own source (`priceSource`) may leave fields out; they come from `price_sources.default`, field by
 //! field, and then from the built-in defaults (`none`, drift 0, volatility 0.2, a step a second).
 
-use std::collections::HashMap;
+pub mod finnhub;
+
+use std::collections::{BTreeSet, HashMap};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -35,6 +42,7 @@ pub enum PriceSourceKind {
     None,
     Fixed,
     Synthetic,
+    Finnhub,
 }
 
 impl PriceSourceKind {
@@ -43,6 +51,7 @@ impl PriceSourceKind {
             Self::None => "none",
             Self::Fixed => "fixed",
             Self::Synthetic => "synthetic",
+            Self::Finnhub => "finnhub",
         }
     }
 }
@@ -98,6 +107,14 @@ pub enum PriceSourceError {
         field: &'static str,
         kind: &'static str,
     },
+    #[error(
+        "priceSource.kind finnhub needs an API key (price_sources.finnhub.api_key_file or FINNHUB_API_KEY)"
+    )]
+    NoLiveFeed,
+    #[error(
+        "priceSource.kind finnhub: at most {max} symbols can stream (price_sources.finnhub.max_symbols)"
+    )]
+    SymbolLimit { max: usize },
     #[error("priceSource.{field}: {error}")]
     Price {
         field: &'static str,
@@ -150,8 +167,30 @@ pub struct Reference {
     pub ticks: i64,
     /// When the price was produced: when a fixed source was configured, or the synthetic step's grid time.
     pub source_timestamp: DateTime<Utc>,
-    /// Older than its source allows (a live source, plan item 6.9); never for `fixed` and `synthetic`.
+    /// Nothing new from a live source for longer than `stale_after`; never for `fixed` and `synthetic`.
     pub stale: bool,
+}
+
+/// The live feed and how its prices are read (`price_sources.finnhub`).
+#[derive(Clone, Debug)]
+pub struct LiveSource {
+    pub feed: finnhub::LiveFeed,
+    /// Real time without an update after which the reference price is stale.
+    pub stale_after: std::time::Duration,
+    /// The least real time between two adopted prices of one instrument (`1 / max_updates_per_second`).
+    pub min_interval: std::time::Duration,
+    pub max_symbols: usize,
+}
+
+/// A live price taken in as the reference price.
+#[derive(Clone, Copy, Debug)]
+struct Adopted {
+    ticks: i64,
+    source_timestamp: DateTime<Utc>,
+    /// When it was taken in, for conflation.
+    at: std::time::Instant,
+    /// When the feed received it, to tell a newer price.
+    received: std::time::Instant,
 }
 
 /// The parameters of a synthetic walk, resolved.
@@ -177,6 +216,12 @@ enum State {
         ticks: f64,
         step: u64,
     },
+    Live {
+        symbol: String,
+        /// Ticks per major currency unit.
+        ticks_per_unit: f64,
+        adopted: Option<Adopted>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +236,8 @@ pub struct PriceSources {
     default: PriceSourceSpec,
     seed: u64,
     active: HashMap<InstrumentId, Active>,
+    /// `None` without an API key: `finnhub` sources are then refused.
+    live: Option<LiveSource>,
 }
 
 impl PriceSources {
@@ -202,7 +249,19 @@ impl PriceSources {
             default,
             seed,
             active: HashMap::new(),
+            live: None,
         })
+    }
+
+    /// These sources with `finnhub` prices from `live`.
+    pub fn with_live(mut self, live: LiveSource) -> Self {
+        self.live = Some(live);
+        self
+    }
+
+    /// Whether `instrument`'s source, resolved, is a live one, so a new `referenceSymbol` must restart it.
+    pub fn is_live(&self, instrument: &Instrument) -> bool {
+        self.merged(instrument).kind == Some(PriceSourceKind::Finnhub)
     }
 
     /// Makes `instrument`'s own source ready to store, given its `current` reference price: validates it and, when it
@@ -244,15 +303,44 @@ impl PriceSources {
                 step: 0,
                 params,
             },
+            Resolved::Live {
+                symbol,
+                ticks_per_unit,
+            } => State::Live {
+                symbol,
+                ticks_per_unit,
+                adopted: None,
+            },
         };
         self.active
             .insert(instrument.id.clone(), Active { since, state });
+        self.sync_wanted();
         Ok(())
+    }
+
+    /// Tells the feed which symbols the live sources need.
+    fn sync_wanted(&self) {
+        if let Some(live) = &self.live {
+            live.feed.set_wanted(self.live_symbols(None));
+        }
+    }
+
+    /// The symbols of the running live sources, `except` one instrument's.
+    fn live_symbols(&self, except: Option<&InstrumentId>) -> BTreeSet<String> {
+        self.active
+            .iter()
+            .filter(|(id, _)| Some(*id) != except)
+            .filter_map(|(_, active)| match &active.state {
+                State::Live { symbol, .. } => Some(symbol.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The instrument's reference price at `now`, catching a synthetic walk up to the last step at or before `now`;
     /// `None` for an unknown instrument or a `none` source.
     pub fn reference(&mut self, id: &InstrumentId, now: DateTime<Utc>) -> Option<Reference> {
+        let live = self.live.clone();
         let active = self.active.get_mut(id)?;
         match &mut active.state {
             State::None => None,
@@ -290,12 +378,42 @@ impl PriceSources {
                     stale: false,
                 })
             }
+            State::Live {
+                symbol,
+                ticks_per_unit,
+                adopted,
+            } => {
+                let live = live?;
+                let latest = live.feed.latest(symbol);
+                if let Some(latest) = latest {
+                    let newer = adopted.is_none_or(|a| {
+                        a.received != latest.received && a.at.elapsed() >= live.min_interval
+                    });
+                    if newer {
+                        *adopted = Some(Adopted {
+                            ticks: publish(latest.price * *ticks_per_unit),
+                            source_timestamp: latest.source_timestamp,
+                            at: std::time::Instant::now(),
+                            received: latest.received,
+                        });
+                    }
+                }
+                let adopted = (*adopted)?;
+                let last_heard = latest.map_or(adopted.received, |l| l.received);
+                Some(Reference {
+                    kind: PriceSourceKind::Finnhub,
+                    ticks: adopted.ticks,
+                    source_timestamp: adopted.source_timestamp,
+                    stale: last_heard.elapsed() > live.stale_after,
+                })
+            }
         }
     }
 
     /// Forgets every source (after a reset).
     pub fn clear(&mut self) {
         self.active.clear();
+        self.sync_wanted();
     }
 
     fn merged(&self, instrument: &Instrument) -> PriceSourceSpec {
@@ -331,6 +449,25 @@ impl PriceSources {
                     .seed
                     .unwrap_or_else(|| derived_seed(self.seed, &instrument.id)),
             }),
+            PriceSourceKind::Finnhub => {
+                let live = self.live.as_ref().ok_or(PriceSourceError::NoLiveFeed)?;
+                let symbol = instrument
+                    .reference_symbol
+                    .clone()
+                    .unwrap_or_else(|| instrument.symbol.clone());
+                let mut symbols = self.live_symbols(Some(&instrument.id));
+                symbols.insert(symbol.clone());
+                if symbols.len() > live.max_symbols {
+                    return Err(PriceSourceError::SymbolLimit {
+                        max: live.max_symbols,
+                    });
+                }
+                Resolved::Live {
+                    symbol,
+                    ticks_per_unit: 10f64.powi(i32::from(instrument.currency_scale))
+                        / instrument.tick_size_minor as f64,
+                }
+            }
         })
     }
 }
@@ -339,6 +476,7 @@ enum Resolved {
     None,
     Fixed(i64),
     Synthetic(Synthetic),
+    Live { symbol: String, ticks_per_unit: f64 },
 }
 
 /// Rounds the walk to the nearest tick, never below one tick.

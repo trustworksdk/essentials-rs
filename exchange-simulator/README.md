@@ -27,6 +27,10 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `exchange.command_queue_capacity` | `10000` | Commands waiting for the exchange thread; when full, requests get `503 overloaded` |
 | `exchange.group_commit.max_commands` / `max_wait_us` | `256` / `0` | Group commit: most orders and cancellations per commit (`1` commits each on its own); how long to wait for more once the queue is empty |
 | `events.simulation_id` | unset | Stamped on every event as `simulationId` |
+| `price_sources.finnhub.api_key_file` | unset | File holding the Finnhub API key; else `FINNHUB_API_KEY`. Without a key the feed does not run (see Finnhub live prices) |
+| `price_sources.finnhub.stale_after_ms` / `refresh_after_ms` | `120000` / `60000` | Real time without an update before a live price is stale / before a symbol is refreshed over REST |
+| `price_sources.finnhub.max_updates_per_second`, `max_symbols`, `rest_calls_per_minute` | `4`, `50`, `60` | Live price conflation per instrument; Finnhub free-tier limits |
+| `price_sources.finnhub.ws_url`, `rest_url`, `request_timeout_ms`, `reconnect_initial_ms` / `reconnect_max_ms` | Finnhub's, `10000`, `1000` / `60000` | Endpoints, timeout and reconnect backoff |
 | `market_data.conflation_interval_ms` / `stream_buffer` | `0` / `1024` | Market-data stream: at most one message per instrument and kind per interval (`0`: every message); how far a subscriber may fall behind before its stream is closed (see `GET /api/marketdata/stream`) |
 | `webhooks.poll_interval_ms` | `250` | How often due deliveries (retries) are looked for; new events are sent at once |
 | `webhooks.batch_size` / `concurrency` | `100` / `16` | Deliveries claimed per round / concurrent requests |
@@ -224,6 +228,7 @@ will quote around and the market data publishes. The demo never pushes prices in
 | `none` | No reference price; the instrument trades only on client orders (the default) | – |
 | `fixed` | A constant price | `price` |
 | `synthetic` | A seeded geometric Brownian motion on simulated time | `initialPrice`, `drift`, `volatility`, `tickIntervalMs`, `seed` |
+| `finnhub` | Live trade prices from Finnhub for the instrument's `referenceSymbol` (else its `symbol`) | – (the service needs an API key, below) |
 
 ```json
 "priceSource": { "kind": "synthetic", "initialPrice": "187.50", "drift": 0.05, "volatility": 0.3,
@@ -245,6 +250,29 @@ will quote around and the market data publishes. The demo never pushes prices in
 - **Clock jumps** catch the walk up step by step on the exchange thread: about 50 ms per instrument for 30 simulated
   days of one-second steps. `tickIntervalMs` is at least 100.
 
+#### Finnhub live prices
+
+`finnhub` streams real trades for `referenceSymbol` (`AAPL`, `BINANCE:BTCUSDT`; the exchange `symbol` when unset)
+from Finnhub's trades websocket, and seeds or refreshes each symbol from its REST quote endpoint on connect and
+whenever it has been quiet for `price_sources.finnhub.refresh_after_ms` (a closed market streams no trades).
+- **The API key** comes from the `FINNHUB_API_KEY` environment variable, which both Compose files pass through from
+  the host (`FINNHUB_API_KEY=… docker compose up`); `price_sources.finnhub.api_key_file` reads it from a file instead.
+  Without one the feed does not run and `finnhub` sources are refused (a startup error for a declared instrument, a
+  `400` from the API). The key is never logged, returned or used in a metric label.
+- **Time:** a price takes effect at the exchange's current time, also on a virtual or accelerated clock, and keeps
+  Finnhub's own time as `sourceTimestamp`. Live prices are not reproducible; `source: "finnhub"` says so.
+- **Conflation:** each instrument takes in at most `max_updates_per_second` new prices a second, the latest winning.
+- **Stale:** with nothing from Finnhub for `stale_after_ms` (real time; the connection or REST down), the last price
+  stays, marked `stale: true` in the market data, and the liquidity provider applies its `stalePolicy`. The feed
+  reconnects with backoff and jitter, subscribes every symbol again, and the price is fresh with the next update. A
+  feed that is down never stops the exchange.
+- **Limits:** at most `max_symbols` distinct symbols (Finnhub's free tier: 50) and `rest_calls_per_minute` REST calls
+  (free tier: 60). A source past the symbol limit is refused like a missing key; a REST call past the rate limit is
+  skipped and counted. Finnhub's free tier is for personal, non-commercial use.
+- **Changing `referenceSymbol`** of a `finnhub` instrument unsubscribes the old symbol and subscribes the new one.
+- **Metrics:** `exchange_price_feed_connected`, `exchange_price_feed_reconnects_total`,
+  `exchange_price_feed_updates_total{via}` (`websocket`, `rest`), `exchange_price_feed_rest_calls_total{outcome}`.
+
 ### Liquidity provider
 
 A built-in participant (`liquidity.participant_id`, default `LP`) quotes a ladder of limit orders around each
@@ -254,7 +282,7 @@ off unless an instrument's `liquidity` (or `liquidity.default`) sets `mode: on`:
 ```json
 "liquidity": { "mode": "on", "levels": 5, "spreadBps": 10, "levelStepTicks": 1, "levelQuantity": 100,
                "levelQuantityGrowth": 1, "requoteThresholdTicks": 1, "refillDelayMs": 0, "skewBpsPerLot": 0,
-               "maxInventory": 10000 }
+               "maxInventory": 10000, "stalePolicy": "pull", "staleWidenFactor": 2 }
 ```
 
 - **Ladder:** `levels` limit orders a side. The best bid and ask are `spreadBps` from the mid, rounded away from it to
@@ -269,6 +297,9 @@ off unless an instrument's `liquidity` (or `liquidity.default`) sets `mode: on`:
 - **Inventory:** its net position, in lots, moves the mid `skewBpsPerLot` per lot against the position: a long
   provider lowers both sides, so one-sided client buying pushes the price up. At `maxInventory` lots it stops quoting
   the side that would add to the position.
+- **Stale reference price** (a live source gone quiet): `stalePolicy` `pull` (the default) cancels the ladder until
+  the price is fresh, `widen` quotes it with the spread times `staleWidenFactor`, `keep` leaves it as it was quoted.
+  The market data's `liquidity` says which applies: `kept`, `widened` or `pulled`.
 - **Events:** its order lifecycle (accepted, filled, cancelled) stays out of the event log and webhooks unless
   `liquidity.emit_order_events` is true. Its trades are always published (`TradeExecuted` with it as buyer or seller),
   and it settles and appears on clearing statements like any participant. Metrics count its quotes
@@ -286,7 +317,7 @@ off unless an instrument's `liquidity` (or `liquidity.default`) sets `mode: on`:
   "bestBid": { "priceTicks": 18733, "price": "187.33", "quantity": 100 },
   "bestAsk": { "priceTicks": 18771, "price": "187.71", "quantity": 100 },
   "lastTrade": { "priceTicks": 18771, "price": "187.71", "quantity": 25, "executedAt": "2030-01-07T09:01:12Z" },
-  "sessionVolume": 1250 }
+  "sessionVolume": 1250, "liquidity": "quoting" }
 ```
 
 Each instrument's market data, in instrument ID order; `404` for an unknown instrument.
@@ -296,6 +327,8 @@ Each instrument's market data, in instrument ID order; `404` for an unknown inst
 - `bestBid` and `bestAsk` (`null` for an empty side) carry the quantity resting at the best price. `lastTrade` has no
   participants; `null` before the first trade.
 - `sessionVolume` is the quantity traded on the current business date, which ends at `clearing.cutoff`.
+- `liquidity` is what the liquidity provider did when it last quoted: `off` (no provider, mode `off`, or trading
+  disabled), `no-reference`, `quoting`, or under a stale price `kept`, `widened` or `pulled`.
 - `mdSequence` is that of the last stream message about the instrument (below), so the snapshot and the stream line
   up.
 

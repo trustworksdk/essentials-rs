@@ -11,6 +11,8 @@
 //! - **Inventory skew:** the provider's net position, in lots, moves the mid by `skew_bps_per_lot` per lot against the
 //!   position: a long provider lowers both sides, a short one raises them.
 //! - **Limit:** at `max_inventory` lots long it stops bidding, at `max_inventory` short it stops offering.
+//! - **Stale reference price** (SR-9, a live source that stopped updating): `stale_policy` `keep` leaves the ladder
+//!   as it was quoted, `widen` quotes it with the spread times `stale_widen_factor`, `pull` (the default) cancels it.
 //!
 //! An instrument's own settings (`liquidity`) may leave fields out; they come from `liquidity.default`, field by field,
 //! then from the built-in defaults. `mode` defaults to `off`, so nothing is quoted unless asked for.
@@ -24,6 +26,18 @@ use crate::domain::Side;
 pub enum LiquidityMode {
     On,
     Off,
+}
+
+/// What the provider does while the reference price is stale (SR-9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StalePolicy {
+    /// Leave the ladder quoted around the last fresh price.
+    Keep,
+    /// Quote with the spread multiplied by `stale_widen_factor`.
+    Widen,
+    /// Cancel the ladder until the price is fresh again.
+    Pull,
 }
 
 /// Liquidity settings as configured: on an instrument (`liquidity`, API and configuration) or as the default
@@ -88,6 +102,20 @@ pub struct LiquiditySpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_inventory: Option<u64>,
+    /// What to do while the reference price is stale.
+    #[serde(
+        default,
+        alias = "stale_policy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stale_policy: Option<StalePolicy>,
+    /// `widen`: the factor the spread is multiplied by while the price is stale.
+    #[serde(
+        default,
+        alias = "stale_widen_factor",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stale_widen_factor: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
@@ -112,6 +140,8 @@ pub struct LiquiditySettings {
     pub refill_delay_ms: u64,
     pub skew_bps_per_lot: f64,
     pub max_inventory: u64,
+    pub stale_policy: StalePolicy,
+    pub stale_widen_factor: f64,
 }
 
 impl Default for LiquiditySettings {
@@ -127,6 +157,8 @@ impl Default for LiquiditySettings {
             refill_delay_ms: 0,
             skew_bps_per_lot: 0.0,
             max_inventory: 10_000,
+            stale_policy: StalePolicy::Pull,
+            stale_widen_factor: 2.0,
         }
     }
 }
@@ -171,6 +203,12 @@ impl LiquiditySpec {
         if self.max_inventory == Some(0) {
             return out("maxInventory", "at least 1 lot");
         }
+        if self
+            .stale_widen_factor
+            .is_some_and(|f| !f.is_finite() || !(1.0..=100.0).contains(&f))
+        {
+            return out("staleWidenFactor", "between 1 and 100");
+        }
         Ok(())
     }
 
@@ -189,6 +227,8 @@ impl LiquiditySpec {
             refill_delay_ms: self.refill_delay_ms.or(default.refill_delay_ms),
             skew_bps_per_lot: self.skew_bps_per_lot.or(default.skew_bps_per_lot),
             max_inventory: self.max_inventory.or(default.max_inventory),
+            stale_policy: self.stale_policy.or(default.stale_policy),
+            stale_widen_factor: self.stale_widen_factor.or(default.stale_widen_factor),
         }
     }
 
@@ -210,6 +250,8 @@ impl LiquiditySpec {
             refill_delay_ms: self.refill_delay_ms.unwrap_or(d.refill_delay_ms),
             skew_bps_per_lot: self.skew_bps_per_lot.unwrap_or(d.skew_bps_per_lot),
             max_inventory: self.max_inventory.unwrap_or(d.max_inventory),
+            stale_policy: self.stale_policy.unwrap_or(d.stale_policy),
+            stale_widen_factor: self.stale_widen_factor.unwrap_or(d.stale_widen_factor),
         }
     }
 }

@@ -81,7 +81,8 @@ instruments:
 
 ## Price sources
 
-Each instrument's reference price comes from its price source: `none` (the default), `fixed` or `synthetic`. The
+Each instrument's reference price comes from its price source: `none` (the default), `fixed`, `synthetic` or
+`finnhub`. The
 [README](../README.md#price-sources) describes each kind and the synthetic walk. Fields an instrument's
 `price_source` leaves out come from `price_sources.default`, so a market of synthetic instruments is set once:
 
@@ -103,6 +104,38 @@ A source that cannot resolve stops startup with an error naming the instrument, 
 recomputed from when their source was set, with the new parameters, so their reference prices jump. Change an
 instrument's own `price_source` instead to restart its walk from the current time.
 
+### Live prices from Finnhub
+
+`kind: finnhub` follows real trades ([README](../README.md#finnhub-live-prices)). The API key comes from the
+`FINNHUB_API_KEY` environment variable. Both Compose files (`compose.yaml` and `examples/compose/compose.yaml`) pass
+it through from the shell that runs `docker compose`, so the key never lands in a file in the repository:
+
+```bash
+FINNHUB_API_KEY=<your key> docker compose -f exchange-simulator/compose.yaml up --build
+```
+
+Unset or empty, the feed does not run. `api_key_file` reads the key from a file instead, and wins over the variable
+when set. The rest of the setup:
+
+```yaml
+price_sources:
+  finnhub:
+    stale_after_ms: 120000               # stale after two minutes without an update
+    max_updates_per_second: 4
+instruments:
+  - { id: AAPL, symbol: AAPL, mic: XNAS, currency: USD, currency_scale: 2, price_source: { kind: finnhub } }
+  - { id: BTC, symbol: BTC, currency: USD, currency_scale: 2, reference_symbol: "BINANCE:BTCUSDT",
+      price_source: { kind: finnhub } }
+liquidity:
+  default: { mode: on, stale_policy: widen, stale_widen_factor: 3 }
+```
+
+The variable is visible to anyone who can run `docker inspect` on the container; use `api_key_file` with a Docker
+secret where that matters. The defaults for
+`max_symbols` (50) and `rest_calls_per_minute` (60) are Finnhub's free tier; raise them for a paid plan.
+`stale_after_ms` must be longer than `refresh_after_ms`, or a closed market's prices would go stale between REST
+refreshes. Automated tests never call Finnhub; they run against a local mock (`tests/finnhub.rs`).
+
 ## Liquidity provider
 
 A built-in participant quotes a ladder around each instrument's reference price ([README](../README.md#liquidity-provider)).
@@ -120,7 +153,8 @@ instruments:
 ```
 
 An instrument's own `liquidity` overrides the default field by field; set `liquidity: { mode: off }` on one to leave
-it to client orders only.
+it to client orders only. `stale_policy` (`pull` by default, `widen` with `stale_widen_factor`, or `keep`) decides
+what happens to the ladder while a live reference price is stale.
 
 ## Market data
 

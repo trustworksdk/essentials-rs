@@ -84,6 +84,15 @@ impl App {
             buffer: config.market_data.stream_buffer.max(2),
         };
         let (market_data, _) = tokio::sync::broadcast::channel(stream_options.buffer);
+        let live = config
+            .price_sources
+            .finnhub
+            .live()
+            .map_err(anyhow::Error::msg)?;
+        let mut price_sources = config.price_sources.sources().map_err(anyhow::Error::msg)?;
+        if let Some(live) = &live {
+            price_sources = price_sources.with_live(live.source.clone());
+        }
         let exchange = Exchange::recover(
             store,
             ExchangeOptions {
@@ -113,7 +122,7 @@ impl App {
                     i64::try_from(config.webhooks.secret_grace_seconds).unwrap_or(i64::MAX / 1000),
                 ),
                 instruments: config.declared_instruments().map_err(anyhow::Error::msg)?,
-                price_sources: config.price_sources.sources().map_err(anyhow::Error::msg)?,
+                price_sources,
                 business_days: Some(config.business_calendar().map_err(anyhow::Error::msg)?),
                 liquidity: Some(config.liquidity.policy().map_err(anyhow::Error::msg)?),
                 market_data: Some(market_data.clone()),
@@ -150,6 +159,18 @@ impl App {
             config.webhooks.worker(),
             stopped.clone(),
         )];
+        if let Some(live) = live {
+            tracing::info!(
+                symbols = live.source.feed.wanted().len(),
+                "Finnhub price feed running"
+            );
+            background.push(tokio::spawn(crate::pricing::finnhub::run(
+                live.source.feed,
+                live.settings,
+                live.key,
+                stopped.clone(),
+            )));
+        }
         // Business days close on domain time whatever else runs, so the ticker always does.
         let interval = Duration::from_millis(config.settlement.tick_interval_ms.max(1));
         background.push(spawn_domain_ticker(dispatcher.clone(), interval, stopped));

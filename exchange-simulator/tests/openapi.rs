@@ -314,6 +314,24 @@ async fn every_operation_and_event_matches_the_document() {
         Some(json!({ "priceSource": { "kind": "fixed", "price": "100.25" } })),
     )
     .await;
+    // Every liquidity field; mode off, so the orders below meet no provider.
+    let liquidity = json!({ "mode": "off", "levels": 3, "spreadBps": 10.0, "levelStepTicks": 1, "levelQuantity": 10,
+        "levelQuantityGrowth": 1.5, "requoteThresholdTicks": 2, "refillDelayMs": 500, "skewBpsPerLot": 0.5,
+        "maxInventory": 100, "stalePolicy": "widen", "staleWidenFactor": 3.0 });
+    expect(
+        a,
+        s,
+        200,
+        M::PATCH,
+        "/api/instruments/ACME",
+        Some(json!({ "liquidity": liquidity })),
+    )
+    .await;
+    s.check_request(
+        "PATCH",
+        "/api/instruments/ACME",
+        &json!({ "liquidity": { "mode": "on" } }),
+    );
     expect(a, s, 200, M::GET, "/api/marketdata", None).await;
     expect(a, s, 200, M::GET, "/api/marketdata/SYN", None).await;
     expect(a, s, 404, M::GET, "/api/marketdata/NOPE", None).await;

@@ -62,10 +62,26 @@ instruments: []
 price_sources:
   seed: 0                     # base of each instrument's derived synthetic seed
   default: { kind: none }
+  # Live prices for kind finnhub. The feed runs only with an API key: the FINNHUB_API_KEY environment variable
+  # (passed through by the compose files), or api_key_file, which wins when set.
+  # The limits are Finnhub's free tier (checked 2026-10-19); the free tier is for personal, non-commercial use.
+  finnhub:
+    api_key_file: null
+    ws_url: "wss://ws.finnhub.io"
+    rest_url: "https://finnhub.io/api/v1"
+    stale_after_ms: 120000      # real time without an update before a price is stale; longer than refresh_after_ms
+    refresh_after_ms: 60000     # real time without an update before a symbol is refreshed over REST
+    max_updates_per_second: 4   # reference price updates taken in per instrument; the latest wins
+    max_symbols: 50
+    rest_calls_per_minute: 60
+    request_timeout_ms: 10000
+    reconnect_initial_ms: 1000  # backoff, doubled per failure up to reconnect_max_ms, with jitter
+    reconnect_max_ms: 60000
 # The built-in liquidity provider: a participant that quotes a ladder of limit orders around each instrument's
 # reference price. Off unless an instrument's liquidity (or the default here) sets mode: on. Fields: levels,
 # spread_bps, level_step_ticks, level_quantity (lots), level_quantity_growth, requote_threshold_ticks, refill_delay_ms
-# (simulated), skew_bps_per_lot, max_inventory (lots).
+# (simulated), skew_bps_per_lot, max_inventory (lots), stale_policy (keep, widen or pull; default pull),
+# stale_widen_factor.
 liquidity:
   participant_id: "LP"
   # Publish its order lifecycle (accepted, filled, cancelled); its trades are published either way.

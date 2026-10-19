@@ -94,12 +94,12 @@ async fn each_kind_produces_its_reference_price() {
         json!({ "instrumentId": "FIX", "mdSequence": 2,
                 "reference": { "price": "12.34", "priceTicks": 1234, "source": "fixed", "sourceTimestamp": START,
                                "stale": false },
-                "bestBid": null, "bestAsk": null, "lastTrade": null, "sessionVolume": 0 })
+                "bestBid": null, "bestAsk": null, "lastTrade": null, "sessionVolume": 0, "liquidity": "off" })
     );
     assert_eq!(
         all[1],
         json!({ "instrumentId": "NONE", "mdSequence": 2, "reference": null, "bestBid": null, "bestAsk": null,
-                "lastTrade": null, "sessionVolume": 0 })
+                "lastTrade": null, "sessionVolume": 0, "liquidity": "off" })
     );
     let syn = &all[2]["reference"];
     assert_eq!(

@@ -9,6 +9,8 @@ services:
       - "8080:8080"
     environment:
       RUST_LOG: ${RUST_LOG:-info}
+      # Live prices (price source kind finnhub): taken from the host's environment; empty means no feed.
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
     volumes:
       - exchange-data:/var/lib/exchange
 

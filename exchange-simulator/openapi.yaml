@@ -1231,7 +1231,7 @@ components:
         `liquidity.default`, field by field, then the built-in defaults (shown). It quotes `levels` limit orders a side
         around the reference price, as the participant `liquidity.participant_id`.
       properties:
-        mode: { enum: [on, off], default: off }
+        mode: { enum: ["on", "off"], default: "off" }
         levels: { type: integer, minimum: 1, maximum: 50, default: 5, description: Price levels a side. }
         spreadBps: { type: number, minimum: 0, maximum: 10000, default: 10, description: From the mid to the best bid and to the best ask; rounded away from the mid to the tick. }
         levelStepTicks: { type: integer, minimum: 1, default: 1, description: Between levels. }
@@ -1241,6 +1241,11 @@ components:
         refillDelayMs: { type: integer, minimum: 0, maximum: 86400000, default: 0, description: Simulated time after a fill before the ladder is refilled. }
         skewBpsPerLot: { type: number, minimum: 0, maximum: 10000, default: 0, description: How far each lot of inventory moves the mid against the position. }
         maxInventory: { type: integer, minimum: 1, default: 10000, description: Lots long (or short) past which the side that adds to it is not quoted. }
+        stalePolicy:
+          enum: [keep, widen, pull]
+          default: pull
+          description: While the reference price is stale, keep the ladder as quoted, quote it with the spread times `staleWidenFactor`, or pull it.
+        staleWidenFactor: { type: number, minimum: 1, maximum: 100, default: 2, description: "`widen`: the factor the spread is multiplied by while the price is stale." }
     PriceSource:
       type: object
       additionalProperties: false
@@ -1250,8 +1255,8 @@ components:
         not use are ignored. Prices are decimal strings in major units, on the instrument's tick grid.
       properties:
         kind:
-          enum: [none, fixed, synthetic]
-          description: "`none`: no reference price. `fixed`: `price`. `synthetic`: a seeded geometric Brownian motion."
+          enum: [none, fixed, synthetic, finnhub]
+          description: "`none`: no reference price. `fixed`: `price`. `synthetic`: a seeded geometric Brownian motion. `finnhub`: live trade prices for the instrument's `referenceSymbol` (else its `symbol`); needs a Finnhub API key in the service's configuration."
         price: { $ref: "#/components/schemas/Amount" }
         initialPrice:
           $ref: "#/components/schemas/Amount"
@@ -1263,7 +1268,7 @@ components:
     MarketData:
       type: object
       additionalProperties: false
-      required: [instrumentId, mdSequence, reference, bestBid, bestAsk, lastTrade, sessionVolume]
+      required: [instrumentId, mdSequence, reference, bestBid, bestAsk, lastTrade, sessionVolume, liquidity]
       properties:
         instrumentId: { type: string }
         mdSequence:
@@ -1282,6 +1287,9 @@ components:
           type: integer
           minimum: 0
           description: Quantity traded on the current business date (the business day ends at `clearing.cutoff`).
+        liquidity:
+          enum: ["off", no-reference, quoting, kept, widened, pulled]
+          description: What the liquidity provider did when it last quoted the instrument. `off` without a provider, with mode `off` or with trading disabled; `kept`, `widened` and `pulled` apply its `stalePolicy` to a stale reference price.
     MarketDataReferencePrice:
       description: "`null` when the price source is `none`."
       oneOf:
@@ -1292,13 +1300,13 @@ components:
           properties:
             price: { $ref: "#/components/schemas/Amount" }
             priceTicks: { type: integer, minimum: 1 }
-            source: { enum: [fixed, synthetic] }
+            source: { enum: [fixed, synthetic, finnhub] }
             sourceTimestamp:
               $ref: "#/components/schemas/Timestamp"
               description: When the price was produced, on the exchange's clock.
             stale:
               type: boolean
-              description: Older than its source allows. Always `false` for `fixed` and `synthetic`.
+              description: "`finnhub`: nothing has arrived for `price_sources.finnhub.stale_after_ms` (real time); the last price is kept. Always `false` for `fixed` and `synthetic`."
     MarketDataTop:
       description: The best price on one side and the quantity resting there; `null` for an empty side.
       oneOf:

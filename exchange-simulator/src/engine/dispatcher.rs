@@ -719,7 +719,8 @@ mod tests {
         let delta = |i: usize| (after[i].0 - before[i].0, after[i].1 - before[i].1);
         let (wait, waits) = delta(0);
         let (ack, acks) = delta(1);
-        let (duration, _) = delta(2);
+        let (_, durations) = delta(2);
+        assert_eq!(durations, 1.0, "one execution");
         assert_eq!(
             (waits, acks),
             (1.0, 1.0),
@@ -729,9 +730,11 @@ mod tests {
             wait >= 0.1,
             "queue wait {wait} s covers the 100 ms in the queue"
         );
+        // Not `ack >= wait + duration`: the caller records the acknowledgement as soon as the reply wakes it, while
+        // the exchange thread records the execution's duration after sending that reply, so they overlap.
         assert!(
-            ack >= wait + duration,
-            "acknowledgement {ack} s covers the wait {wait} s and the execution {duration} s"
+            ack >= wait,
+            "acknowledgement {ack} s covers the wait {wait} s in the queue"
         );
     }
 
