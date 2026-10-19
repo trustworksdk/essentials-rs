@@ -1,0 +1,67 @@
+# A live market: 37 large US stocks and ETFs and 3 crypto pairs, priced by Finnhub (price source kind finnhub).
+#
+# Use it as the configuration file. The image ships it at /etc/exchange/finnhub-market.yaml:
+#   FINNHUB_API_KEY=<key> EXCHANGE_CONFIG=/etc/exchange/finnhub-market.yaml \
+#     docker compose -f exchange-simulator/compose.yaml up --build
+# or from a checkout:
+#   FINNHUB_API_KEY=<key> EXCHANGE_CONFIG=exchange-simulator/config/finnhub-market.yaml cargo run -p exchange-simulator
+#
+# - 40 symbols, within Finnhub's free-tier limit of 50 websocket symbols (price_sources.finnhub.max_symbols).
+# - US stocks stream trades during US market hours (09:30-16:00 New York); outside them the REST quote keeps the
+#   last price fresh, so prices hold still. The crypto pairs trade around the clock, for demos at any hour.
+# - The crypto pairs are quoted in USDT on Binance and listed here as USD.
+# - Copy the file and edit it for a different market; the service reads one configuration file (EXCHANGE_CONFIG).
+#   Instruments listed once stay listed: removing one here does not delist it from an existing database.
+
+price_sources:
+  default: { kind: finnhub }
+
+# The liquidity provider is off by default. To give every instrument a counterparty, uncomment:
+# liquidity:
+#   default: { mode: on, levels: 5, spread_bps: 5, level_quantity: 100, stale_policy: pull }
+
+instruments:
+  # Nasdaq
+  - { id: AAPL,  symbol: AAPL,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: MSFT,  symbol: MSFT,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: NVDA,  symbol: NVDA,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: AMZN,  symbol: AMZN,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: GOOGL, symbol: GOOGL, mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: META,  symbol: META,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: AVGO,  symbol: AVGO,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: TSLA,  symbol: TSLA,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: COST,  symbol: COST,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: NFLX,  symbol: NFLX,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: AMD,   symbol: AMD,   mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: ADBE,  symbol: ADBE,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: PEP,   symbol: PEP,   mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: CSCO,  symbol: CSCO,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: INTC,  symbol: INTC,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: QCOM,  symbol: QCOM,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: AMGN,  symbol: AMGN,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: INTU,  symbol: INTU,  mic: XNAS, currency: USD, currency_scale: 2 }
+  - { id: QQQ,   symbol: QQQ,   mic: XNAS, currency: USD, currency_scale: 2 }   # Invesco QQQ (Nasdaq-100 ETF)
+  # New York Stock Exchange
+  - { id: JPM,   symbol: JPM,   mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: V,     symbol: V,     mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: MA,    symbol: MA,    mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: BAC,   symbol: BAC,   mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: LLY,   symbol: LLY,   mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: UNH,   symbol: UNH,   mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: JNJ,   symbol: JNJ,   mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: ABBV,  symbol: ABBV,  mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: XOM,   symbol: XOM,   mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: CVX,   symbol: CVX,   mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: PG,    symbol: PG,    mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: KO,    symbol: KO,    mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: MCD,   symbol: MCD,   mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: HD,    symbol: HD,    mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: DIS,   symbol: DIS,   mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: ORCL,  symbol: ORCL,  mic: XNYS, currency: USD, currency_scale: 2 }
+  - { id: CRM,   symbol: CRM,   mic: XNYS, currency: USD, currency_scale: 2 }
+  # NYSE Arca
+  - { id: SPY,   symbol: SPY,   mic: ARCX, currency: USD, currency_scale: 2 }   # SPDR S&P 500 ETF
+  # Crypto, around the clock (Finnhub symbol in reference_symbol)
+  - { id: BTCUSD, symbol: BTCUSD, currency: USD, currency_scale: 2, reference_symbol: "BINANCE:BTCUSDT" }
+  - { id: ETHUSD, symbol: ETHUSD, currency: USD, currency_scale: 2, reference_symbol: "BINANCE:ETHUSDT" }
+  - { id: SOLUSD, symbol: SOLUSD, currency: USD, currency_scale: 2, reference_symbol: "BINANCE:SOLUSDT" }

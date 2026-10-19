@@ -17,6 +17,8 @@ RUN apt-get update \
  && mkdir -p /var/lib/exchange \
  && chown exchange /var/lib/exchange
 COPY --from=build /exchange-simulator /usr/local/bin/exchange-simulator
+# Ready-made configuration files, chosen with EXCHANGE_CONFIG (e.g. /etc/exchange/finnhub-market.yaml).
+COPY exchange-simulator/config/finnhub-market.yaml /etc/exchange/finnhub-market.yaml
 USER exchange
 ENV EXCHANGE__SERVER__BIND=0.0.0.0:8080 \
     EXCHANGE__DATABASE__PATH=/var/lib/exchange/exchange.db \

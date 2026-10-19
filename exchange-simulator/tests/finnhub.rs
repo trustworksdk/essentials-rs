@@ -636,3 +636,34 @@ async fn missing_keys_and_exceeded_limits_are_refused() {
     app.stop().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn the_finnhub_market_file_starts_and_subscribes_every_symbol() {
+    #[derive(serde::Deserialize)]
+    struct MarketFile {
+        instruments: Vec<InstrumentConfig>,
+    }
+    let file: MarketFile =
+        serde_saphyr::from_str(include_str!("../config/finnhub-market.yaml")).unwrap();
+    let count = file.instruments.len();
+    let mock = Mock::start().await;
+    let mut app = start(&mock, |c| {
+        c.price_sources.default.kind = Some(PriceSourceKind::Finnhub);
+        c.instruments = file.instruments;
+    })
+    .await;
+    mock.until_seen("subscribe:BINANCE:BTCUSDT").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while mock.subscriptions().len() < count {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:?}",
+            mock.subscriptions()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(mock.subscriptions().contains(&"subscribe:AAPL".to_string()));
+    let (_, listed) = app.get("/api/instruments").await;
+    assert_eq!(listed.as_array().unwrap().len(), count);
+    app.stop().await;
+}

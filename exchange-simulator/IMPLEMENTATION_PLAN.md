@@ -1981,6 +1981,21 @@ then 6.11, 6.12, 6.13–6.14.
 
 ## Beyond the milestones
 
+**Finnhub market file ✅ done (2026-10-19, requested by the user)**
+- **Delivered:** `config/finnhub-market.yaml`, a configuration file for `EXCHANGE_CONFIG`: 40 instruments on
+  `price_sources.default.kind: finnhub`. 37 are large US stocks and ETFs (19 on XNAS, 17 on XNYS, SPY on ARCX); 3
+  are Binance crypto pairs (`BINANCE:BTCUSDT`, `ETHUSDT`, `SOLUSDT` as `reference_symbol`, listed in USD) that trade
+  around the clock. 40 symbols stay within the free tier's 50. The liquidity provider is left off, with a commented
+  block to turn it on. The image ships the file at `/etc/exchange/finnhub-market.yaml`, and `compose.yaml` passes
+  `EXCHANGE_CONFIG` through.
+- **Change:** an empty `EXCHANGE_CONFIG` now counts as unset (Compose passes an unset variable as empty); before,
+  the service tried to open a file named `""`.
+- **Checks:** a unit test loads the file over the defaults (40 instruments, each valid under the strict identifier
+  policy, no symbol twice, within `max_symbols`); `tests/finnhub.rs` starts the service with it against the mock and
+  sees every symbol subscribed. The image itself was not rebuilt.
+- **Choices:** no ISINs (optional, and a wrong one would pass the check digit unnoticed); Walmart left out because
+  its listing moved between exchanges recently; BRK.B left out over its dotted symbol.
+
 **OpenAPI specifications ✅ done (2026-10-17, requested by the user)**
 - **Delivered:** `exchange-simulator/openapi.yaml` and `payment-gateway/openapi.yaml`, OpenAPI 3.1, written by hand,
   served by each service at `GET /openapi.yaml`. Each describes every route, the `/test` routes under a

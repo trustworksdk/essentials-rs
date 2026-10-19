@@ -115,7 +115,19 @@ FINNHUB_API_KEY=<your key> docker compose -f exchange-simulator/compose.yaml up 
 ```
 
 Unset or empty, the feed does not run. `api_key_file` reads the key from a file instead, and wins over the variable
-when set. The rest of the setup:
+when set.
+
+**A ready-made market:** [`config/finnhub-market.yaml`](../config/finnhub-market.yaml) lists 40 instruments on
+Finnhub prices: 37 large US stocks and ETFs (Nasdaq, NYSE, NYSE Arca) and 3 crypto pairs that trade around the clock.
+The image ships it at `/etc/exchange/finnhub-market.yaml`, and `compose.yaml` passes `EXCHANGE_CONFIG` through:
+
+```bash
+FINNHUB_API_KEY=<your key> EXCHANGE_CONFIG=/etc/exchange/finnhub-market.yaml \
+  docker compose -f exchange-simulator/compose.yaml up --build
+```
+
+Without a key that configuration refuses to start, since every instrument needs the feed. Copy the file to change
+the market. A hand-written setup looks like this:
 
 ```yaml
 price_sources:

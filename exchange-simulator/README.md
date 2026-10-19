@@ -269,6 +269,9 @@ whenever it has been quiet for `price_sources.finnhub.refresh_after_ms` (a close
 - **Limits:** at most `max_symbols` distinct symbols (Finnhub's free tier: 50) and `rest_calls_per_minute` REST calls
   (free tier: 60). A source past the symbol limit is refused like a missing key; a REST call past the rate limit is
   skipped and counted. Finnhub's free tier is for personal, non-commercial use.
+- **A ready-made market** of 40 instruments (large US stocks and ETFs, three crypto pairs) is
+  [`config/finnhub-market.yaml`](config/finnhub-market.yaml), shipped in the image at
+  `/etc/exchange/finnhub-market.yaml`: `FINNHUB_API_KEY=… EXCHANGE_CONFIG=/etc/exchange/finnhub-market.yaml docker compose up`.
 - **Changing `referenceSymbol`** of a `finnhub` instrument unsubscribes the old symbol and subscribes the new one.
 - **Metrics:** `exchange_price_feed_connected`, `exchange_price_feed_reconnects_total`,
   `exchange_price_feed_updates_total{via}` (`websocket`, `rest`), `exchange_price_feed_rest_calls_total{outcome}`.

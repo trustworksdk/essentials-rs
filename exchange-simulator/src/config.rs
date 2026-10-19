@@ -626,11 +626,14 @@ pub enum LogFormat {
 }
 
 impl Config {
-    /// Loads the defaults, the file named by [`CONFIG_FILE_ENV`] if set, and `EXCHANGE__*` environment variables.
+    /// Loads the defaults, the file named by [`CONFIG_FILE_ENV`] if set (empty counts as unset, as Compose passes an
+    /// unset variable), and `EXCHANGE__*` environment variables.
     pub fn load() -> Result<Self, config::ConfigError> {
         let mut builder = config::Config::builder()
             .add_source(config::File::from_str(DEFAULTS, config::FileFormat::Yaml));
-        if let Ok(path) = std::env::var(CONFIG_FILE_ENV) {
+        if let Ok(path) = std::env::var(CONFIG_FILE_ENV)
+            && !path.is_empty()
+        {
             builder = builder.add_source(config::File::with_name(&path));
         }
         builder
@@ -647,6 +650,37 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_finnhub_market_file_lists_valid_live_instruments_within_the_free_tier() {
+        let config: Config = config::Config::builder()
+            .add_source(config::File::from_str(DEFAULTS, config::FileFormat::Yaml))
+            .add_source(config::File::from_str(
+                include_str!("../config/finnhub-market.yaml"),
+                config::FileFormat::Yaml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(
+            config.price_sources.default.kind,
+            Some(crate::pricing::PriceSourceKind::Finnhub)
+        );
+        let instruments = config.declared_instruments().unwrap();
+        assert_eq!(instruments.len(), 40);
+        for instrument in &instruments {
+            instrument
+                .validate(IdentifierPolicy::Strict)
+                .unwrap_or_else(|e| panic!("{}: {e}", instrument.id));
+        }
+        let symbols: std::collections::BTreeSet<&str> = instruments
+            .iter()
+            .map(|i| i.reference_symbol.as_deref().unwrap_or(&i.symbol))
+            .collect();
+        assert_eq!(symbols.len(), instruments.len(), "no symbol streams twice");
+        assert!(symbols.len() <= FinnhubConfig::default().max_symbols);
+    }
 
     #[test]
     fn the_finnhub_key_comes_from_the_environment_unless_a_file_is_named() {
