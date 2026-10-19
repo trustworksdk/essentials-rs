@@ -25,7 +25,7 @@ use simulator_kit::webhooks::{
 use uuid::Uuid;
 
 use crate::gateway::{ClockChange, ClockState, Gateway, GatewayError, PaymentRequest};
-use crate::payments::{BankAccount, PaymentType, payment_view};
+use crate::payments::{BankAccount, ForcedOutcome, PaymentType, payment_view};
 use crate::statement::{Break, Statement};
 use crate::store;
 
@@ -35,7 +35,10 @@ impl From<GatewayError> for ApiError {
         let (status, code) = match &error {
             E::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             E::IdempotencyConflict { .. } => (StatusCode::CONFLICT, "idempotency_conflict"),
+            E::UnknownPayment(_) => (StatusCode::NOT_FOUND, "not_found"),
+            E::PaymentSettled { .. } => (StatusCode::CONFLICT, "payment_settled"),
             E::ClockNotVirtual => (StatusCode::CONFLICT, "clock_not_virtual"),
+            E::ClockFollows => (StatusCode::CONFLICT, "clock_follows"),
             E::Clock(ClockError::Speed(_)) => (StatusCode::BAD_REQUEST, "invalid_clock_speed"),
             E::Clock(_) => (StatusCode::CONFLICT, "clock_backwards"),
             E::Webhook(_) => {
@@ -215,6 +218,7 @@ impl simulator_kit::api::clock::ClockBackend for AppState {
 pub fn test_router(state: AppState) -> Router {
     Router::new()
         .route("/test/reset", post(reset))
+        .route("/test/payments/{id}/outcome", post(force_outcome))
         .route("/test/statements/breaks", get(breaks))
         .with_state(state.clone())
         .merge(simulator_kit::api::clock::test_router(state.clone()))
@@ -454,6 +458,72 @@ async fn breaks(
         .collect();
     views.sort_by(|a, b| (a.business_date, &a.currency).cmp(&(b.business_date, &b.currency)));
     Ok(Json(views))
+}
+
+/// `POST /test/payments/{id}/outcome`: the outcome to force (decision D20).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForceRequest {
+    outcome: ForcedKind,
+    /// `FAILED` only; default `REFUSED_BY_BANK`.
+    reason: Option<String>,
+    /// `RETURNED` only: how long after completing it is returned; default a day.
+    return_after_seconds: Option<u64>,
+    /// A pending payment's outcome happens this long from now instead of when it was scheduled; 0 is at once.
+    delay_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ForcedKind {
+    Completed,
+    Failed,
+    Returned,
+}
+
+async fn force_outcome(
+    State(state): State<AppState>,
+    id: Result<Path<Uuid>, PathRejection>,
+    body: Result<Json<ForceRequest>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Path(id) = id?;
+    let Json(body) = body?;
+    let seconds = |name: &str, value: u64| {
+        if value > crate::payments::MAX_DELAY_SECONDS {
+            Err(ApiError::bad_request(format!(
+                "{name} must be at most {}",
+                crate::payments::MAX_DELAY_SECONDS
+            )))
+        } else {
+            Ok(chrono::Duration::seconds(value as i64))
+        }
+    };
+    let outcome = match (body.outcome, body.reason, body.return_after_seconds) {
+        (ForcedKind::Completed, None, None) => ForcedOutcome::Completed,
+        (ForcedKind::Failed, reason, None) => ForcedOutcome::Failed {
+            reason: reason.unwrap_or_else(|| "REFUSED_BY_BANK".into()),
+        },
+        (ForcedKind::Returned, None, after) => {
+            let after = after.unwrap_or(86_400);
+            seconds("returnAfterSeconds", after)?;
+            ForcedOutcome::Returned {
+                return_after_seconds: after,
+            }
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "reason is for FAILED and returnAfterSeconds for RETURNED only",
+            ));
+        }
+    };
+    let delay = body
+        .delay_seconds
+        .map(|d| seconds("delaySeconds", d))
+        .transpose()?;
+    let payment = state
+        .run(move |g| g.force_outcome(id, outcome, delay))
+        .await?;
+    Ok(Json(payment_view(&payment)))
 }
 
 async fn reset(State(state): State<AppState>) -> Result<StatusCode, ApiError> {

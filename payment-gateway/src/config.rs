@@ -8,7 +8,7 @@ use simulator_kit::calendar::CutoffCalendar;
 use simulator_kit::ids::IdScheme;
 use simulator_kit::persistence::PersistenceMode;
 
-pub use simulator_kit::clock::{ClockConfig, ClockMode};
+pub use simulator_kit::clock::{ClockConfig, ClockMode, FollowConfig};
 pub use simulator_kit::webhooks::{SubscriptionConfig, WebhooksConfig};
 
 use crate::money::{Currencies, parse_amount};
@@ -240,10 +240,15 @@ mod tests {
             .unwrap()
             .try_deserialize()
             .unwrap();
-        assert_eq!(config.clock.mode, ClockMode::Virtual);
+        assert_eq!(config.clock.mode, ClockMode::Follow);
+        assert_eq!(
+            config.clock.follow.as_ref().map(|f| f.url.as_str()),
+            Some("http://exchange:8080")
+        );
         assert!(config.payment_policy().is_ok());
         let statements = config.statement_policy().unwrap().unwrap();
         assert_eq!(statements.opening_balances["DKK"], 100_000_000);
+        assert_eq!(statements.opening_balances["USD"], 100_000_000);
         // Event types only: the secret file exists in the container.
         let declared = &config.webhooks.subscriptions[0];
         assert!(

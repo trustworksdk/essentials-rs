@@ -192,6 +192,41 @@ paths:
               schema: { $ref: "#/components/schemas/BankStatement" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /test/payments/{id}/outcome:
+    post:
+      tags: [test-control]
+      operationId: forcePaymentOutcome
+      summary: Force a payment's outcome
+      description: |
+        Decision D20. The outcome replaces the payment's seeded draws and is stored with it. A pending payment takes
+        any outcome, due when it was scheduled or `delaySeconds` from now (0 is at once); a completed payment not yet
+        returned takes only `RETURNED`, due `returnAfterSeconds` from now. A failed or returned payment is
+        `409 payment_settled`. Whatever is due at once happens before the answer.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [outcome]
+              properties:
+                outcome: { enum: [COMPLETED, FAILED, RETURNED] }
+                reason: { type: string, minLength: 1, maxLength: 64, description: "`FAILED` only; default `REFUSED_BY_BANK`." }
+                returnAfterSeconds: { type: integer, minimum: 0, maximum: 604800, description: "`RETURNED` only: how long after completing it is returned; default 86400." }
+                delaySeconds: { type: integer, minimum: 0, maximum: 604800, description: A pending payment's outcome happens this long from now. }
+      responses:
+        "200":
+          description: The payment after the change.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /test/statements/breaks:
     get:
       tags: [test-control]
@@ -899,7 +934,9 @@ components:
         reproducible run). Changes that alter nothing publish nothing; a reset publishes nothing
         either (read `GET /api/clock` after one).
       properties:
-        change: { enum: [advance, set, freeze, resume, speed] }
+        change:
+          enum: [advance, set, freeze, resume, speed, follow]
+          description: "`follow`: a following clock (the payment gateway's `clock.mode: follow`) took the followed clock's state."
         mode: { const: virtual }
         running: { type: boolean }
         speed: { type: number }

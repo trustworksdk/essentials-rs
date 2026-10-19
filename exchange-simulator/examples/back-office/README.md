@@ -25,8 +25,8 @@ curl -s -XPOST $E/api/instruments -H "$H" -d '{"id":"ACME","symbol":"ACME","mic"
 curl -s -XPOST $E/api/participants -H "$H" -d '{"id":"client-a","name":"Client A"}'
 curl -s -XPOST $E/api/participants -H "$H" -d '{"id":"client-b","name":"Client B"}'
 
-# Start both clocks together: a simulated day now takes a real minute.
-curl -s -XPOST $E/test/clock/resume; curl -s -XPOST $G/test/clock/resume
+# Start the clock: a simulated day now takes a real minute. The gateway's clock follows the exchange's.
+curl -s -XPOST $E/test/clock/resume
 
 # A deposit, then a trade.
 curl -s -XPOST $G/api/payments -H "$H" -d '{"idempotencyKey":"dep-1","type":"DEPOSIT","accountId":"client-a",
@@ -51,5 +51,5 @@ docker compose -f compose.yaml -f compose.breaks.yaml up --build -d --wait
 curl -s $E/test/clearing/breaks; curl -s $G/test/statements/breaks
 ```
 
-`SPEED` changes the clock speed for both services, e.g. `SPEED=4320 docker compose up -d --wait` (the e2e test
+`SPEED` changes the exchange's clock speed, which the gateway follows, e.g. `SPEED=4320 docker compose up -d --wait` (the e2e test
 uses it). `EXCHANGE_PORT`, `GATEWAY_PORT` and `RECEIVER_PORT` change the host ports.

@@ -1,7 +1,7 @@
 # The back-office demo: the exchange simulator (with settlement and clearing), the payment gateway, and a receiver
 # standing in for the demo app. From this directory:
 #   docker compose up --build -d --wait
-#   curl -X POST localhost:8080/test/clock/resume; curl -X POST localhost:8081/test/clock/resume
+#   curl -X POST localhost:8080/test/clock/resume      # the gateway's clock follows the exchange's
 # With reconciliation breaks: add -f compose.breaks.yaml to every docker compose command. See README.md.
 # EXCHANGE_PORT, GATEWAY_PORT and RECEIVER_PORT change the host ports (8080, 8081, 9000); SPEED the clock speed.
 name: back-office-demo
@@ -36,7 +36,6 @@ services:
       - "${GATEWAY_PORT:-8081}:8081"
     environment:
       GATEWAY_CONFIG: /etc/gateway/gateway.yaml
-      GATEWAY__CLOCK__SPEED: ${SPEED:-1440}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - ./gateway.yaml:/etc/gateway/gateway.yaml:ro

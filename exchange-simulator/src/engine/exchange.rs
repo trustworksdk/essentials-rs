@@ -1293,7 +1293,7 @@ impl Exchange {
         self.tick()?;
         if changed {
             let mut event =
-                simulator_kit::clock::changed_event(&change, &clock, events::EXCHANGE_SOURCE);
+                simulator_kit::clock::changed_event(change.name(), &clock, events::EXCHANGE_SOURCE);
             let next = NewEvent::stamp(
                 std::slice::from_mut(&mut event),
                 self.next_event_sequence,

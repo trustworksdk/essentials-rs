@@ -975,10 +975,8 @@ async fn back_office_days(http: &Http, demo: &BackOffice) -> Vec<Value> {
         )
         .await;
     }
-    // Both clocks start frozen at Monday 08:00 and run from here, together.
+    // Both clocks start frozen at Monday 08:00; the gateway's follows the exchange's, which runs from here.
     http.post(format!("{exchange}/test/clock/resume"), json!({}))
-        .await;
-    http.post(format!("{gateway}/test/clock/resume"), json!({}))
         .await;
     let pay = |key: String, kind: &str, account: &str, amount: &str| {
         json!({ "idempotencyKey": key, "type": kind, "accountId": account,

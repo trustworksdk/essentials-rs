@@ -263,13 +263,14 @@ impl ClockChange {
 /// The event every clock change publishes, so a consumer can follow simulated time without polling.
 pub const CLOCK_CHANGED: &str = "ClockChanged";
 
-/// `ClockChanged` for `change`, just applied to `clock`: its state after the change, with `now` the reading at the
+/// `ClockChanged` for `change` (a [`ClockChange::name`], or `follow` for a follower's correction), just applied to
+/// `clock`: its state after the change, with `now` the reading at the
 /// change and `effectiveAt` the real time of it ([`VirtualClock::anchor`]). A follower computes simulated time as
 /// `now + (real time − effectiveAt) × speed` while `running`. A frozen clock reads `now` whenever it is asked, so
 /// its `effectiveAt` is `null`: real time stays out of the event log of a reproducible run, whose clock is frozen
 /// (decision D6). The aggregate ID is `clock`; `source` is the simulator's own.
 pub fn changed_event(
-    change: &ClockChange,
+    change: &'static str,
     clock: &VirtualClock,
     source: &'static str,
 ) -> crate::events::NewEvent {
@@ -284,7 +285,7 @@ pub fn changed_event(
         correlation_id: None,
         occurred_at: now,
         payload: serde_json::json!({
-            "change": change.name(),
+            "change": change,
             "mode": "virtual",
             "running": running,
             "speed": clock.speed(),
@@ -311,6 +312,24 @@ pub struct ClockConfig {
     /// without test control's reset and fault injection. `GET /api/clock` is always mounted.
     #[serde(default)]
     pub operator_control: bool,
+    /// `follow` mode only: whose clock to follow.
+    #[serde(default)]
+    pub follow: Option<FollowConfig>,
+}
+
+/// Following another simulator's clock (`clock.mode: follow`): its `GET /api/clock`, polled.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FollowConfig {
+    /// The other simulator's base URL, e.g. `http://exchange:8080`.
+    pub url: String,
+    /// How often to read its clock. The follower lags a change by at most this much real time.
+    #[serde(default = "follow_poll_interval")]
+    pub poll_interval_ms: u64,
+}
+
+fn follow_poll_interval() -> u64 {
+    250
 }
 
 fn real_time() -> f64 {
@@ -322,6 +341,8 @@ fn real_time() -> f64 {
 pub enum ClockMode {
     System,
     Virtual,
+    /// A virtual clock that follows another simulator's (`clock.follow`); only the payment gateway supports it.
+    Follow,
 }
 
 #[cfg(test)]

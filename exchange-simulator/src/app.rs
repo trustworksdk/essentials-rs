@@ -32,6 +32,11 @@ impl App {
     pub fn start(config: &Config) -> anyhow::Result<Self> {
         crate::clock::validate_speed(config.clock.speed).context("clock.speed")?;
         let clearing = config.clearing_policy().map_err(anyhow::Error::msg)?;
+        if config.clock.mode == ClockMode::Follow {
+            anyhow::bail!(
+                "clock.mode: follow is for the payment gateway; the exchange keeps its own clock"
+            );
+        }
         if config.clock.mode == ClockMode::System && config.clock.speed != 1.0 {
             anyhow::bail!(
                 "clock.speed needs clock.mode: virtual; the system clock runs at real time"

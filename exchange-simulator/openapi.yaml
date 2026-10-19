@@ -1707,7 +1707,9 @@ components:
         reproducible run). Changes that alter nothing publish nothing; a reset publishes nothing
         either (read `GET /api/clock` after one).
       properties:
-        change: { enum: [advance, set, freeze, resume, speed] }
+        change:
+          enum: [advance, set, freeze, resume, speed, follow]
+          description: "`follow`: a following clock (the payment gateway's `clock.mode: follow`) took the followed clock's state."
         mode: { const: virtual }
         running: { type: boolean }
         speed: { type: number }

@@ -30,7 +30,8 @@ variables (`__` between levels, e.g. `GATEWAY__SERVER__BIND=0.0.0.0:8081`).
 | `statement.tick_interval_ms` | `250` | How often due transitions and statements are looked for |
 | `webhooks.*` | as in the exchange simulator | Delivery timing and declared subscriptions; a `participants` filter is refused, since payments have no participants |
 | `ids.mode` / `ids.seed` | `random` / `0` | `deterministic` makes every ID reproducible |
-| `clock.mode`, `start`, `running`, `speed`, `operator_control` | `system` | As in the exchange simulator; `speed: 1440` makes a day pass in a minute. `GET /api/clock` is always mounted, the operator routes and `ClockChanged` too (see the exchange's README, The clock API) |
+| `clock.mode`, `start`, `running`, `speed`, `operator_control` | `system` | As in the exchange simulator; `speed: 1440` makes a day pass in a minute. `GET /api/clock` is always mounted, the operator routes and `ClockChanged` too (see the exchange's README, The clock API). `follow` follows the exchange's clock (below) |
+| `clock.follow.url`, `poll_interval_ms` | – / `250` | `follow` mode: the exchange's base URL, and how often its clock is read |
 | `test_control.enabled` | `false` | Mounts `/test`; never in a real deployment |
 | `database.mode`, `path` | `durable`, `data/payment-gateway.db` | `durable`, `fast` or `memory`, as in the exchange simulator |
 
@@ -144,6 +145,31 @@ With `test_control.enabled: true`: `GET /test/clock`, `POST /test/clock/advance`
 `/speed` (as in the exchange simulator); `POST /test/reset`; `GET /test/statements/breaks`; and the shared webhook
 routes (`/test/deliveries`, `/test/attempts`, `/test/dead-letters/retry`, `/test/webhooks/{id}/redeliver`,
 `/test/webhooks/{id}/faults`).
+
+**Forcing a payment's outcome** (decision D20): `POST /test/payments/{id}/outcome` with
+`{ "outcome": "COMPLETED" | "FAILED" | "RETURNED", "reason", "returnAfterSeconds", "delaySeconds" }`. The outcome
+replaces the payment's seeded draws and is stored with it, so a test takes the same path every time:
+- `COMPLETED`: completes, and is never returned.
+- `FAILED`: fails with `reason` (default `REFUSED_BY_BANK`).
+- `RETURNED`: completes, and is returned `returnAfterSeconds` later (default a day).
+
+A pending payment takes any outcome, at its scheduled time or `delaySeconds` from now (0 is at once); a completed
+one not yet returned takes only `RETURNED`, due `returnAfterSeconds` from now. A failed or returned payment is
+`409 payment_settled`. Whatever is due at once happens before the answer.
+
+## Following the exchange's clock
+
+`clock.mode: follow` with `clock.follow.url` (the exchange's base URL) makes the gateway's clock follow the
+exchange's: every `clock.follow.poll_interval_ms` (default 250) it reads `GET /api/clock` and takes its reading,
+speed and running state, correcting the reading by half the request's round trip. Then both services agree on the
+date, with no clocks to resume together by hand.
+- **Changes go to the exchange.** The gateway's own clock routes answer `409 clock_follows`.
+- **Lag:** a change reaches the gateway within one poll interval. At 1440x, 250 ms is six simulated minutes.
+- **Never backwards:** when the exchange's clock is behind (it slowed or froze between two reads, or was reset), the
+  gateway holds its reading and logs a warning until the exchange catches up. Reset both services together.
+- **Unreachable exchange:** the clock runs on at its last speed; a warning is logged once, and following resumes
+  when the exchange answers.
+- **Events:** a change of speed or running state, or a jump, publishes `ClockChanged` with `change: follow`.
 
 ## Running it with the exchange
 

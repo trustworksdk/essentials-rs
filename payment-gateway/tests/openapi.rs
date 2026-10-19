@@ -602,6 +602,57 @@ async fn every_operation_and_event_matches_the_document() {
     }
     assert_eq!(seen, spec.event_types(), "every event type occurs");
 
+    // Forced outcomes.
+    let forced = expect(
+        a,
+        s,
+        201,
+        M::POST,
+        "/api/payments",
+        Some(payment("forced", "DEPOSIT", "10.00", "DKK")),
+    )
+    .await;
+    let outcome = format!(
+        "/test/payments/{}/outcome",
+        forced["paymentId"].as_str().unwrap()
+    );
+    expect(
+        a,
+        s,
+        200,
+        M::POST,
+        &outcome,
+        Some(json!({ "outcome": "FAILED", "reason": "TEST", "delaySeconds": 0 })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        409,
+        M::POST,
+        &outcome,
+        Some(json!({ "outcome": "COMPLETED" })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        400,
+        M::POST,
+        &outcome,
+        Some(json!({ "outcome": "COMPLETED", "reason": "x" })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        404,
+        M::POST,
+        "/test/payments/00000000-0000-0000-0000-000000000000/outcome",
+        Some(json!({ "outcome": "COMPLETED" })),
+    )
+    .await;
+
     expect(a, s, 204, M::POST, "/test/reset", None).await;
     assert_eq!(
         spec.uncovered(),

@@ -28,6 +28,25 @@ impl TestApp {
 
     pub async fn start_with(adjust: impl FnOnce(&mut Config)) -> Self {
         let dir = std::env::temp_dir().join(format!("payment-gateway-it-{}", Uuid::now_v7()));
+        let mut config = Self::config_in(&dir);
+        adjust(&mut config);
+        let mut test = Self {
+            app: None,
+            dir,
+            config,
+        };
+        test.restart().await;
+        test
+    }
+
+    /// The test configuration with its database in a fresh temporary directory, for starting an app by hand.
+    pub fn config_for_tests() -> Config {
+        Self::config_in(
+            &std::env::temp_dir().join(format!("payment-gateway-it-{}", Uuid::now_v7())),
+        )
+    }
+
+    fn config_in(dir: &std::path::Path) -> Config {
         let mut config = Config::defaults();
         config.database.path = dir.join("gateway.db").to_string_lossy().into_owned();
         config.clock.mode = ClockMode::Virtual;
@@ -44,14 +63,7 @@ impl TestApp {
         config.payments.deposit.fail_probability = 0.0;
         config.payments.withdrawal.fail_probability = 0.0;
         config.payments.return_probability = 0.0;
-        adjust(&mut config);
-        let mut test = Self {
-            app: None,
-            dir,
-            config,
-        };
-        test.restart().await;
-        test
+        config
     }
 
     pub async fn restart(&mut self) {

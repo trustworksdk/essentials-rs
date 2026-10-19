@@ -1777,6 +1777,44 @@ then 6.11, 6.12, 6.13–6.14.
   test's clock happened to restart where the stale cursor was right. A new test resets after closing days, so the
   clock goes back past them, and it fails.
 
+**6.6 — payment gateway for the demo ✅ done (2026-10-19)**
+- **Delivered:**
+  - **SR-21:** the back-office example's gateway has a USD opening balance next to DKK; USD was already accepted.
+  - **SR-22, D20:** `POST /test/payments/{id}/outcome` with `COMPLETED`, `FAILED` (with `reason`) or `RETURNED` (with
+    `returnAfterSeconds`), and an optional `delaySeconds`. The outcome is stored with the payment (gateway migration
+    4, `forced_outcome`) and replaces its seeded draws in `PaymentPolicy::transition`, so it holds across a restart.
+    A pending payment takes any outcome; a completed one not yet returned takes only `RETURNED`; a final one is
+    `409 payment_settled`.
+  - **SR-27:** `clock.mode: follow` with `clock.follow.url` and `poll_interval_ms` (default 250), in the kit's
+    `ClockConfig`. A background task reads the exchange's `GET /api/clock`, corrects the reading by half the round
+    trip, and `Gateway::follow` takes its speed, running state and reading. A change of speed or running state, or
+    a jump of over a simulated minute, publishes `ClockChanged` with `change: follow`; `follow` joins the shared
+    `ClockChangedPayload` enum in both documents. The gateway's own clock routes answer `409 clock_follows`. The
+    exchange refuses `follow` mode at startup.
+  - The back-office example follows: the gateway's clock follows the exchange's, so the walkthrough and the e2e
+    test resume only the exchange's clock. The example README, the back-office guide, the gateway README (forced
+    outcomes, following) and its default configuration are updated.
+  - Tests: gateway `tests/forced_outcomes.rs` (4) and `tests/follow.rs` (4, against a stand-in clock server), a
+    unit test of forced transitions, the gateway contract test for the new route, and an exchange test refusing
+    `follow`.
+  - SR-23 (memory mode) was already done.
+- **Decisions:**
+  - **Follow by polling `GET /api/clock`, not by consuming `ClockChanged`.** The exchange's initial running state
+    from configuration is never an event, so the clock endpoint is needed anyway, and polling needs no inbound
+    endpoint or signature check on the gateway. The cost is a lag of up to one poll interval: at 1440×, 250 ms is
+    six simulated minutes. The example polls every 100 ms.
+  - **Never backwards.** When the followed clock is behind, because it slowed or froze between reads or was reset,
+    the gateway holds its reading and logs once. Moving back would break the gateway's own time order. Resetting
+    both services together is documented.
+  - **Small corrections publish nothing**, so a running follower does not write an event per poll.
+  - **The forced outcome is test-only state.** It is not in the payment view or events, which stay as the bank would
+    show them.
+- **Deviation:** the 6.6 row said the gateway would "follow its `ClockChanged` events"; it reads `GET /api/clock`
+  only, for the reason above.
+- **Mutation checks**, each made a test fail: a forced failure ignored; a forced completion still returned; the
+  forced outcome not stored (the restart test); a following clock accepting changes; a follower moving backwards.
+  Two first attempts were malformed (one did not compile, one could not move the clock back) and were redone.
+
 ## Beyond the milestones
 
 **OpenAPI specifications ✅ done (2026-10-17, requested by the user)**

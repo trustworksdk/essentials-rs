@@ -165,3 +165,18 @@ async fn a_follower_computes_simulated_time_from_the_event() {
     assert!(drift < 180_000, "follower off by {drift} ms");
     app.stop().await;
 }
+
+#[tokio::test]
+async fn the_exchange_refuses_to_follow_another_clock() {
+    let dir = std::env::temp_dir().join(format!("exchange-sim-it-{}", uuid::Uuid::now_v7()));
+    let mut config = TestApp::config(&dir);
+    config.clock.mode = ClockMode::Follow;
+    let error = exchange_simulator::app::App::start(&config)
+        .err()
+        .expect("startup fails");
+    assert!(
+        format!("{error:#}").contains("clock.mode: follow is for the payment gateway"),
+        "{error:#}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

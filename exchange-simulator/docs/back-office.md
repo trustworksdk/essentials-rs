@@ -32,9 +32,11 @@ Take every date and time from the events: `executedAt`, `tradeDate`, `intendedSe
 a statement is due. The end of a business day is `BusinessDayClosed` from the exchange: start end-of-day work on it,
 before the day's clearing statements arrive. It is published on days without trades too.
 
-The two services keep separate clocks. The example starts both frozen at the same instant and resumes them together
-(`POST /test/clock/resume` on each), which keeps them within a fraction of a simulated minute of each other. A
-restart of one service continues its clock from where it was, so they may drift apart by the restart's duration.
+The gateway's clock follows the exchange's (`clock.mode: follow`): it reads the exchange's `GET /api/clock` every
+`clock.follow.poll_interval_ms` and takes its speed, running state and reading, so both services agree on the date.
+Start, freeze or speed up the exchange's clock only; the gateway's clock API refuses changes (`409 clock_follows`).
+A follower lags a change by at most one poll interval, and never moves back: if the exchange slows or freezes, the
+gateway holds until the exchange catches up, and a reset of the exchange needs a reset of the gateway too.
 
 ## Trading and settlement
 
