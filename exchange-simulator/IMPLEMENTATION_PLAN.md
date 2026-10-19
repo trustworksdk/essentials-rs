@@ -1747,6 +1747,36 @@ then 6.11, 6.12, 6.13–6.14.
 - **Known limit:** on a running, very fast clock, an item that falls due between the change and the run of due work
   can be stamped a little after `ClockChanged`'s `now`. A frozen clock, the reproducible setup, is exact.
 
+**6.5 — `BusinessDayClosed` ✅ done (2026-10-19)**
+- **Delivered:**
+  - `BusinessDayClosed` (`source: exchange`, aggregate ID the business date, `occurredAt` the cutoff): `businessDate`,
+    `cutoffAt`, `nextBusinessDate` and `timeZone`. Emitted at the cutoff of every weekday, whether or not clearing
+    is enabled and whether or not anything traded.
+  - The business-day calendar is `clearing.cutoff` in `clearing.time_zone` (`Config::business_calendar`), the same
+    one clearing uses. Closing keeps its own cursor, in a new table (migration 016), since it runs without clearing
+    too. A new database or a reset starts at the current business day, as clearing does.
+  - `Exchange::tick` takes the earliest of the next close and the next clearing instant. At the same cutoff the day
+    closes first, then its statements are issued, each after the settlement transitions due by then. A clock move
+    past several cutoffs closes each day in turn. Cutoffs passed while the service was down close at startup, once.
+  - The background domain ticker now always runs (it ran only with settlement simulation or clearing), so a running
+    clock closes days with no request.
+  - `openapi.yaml` (`BusinessDayClosedEvent`), the README (a Business days section), the configuration guide and the
+    back-office guide (start end-of-day work on `BusinessDayClosed`).
+  - Tests: `tests/business_days.rs` (6); `tests/clock.rs` now expects the two closes its clock move passes.
+- **Decisions:**
+  - **One calendar.** Business days and clearing share `clearing.cutoff` and `clearing.time_zone`. The settings keep
+    their names; the configuration guide says they define the business days too. A separate `business_day` section
+    would allow a calendar that disagrees with clearing, which SR-26's ordering rules out.
+  - **`ExchangeOptions::business_days` is optional** (default `None`), so engine-level tests that build an
+    `Exchange` directly are unchanged; the service always sets it.
+  - **The gateway gets no business-day event.** SR-26 asks it of the exchange, and the gateway's statements have
+    their own cutoff.
+- **Deviation:** none from the 6.5 row.
+- **Mutation checks**, each made a test fail: statements before the close; the cursor not stored; the first day
+  skipped; no background ticker without clearing; a reset keeping the cursor. The last one first survived: the reset
+  test's clock happened to restart where the stale cursor was right. A new test resets after closing days, so the
+  clock goes back past them, and it fails.
+
 ## Beyond the milestones
 
 **OpenAPI specifications ✅ done (2026-10-17, requested by the user)**

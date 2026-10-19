@@ -29,7 +29,8 @@ by `eventId`, and use ordered subscriptions where order matters (the example dec
 Both services run on their own domain clock, which in a demo runs fast (`clock.speed: 1440` is a day per minute).
 Take every date and time from the events: `executedAt`, `tradeDate`, `intendedSettlementDate`, `occurredAt`,
 `completedAt`, `businessDate`. Never use your own clock to decide what day a trade or payment belongs to, or whether
-a statement is due.
+a statement is due. The end of a business day is `BusinessDayClosed` from the exchange: start end-of-day work on it,
+before the day's clearing statements arrive. It is published on days without trades too.
 
 The two services keep separate clocks. The example starts both frozen at the same instant and resumes them together
 (`POST /test/clock/resume` on each), which keeps them within a fraction of a simulated minute of each other. A

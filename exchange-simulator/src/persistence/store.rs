@@ -563,6 +563,34 @@ impl Store {
             .optional()
     }
 
+    /// The last business date closed with `BusinessDayClosed`, once one was.
+    pub fn business_day_cursor(&self) -> rusqlite::Result<Option<chrono::NaiveDate>> {
+        self.conn
+            .query_row(
+                "SELECT business_date FROM business_day_cursor WHERE id = 1",
+                [],
+                |row| parsed(row, 0),
+            )
+            .optional()
+    }
+
+    pub fn save_business_day_cursor(&self, date: chrono::NaiveDate) -> rusqlite::Result<()> {
+        save_business_day_cursor(&self.conn, date)
+    }
+
+    /// Closes a business day: its `BusinessDayClosed` and the moved cursor, in one transaction.
+    pub fn commit_business_day(
+        &mut self,
+        date: chrono::NaiveDate,
+        event: &NewEvent,
+        outbox: Outbox<'_>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        save_business_day_cursor(&tx, date)?;
+        write_events(&tx, std::slice::from_ref(event), &outbox)?;
+        tx.commit()
+    }
+
     pub fn save_clearing_cursor(
         &self,
         date: chrono::NaiveDate,
@@ -915,6 +943,15 @@ fn instruction_row(row: &Row<'_>) -> rusqlite::Result<Instruction> {
             })
             .transpose()?,
     })
+}
+
+fn save_business_day_cursor(conn: &Connection, date: chrono::NaiveDate) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO business_day_cursor (id, business_date) VALUES (1, ?1)
+         ON CONFLICT (id) DO UPDATE SET business_date = excluded.business_date",
+        [date.to_string()],
+    )
+    .map(drop)
 }
 
 fn save_clearing_cursor(

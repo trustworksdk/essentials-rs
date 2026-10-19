@@ -941,6 +941,12 @@ webhooks:
       operationId: onClockChanged
       requestBody: { $ref: "#/components/requestBodies/ClockChangedEvent" }
       responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
+  BusinessDayClosed:
+    post:
+      summary: A business day ended at its cutoff, also without trades and without clearing (`source` is `exchange`)
+      operationId: onBusinessDayClosed
+      requestBody: { $ref: "#/components/requestBodies/BusinessDayClosedEvent" }
+      responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
   SettlementPending:
     post:
       summary: A settlement instruction was created
@@ -1082,6 +1088,8 @@ components:
       content: { application/json: { schema: { $ref: "#/components/schemas/InstrumentUpdatedEvent" } } }
     ClockChangedEvent:
       content: { application/json: { schema: { $ref: "#/components/schemas/ClockChangedEvent" } } }
+    BusinessDayClosedEvent:
+      content: { application/json: { schema: { $ref: "#/components/schemas/BusinessDayClosedEvent" } } }
     SettlementPendingEvent:
       content: { application/json: { schema: { $ref: "#/components/schemas/SettlementPendingEvent" } } }
     SettlementCompletedEvent:
@@ -1525,7 +1533,7 @@ components:
 
     EventType:
       enum: [OrderAccepted, OrderRejected, OrderPartiallyFilled, OrderFilled, OrderCancelled, TradeExecuted,
-             InstrumentListed, InstrumentUpdated, ClockChanged, SettlementPending, SettlementCompleted, SettlementFailed, SettlementRejected, SettlementDelayed,
+             InstrumentListed, InstrumentUpdated, ClockChanged, BusinessDayClosed, SettlementPending, SettlementCompleted, SettlementFailed, SettlementRejected, SettlementDelayed,
              SettlementCorrected, SettlementCancelled, SettlementOutcomeReported, ClearingStatementIssued]
     EventEnvelope:
       type: object
@@ -1715,6 +1723,25 @@ components:
         aggregateId: { const: clock }
         correlationId: { const: null }
         payload: { $ref: "#/components/schemas/ClockChangedPayload" }
+    BusinessDayClosedEvent:
+      allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
+      description: |
+        The authoritative end of a business day: at `clearing.cutoff` in `clearing.time_zone`, every weekday, whether
+        or not clearing is enabled and whether or not anything traded. It comes before that day's
+        `ClearingStatementIssued`; a clock move past several cutoffs closes each day in turn.
+      properties:
+        eventType: { const: BusinessDayClosed }
+        source: { const: exchange }
+        correlationId: { const: null }
+        payload:
+          type: object
+          additionalProperties: false
+          required: [businessDate, cutoffAt, nextBusinessDate, timeZone]
+          properties:
+            businessDate: { $ref: "#/components/schemas/Date" }
+            cutoffAt: { $ref: "#/components/schemas/Timestamp" }
+            nextBusinessDate: { $ref: "#/components/schemas/Date" }
+            timeZone: { type: string, description: The IANA time zone of the cutoff. }
     InstrumentListedEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
       properties:

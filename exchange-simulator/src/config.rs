@@ -224,17 +224,20 @@ impl Config {
             .collect()
     }
 
+    /// The business-day calendar: `clearing.cutoff` in `clearing.time_zone`, on weekdays. Business days close on it
+    /// (`BusinessDayClosed`) whether or not clearing is enabled.
+    pub fn business_calendar(&self) -> Result<crate::clearing::ClearingCalendar, String> {
+        crate::clearing::ClearingCalendar::parse(&self.clearing.cutoff, &self.clearing.time_zone)
+            .map_err(|e| format!("clearing.{e}"))
+    }
+
     /// The clearinghouse's policy when clearing is enabled; an error for an invalid cutoff, time zone or break
     /// policy.
     pub fn clearing_policy(&self) -> Result<Option<crate::clearing::ClearingPolicy>, String> {
         if !self.clearing.enabled {
             return Ok(None);
         }
-        let calendar = crate::clearing::ClearingCalendar::parse(
-            &self.clearing.cutoff,
-            &self.clearing.time_zone,
-        )
-        .map_err(|e| format!("clearing.{e}"))?;
+        let calendar = self.business_calendar()?;
         self.clearing.breaks.validate()?;
         Ok(Some(crate::clearing::ClearingPolicy {
             calendar,

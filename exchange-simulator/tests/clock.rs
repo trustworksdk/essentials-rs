@@ -70,12 +70,20 @@ async fn simulated_time_stamps_orders_trades_and_events() {
     );
 
     let events = app.get("/api/events?limit=1000").await.1;
-    let stamps: Vec<_> = events
+    let (closes, others): (Vec<&Value>, Vec<&Value>) = events
         .as_array()
         .unwrap()
         .iter()
-        .map(|e| time(&e["occurredAt"]))
-        .collect();
+        .partition(|e| e["eventType"] == "BusinessDayClosed");
+    assert_eq!(
+        closes
+            .iter()
+            .map(|e| e["occurredAt"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["2030-01-07T17:30:00Z", "2030-01-08T17:30:00Z"],
+        "the advance passed two cutoffs"
+    );
+    let stamps: Vec<_> = others.iter().map(|e| time(&e["occurredAt"])).collect();
     assert!(
         stamps.iter().all(|t| *t == start() || *t == later),
         "{stamps:?}"

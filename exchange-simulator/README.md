@@ -551,6 +551,19 @@ Everything known about one execution's settlement, side by side:
 
 Simulated instructions in trade order, optionally of one status. `limit` is 1–1000, default 100.
 
+## Business days
+
+At `clearing.cutoff`, local time in `clearing.time_zone`, every weekday, the exchange closes the business day with
+**`BusinessDayClosed`** (`source: "exchange"`, aggregate ID the business date, `occurredAt` the cutoff):
+`businessDate`, `cutoffAt`, `nextBusinessDate` and `timeZone`. It is the authoritative end-of-day signal for a
+consumer's end-of-day work (statements, valuation, closing books):
+- **Always:** whether or not clearing is enabled, and also on a day without trades. Weekends are skipped.
+- **Before the day's statements:** at the cutoff the day closes first, then that day's `ClearingStatementIssued`.
+- **Every day, in order:** a clock move past several cutoffs closes each day in turn, in time order with the
+  settlement events around it. A running clock closes days on its own (the background tick, every
+  `settlement.tick_interval_ms`). Cutoffs passed while the service was down are closed at startup, once.
+- **From now on:** a new database, or a reset, starts with the current business day; no earlier day is closed.
+
 ## Clearing
 
 With `clearing.enabled: true`, a clearinghouse issues end-of-day statements on the exchange clock. It plays an outside

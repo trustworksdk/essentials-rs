@@ -180,6 +180,9 @@ pub struct ExchangeOptions {
     pub instruments: Vec<Instrument>,
     /// What an instrument's own price source leaves out, and the base of derived synthetic seeds.
     pub price_sources: PriceSources,
+    /// Closes every business day at this calendar's cutoff with `BusinessDayClosed`, whether or not clearing runs.
+    /// `None` closes no days.
+    pub business_days: Option<simulator_kit::calendar::CutoffCalendar>,
 }
 
 impl Default for ExchangeOptions {
@@ -199,6 +202,7 @@ impl Default for ExchangeOptions {
             instruments: Vec::new(),
             price_sources: PriceSources::new(Default::default(), 0)
                 .expect("the empty default is valid"),
+            business_days: None,
         }
     }
 }
@@ -243,6 +247,30 @@ pub struct Exchange {
     declared_instruments: Vec<Instrument>,
     /// Every listed instrument's running price source.
     prices: PriceSources,
+    /// The business-day calendar and the last date closed.
+    days: Option<BusinessDays>,
+}
+
+/// Business days and the last one closed with `BusinessDayClosed`.
+struct BusinessDays {
+    calendar: simulator_kit::calendar::CutoffCalendar,
+    cursor: chrono::NaiveDate,
+}
+
+impl BusinessDays {
+    /// When the next business day closes.
+    fn due(&self) -> DateTime<Utc> {
+        self.calendar.cutoff_at(next_business_day(self.cursor))
+    }
+
+    /// The cursor for days starting at `now`: the business day before the one now belongs to, so the first day closed
+    /// is the current one and no past day is.
+    fn first_cursor(
+        calendar: &simulator_kit::calendar::CutoffCalendar,
+        now: DateTime<Utc>,
+    ) -> chrono::NaiveDate {
+        previous_business_day(calendar.business_date(now))
+    }
 }
 
 /// The clearinghouse: its policy, the last business date whose cutoff was handled, and late statements waiting to be
@@ -382,6 +410,7 @@ impl Exchange {
             group: None,
             declared_instruments: options.instruments,
             prices: options.price_sources,
+            days: None,
         };
         exchange.start_price_sources()?;
         exchange.reconcile_webhooks()?;
@@ -404,6 +433,17 @@ impl Exchange {
                 pending,
             });
             exchange.sort_pending();
+        }
+        if let Some(calendar) = options.business_days {
+            let cursor = match exchange.store.business_day_cursor()? {
+                Some(cursor) => cursor,
+                None => {
+                    let cursor = BusinessDays::first_cursor(&calendar, exchange.now());
+                    exchange.store.save_business_day_cursor(cursor)?;
+                    cursor
+                }
+            };
+            exchange.days = Some(BusinessDays { calendar, cursor });
         }
         // Trades committed while the simulator was off (or before it existed) are taken in now, before any command,
         // so intake order does not depend on when a background tick happens to run. Cutoffs passed while the service
@@ -893,6 +933,10 @@ impl Exchange {
                 .save_virtual_clock(clock.now(), clock.is_running())?;
         }
         let now = self.now();
+        if let Some(days) = &mut self.days {
+            days.cursor = BusinessDays::first_cursor(&days.calendar, now);
+            self.store.save_business_day_cursor(days.cursor)?;
+        }
         if let Some(clearing) = &mut self.clearing {
             clearing.cursor = Clearing::first_cursor(&clearing.policy, now);
             clearing.after = 0;
@@ -934,21 +978,55 @@ impl Exchange {
         Ok(retried)
     }
 
-    /// Everything due by now on domain time, in time order: settlement transitions, and clearing statements at each
-    /// cutoff (and late ones when due). Before each statement, the settlement transitions due by its instant run
-    /// first, so the event log stays in time order across a large clock move. Returns the number of events.
+    /// Everything due by now on domain time, in time order: settlement transitions, each business day's close, and
+    /// clearing statements at each cutoff (and late ones when due). Before each instant, the settlement transitions
+    /// due by it run first, so the event log stays in time order across a large clock move; at a cutoff the day closes
+    /// before its statements are issued. Returns the number of events.
     pub fn tick(&mut self) -> Result<usize, ExchangeError> {
         let mut total = 0;
         loop {
             let now = self.now();
-            match self.clearing.as_ref().map(Clearing::due) {
+            let close = self.days.as_ref().map(BusinessDays::due);
+            let clearing = self.clearing.as_ref().map(Clearing::due);
+            match close.into_iter().chain(clearing).min() {
                 Some(due) if due <= now => {
                     total += self.settlement_step(due)?;
-                    total += self.clearing_step(due)?;
+                    if close == Some(due) {
+                        total += self.close_business_day()?;
+                    }
+                    if clearing == Some(due) {
+                        total += self.clearing_step(due)?;
+                    }
                 }
                 _ => return Ok(total + self.settlement_step(now)?),
             }
         }
+    }
+
+    /// Closes the next business day with `BusinessDayClosed`, committed with the moved cursor.
+    fn close_business_day(&mut self) -> Result<usize, ExchangeError> {
+        let days = self.days.as_ref().expect("business days run");
+        let date = next_business_day(days.cursor);
+        let mut event = events::business_day_closed(date, &days.calendar);
+        let next = NewEvent::stamp(
+            std::slice::from_mut(&mut event),
+            self.next_event_sequence,
+            self.ids,
+        );
+        let outbox = Outbox {
+            subscriptions: self.webhooks.subscriptions(),
+            simulation_id: self.simulation_id.as_deref(),
+            ids: self.ids,
+            due: wall_now(),
+            schema_version: events::SCHEMA_VERSION,
+            parties: self.webhooks.parties(),
+        };
+        self.store.commit_business_day(date, &event, outbox)?;
+        self.next_event_sequence = next;
+        ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type).increment(1);
+        self.days.as_mut().expect("business days run").cursor = date;
+        self.wake_delivery(std::slice::from_ref(&event));
+        Ok(1)
     }
 
     /// One clearing step at `at`, the earliest instant something is due: the cutoff's statements (those not drafted

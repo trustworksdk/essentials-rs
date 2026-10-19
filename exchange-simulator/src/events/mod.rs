@@ -29,6 +29,8 @@ pub const ORDER_CANCELLED: &str = "OrderCancelled";
 pub const TRADE_EXECUTED: &str = "TradeExecuted";
 /// An instrument was listed, through the API or from configuration.
 pub const INSTRUMENT_LISTED: &str = "InstrumentListed";
+/// A business day ended at its cutoff (`source: "exchange"`), also on days without trades.
+pub const BUSINESS_DAY_CLOSED: &str = "BusinessDayClosed";
 /// The virtual clock changed: speed, freeze, resume, set or advance (`source: "exchange"`).
 pub use simulator_kit::clock::CLOCK_CHANGED;
 /// A listed instrument changed (trading enabled or disabled, reference symbol).
@@ -57,6 +59,7 @@ pub const EVENT_TYPES: &[&str] = &[
     INSTRUMENT_LISTED,
     INSTRUMENT_UPDATED,
     CLOCK_CHANGED,
+    BUSINESS_DAY_CLOSED,
     SETTLEMENT_PENDING,
     SETTLEMENT_COMPLETED,
     SETTLEMENT_FAILED,
@@ -67,6 +70,30 @@ pub const EVENT_TYPES: &[&str] = &[
     SETTLEMENT_OUTCOME_REPORTED,
     CLEARING_STATEMENT_ISSUED,
 ];
+
+/// `BusinessDayClosed` for `date` under `calendar`: the authoritative end of the business day. Its `occurredAt` is
+/// the cutoff; the aggregate ID is the business date.
+pub fn business_day_closed(
+    date: chrono::NaiveDate,
+    calendar: &simulator_kit::calendar::CutoffCalendar,
+) -> NewEvent {
+    let cutoff_at = calendar.cutoff_at(date);
+    NewEvent {
+        event_id: Uuid::nil(),
+        sequence: 0,
+        event_type: BUSINESS_DAY_CLOSED,
+        source: EXCHANGE_SOURCE,
+        aggregate_id: date.to_string(),
+        correlation_id: None,
+        occurred_at: cutoff_at,
+        payload: json!({
+            "businessDate": date,
+            "cutoffAt": cutoff_at,
+            "nextBusinessDate": simulator_kit::calendar::next_business_day(date),
+            "timeZone": calendar.time_zone.name(),
+        }),
+    }
+}
 
 /// The participants an event involves, for webhook participant filters: the `participantId` of order events and
 /// clearing statements, the `buyerId` and `sellerId` of trades and settlement events. Instrument events involve none.

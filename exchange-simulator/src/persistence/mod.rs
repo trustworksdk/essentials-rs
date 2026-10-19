@@ -29,6 +29,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/013_instrument_reference_symbol.sql"),
     include_str!("../../migrations/014_price_sources.sql"),
     include_str!("../../migrations/015_webhook_participant_filter.sql"),
+    include_str!("../../migrations/016_business_days.sql"),
 ];
 
 /// A fresh name for an in-memory exchange database (see [`simulator_kit::persistence::memory_location`]).
@@ -104,6 +105,7 @@ mod tests {
         assert_eq!(
             tables,
             [
+                "business_day_cursor",
                 "clearing_cursor",
                 "clearing_statements",
                 "consumer_offsets",

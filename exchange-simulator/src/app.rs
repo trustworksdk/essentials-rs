@@ -104,6 +104,7 @@ impl App {
                 ),
                 instruments: config.declared_instruments().map_err(anyhow::Error::msg)?,
                 price_sources: config.price_sources.sources().map_err(anyhow::Error::msg)?,
+                business_days: Some(config.business_calendar().map_err(anyhow::Error::msg)?),
             },
         )
         .context("recovering order books")?;
@@ -137,9 +138,10 @@ impl App {
             config.webhooks.worker(),
             stopped.clone(),
         )];
-        if config.settlement.simulator_policy().is_some() || config.clearing.enabled {
-            let interval = Duration::from_millis(config.settlement.tick_interval_ms.max(1));
-            background.push(spawn_domain_ticker(dispatcher.clone(), interval, stopped));
+        // Business days close on domain time whatever else runs, so the ticker always does.
+        let interval = Duration::from_millis(config.settlement.tick_interval_ms.max(1));
+        background.push(spawn_domain_ticker(dispatcher.clone(), interval, stopped));
+        if config.settlement.simulator_policy().is_some() {
             tracing::info!(mode = ?config.settlement.mode, "settlement simulator running");
         }
         let state = AppState::new(dispatcher, Store::new(reader), metrics, mode);
@@ -192,7 +194,7 @@ impl App {
     }
 }
 
-/// Runs everything due on domain time (settlement, clearing) every `interval` until `stop` turns true or the exchange stops. A full command queue just
+/// Runs everything due on domain time (settlement, business days, clearing) every `interval` until `stop` turns true or the exchange stops. A full command queue just
 /// skips a beat.
 fn spawn_domain_ticker(
     dispatcher: crate::engine::Dispatcher,

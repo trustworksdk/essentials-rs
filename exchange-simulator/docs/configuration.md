@@ -159,6 +159,9 @@ The [README's Settlement section](../README.md#settlement) covers the policy key
 
 ## Clearing
 
+`clearing.cutoff` and `clearing.time_zone` also define the business days: each one ends at the cutoff with
+`BusinessDayClosed`, whether or not clearing is enabled ([README](../README.md#business-days)).
+
 `clearing.enabled: true` adds end-of-day clearing statements: at the cutoff on each business day, one
 `ClearingStatementIssued` per participant that traded, with its trades and net obligations per instrument and
 settlement date. The cutoff is local time in an IANA time zone, so it follows daylight saving:
