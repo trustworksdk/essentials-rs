@@ -16,7 +16,7 @@ use crate::events::NewEvent;
 use crate::events::{self, Command};
 use crate::ids::ExchangeIds;
 use crate::persistence::{Outbox, SettlementWrite, Store};
-use crate::pricing::{PriceSourceError, PriceSources, Reference};
+use crate::pricing::{PriceSourceError, PriceSources};
 use crate::settlement::{
     ExternalReport, NewReport, SettlementPolicy, SettlementSimulator, TradeFacts,
 };
@@ -187,6 +187,8 @@ pub struct ExchangeOptions {
     pub business_days: Option<simulator_kit::calendar::CutoffCalendar>,
     /// Runs the built-in liquidity provider (plan item 6.7); `None` quotes nothing.
     pub liquidity: Option<LiquidityPolicy>,
+    /// Where market-data messages go (plan item 6.8); `None` publishes nothing, the snapshot still works.
+    pub market_data: Option<crate::market_data::Sender>,
 }
 
 /// How the liquidity provider runs (`liquidity:` in the configuration).
@@ -220,6 +222,7 @@ impl Default for ExchangeOptions {
                 .expect("the empty default is valid"),
             business_days: None,
             liquidity: None,
+            market_data: None,
         }
     }
 }
@@ -268,6 +271,11 @@ pub struct Exchange {
     days: Option<BusinessDays>,
     /// The liquidity provider and its state per instrument.
     provider: Option<Provider>,
+    /// Market data per instrument, and where to publish it.
+    market_data: crate::market_data::States,
+    market_data_sender: Option<crate::market_data::Sender>,
+    /// Instruments to publish once the open commit group is durable.
+    market_data_due: std::collections::BTreeSet<InstrumentId>,
 }
 
 /// The liquidity provider: its policy, and per instrument what it last quoted around and holds.
@@ -452,6 +460,9 @@ impl Exchange {
                 policy,
                 quoting: HashMap::new(),
             }),
+            market_data: HashMap::new(),
+            market_data_sender: options.market_data,
+            market_data_due: Default::default(),
         };
         exchange.start_price_sources()?;
         exchange.reconcile_webhooks()?;
@@ -487,6 +498,7 @@ impl Exchange {
             };
             exchange.days = Some(BusinessDays { calendar, cursor });
         }
+        exchange.load_market_data()?;
         // Trades committed while the simulator was off (or before it existed) are taken in now, before any command,
         // so intake order does not depend on when a background tick happens to run. Cutoffs passed while the service
         // was down are issued too.
@@ -514,7 +526,9 @@ impl Exchange {
         let mut instrument = instrument;
         let id = instrument.id.clone();
         self.commit_instrument(&mut instrument, None)?;
-        self.maintain_liquidity(Some(&id))
+        self.maintain_liquidity(Some(&id))?;
+        self.publish_market_data(Some(&id));
+        Ok(())
     }
 
     /// Switches trading in an instrument on or off, durably, and returns the updated instrument.
@@ -553,6 +567,7 @@ impl Exchange {
         self.commit_instrument(&mut instrument, Some(&changes))?;
         // A new price source, liquidity setting or trading status changes what the provider quotes.
         self.maintain_liquidity(Some(id))?;
+        self.publish_market_data(Some(id));
         Ok(instrument)
     }
 
@@ -849,27 +864,122 @@ impl Exchange {
         Ok(())
     }
 
-    /// Every listed instrument with its reference price now, in ID order (or only `id`'s).
-    pub fn references(
-        &mut self,
-        id: Option<&InstrumentId>,
-    ) -> Vec<(Instrument, Option<Reference>)> {
+    /// Every listed instrument's market data now, in ID order (or only `id`'s). What changed since the last
+    /// publication is published first, so the snapshot's `mdSequence` is that of the last message about it.
+    pub fn market_data(&mut self, id: Option<&InstrumentId>) -> Vec<crate::market_data::Snapshot> {
+        self.publish_market_data(id);
         let now = self.now();
-        let mut instruments: Vec<Instrument> = self
+        let today = self.business_date(now);
+        let mut ids: Vec<InstrumentId> = self
             .books
-            .values()
-            .map(|b| b.instrument())
-            .filter(|i| id.is_none_or(|id| *id == i.id))
+            .keys()
+            .filter(|i| id.is_none_or(|id| id == *i))
             .cloned()
             .collect();
-        instruments.sort_by(|a, b| a.id.cmp(&b.id));
-        instruments
-            .into_iter()
-            .map(|i| {
-                let reference = self.prices.reference(&i.id, now);
-                (i, reference)
+        ids.sort();
+        ids.into_iter()
+            .map(|id| {
+                let reference = self.prices.reference(&id, now);
+                let (best_bid, best_ask) = self.top_of_book(&id);
+                let state = self.market_data.get(&id).cloned().unwrap_or_default();
+                crate::market_data::Snapshot {
+                    instrument: self.books[&id].instrument().clone(),
+                    md_sequence: state.md_sequence,
+                    reference,
+                    best_bid,
+                    best_ask,
+                    last_trade: state.last_trade,
+                    session_volume: state.volume_on(today),
+                }
             })
             .collect()
+    }
+
+    /// Publishes what changed in one instrument's market data, or every instrument's, since the last publication:
+    /// trade prints, then the quote, then the reference price. Inside a commit group, nothing is published until the
+    /// group is durable (see [`Self::commit_group`]).
+    fn publish_market_data(&mut self, only: Option<&InstrumentId>) {
+        let ids: Vec<InstrumentId> = match only {
+            Some(id) => vec![id.clone()],
+            None => self.books.keys().cloned().collect(),
+        };
+        if self.group.is_some() {
+            self.market_data_due.extend(ids);
+            return;
+        }
+        let now = self.now();
+        let mut ids = ids;
+        ids.sort();
+        for id in ids {
+            let Some(book) = self.books.get(&id) else {
+                continue;
+            };
+            let instrument = book.instrument().clone();
+            let quote = self.top_of_book(&id);
+            let reference = self.prices.reference(&id, now);
+            let messages =
+                self.market_data
+                    .entry(id)
+                    .or_default()
+                    .publish(&instrument, quote, reference);
+            for message in messages {
+                ::metrics::counter!(crate::metrics::MARKET_DATA_MESSAGES, "kind" => message.kind)
+                    .increment(1);
+                if let Some(sender) = &self.market_data_sender {
+                    // No subscribers is not an error; a full subscriber loses its place, never blocks this.
+                    let _ = sender.send(std::sync::Arc::new(message));
+                }
+            }
+        }
+    }
+
+    /// The best bid and ask of an instrument's book, with the quantity resting there.
+    fn top_of_book(
+        &self,
+        id: &InstrumentId,
+    ) -> (
+        Option<crate::market_data::Top>,
+        Option<crate::market_data::Top>,
+    ) {
+        let top = |side| {
+            self.books[id]
+                .depth(side)
+                .first()
+                .map(|level| crate::market_data::Top {
+                    price_ticks: level.price_ticks,
+                    quantity: level.quantity,
+                })
+        };
+        (top(Side::Buy), top(Side::Sell))
+    }
+
+    /// The business date an instant belongs to: on the business-day calendar when there is one, else its UTC date.
+    fn business_date(&self, at: DateTime<Utc>) -> chrono::NaiveDate {
+        self.days
+            .as_ref()
+            .map_or_else(|| at.date_naive(), |d| d.calendar.business_date(at))
+    }
+
+    /// Rebuilds the market data a restart lost: each instrument's last trade and its volume on the current business
+    /// date. The `mdSequence` starts again from 0.
+    fn load_market_data(&mut self) -> Result<(), ExchangeError> {
+        let now = self.now();
+        let today = self.business_date(now);
+        let since = match &self.days {
+            Some(days) => days.calendar.window(today).0,
+            None => today.and_hms_opt(0, 0, 0).expect("midnight").and_utc(),
+        };
+        for summary in self.store.trade_summary(since)? {
+            let state = self.market_data.entry(summary.instrument_id).or_default();
+            state.last_trade = Some(crate::market_data::Print {
+                price_ticks: summary.last_price_ticks,
+                quantity: summary.last_quantity,
+                executed_at: summary.last_executed_at,
+            });
+            state.volume_date = Some(today);
+            state.volume = summary.volume_since;
+        }
+        Ok(())
     }
 
     pub fn register_participant(&mut self, participant: Participant) -> Result<(), ExchangeError> {
@@ -907,6 +1017,7 @@ impl Exchange {
         let instrument_id = command.instrument_id.clone();
         let outcome = self.submit_order(command)?;
         self.maintain_liquidity(Some(&instrument_id))?;
+        self.publish_market_data(Some(&instrument_id));
         Ok(outcome)
     }
 
@@ -980,6 +1091,8 @@ impl Exchange {
             if let Err(reload) = self.reload() {
                 panic!("cannot reload the exchange after a failed group commit: {reload}");
             }
+            // Nothing of the group was published; what is due now compares against the reloaded books.
+            self.publish_due_market_data();
             return Err(error.into());
         }
         ::metrics::histogram!(crate::metrics::COMMIT_DURATION).record(started.elapsed());
@@ -987,12 +1100,27 @@ impl Exchange {
             command.record();
         }
         self.signal_deliveries(committed.iter().any(|c| c.delivers));
+        self.publish_due_market_data();
         Ok(())
+    }
+
+    fn publish_due_market_data(&mut self) {
+        for id in std::mem::take(&mut self.market_data_due) {
+            self.publish_market_data(Some(&id));
+        }
     }
 
     /// Rebuilds what commands change in memory (books, sequences, the settlement simulator) from storage.
     fn reload(&mut self) -> Result<(), ExchangeError> {
         self.books = load_books(&self.store)?;
+        // The group's trades are gone: forget their prints, and take the last trade and volume from storage again.
+        for state in self.market_data.values_mut() {
+            state.pending.clear();
+            state.last_trade = None;
+            state.volume_date = None;
+            state.volume = 0;
+        }
+        self.load_market_data()?;
         self.last_sequence = self.store.max_sequence()?;
         self.next_event_sequence = self.store.next_event_sequence()?;
         if let Some(simulator) = &mut self.settlement {
@@ -1009,6 +1137,7 @@ impl Exchange {
     pub fn cancel(&mut self, order_id: Uuid) -> Result<BookUpdate, ExchangeError> {
         let update = self.cancel_order(order_id)?;
         self.maintain_liquidity(Some(&update.order.instrument_id))?;
+        self.publish_market_data(Some(&update.order.instrument_id));
         Ok(update)
     }
 
@@ -1137,6 +1266,7 @@ impl Exchange {
         self.store.reset()?;
         self.books.clear();
         self.prices.clear();
+        self.market_data.clear();
         self.participants.clear();
         self.webhooks.clear();
         self.last_sequence = 0;
@@ -1222,6 +1352,7 @@ impl Exchange {
                     total += self.settlement_step(now)?;
                     // Time moved: reference prices with it, and refill delays ran out.
                     self.maintain_liquidity(None)?;
+                    self.publish_market_data(None);
                     return Ok(total);
                 }
             }
@@ -1616,6 +1747,20 @@ impl Exchange {
         book.apply(&update)
             .expect("nothing else touched the book between plan and apply");
         self.last_sequence = self.last_sequence.max(update.order.sequence);
+        for execution in &update.executions {
+            let date = self.business_date(execution.executed_at);
+            self.market_data
+                .entry(update.order.instrument_id.clone())
+                .or_default()
+                .trade(
+                    crate::market_data::Print {
+                        price_ticks: execution.price_ticks,
+                        quantity: execution.quantity,
+                        executed_at: execution.executed_at,
+                    },
+                    date,
+                );
+        }
         if let Some(provider) = &mut self.provider {
             let lp = &provider.policy.participant;
             for execution in &update.executions {

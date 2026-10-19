@@ -79,6 +79,11 @@ impl App {
                 .checkpoint_in_background(busy_timeout, config.database.checkpoint_pages)
                 .context("starting background checkpoints")?;
         }
+        let stream_options = crate::market_data::StreamOptions {
+            conflation: Duration::from_millis(config.market_data.conflation_interval_ms),
+            buffer: config.market_data.stream_buffer.max(2),
+        };
+        let (market_data, _) = tokio::sync::broadcast::channel(stream_options.buffer);
         let exchange = Exchange::recover(
             store,
             ExchangeOptions {
@@ -111,6 +116,7 @@ impl App {
                 price_sources: config.price_sources.sources().map_err(anyhow::Error::msg)?,
                 business_days: Some(config.business_calendar().map_err(anyhow::Error::msg)?),
                 liquidity: Some(config.liquidity.policy().map_err(anyhow::Error::msg)?),
+                market_data: Some(market_data.clone()),
             },
         )
         .context("recovering order books")?;
@@ -150,7 +156,8 @@ impl App {
         if config.settlement.simulator_policy().is_some() {
             tracing::info!(mode = ?config.settlement.mode, "settlement simulator running");
         }
-        let state = AppState::new(dispatcher, Store::new(reader), metrics, mode);
+        let state = AppState::new(dispatcher, Store::new(reader), metrics, mode)
+            .with_market_data(market_data, stream_options);
         let mut router = api::router(state.clone()).merge(simulator_kit::api::clock::router(
             state.clone(),
             config.clock.operator_control,

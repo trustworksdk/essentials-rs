@@ -91,10 +91,16 @@ async fn each_kind_produces_its_reference_price() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         all[0],
-        json!({ "instrumentId": "FIX", "reference": { "price": "12.34", "priceTicks": 1234, "source": "fixed",
-                                                      "sourceTimestamp": START } })
+        json!({ "instrumentId": "FIX", "mdSequence": 2,
+                "reference": { "price": "12.34", "priceTicks": 1234, "source": "fixed", "sourceTimestamp": START,
+                               "stale": false },
+                "bestBid": null, "bestAsk": null, "lastTrade": null, "sessionVolume": 0 })
     );
-    assert_eq!(all[1], json!({ "instrumentId": "NONE", "reference": null }));
+    assert_eq!(
+        all[1],
+        json!({ "instrumentId": "NONE", "mdSequence": 2, "reference": null, "bestBid": null, "bestAsk": null,
+                "lastTrade": null, "sessionVolume": 0 })
+    );
     let syn = &all[2]["reference"];
     assert_eq!(
         (&syn["source"], &syn["sourceTimestamp"]),
@@ -209,7 +215,7 @@ async fn the_source_can_change_at_runtime() {
     assert_eq!(
         reference(&app, "LIVE").await,
         json!({ "price": "50.00", "priceTicks": 5000, "source": "synthetic",
-                "sourceTimestamp": "2030-01-07T09:01:00Z" }),
+                "sourceTimestamp": "2030-01-07T09:01:00Z", "stale": false }),
         "the walk starts at the switch"
     );
     let (_, events) = app.get("/api/events?eventType=InstrumentUpdated").await;

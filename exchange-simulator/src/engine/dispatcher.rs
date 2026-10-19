@@ -8,7 +8,6 @@ use super::{
     BookUpdate, ClockChange, ClockState, Exchange, ExchangeError, Level, SubmitOrder, SubmitOutcome,
 };
 use crate::domain::{Instrument, InstrumentChange, InstrumentId, Participant, Side};
-use crate::pricing::Reference;
 use crate::settlement::{ExternalReport, NewReport};
 use crate::webhooks::{
     DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription, WebhookChange,
@@ -83,9 +82,9 @@ enum Request {
     RetryDeadLetters(Option<Uuid>, Vec<Uuid>, Reply<usize>),
     Reset(Reply<()>),
     UpdateInstrument(InstrumentId, InstrumentChange, Reply<Instrument>),
-    References(
+    MarketData(
         Option<InstrumentId>,
-        oneshot::Sender<Vec<(Instrument, Option<Reference>)>>,
+        oneshot::Sender<Vec<crate::market_data::Snapshot>>,
     ),
     ClockState(oneshot::Sender<ClockState>),
     Tick(Reply<usize>),
@@ -113,7 +112,7 @@ impl Request {
             Self::RetryDeadLetters(..) => "retry_dead_letters",
             Self::Reset(..) => "reset",
             Self::UpdateInstrument(..) => "update_instrument",
-            Self::References(..) => "references",
+            Self::MarketData(..) => "market_data",
             Self::ClockState(..) => "clock_state",
             Self::Tick(..) => "tick",
             Self::ReportSettlement(..) => "report_settlement",
@@ -239,12 +238,12 @@ impl Dispatcher {
         self.call(|reply| Request::ChangeClock(change, reply)).await
     }
 
-    /// Every listed instrument with its reference price now (or only `id`'s), in ID order.
-    pub async fn references(
+    /// Every listed instrument's market data now (or only `id`'s), in ID order.
+    pub async fn market_data(
         &self,
         id: Option<InstrumentId>,
-    ) -> Result<Vec<(Instrument, Option<Reference>)>, DispatchError> {
-        self.ask(|reply| Request::References(id, reply)).await
+    ) -> Result<Vec<crate::market_data::Snapshot>, DispatchError> {
+        self.ask(|reply| Request::MarketData(id, reply)).await
     }
 
     /// Changes a listed instrument (see [`Exchange::update_instrument`]).
@@ -543,8 +542,8 @@ fn handle(exchange: &mut Exchange, request: Request) -> &'static str {
         Request::UpdateInstrument(id, change, reply) => {
             answer(reply, exchange.update_instrument(&id, &change))
         }
-        Request::References(id, reply) => {
-            let _ = reply.send(exchange.references(id.as_ref()));
+        Request::MarketData(id, reply) => {
+            let _ = reply.send(exchange.market_data(id.as_ref()));
             "ok"
         }
         Request::RegisterWebhook(request, reply) => {

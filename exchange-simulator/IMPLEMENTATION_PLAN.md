@@ -1857,6 +1857,63 @@ then 6.11, 6.12, 6.13–6.14.
   cleared the settings, so the ladder was pulled for `mode: off`; it now disables only, and asserts that no
   provider order is refused one by one.
 
+**6.8 — market-data snapshot and stream ✅ done (2026-10-19)**
+- **Delivered:**
+  - `src/market_data`: per instrument `State` (what was last published, the last trade, the session volume, prints
+    not yet published) and `State::publish`, which diffs the current top of book and reference price against what
+    was last published and returns the messages: prints first, then `quote`, then `reference`, each with the next
+    `mdSequence`. Each message is serialized once and shared by every subscriber (`Arc<Message>`).
+  - In the exchange: `publish_market_data` after every order and cancellation (after the provider's re-quote), after
+    instrument listings and changes, and on every tick; prints recorded in `commit_and_apply`. `Exchange::market_data`
+    builds the snapshot, publishing pending changes first so its `mdSequence` lines up with the stream. At startup
+    `load_market_data` rebuilds each instrument's last trade and its volume on the current business date from the
+    executions table (`Store::trade_summary`).
+  - `GET /api/marketdata[/{id}]` returns the full snapshot (reference with `stale`, `bestBid`/`bestAsk` with
+    quantity, `lastTrade`, `sessionVolume`, `mdSequence`). `GET /api/marketdata/stream?instruments=` serves server-sent
+    events (`event:` kind, `id:` `mdSequence`, `data:` JSON) from a tokio broadcast channel, filtered and conflated
+    per subscriber; `400` for an unknown instrument or query field.
+  - `market_data:` in the configuration: `conflation_interval_ms` (default 0, off) and `stream_buffer` (default 1024).
+    Metrics: `exchange_market_data_messages_total{kind}`, `_catch_ups_total`, `_streams_closed_total`.
+  - `Reference` gains `stale`, always `false` until a live source can be stale (6.9).
+  - `openapi.yaml` (the stream operation; `MarketData` completed; `MarketDataQuote`, `MarketDataTrade`,
+    `MarketDataReference` for the event bodies), the README, the configuration guide, `config/default.yaml`.
+  - Tests: `tests/market_data.rs` (8), one in `tests/recovery.rs` (a failed group commit). `tests/openapi.rs`
+    exercises the stream and validates every event's `data` against its kind's schema; `tests/price_sources.rs`
+    asserts the full snapshot.
+- **Decisions:**
+  - **Published at command boundaries, as a diff against what was last published.** Not from individual book
+    updates, so a half-replaced ladder or a partly matched order never reaches the feed, and a command that leaves
+    the top of book unchanged sends no `quote`. On a frozen clock the feed depends only on the commands.
+  - **Nothing is published before it is durable.** Inside a commit group (the dispatcher's normal path) the touched
+    instruments are noted and published after `commit_group`. A failed commit reloads the books and rebuilds the last
+    trade and volume from storage, so the group's trades never reach the feed or the snapshot. A subscriber sees the
+    group's net change: its prints, then one quote.
+  - **`mdSequence` is per instrument and in memory.** The feed is not durable, so it starts again from 0 with the
+    service; a subscriber resynchronises from the snapshot. The last trade and session volume do survive, rebuilt
+    from executions.
+  - **The session is the business date** of the business-day calendar (`clearing.cutoff`, 6.5), so `sessionVolume`
+    resets at the same cutoff that issues `BusinessDayClosed`.
+  - **Slow subscribers:** the plan row's "conflated harder, then closed" is a two-stage rule. More than half of
+    `stream_buffer` behind, the backlog collapses at once to the latest message per instrument and kind; a whole
+    buffer behind (the broadcast channel's lag), the stream is closed. The exchange thread's `send` never waits.
+  - **Trades conflate too** (latest print per interval). The plan said "conflated per instrument and kind"; prints
+    left out stay in `/api/trades` and the event log.
+  - **Message bodies are built with `serde_json::json!`** in `src/market_data` rather than `Serialize` structs in
+    `api::model`, because the same body is shared by the snapshot and the stream and serialized once per message.
+    `MarketDataView` in `api::model` is gone.
+  - Conflation defaults to off, so tests and scenarios see every message; a browser client sets 100–500 ms.
+- **Mutation checks**, each made a test fail: the quote republished unchanged; prints never published; no publish
+  after a cancellation; the session volume never reset; market data not rebuilt at startup; the instrument filter
+  ignored; no catch-up; a lagging subscriber not closed; conflation ignored; no publish on the tick; the snapshot not
+  publishing pending changes first; publishing inside an open group; a rolled-back trade kept as the last trade.
+  Three first survived and exposed gaps:
+  - The cancellation test ran with background ticks, which publish every instrument every 250 ms and covered for
+    the missing publish. It now runs without ticks.
+  - No test read the snapshot while a change was still unpublished. A new one moves a synthetic walk with no tick
+    running.
+  - Reviewing the group path showed the feed published before `commit_group`, so a failed commit's trades would
+    have been streamed. Fixed as above, with a test and two more mutations.
+
 ## Beyond the milestones
 
 **OpenAPI specifications ✅ done (2026-10-17, requested by the user)**

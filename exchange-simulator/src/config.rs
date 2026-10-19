@@ -33,6 +33,9 @@ pub struct Config {
     /// The built-in liquidity provider (plan item 6.7).
     #[serde(default)]
     pub liquidity: LiquidityConfig,
+    /// The market-data stream (plan item 6.8).
+    #[serde(default)]
+    pub market_data: MarketDataConfig,
     pub ids: IdsConfig,
     pub settlement: SettlementConfig,
     #[serde(default)]
@@ -260,6 +263,31 @@ pub enum SettlementMode {
     Simulated,
     /// The simulator and externally reported outcomes, side by side.
     Both,
+}
+
+/// The market-data stream (see [`crate::market_data`]).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketDataConfig {
+    /// Per subscriber, per instrument and message kind, at most one message this often; 0 sends every message.
+    #[serde(default)]
+    pub conflation_interval_ms: u64,
+    /// Messages a subscriber may fall behind before its stream is closed.
+    #[serde(default = "stream_buffer")]
+    pub stream_buffer: usize,
+}
+
+fn stream_buffer() -> usize {
+    1024
+}
+
+impl Default for MarketDataConfig {
+    fn default() -> Self {
+        Self {
+            conflation_interval_ms: 0,
+            stream_buffer: stream_buffer(),
+        }
+    }
 }
 
 /// The built-in liquidity provider (see [`crate::liquidity`]).

@@ -630,6 +630,7 @@ impl Service {
             instruments: Vec::new(),
             price_sources: Default::default(),
             liquidity: Default::default(),
+            market_data: Default::default(),
             webhooks: WebhooksConfig {
                 subscriptions: Vec::new(),
                 secret_grace_seconds: 3600,

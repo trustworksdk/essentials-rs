@@ -12,6 +12,7 @@ use exchange_simulator::domain::{
 use exchange_simulator::engine::{
     BookUpdate, Exchange, ExchangeError, ExchangeOptions, SubmitOrder, SubmitOutcome,
 };
+use exchange_simulator::market_data::Message;
 use exchange_simulator::persistence::{self, InstrumentFilter, Store};
 use exchange_simulator::webhooks::NewSubscription;
 use uuid::Uuid;
@@ -1276,6 +1277,71 @@ fn a_failed_group_commit_changes_neither_memory_nor_storage() {
         0,
         "event sequences have no gaps"
     );
+}
+
+#[test]
+fn market_data_is_published_only_once_its_group_is_durable() {
+    let db = TempDb::new();
+    let conn = persistence::open(db.path(), Duration::from_secs(5)).unwrap();
+    let (sender, _) = tokio::sync::broadcast::channel(64);
+    let mut feed = sender.subscribe();
+    let mut exchange = Exchange::recover(
+        Store::new(conn),
+        ExchangeOptions {
+            market_data: Some(sender),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    exchange.register_instrument(acme()).unwrap();
+    for id in ["A", "B", "C"] {
+        exchange.register_participant(participant(id)).unwrap();
+    }
+    processed(exchange.submit(order("A", Side::Sell, Some(10000), 100)));
+    fn kinds(
+        feed: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<Message>>,
+    ) -> Vec<&'static str> {
+        std::iter::from_fn(|| feed.try_recv().ok())
+            .map(|m| m.kind)
+            .collect()
+    }
+    assert_eq!(kinds(&mut feed), ["quote", "reference", "quote"]);
+    exchange
+        .store()
+        .connection()
+        .execute_batch(FAIL_COMMIT_ON_QUANTITY_7)
+        .unwrap();
+
+    exchange.begin_group().unwrap();
+    processed(exchange.submit(order("B", Side::Buy, Some(10000), 60)));
+    assert!(kinds(&mut feed).is_empty(), "nothing before the commit");
+    processed(exchange.submit(order("C", Side::Sell, Some(10100), 7)));
+    exchange.commit_group().unwrap_err();
+    assert!(
+        kinds(&mut feed).is_empty(),
+        "the failed group's trade and quotes never reach the feed"
+    );
+    let snapshot = &exchange.market_data(None)[0];
+    assert_eq!((snapshot.last_trade, snapshot.session_volume), (None, 0));
+    assert_eq!(snapshot.best_ask.unwrap().quantity, 100);
+
+    exchange
+        .store()
+        .connection()
+        .execute_batch("DROP TRIGGER fail_commit")
+        .unwrap();
+    exchange.begin_group().unwrap();
+    processed(exchange.submit(order("B", Side::Buy, Some(10000), 60)));
+    processed(exchange.submit(order("C", Side::Sell, Some(10100), 7)));
+    exchange.commit_group().unwrap();
+    assert_eq!(
+        kinds(&mut feed),
+        ["trade", "quote"],
+        "once durable, the net change: the print, then the quote both orders left"
+    );
+    let snapshot = &exchange.market_data(None)[0];
+    assert_eq!(snapshot.session_volume, 60);
+    assert_eq!(snapshot.best_ask.unwrap().quantity, 40);
 }
 
 #[test]

@@ -87,6 +87,64 @@ async fn expect(
     value
 }
 
+/// Opens `GET uri`, a server-sent event stream, and checks it answered `200` as `text/event-stream`.
+async fn open_stream(app: &TestApp, uri: &str) -> Body {
+    let request = Request::get(uri).body(Body::empty()).unwrap();
+    let response = app.router().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), 200, "GET {uri}");
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    response.into_body()
+}
+
+/// Reads what the stream sent until it is quiet for a moment, validates the response and each event's `data` against
+/// the schema for its kind, and returns the kinds seen.
+async fn drain_stream(
+    spec: &Spec,
+    uri: &str,
+    mut body: Body,
+) -> std::collections::BTreeSet<String> {
+    let mut text = String::new();
+    while let Ok(Some(frame)) =
+        tokio::time::timeout(std::time::Duration::from_millis(300), body.frame()).await
+    {
+        if let Ok(bytes) = frame.unwrap().into_data() {
+            text.push_str(std::str::from_utf8(&bytes).unwrap());
+        }
+    }
+    spec.check_response("GET", uri, 200, &json!(text));
+    let mut kinds = std::collections::BTreeSet::new();
+    for block in text.split("\n\n").filter(|b| b.contains("data:")) {
+        let field = |name: &str| {
+            block
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("{name}:")))
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        let (kind, data) = (field("event"), field("data"));
+        let data: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(
+            field("id"),
+            data["mdSequence"].to_string(),
+            "`id:` is the mdSequence"
+        );
+        let schema = match kind.as_str() {
+            "quote" => "MarketDataQuote",
+            "trade" => "MarketDataTrade",
+            "reference" => "MarketDataReference",
+            other => panic!("undocumented market-data event {other}"),
+        };
+        spec.validate(
+            &json!({ "$ref": format!("#/components/schemas/{schema}") }),
+            &data,
+            &format!("market-data event {kind}"),
+        );
+        kinds.insert(kind);
+    }
+    kinds
+}
+
 #[test]
 fn the_document_describes_exactly_the_mounted_routes() {
     let sources = [
@@ -236,6 +294,17 @@ async fn every_operation_and_event_matches_the_document() {
         "priceSource": { "kind": "synthetic", "initialPrice": "100.00", "drift": 0.05, "volatility": 0.4,
                          "tickIntervalMs": 1000, "seed": 3 } });
     expect(a, s, 201, M::POST, "/api/instruments", Some(synthetic)).await;
+    let stream_uri = "/api/marketdata/stream?instruments=ACME,SYN";
+    let stream = open_stream(a, stream_uri).await;
+    expect(
+        a,
+        s,
+        400,
+        M::GET,
+        "/api/marketdata/stream?instruments=NOPE",
+        None,
+    )
+    .await;
     expect(
         a,
         s,
@@ -370,6 +439,11 @@ async fn every_operation_and_event_matches_the_document() {
     market["type"] = json!("MARKET");
     market["priceTicks"] = Value::Null;
     expect(a, s, 201, M::POST, "/api/orders", Some(market)).await;
+    assert_eq!(
+        drain_stream(s, stream_uri, stream).await,
+        ["quote", "reference", "trade"].map(String::from).into(),
+        "every kind of market-data event"
+    );
     let mut unknown = order("A", "SELL", 10_000, 1);
     unknown["instrumentId"] = json!("NOPE");
     expect(a, s, 422, M::POST, "/api/orders", Some(unknown)).await;

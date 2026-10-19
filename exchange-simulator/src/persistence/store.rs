@@ -55,6 +55,17 @@ pub struct OrderRecord {
 const ORDER_COLUMNS: &str = "id, client_order_id, instrument_id, participant_id, side, order_type, limit_price_ticks, \
                              quantity, remaining_quantity, sequence, status, created_at, updated_at";
 
+/// An instrument's last trade and recent volume ([`Store::trade_summary`]).
+#[derive(Debug)]
+pub struct TradeSummary {
+    pub instrument_id: InstrumentId,
+    pub last_price_ticks: i64,
+    pub last_quantity: u64,
+    pub last_executed_at: DateTime<Utc>,
+    /// Quantity traded since the time asked for.
+    pub volume_since: u64,
+}
+
 impl Store {
     pub fn new(conn: Connection) -> Self {
         Self {
@@ -683,6 +694,29 @@ impl Store {
             [execution_id.to_string()],
             |row| from_sql(row, 0),
         )
+    }
+
+    /// Per instrument that traded: its last trade and the quantity traded since `since`, in instrument ID order.
+    pub fn trade_summary(&self, since: DateTime<Utc>) -> rusqlite::Result<Vec<TradeSummary>> {
+        self.conn
+            .prepare_cached(
+                "SELECT e.instrument_id, e.price_ticks, e.quantity, e.executed_at,
+                        (SELECT COALESCE(SUM(v.quantity), 0) FROM executions v
+                         WHERE v.instrument_id = e.instrument_id AND v.executed_at >= ?1)
+                 FROM executions e
+                 WHERE e.rowid = (SELECT MAX(l.rowid) FROM executions l WHERE l.instrument_id = e.instrument_id)
+                 ORDER BY e.instrument_id",
+            )?
+            .query_map([timestamp(since)], |row| {
+                Ok(TradeSummary {
+                    instrument_id: InstrumentId(row.get(0)?),
+                    last_price_ticks: row.get(1)?,
+                    last_quantity: from_sql(row, 2)?,
+                    last_executed_at: parsed(row, 3)?,
+                    volume_since: from_sql(row, 4)?,
+                })
+            })?
+            .collect()
     }
 
     /// A participant's net traded quantity per instrument (bought minus sold), for instruments it traded.

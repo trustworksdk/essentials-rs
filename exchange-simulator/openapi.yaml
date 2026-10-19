@@ -259,6 +259,36 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/MarketData" }
         "503": { $ref: "#/components/responses/Unavailable" }
+  /api/marketdata/stream:
+    get:
+      tags: [market-data]
+      operationId: marketDataStream
+      summary: Live market data as server-sent events
+      description: |
+        One event per message: `event:` its kind, `id:` its `mdSequence`, `data:` its JSON
+        (`MarketDataQuote`, `MarketDataTrade` or `MarketDataReference`). `mdSequence` counts each instrument's
+        messages from 1 since the service started; the snapshot's `mdSequence` is that of the last message about the
+        instrument, so a subscriber resynchronises by reading the snapshot after subscribing and skipping messages at
+        or below it.
+
+        With `market_data.conflation_interval_ms`, at most one message per instrument and kind is sent per interval,
+        the latest. A subscriber more than half of `market_data.stream_buffer` messages behind has its backlog
+        collapsed the same way; one a whole buffer behind has its stream closed. Trade prints left out by conflation
+        remain in `/api/trades`. Market data is not in the event log and not delivered over webhooks.
+      parameters:
+        - name: instruments
+          in: query
+          required: false
+          description: Comma-separated instrument IDs; every instrument when left out.
+          schema: { type: string }
+      responses:
+        "200":
+          description: The event stream, open until the client disconnects, falls a buffer behind, or the service stops.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /api/marketdata/{instrumentId}:
     get:
       tags: [market-data]
@@ -1233,23 +1263,94 @@ components:
     MarketData:
       type: object
       additionalProperties: false
-      required: [instrumentId, reference]
+      required: [instrumentId, mdSequence, reference, bestBid, bestAsk, lastTrade, sessionVolume]
       properties:
         instrumentId: { type: string }
-        reference:
-          description: "`null` when the price source is `none`."
+        mdSequence:
+          type: integer
+          minimum: 0
+          description: The `mdSequence` of the last stream message about the instrument (0 before the first).
+        reference: { $ref: "#/components/schemas/MarketDataReferencePrice" }
+        bestBid: { $ref: "#/components/schemas/MarketDataTop" }
+        bestAsk: { $ref: "#/components/schemas/MarketDataTop" }
+        lastTrade:
+          description: "`null` before the instrument's first trade."
           oneOf:
             - { type: "null" }
-            - type: object
-              additionalProperties: false
-              required: [price, priceTicks, source, sourceTimestamp]
-              properties:
-                price: { $ref: "#/components/schemas/Amount" }
-                priceTicks: { type: integer, minimum: 1 }
-                source: { enum: [fixed, synthetic] }
-                sourceTimestamp:
-                  $ref: "#/components/schemas/Timestamp"
-                  description: When the price was produced, on the exchange's clock.
+            - $ref: "#/components/schemas/MarketDataPrint"
+        sessionVolume:
+          type: integer
+          minimum: 0
+          description: Quantity traded on the current business date (the business day ends at `clearing.cutoff`).
+    MarketDataReferencePrice:
+      description: "`null` when the price source is `none`."
+      oneOf:
+        - { type: "null" }
+        - type: object
+          additionalProperties: false
+          required: [price, priceTicks, source, sourceTimestamp, stale]
+          properties:
+            price: { $ref: "#/components/schemas/Amount" }
+            priceTicks: { type: integer, minimum: 1 }
+            source: { enum: [fixed, synthetic] }
+            sourceTimestamp:
+              $ref: "#/components/schemas/Timestamp"
+              description: When the price was produced, on the exchange's clock.
+            stale:
+              type: boolean
+              description: Older than its source allows. Always `false` for `fixed` and `synthetic`.
+    MarketDataTop:
+      description: The best price on one side and the quantity resting there; `null` for an empty side.
+      oneOf:
+        - { type: "null" }
+        - type: object
+          additionalProperties: false
+          required: [priceTicks, price, quantity]
+          properties:
+            priceTicks: { type: integer }
+            price: { $ref: "#/components/schemas/Amount" }
+            quantity: { type: integer, minimum: 1 }
+    MarketDataPrint:
+      type: object
+      description: A trade, without participants.
+      additionalProperties: false
+      required: [priceTicks, price, quantity, executedAt]
+      properties:
+        priceTicks: { type: integer }
+        price: { $ref: "#/components/schemas/Amount" }
+        quantity: { type: integer, minimum: 1 }
+        executedAt: { $ref: "#/components/schemas/Timestamp" }
+    MarketDataQuote:
+      type: object
+      description: "Stream event `quote`: the best bid or ask changed."
+      additionalProperties: false
+      required: [instrumentId, mdSequence, bestBid, bestAsk]
+      properties:
+        instrumentId: { type: string }
+        mdSequence: { type: integer, minimum: 1 }
+        bestBid: { $ref: "#/components/schemas/MarketDataTop" }
+        bestAsk: { $ref: "#/components/schemas/MarketDataTop" }
+    MarketDataTrade:
+      type: object
+      description: "Stream event `trade`: an anonymous print."
+      additionalProperties: false
+      required: [instrumentId, mdSequence, priceTicks, price, quantity, executedAt]
+      properties:
+        instrumentId: { type: string }
+        mdSequence: { type: integer, minimum: 1 }
+        priceTicks: { type: integer }
+        price: { $ref: "#/components/schemas/Amount" }
+        quantity: { type: integer, minimum: 1 }
+        executedAt: { $ref: "#/components/schemas/Timestamp" }
+    MarketDataReference:
+      type: object
+      description: "Stream event `reference`: the reference price changed, became stale, or went away."
+      additionalProperties: false
+      required: [instrumentId, mdSequence, reference]
+      properties:
+        instrumentId: { type: string }
+        mdSequence: { type: integer, minimum: 1 }
+        reference: { $ref: "#/components/schemas/MarketDataReferencePrice" }
     Participant:
       type: object
       additionalProperties: false

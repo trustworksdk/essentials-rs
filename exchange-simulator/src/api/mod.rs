@@ -35,6 +35,11 @@ pub struct AppState {
     reader: Arc<Mutex<Store>>,
     metrics: PrometheusHandle,
     persistence: PersistenceMode,
+    /// Where the exchange publishes market data, and how the stream serves subscribers.
+    market_data: Option<(
+        crate::market_data::Sender,
+        crate::market_data::StreamOptions,
+    )>,
 }
 
 impl AppState {
@@ -50,7 +55,18 @@ impl AppState {
             reader: Arc::new(Mutex::new(reader)),
             metrics,
             persistence,
+            market_data: None,
         }
+    }
+
+    /// Serves `GET /api/marketdata/stream` from `sender`.
+    pub fn with_market_data(
+        mut self,
+        sender: crate::market_data::Sender,
+        options: crate::market_data::StreamOptions,
+    ) -> Self {
+        self.market_data = Some((sender, options));
+        self
     }
 
     /// Runs a query on the read connection off the async runtime.

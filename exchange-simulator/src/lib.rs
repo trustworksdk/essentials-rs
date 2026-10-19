@@ -12,6 +12,7 @@ pub mod events;
 pub mod ids;
 pub mod liquidity;
 pub mod market;
+pub mod market_data;
 pub mod metrics;
 pub mod persistence;
 pub mod pricing;

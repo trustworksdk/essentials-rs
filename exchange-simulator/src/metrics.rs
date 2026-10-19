@@ -42,6 +42,12 @@ pub const LIQUIDITY_QUOTES: &str = "exchange_liquidity_quotes_total";
 pub const LIQUIDITY_REQUOTES: &str = "exchange_liquidity_requotes_total";
 /// Executions with the liquidity provider on one side. Label: `instrument`.
 pub const LIQUIDITY_FILLS: &str = "exchange_liquidity_fills_total";
+/// Market-data messages published. Label: `kind`.
+pub const MARKET_DATA_MESSAGES: &str = "exchange_market_data_messages_total";
+/// Times a market-data subscriber more than half a buffer behind had its backlog collapsed.
+pub const MARKET_DATA_CATCH_UPS: &str = "exchange_market_data_catch_ups_total";
+/// Market-data streams closed because their subscriber fell behind the buffer.
+pub const MARKET_DATA_STREAMS_CLOSED: &str = "exchange_market_data_streams_closed_total";
 /// Settlement instructions with a transition still to come.
 pub const SETTLEMENT_OPEN: &str = "settlement_open_instructions";
 

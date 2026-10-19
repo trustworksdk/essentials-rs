@@ -27,6 +27,7 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `exchange.command_queue_capacity` | `10000` | Commands waiting for the exchange thread; when full, requests get `503 overloaded` |
 | `exchange.group_commit.max_commands` / `max_wait_us` | `256` / `0` | Group commit: most orders and cancellations per commit (`1` commits each on its own); how long to wait for more once the queue is empty |
 | `events.simulation_id` | unset | Stamped on every event as `simulationId` |
+| `market_data.conflation_interval_ms` / `stream_buffer` | `0` / `1024` | Market-data stream: at most one message per instrument and kind per interval (`0`: every message); how far a subscriber may fall behind before its stream is closed (see `GET /api/marketdata/stream`) |
 | `webhooks.poll_interval_ms` | `250` | How often due deliveries (retries) are looked for; new events are sent at once |
 | `webhooks.batch_size` / `concurrency` | `100` / `16` | Deliveries claimed per round / concurrent requests |
 | `webhooks.request_timeout_ms` | `5000` | Per request; a timeout is a failed attempt |
@@ -279,14 +280,64 @@ off unless an instrument's `liquidity` (or `liquidity.default`) sets `mode: on`:
 ### `GET /api/marketdata` and `GET /api/marketdata/{instrumentId}`
 
 ```json
-{ "instrumentId": "AAPL",
+{ "instrumentId": "AAPL", "mdSequence": 41,
   "reference": { "price": "187.52", "priceTicks": 18752, "source": "synthetic",
-                 "sourceTimestamp": "2030-01-07T09:01:30Z" } }
+                 "sourceTimestamp": "2030-01-07T09:01:30Z", "stale": false },
+  "bestBid": { "priceTicks": 18733, "price": "187.33", "quantity": 100 },
+  "bestAsk": { "priceTicks": 18771, "price": "187.71", "quantity": 100 },
+  "lastTrade": { "priceTicks": 18771, "price": "187.71", "quantity": 25, "executedAt": "2030-01-07T09:01:12Z" },
+  "sessionVolume": 1250 }
 ```
 
-Each instrument's market data, in instrument ID order; `404` for an unknown instrument. `reference` is `null` for a
-`none` source. `sourceTimestamp` is when the price was produced, on the exchange's clock: when a fixed source was set,
-or the synthetic step's grid time. Best bid and ask, the last trade and a stream follow in a later step.
+Each instrument's market data, in instrument ID order; `404` for an unknown instrument.
+- `reference` is `null` for a `none` source. `sourceTimestamp` is when the price was produced, on the exchange's
+  clock: when a fixed source was set, or the synthetic step's grid time. `stale` is for live sources (always `false`
+  for `fixed` and `synthetic`).
+- `bestBid` and `bestAsk` (`null` for an empty side) carry the quantity resting at the best price. `lastTrade` has no
+  participants; `null` before the first trade.
+- `sessionVolume` is the quantity traded on the current business date, which ends at `clearing.cutoff`.
+- `mdSequence` is that of the last stream message about the instrument (below), so the snapshot and the stream line
+  up.
+
+The last trade and the session volume survive a restart; `mdSequence` starts again from 0 with the service.
+
+### `GET /api/marketdata/stream?instruments=`
+
+Server-sent events for the listed instruments (comma-separated; all when left out; `400` for an unknown one):
+
+```text
+event: quote
+id: 42
+data: {"instrumentId":"AAPL","mdSequence":42,"bestBid":{"priceTicks":18733,"price":"187.33","quantity":75},"bestAsk":{...}}
+
+event: trade
+id: 43
+data: {"instrumentId":"AAPL","mdSequence":43,"priceTicks":18733,"price":"187.33","quantity":25,"executedAt":"..."}
+
+event: reference
+id: 44
+data: {"instrumentId":"AAPL","mdSequence":44,"reference":{"price":"187.40",...,"stale":false}}
+```
+
+- **`quote`** when the best bid or ask (price or quantity) changes, **`trade`** for each print (anonymous), and
+  **`reference`** when the reference price changes, goes stale or goes away. Each carries the instrument's
+  `mdSequence`, which counts its messages from 1 and is the event's `id:`.
+- Messages are published once a whole command is done: an order, with the matching and the liquidity provider's
+  re-quote it caused; a cancellation; an instrument change; a clock tick. A trade's prints come before the quote
+  they leave behind. Intermediate states never reach the feed.
+- **To start:** open the stream, then read the snapshot, and skip messages at or below the snapshot's `mdSequence`.
+- **Conflation** (`market_data.conflation_interval_ms`, off by default): at most one message per instrument and
+  kind per interval, the latest. `quote` and `reference` carry their whole state, so nothing is lost but
+  intermediate values; prints left out remain in `GET /api/trades`.
+- **Slow subscribers** never slow the exchange. More than half of `market_data.stream_buffer` behind, a subscriber's
+  backlog collapses to the latest message per instrument and kind; a whole buffer behind, its stream is closed.
+  Reconnect and start again from the snapshot. Metrics: `exchange_market_data_messages_total{kind}`,
+  `exchange_market_data_catch_ups_total`, `exchange_market_data_streams_closed_total`.
+- Market data is not in the event log and not delivered over webhooks.
+
+```bash
+curl -N 'localhost:8080/api/marketdata/stream?instruments=AAPL'
+```
 
 ### `GET /api/trades?instrumentId=&participantId=&orderId=&limit=`
 

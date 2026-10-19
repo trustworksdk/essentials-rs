@@ -122,6 +122,22 @@ instruments:
 An instrument's own `liquidity` overrides the default field by field; set `liquidity: { mode: off }` on one to leave
 it to client orders only.
 
+## Market data
+
+The snapshot (`GET /api/marketdata`) needs no setting. The stream (`GET /api/marketdata/stream`, [README](../README.md#get-apimarketdatastreaminstruments))
+has two:
+
+```yaml
+market_data:
+  conflation_interval_ms: 250   # per subscriber, instrument and kind, at most one message per 250 ms; 0 sends all
+  stream_buffer: 1024           # messages a subscriber may fall behind before its stream is closed
+```
+
+A browser chart wants a few updates a second, not every quote: 100–500 ms is a good conflation interval. A
+subscriber more than half of `stream_buffer` behind is caught up at once (its backlog collapses to the latest message
+per instrument and kind); a whole buffer behind, its stream is closed and it reconnects. The exchange never waits for
+a subscriber either way.
+
 ## Webhooks
 
 | Key | Default | |

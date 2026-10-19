@@ -150,6 +150,8 @@ pub struct Reference {
     pub ticks: i64,
     /// When the price was produced: when a fixed source was configured, or the synthetic step's grid time.
     pub source_timestamp: DateTime<Utc>,
+    /// Older than its source allows (a live source, plan item 6.9); never for `fixed` and `synthetic`.
+    pub stale: bool,
 }
 
 /// The parameters of a synthetic walk, resolved.
@@ -258,6 +260,7 @@ impl PriceSources {
                 kind: PriceSourceKind::Fixed,
                 ticks: *ticks,
                 source_timestamp: active.since,
+                stale: false,
             }),
             State::Synthetic {
                 params,
@@ -284,6 +287,7 @@ impl PriceSources {
                     kind: PriceSourceKind::Synthetic,
                     ticks: publish(*ticks),
                     source_timestamp: at,
+                    stale: false,
                 })
             }
         }
@@ -539,6 +543,7 @@ mod tests {
             kind: PriceSourceKind::Fixed,
             ticks: 12_345,
             source_timestamp: t0(),
+            stale: false,
         };
         sources.prepare(&mut instrument, Some(current)).unwrap();
         assert_eq!(
