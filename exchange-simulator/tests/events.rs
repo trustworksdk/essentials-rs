@@ -23,6 +23,7 @@ fn acme() -> Instrument {
         enabled: true,
         reference_symbol: None,
         price_source: None,
+        liquidity: None,
     }
 }
 

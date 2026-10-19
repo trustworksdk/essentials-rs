@@ -11,7 +11,8 @@ pub use crate::clock::{Clock, FixedClock, SystemClock};
 pub use book::{BookError, BookUpdate, InvalidOrder, Level, OrderBook, RejectReason};
 pub use dispatcher::{BookSnapshot, DispatchError, Dispatcher, GroupCommit};
 pub use exchange::{
-    ClockChange, ClockState, Exchange, ExchangeError, ExchangeOptions, SubmitOrder, SubmitOutcome,
+    ClockChange, ClockState, Exchange, ExchangeError, ExchangeOptions, LiquidityPolicy,
+    SubmitOrder, SubmitOutcome,
 };
 
 pub use crate::ids::IdScheme;

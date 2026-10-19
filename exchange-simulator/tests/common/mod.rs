@@ -70,6 +70,7 @@ impl TestApp {
             webhooks: webhooks_config(),
             instruments: Vec::new(),
             price_sources: Default::default(),
+            liquidity: Default::default(),
             database: DatabaseConfig {
                 mode: Default::default(),
                 memory_max_mib: 1024,

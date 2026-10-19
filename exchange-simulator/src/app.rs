@@ -110,6 +110,7 @@ impl App {
                 instruments: config.declared_instruments().map_err(anyhow::Error::msg)?,
                 price_sources: config.price_sources.sources().map_err(anyhow::Error::msg)?,
                 business_days: Some(config.business_calendar().map_err(anyhow::Error::msg)?),
+                liquidity: Some(config.liquidity.policy().map_err(anyhow::Error::msg)?),
             },
         )
         .context("recovering order books")?;

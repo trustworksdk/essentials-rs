@@ -325,6 +325,11 @@ impl OrderBook {
         self.orders.get(&order_id)
     }
 
+    /// The resting orders, in no particular order.
+    pub fn orders(&self) -> impl Iterator<Item = &Order> {
+        self.orders.values()
+    }
+
     /// Number of resting orders.
     pub fn len(&self) -> usize {
         self.orders.len()

@@ -36,6 +36,12 @@ pub const EXECUTIONS: &str = "exchange_executions_total";
 pub const TRADED_QUANTITY: &str = "exchange_traded_quantity_total";
 /// Canonical events written. Label: `event_type`.
 pub const EVENTS: &str = "exchange_events_total";
+/// Orders the liquidity provider placed (each level of each ladder), whether or not its order events are published.
+pub const LIQUIDITY_QUOTES: &str = "exchange_liquidity_quotes_total";
+/// Ladders the liquidity provider replaced (or pulled). Label: `instrument`.
+pub const LIQUIDITY_REQUOTES: &str = "exchange_liquidity_requotes_total";
+/// Executions with the liquidity provider on one side. Label: `instrument`.
+pub const LIQUIDITY_FILLS: &str = "exchange_liquidity_fills_total";
 /// Settlement instructions with a transition still to come.
 pub const SETTLEMENT_OPEN: &str = "settlement_open_instructions";
 

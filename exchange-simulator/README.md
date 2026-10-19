@@ -244,6 +244,38 @@ will quote around and the market data publishes. The demo never pushes prices in
 - **Clock jumps** catch the walk up step by step on the exchange thread: about 50 ms per instrument for 30 simulated
   days of one-second steps. `tickIntervalMs` is at least 100.
 
+### Liquidity provider
+
+A built-in participant (`liquidity.participant_id`, default `LP`) quotes a ladder of limit orders around each
+instrument's reference price, so a demo whose orders all come from one participant always has a counterparty. It is
+off unless an instrument's `liquidity` (or `liquidity.default`) sets `mode: on`:
+
+```json
+"liquidity": { "mode": "on", "levels": 5, "spreadBps": 10, "levelStepTicks": 1, "levelQuantity": 100,
+               "levelQuantityGrowth": 1, "requoteThresholdTicks": 1, "refillDelayMs": 0, "skewBpsPerLot": 0,
+               "maxInventory": 10000 }
+```
+
+- **Ladder:** `levels` limit orders a side. The best bid and ask are `spreadBps` from the mid, rounded away from it to
+  the tick (with R = 100.00, 10 bps and a 0.01 tick: 99.90 and 100.10); each deeper level is `levelStepTicks`
+  further out and holds `levelQuantity` lots, times `levelQuantityGrowth` per level. Its orders are ordinary limit
+  orders: a market order sweeps the ladder level by level and its remainder is cancelled (`MARKET_REMAINDER`) when
+  the ladder runs out; a crossing limit order fills at the ladder's prices; a limit order inside the spread rests.
+- **When it quotes:** after every order and cancellation, after an instrument change, and on every tick. It quotes
+  again when the reference price moved `requoteThresholdTicks` from its last quote, and refills `refillDelayMs` of
+  simulated time after a fill. The old ladder is cancelled and the new one placed in one commit, inside the exchange
+  thread, so no order sees half a ladder. With mode `off`, trading disabled or no reference price, it pulls its ladder.
+- **Inventory:** its net position, in lots, moves the mid `skewBpsPerLot` per lot against the position: a long
+  provider lowers both sides, so one-sided client buying pushes the price up. At `maxInventory` lots it stops quoting
+  the side that would add to the position.
+- **Events:** its order lifecycle (accepted, filled, cancelled) stays out of the event log and webhooks unless
+  `liquidity.emit_order_events` is true. Its trades are always published (`TradeExecuted` with it as buyer or seller),
+  and it settles and appears on clearing statements like any participant. Metrics count its quotes
+  (`exchange_liquidity_quotes_total`), ladders replaced (`exchange_liquidity_requotes_total`) and fills
+  (`exchange_liquidity_fills_total`) either way.
+- **After a restart or reset** it quotes afresh: its inventory comes from its trades, its old ladder is replaced
+  (decision D18). On a frozen clock what it does depends only on the commands, so reproducible runs stay byte-identical.
+
 ### `GET /api/marketdata` and `GET /api/marketdata/{instrumentId}`
 
 ```json

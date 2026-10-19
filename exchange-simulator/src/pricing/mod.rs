@@ -376,6 +376,7 @@ mod tests {
             enabled: true,
             reference_symbol: None,
             price_source: Some(price_source),
+            liquidity: None,
         }
     }
 

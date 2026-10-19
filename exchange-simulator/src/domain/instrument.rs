@@ -2,6 +2,7 @@ use super::InstrumentId;
 use super::identifiers::{
     IdentifierError, check_length, validate_cusip, validate_isin, validate_mic,
 };
+use crate::liquidity::LiquiditySpec;
 use crate::pricing::PriceSourceSpec;
 
 type Validator = fn(&str) -> Result<(), IdentifierError>;
@@ -37,21 +38,27 @@ pub struct Instrument {
     pub reference_symbol: Option<String>,
     /// The instrument's own price source; `None` takes `price_sources.default` (see [`crate::pricing`]).
     pub price_source: Option<PriceSourceSpec>,
+    /// The instrument's own liquidity settings; `None` takes `liquidity.default` (see [`crate::liquidity`]).
+    pub liquidity: Option<LiquiditySpec>,
 }
 
-/// A change to a listed instrument: only trading status, the reference symbol and the price source may change after
-/// listing. `None` leaves a field as it is; `Some(None)` clears an optional one.
+/// A change to a listed instrument: only trading status, the reference symbol, the price source and the liquidity
+/// settings may change after listing. `None` leaves a field as it is; `Some(None)` clears an optional one.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InstrumentChange {
     pub enabled: Option<bool>,
     pub reference_symbol: Option<Option<String>>,
     pub price_source: Option<Option<PriceSourceSpec>>,
+    pub liquidity: Option<Option<LiquiditySpec>>,
 }
 
 impl InstrumentChange {
     /// Whether the change names no field.
     pub fn is_empty(&self) -> bool {
-        self.enabled.is_none() && self.reference_symbol.is_none() && self.price_source.is_none()
+        self.enabled.is_none()
+            && self.reference_symbol.is_none()
+            && self.price_source.is_none()
+            && self.liquidity.is_none()
     }
 
     /// Applies the change and returns the wire names of the fields whose value it changed, in a fixed order.
@@ -74,6 +81,12 @@ impl InstrumentChange {
         {
             instrument.price_source = price_source.clone();
             changed.push("priceSource");
+        }
+        if let Some(liquidity) = &self.liquidity
+            && *liquidity != instrument.liquidity
+        {
+            instrument.liquidity = liquidity.clone();
+            changed.push("liquidity");
         }
         changed
     }
@@ -236,6 +249,7 @@ mod tests {
             enabled: true,
             reference_symbol: None,
             price_source: None,
+            liquidity: None,
         }
     }
 
@@ -305,12 +319,14 @@ mod tests {
             enabled: Some(true),
             reference_symbol: Some(None),
             price_source: Some(None),
+            liquidity: Some(None),
         };
         assert!(unchanged.apply(&mut instrument).is_empty());
         let change = InstrumentChange {
             enabled: Some(false),
             reference_symbol: Some(Some("ACME.CO".into())),
             price_source: None,
+            liquidity: None,
         };
         assert_eq!(
             change.apply(&mut instrument),

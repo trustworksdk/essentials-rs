@@ -154,6 +154,9 @@ paths:
                 priceSource:
                   oneOf: [{ $ref: "#/components/schemas/PriceSource" }, { type: "null" }]
                   description: Replaces the instrument's own price source and restarts it; `null` falls back to the default.
+                liquidity:
+                  oneOf: [{ $ref: "#/components/schemas/Liquidity" }, { type: "null" }]
+                  description: Replaces the instrument's own liquidity settings; `null` falls back to the default.
       responses:
         "200":
           description: The instrument after the change.
@@ -1167,11 +1170,14 @@ components:
         priceSource:
           oneOf: [{ $ref: "#/components/schemas/PriceSource" }, { type: "null" }]
           description: The instrument's own price source; absent or `null` takes `price_sources.default`.
+        liquidity:
+          oneOf: [{ $ref: "#/components/schemas/Liquidity" }, { type: "null" }]
+          description: The instrument's own liquidity settings; absent or `null` takes `liquidity.default`.
     Instrument:
       type: object
       additionalProperties: false
       required: [id, symbol, mic, isin, cusip, currency, currencyScale, tickSizeMinor, tickSize, lotSize, enabled,
-                 referenceSymbol, priceSource]
+                 referenceSymbol, priceSource, liquidity]
       properties:
         id: { type: string }
         symbol: { type: string }
@@ -1186,6 +1192,25 @@ components:
         enabled: { type: boolean }
         referenceSymbol: { type: [string, "null"] }
         priceSource: { oneOf: [{ $ref: "#/components/schemas/PriceSource" }, { type: "null" }] }
+        liquidity: { oneOf: [{ $ref: "#/components/schemas/Liquidity" }, { type: "null" }] }
+    Liquidity:
+      type: object
+      additionalProperties: false
+      description: |
+        The built-in liquidity provider's settings for an instrument. Every field is optional: missing ones come from
+        `liquidity.default`, field by field, then the built-in defaults (shown). It quotes `levels` limit orders a side
+        around the reference price, as the participant `liquidity.participant_id`.
+      properties:
+        mode: { enum: [on, off], default: off }
+        levels: { type: integer, minimum: 1, maximum: 50, default: 5, description: Price levels a side. }
+        spreadBps: { type: number, minimum: 0, maximum: 10000, default: 10, description: From the mid to the best bid and to the best ask; rounded away from the mid to the tick. }
+        levelStepTicks: { type: integer, minimum: 1, default: 1, description: Between levels. }
+        levelQuantity: { type: integer, minimum: 1, maximum: 1000000000, default: 100, description: Lots at the best level. }
+        levelQuantityGrowth: { type: number, minimum: 0.1, maximum: 10, default: 1, description: Each deeper level holds this many times the one before. }
+        requoteThresholdTicks: { type: integer, minimum: 0, default: 1, description: How far the reference price must move before the ladder is quoted again. }
+        refillDelayMs: { type: integer, minimum: 0, maximum: 86400000, default: 0, description: Simulated time after a fill before the ladder is refilled. }
+        skewBpsPerLot: { type: number, minimum: 0, maximum: 10000, default: 0, description: How far each lot of inventory moves the mid against the position. }
+        maxInventory: { type: integer, minimum: 1, default: 10000, description: Lots long (or short) past which the side that adds to it is not quoted. }
     PriceSource:
       type: object
       additionalProperties: false
@@ -1610,7 +1635,7 @@ components:
     InstrumentEventPayload:
       type: object
       required: [instrumentId, symbol, mic, isin, cusip, currency, currencyScale, tickSizeMinor, tickSize, lotSize,
-                 enabled, referenceSymbol, priceSource]
+                 enabled, referenceSymbol, priceSource, liquidity]
       description: The whole instrument after the change, as `GET /api/instruments` shows it.
       properties:
         instrumentId: { type: string }
@@ -1626,6 +1651,7 @@ components:
         enabled: { type: boolean }
         referenceSymbol: { type: [string, "null"] }
         priceSource: { oneOf: [{ $ref: "#/components/schemas/PriceSource" }, { type: "null" }] }
+        liquidity: { oneOf: [{ $ref: "#/components/schemas/Liquidity" }, { type: "null" }] }
     SettlementPayloadBase:
       type: object
       required: [executionId, tradeSequence, instrumentId, buyerId, sellerId, quantity, priceTicks, currency,
@@ -1767,7 +1793,7 @@ components:
               type: array
               minItems: 1
               uniqueItems: true
-              items: { enum: [enabled, referenceSymbol, priceSource] }
+              items: { enum: [enabled, referenceSymbol, priceSource, liquidity] }
               description: The fields whose value changed.
           unevaluatedProperties: false
     SettlementPendingEvent:

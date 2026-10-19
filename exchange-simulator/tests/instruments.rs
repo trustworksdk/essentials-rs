@@ -24,6 +24,7 @@ fn declared(id: &str, mic: &str) -> InstrumentConfig {
         enabled: true,
         reference_symbol: Some(id.into()),
         price_source: None,
+        liquidity: None,
     }
 }
 
@@ -86,10 +87,10 @@ async fn declared_instruments_are_listed_at_startup_with_an_event_each() {
         json!([
             { "id": "AAPL", "symbol": "AAPL", "mic": "XNAS", "isin": null, "cusip": null, "currency": "USD",
               "currencyScale": 2, "tickSizeMinor": 1, "tickSize": "0.01", "lotSize": 1, "enabled": true,
-              "referenceSymbol": "AAPL", "priceSource": null },
+              "referenceSymbol": "AAPL", "priceSource": null, "liquidity": null },
             { "id": "MSFT", "symbol": "MSFT", "mic": "XNAS", "isin": null, "cusip": null, "currency": "USD",
               "currencyScale": 2, "tickSizeMinor": 1, "tickSize": "0.01", "lotSize": 1, "enabled": true,
-              "referenceSymbol": "MSFT", "priceSource": null }
+              "referenceSymbol": "MSFT", "priceSource": null, "liquidity": null }
         ])
     );
     let all = events(&app).await;
@@ -106,7 +107,7 @@ async fn declared_instruments_are_listed_at_startup_with_an_event_each() {
         all[0]["payload"],
         json!({ "instrumentId": "AAPL", "symbol": "AAPL", "mic": "XNAS", "isin": null, "cusip": null,
                 "currency": "USD", "currencyScale": 2, "tickSizeMinor": 1, "tickSize": "0.01", "lotSize": 1,
-                "enabled": true, "referenceSymbol": "AAPL", "priceSource": null })
+                "enabled": true, "referenceSymbol": "AAPL", "priceSource": null, "liquidity": null })
     );
     // The declared subscription exists before the instruments are listed, so it has their deliveries.
     assert_eq!(app.count("SELECT COUNT(*) FROM webhook_deliveries"), 2);
@@ -192,7 +193,7 @@ async fn a_declared_field_that_cannot_change_stops_startup() {
     assert!(
         format!("{error:#}").contains(
             "instruments AAPL: tick_size_minor differs from the listed instrument; only enabled, \
-             reference_symbol and price_source can change"
+             reference_symbol, price_source and liquidity can change"
         ),
         "{error:#}"
     );
@@ -281,7 +282,7 @@ async fn api_listings_and_changes_are_events() {
         .post(
             "/api/instruments",
             json!({ "id": "AAPL", "symbol": "AAPL", "mic": "XNAS", "currency": "USD", "currencyScale": 2,
-                    "referenceSymbol": "AAPL", "priceSource": null }),
+                    "referenceSymbol": "AAPL", "priceSource": null, "liquidity": null }),
         )
         .await;
     assert_eq!(

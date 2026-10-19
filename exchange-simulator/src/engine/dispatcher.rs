@@ -788,6 +788,7 @@ mod tests {
                 enabled: true,
                 reference_symbol: None,
                 price_source: None,
+                liquidity: None,
             }
         }
 

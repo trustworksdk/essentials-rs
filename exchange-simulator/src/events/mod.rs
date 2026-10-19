@@ -139,6 +139,7 @@ pub fn instrument_event(
         "enabled": instrument.enabled,
         "referenceSymbol": instrument.reference_symbol,
         "priceSource": instrument.price_source,
+        "liquidity": instrument.liquidity,
     });
     if let Some(changes) = changes {
         payload["changes"] = json!(changes);

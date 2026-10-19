@@ -67,8 +67,8 @@ pub enum ExchangeError {
     #[error("symbol {symbol} is already listed on {mic}")]
     DuplicateListing { mic: String, symbol: String },
     #[error(
-        "instruments {id}: {field} differs from the listed instrument; only enabled, reference_symbol and \
-         price_source can change"
+        "instruments {id}: {field} differs from the listed instrument; only enabled, reference_symbol, \
+         price_source and liquidity can change"
     )]
     DeclaredInstrumentConflict {
         id: InstrumentId,
@@ -81,6 +81,8 @@ pub enum ExchangeError {
     },
     #[error(transparent)]
     PriceSource(#[from] PriceSourceError),
+    #[error(transparent)]
+    Liquidity(#[from] crate::liquidity::LiquidityError),
     #[error("participant {0} already exists")]
     DuplicateParticipant(ParticipantId),
     #[error(
@@ -183,6 +185,20 @@ pub struct ExchangeOptions {
     /// Closes every business day at this calendar's cutoff with `BusinessDayClosed`, whether or not clearing runs.
     /// `None` closes no days.
     pub business_days: Option<simulator_kit::calendar::CutoffCalendar>,
+    /// Runs the built-in liquidity provider (plan item 6.7); `None` quotes nothing.
+    pub liquidity: Option<LiquidityPolicy>,
+}
+
+/// How the liquidity provider runs (`liquidity:` in the configuration).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiquidityPolicy {
+    /// The participant it trades as, registered the first time it quotes.
+    pub participant: ParticipantId,
+    /// Publish its order lifecycle (accepted, filled, cancelled) in the event log and over webhooks. Its trades are
+    /// published either way: they are real clients' counterparties.
+    pub emit_order_events: bool,
+    /// What an instrument's own settings leave out.
+    pub default: crate::liquidity::LiquiditySpec,
 }
 
 impl Default for ExchangeOptions {
@@ -203,6 +219,7 @@ impl Default for ExchangeOptions {
             price_sources: PriceSources::new(Default::default(), 0)
                 .expect("the empty default is valid"),
             business_days: None,
+            liquidity: None,
         }
     }
 }
@@ -249,6 +266,26 @@ pub struct Exchange {
     prices: PriceSources,
     /// The business-day calendar and the last date closed.
     days: Option<BusinessDays>,
+    /// The liquidity provider and its state per instrument.
+    provider: Option<Provider>,
+}
+
+/// The liquidity provider: its policy, and per instrument what it last quoted around and holds.
+struct Provider {
+    policy: LiquidityPolicy,
+    quoting: HashMap<InstrumentId, Quoting>,
+}
+
+/// The provider's state in one instrument. Not stored: after a restart or reset it is rebuilt from the trades, and
+/// the ladder is quoted afresh (decision D18).
+#[derive(Clone, Debug, Default)]
+struct Quoting {
+    /// Net position in units: positive long.
+    inventory: i64,
+    /// The reference price the current ladder was quoted around; `None` before the first quote or once pulled.
+    quoted_at: Option<i64>,
+    /// When it last traded, until the ladder is refilled.
+    filled_at: Option<DateTime<Utc>>,
 }
 
 /// Business days and the last one closed with `BusinessDayClosed`.
@@ -411,9 +448,14 @@ impl Exchange {
             declared_instruments: options.instruments,
             prices: options.price_sources,
             days: None,
+            provider: options.liquidity.map(|policy| Provider {
+                policy,
+                quoting: HashMap::new(),
+            }),
         };
         exchange.start_price_sources()?;
         exchange.reconcile_webhooks()?;
+        exchange.start_liquidity()?;
         exchange.reconcile_instruments()?;
         if let Some(policy) = options.clearing {
             policy.breaks.validate().map_err(ExchangeError::Clearing)?;
@@ -470,7 +512,9 @@ impl Exchange {
             });
         }
         let mut instrument = instrument;
-        self.commit_instrument(&mut instrument, None)
+        let id = instrument.id.clone();
+        self.commit_instrument(&mut instrument, None)?;
+        self.maintain_liquidity(Some(&id))
     }
 
     /// Switches trading in an instrument on or off, durably, and returns the updated instrument.
@@ -507,6 +551,8 @@ impl Exchange {
         }
         instrument.validate(self.identifier_policy)?;
         self.commit_instrument(&mut instrument, Some(&changes))?;
+        // A new price source, liquidity setting or trading status changes what the provider quotes.
+        self.maintain_liquidity(Some(id))?;
         Ok(instrument)
     }
 
@@ -518,6 +564,9 @@ impl Exchange {
         instrument: &mut Instrument,
         changes: Option<&[&'static str]>,
     ) -> Result<(), ExchangeError> {
+        if let Some(liquidity) = &instrument.liquidity {
+            liquidity.validate()?;
+        }
         let now = self.now();
         let restarts = changes.is_none_or(|c| c.contains(&"priceSource"));
         if restarts {
@@ -608,6 +657,7 @@ impl Exchange {
                 enabled: Some(declared.enabled),
                 reference_symbol: Some(declared.reference_symbol.clone()),
                 price_source: Some(declared.price_source.clone()),
+                liquidity: Some(declared.liquidity.clone()),
             };
             self.update_instrument(&declared.id, &change)
                 .map_err(wrap)?;
@@ -639,6 +689,161 @@ impl Exchange {
                     id: instrument.id.clone(),
                     error: Box::new(error.into()),
                 }
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Sets the liquidity provider up, at recovery and after a reset: its inventory per instrument from its trades,
+    /// and no ladder yet, so each is quoted afresh (decision D18). Its resting orders, if any survived a restart, are
+    /// replaced at the first quote.
+    fn start_liquidity(&mut self) -> Result<(), ExchangeError> {
+        let Some(provider) = &mut self.provider else {
+            return Ok(());
+        };
+        provider.quoting = self
+            .store
+            .net_positions(&provider.policy.participant)?
+            .into_iter()
+            .map(|(id, inventory)| {
+                (
+                    id,
+                    Quoting {
+                        inventory,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        Ok(())
+    }
+
+    /// Lets the liquidity provider quote what is due, in one instrument or all (in ID order): the first ladder, a
+    /// new one when the reference price moved `requote_threshold_ticks` from the last quote, a refill once
+    /// `refill_delay_ms` passed since a fill, or no ladder when the instrument is off, disabled or without a reference
+    /// price. Runs after every order and cancellation, after instrument changes, and on every tick, so on a frozen
+    /// clock what it does depends only on the commands.
+    fn maintain_liquidity(&mut self, only: Option<&InstrumentId>) -> Result<(), ExchangeError> {
+        if self.provider.is_none() {
+            return Ok(());
+        }
+        let mut ids: Vec<InstrumentId> = match only {
+            Some(id) => vec![id.clone()],
+            None => self.books.keys().cloned().collect(),
+        };
+        ids.sort();
+        let now = self.now();
+        for id in ids {
+            self.requote(&id, now)?;
+        }
+        Ok(())
+    }
+
+    /// Quotes one instrument if due (see [`Exchange::maintain_liquidity`]). The old ladder is cancelled and the new
+    /// one placed as one commit group, inside the caller's group if one is open, so no order ever sees half a ladder.
+    fn requote(&mut self, id: &InstrumentId, now: DateTime<Utc>) -> Result<(), ExchangeError> {
+        let Some(book) = self.books.get(id) else {
+            return Ok(());
+        };
+        let instrument = book.instrument().clone();
+        let provider = self.provider.as_ref().expect("checked by the caller");
+        let lp = provider.policy.participant.clone();
+        let settings = instrument
+            .liquidity
+            .clone()
+            .unwrap_or_default()
+            .or(&provider.policy.default)
+            .resolve();
+        let state = provider.quoting.get(id).cloned().unwrap_or_default();
+        let mut resting: Vec<Order> = book
+            .orders()
+            .filter(|o| o.participant_id == lp)
+            .cloned()
+            .collect();
+        resting.sort_by_key(|o| o.sequence);
+        let reference = match (settings.mode, instrument.enabled) {
+            (crate::liquidity::LiquidityMode::On, true) => {
+                self.prices.reference(id, now).map(|r| r.ticks)
+            }
+            _ => None,
+        };
+        let lot = instrument.lot_size;
+        let wanted =
+            reference.map(|r| settings.ladder(r, state.inventory / lot.max(1) as i64, lot));
+        let due = match (reference, state.quoted_at) {
+            (None, _) => !resting.is_empty(),
+            (Some(_), None) => true,
+            (Some(r), Some(quoted)) => {
+                (r - quoted).abs() >= i64::from(settings.requote_threshold_ticks)
+                    || state.filled_at.is_some_and(|at| {
+                        now >= at + chrono::Duration::milliseconds(settings.refill_delay_ms as i64)
+                    })
+            }
+        };
+        if !due {
+            return Ok(());
+        }
+        let wanted = wanted.unwrap_or_default();
+        let unchanged = resting.len() == wanted.len()
+            && resting.iter().zip(&wanted).all(|(order, quote)| {
+                order.side == quote.side
+                    && order.limit_price_ticks == Some(quote.price_ticks)
+                    && order.remaining_quantity == quote.quantity
+            });
+        if !unchanged {
+            if !wanted.is_empty() && !self.participants.contains_key(&lp) {
+                self.register_participant(Participant {
+                    id: lp.clone(),
+                    name: "Liquidity provider".into(),
+                    settlement: None,
+                })?;
+            }
+            let own_group = self.group.is_none();
+            if own_group {
+                self.begin_group()?;
+            }
+            let replaced = self.replace_ladder(&instrument.id, &lp, &resting, &wanted);
+            if own_group {
+                // What was written is applied in memory too, so commit it even when a step failed.
+                self.commit_group()?;
+            }
+            replaced?;
+            ::metrics::counter!(crate::metrics::LIQUIDITY_REQUOTES, "instrument" => id.0.clone())
+                .increment(1);
+            ::metrics::counter!(crate::metrics::LIQUIDITY_QUOTES).increment(wanted.len() as u64);
+        }
+        let quoting = self
+            .provider
+            .as_mut()
+            .expect("checked by the caller")
+            .quoting
+            .entry(id.clone())
+            .or_default();
+        quoting.quoted_at = reference;
+        quoting.filled_at = None;
+        Ok(())
+    }
+
+    /// Cancels the provider's resting orders and places `wanted`, bids then asks, best first.
+    fn replace_ladder(
+        &mut self,
+        instrument: &InstrumentId,
+        lp: &ParticipantId,
+        resting: &[Order],
+        wanted: &[crate::liquidity::Quote],
+    ) -> Result<(), ExchangeError> {
+        for order in resting {
+            self.cancel_order(order.id)?;
+        }
+        for quote in wanted {
+            self.submit_order(SubmitOrder {
+                client_order_id: None,
+                instrument_id: instrument.clone(),
+                participant_id: lp.clone(),
+                side: quote.side,
+                order_type: OrderType::Limit,
+                limit_price_ticks: Some(quote.price_ticks),
+                quantity: quote.quantity,
             })?;
         }
         Ok(())
@@ -697,7 +902,15 @@ impl Exchange {
     /// Sequences, matches and commits an order. Malformed orders are refused without a sequence; orders the exchange
     /// rejects (self-trade) are sequenced and stored as `REJECTED`. A repeated client order ID returns the original
     /// order if the terms match and fails otherwise.
+    /// Matches an order, commits it, and then lets the liquidity provider react (refill, re-quote) to what it did.
     pub fn submit(&mut self, command: SubmitOrder) -> Result<SubmitOutcome, ExchangeError> {
+        let instrument_id = command.instrument_id.clone();
+        let outcome = self.submit_order(command)?;
+        self.maintain_liquidity(Some(&instrument_id))?;
+        Ok(outcome)
+    }
+
+    fn submit_order(&mut self, command: SubmitOrder) -> Result<SubmitOutcome, ExchangeError> {
         let book = self
             .books
             .get(&command.instrument_id)
@@ -792,8 +1005,14 @@ impl Exchange {
         Ok(())
     }
 
-    /// Cancels the remaining quantity of an active order.
+    /// Cancels the remaining quantity of an active order, then lets the liquidity provider react.
     pub fn cancel(&mut self, order_id: Uuid) -> Result<BookUpdate, ExchangeError> {
+        let update = self.cancel_order(order_id)?;
+        self.maintain_liquidity(Some(&update.order.instrument_id))?;
+        Ok(update)
+    }
+
+    fn cancel_order(&mut self, order_id: Uuid) -> Result<BookUpdate, ExchangeError> {
         let Some(book) = self
             .books
             .values()
@@ -946,6 +1165,7 @@ impl Exchange {
         self.epoch += 1;
         // Configuration-declared subscriptions and instruments come back, as on a new database.
         self.reconcile_webhooks()?;
+        self.start_liquidity()?;
         self.reconcile_instruments()?;
         tracing::info!(epoch = self.epoch, "exchange state reset");
         Ok(())
@@ -998,7 +1218,12 @@ impl Exchange {
                         total += self.clearing_step(due)?;
                     }
                 }
-                _ => return Ok(total + self.settlement_step(now)?),
+                _ => {
+                    total += self.settlement_step(now)?;
+                    // Time moved: reference prices with it, and refill delays ran out.
+                    self.maintain_liquidity(None)?;
+                    return Ok(total);
+                }
             }
         }
     }
@@ -1337,6 +1562,15 @@ impl Exchange {
         let participants = &self.participants;
         let lookup = |id: &ParticipantId| participants.get(id).cloned().flatten();
         let mut new_events = events::for_update(command, &update, instrument, &lookup, now);
+        if let Some(provider) = &self.provider
+            && !provider.policy.emit_order_events
+        {
+            // The provider's order lifecycle stays out of the log (SR-10); its trades stay in.
+            let lp = provider.policy.participant.0.as_str();
+            new_events.retain(|e| {
+                e.event_type == events::TRADE_EXECUTED || e.payload["participantId"] != lp
+            });
+        }
         let mut next = NewEvent::stamp(&mut new_events, self.next_event_sequence, self.ids);
         let settlement_plan = match &self.settlement {
             Some(simulator) if !update.executions.is_empty() => {
@@ -1382,6 +1616,24 @@ impl Exchange {
         book.apply(&update)
             .expect("nothing else touched the book between plan and apply");
         self.last_sequence = self.last_sequence.max(update.order.sequence);
+        if let Some(provider) = &mut self.provider {
+            let lp = &provider.policy.participant;
+            for execution in &update.executions {
+                let signed = match (&execution.buyer_id, &execution.seller_id) {
+                    (buyer, _) if buyer == lp => execution.quantity as i64,
+                    (_, seller) if seller == lp => -(execution.quantity as i64),
+                    _ => continue,
+                };
+                let quoting = provider
+                    .quoting
+                    .entry(update.order.instrument_id.clone())
+                    .or_default();
+                quoting.inventory += signed;
+                quoting.filled_at = Some(now);
+                ::metrics::counter!(crate::metrics::LIQUIDITY_FILLS, "instrument" => update.order.instrument_id.0.clone())
+                    .increment(1);
+            }
+        }
         if let (Some(plan), Some(simulator)) = (&settlement_plan, self.settlement.as_mut()) {
             simulator.apply(plan);
             ::metrics::gauge!(crate::metrics::SETTLEMENT_OPEN).set(simulator.open() as f64);

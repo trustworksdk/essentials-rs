@@ -26,6 +26,7 @@ fn instrument(id: &str, price_source: Option<PriceSourceSpec>) -> InstrumentConf
         enabled: true,
         reference_symbol: None,
         price_source,
+        liquidity: None,
     }
 }
 

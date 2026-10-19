@@ -138,13 +138,15 @@ impl Store {
             insert_instrument(&tx, instrument)?;
         } else {
             tx.prepare_cached(
-                "UPDATE instruments SET enabled = ?2, reference_symbol = ?3, price_source = ?4 WHERE id = ?1",
+                "UPDATE instruments SET enabled = ?2, reference_symbol = ?3, price_source = ?4, liquidity = ?5
+                 WHERE id = ?1",
             )?
             .execute(params![
                 instrument.id.0,
                 instrument.enabled,
                 instrument.reference_symbol,
                 price_source_json(instrument),
+                liquidity_json(instrument),
             ])?;
         }
         if let Some(since) = price_source_since {
@@ -178,7 +180,7 @@ impl Store {
         self.conn
             .prepare_cached(
                 "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size, enabled,
-                        reference_symbol, price_source
+                        reference_symbol, price_source, liquidity
                  FROM instruments
                  WHERE (?1 IS NULL OR symbol = ?1) AND (?2 IS NULL OR mic = ?2)
                    AND (?3 IS NULL OR isin = ?3) AND (?4 IS NULL OR cusip = ?4)
@@ -192,7 +194,7 @@ impl Store {
         self.conn
             .prepare_cached(
                 "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size, enabled,
-                        reference_symbol, price_source
+                        reference_symbol, price_source, liquidity
                  FROM instruments WHERE id = ?1",
             )?
             .query_row([&id.0], instrument_row)
@@ -683,6 +685,24 @@ impl Store {
         )
     }
 
+    /// A participant's net traded quantity per instrument (bought minus sold), for instruments it traded.
+    pub fn net_positions(
+        &self,
+        participant: &ParticipantId,
+    ) -> rusqlite::Result<Vec<(InstrumentId, i64)>> {
+        self.conn
+            .prepare_cached(
+                "SELECT instrument_id,
+                        SUM(CASE WHEN buyer_id = ?1 THEN quantity ELSE -quantity END)
+                 FROM executions WHERE buyer_id = ?1 OR seller_id = ?1
+                 GROUP BY instrument_id ORDER BY instrument_id",
+            )?
+            .query_map([&participant.0], |row| {
+                Ok((InstrumentId(row.get(0)?), row.get(1)?))
+            })?
+            .collect()
+    }
+
     /// The buyer and seller of an execution; `None` when there is no such execution.
     pub fn execution_parties(&self, id: Uuid) -> rusqlite::Result<Option<(String, String)>> {
         self.conn
@@ -1006,7 +1026,22 @@ fn instrument_row(row: &Row<'_>) -> rusqlite::Result<Instrument> {
                 })
             })
             .transpose()?,
+        liquidity: row
+            .get::<_, Option<String>>(12)?
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(12, Type::Text, Box::new(e))
+                })
+            })
+            .transpose()?,
     })
+}
+
+fn liquidity_json(instrument: &Instrument) -> Option<String> {
+    instrument
+        .liquidity
+        .as_ref()
+        .map(|spec| serde_json::to_string(spec).expect("liquidity settings serialize"))
 }
 
 fn price_source_json(instrument: &Instrument) -> Option<String> {
@@ -1029,8 +1064,8 @@ fn set_price_source_since(
 fn insert_instrument(conn: &Connection, instrument: &Instrument) -> rusqlite::Result<()> {
     conn.prepare_cached(
         "INSERT INTO instruments (id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size,
-                                  enabled, reference_symbol, price_source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                  enabled, reference_symbol, price_source, liquidity)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
     )?
     .execute(params![
         instrument.id.0,
@@ -1045,6 +1080,7 @@ fn insert_instrument(conn: &Connection, instrument: &Instrument) -> rusqlite::Re
         instrument.enabled,
         instrument.reference_symbol,
         price_source_json(instrument),
+        liquidity_json(instrument),
     ])
     .map(drop)
 }

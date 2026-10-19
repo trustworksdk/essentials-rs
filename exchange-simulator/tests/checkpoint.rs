@@ -77,6 +77,7 @@ fn trade(exchange: &mut Exchange) {
             enabled: true,
             reference_symbol: None,
             price_source: None,
+            liquidity: None,
         })
         .unwrap();
     for id in ["A", "B"] {

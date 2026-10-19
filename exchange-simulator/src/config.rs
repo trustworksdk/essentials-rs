@@ -30,6 +30,9 @@ pub struct Config {
     /// Reference prices (plan item 6.2).
     #[serde(default)]
     pub price_sources: PriceSourcesConfig,
+    /// The built-in liquidity provider (plan item 6.7).
+    #[serde(default)]
+    pub liquidity: LiquidityConfig,
     pub ids: IdsConfig,
     pub settlement: SettlementConfig,
     #[serde(default)]
@@ -259,6 +262,51 @@ pub enum SettlementMode {
     Both,
 }
 
+/// The built-in liquidity provider (see [`crate::liquidity`]).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiquidityConfig {
+    /// The participant it trades as.
+    #[serde(default = "provider_id")]
+    pub participant_id: String,
+    /// Publish its order lifecycle in the event log and over webhooks; its trades are published either way.
+    #[serde(default)]
+    pub emit_order_events: bool,
+    /// What an instrument's own `liquidity` leaves out, field by field.
+    #[serde(default)]
+    pub default: crate::liquidity::LiquiditySpec,
+}
+
+fn provider_id() -> String {
+    "LP".into()
+}
+
+impl Default for LiquidityConfig {
+    fn default() -> Self {
+        Self {
+            participant_id: provider_id(),
+            emit_order_events: false,
+            default: Default::default(),
+        }
+    }
+}
+
+impl LiquidityConfig {
+    pub fn policy(&self) -> Result<crate::engine::LiquidityPolicy, String> {
+        if self.participant_id.trim().is_empty() {
+            return Err("liquidity.participant_id must not be blank".into());
+        }
+        self.default
+            .validate()
+            .map_err(|e| format!("liquidity.default: {e}"))?;
+        Ok(crate::engine::LiquidityPolicy {
+            participant: crate::domain::ParticipantId(self.participant_id.clone()),
+            emit_order_events: self.emit_order_events,
+            default: self.default.clone(),
+        })
+    }
+}
+
 /// Defaults for instruments' price sources (see [`crate::pricing`]).
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -303,6 +351,9 @@ pub struct InstrumentConfig {
     /// The instrument's own price source; fields left out come from `price_sources.default`.
     #[serde(default)]
     pub price_source: Option<crate::pricing::PriceSourceSpec>,
+    /// The instrument's own liquidity settings; fields left out come from `liquidity.default`.
+    #[serde(default)]
+    pub liquidity: Option<crate::liquidity::LiquiditySpec>,
 }
 
 fn one() -> u64 {
@@ -328,6 +379,7 @@ impl From<&InstrumentConfig> for crate::domain::Instrument {
             enabled: c.enabled,
             reference_symbol: c.reference_symbol.clone(),
             price_source: c.price_source.clone(),
+            liquidity: c.liquidity.clone(),
         }
     }
 }
@@ -506,6 +558,48 @@ instruments:
             with_overlay("instruments: [ { id: A, symbol: A, currency: USD, currency_scale: 2, colour: red } ]")
                 .is_err(),
             "unknown fields are rejected"
+        );
+    }
+
+    #[test]
+    fn liquidity_reads_in_snake_case() {
+        let config = with_overlay(
+            r#"
+liquidity:
+  participant_id: MM
+  emit_order_events: true
+  default: { mode: on, spread_bps: 5, level_quantity: 20, refill_delay_ms: 500 }
+instruments:
+  - { id: A, symbol: A, currency: USD, currency_scale: 2, liquidity: { levels: 2, skew_bps_per_lot: 0.5 } }
+"#,
+        )
+        .unwrap();
+        let policy = config.liquidity.policy().unwrap();
+        assert_eq!(policy.participant.0, "MM");
+        assert!(policy.emit_order_events);
+        let own = config.declared_instruments().unwrap()[0]
+            .liquidity
+            .clone()
+            .unwrap();
+        let resolved = own.or(&policy.default).resolve();
+        assert_eq!(
+            (
+                resolved.mode,
+                resolved.levels,
+                resolved.spread_bps,
+                resolved.level_quantity,
+                resolved.refill_delay_ms,
+                resolved.skew_bps_per_lot
+            ),
+            (crate::liquidity::LiquidityMode::On, 2, 5.0, 20, 500, 0.5)
+        );
+        let invalid = with_overlay("liquidity: { default: { levels: 0 } }").unwrap();
+        assert!(
+            invalid
+                .liquidity
+                .policy()
+                .unwrap_err()
+                .contains("liquidity.levels")
         );
     }
 

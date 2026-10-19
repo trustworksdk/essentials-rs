@@ -103,6 +103,25 @@ A source that cannot resolve stops startup with an error naming the instrument, 
 recomputed from when their source was set, with the new parameters, so their reference prices jump. Change an
 instrument's own `price_source` instead to restart its walk from the current time.
 
+## Liquidity provider
+
+A built-in participant quotes a ladder around each instrument's reference price ([README](../README.md#liquidity-provider)).
+It needs a price source, and is off until `mode: on`. A market where every instrument has a counterparty:
+
+```yaml
+price_sources:
+  default: { kind: synthetic, volatility: 0.3 }
+liquidity:
+  participant_id: LP            # the participant it trades as
+  emit_order_events: false      # its order lifecycle stays out of the log; its trades never do
+  default: { mode: on, levels: 5, spread_bps: 10, level_quantity: 100, skew_bps_per_lot: 0.5, max_inventory: 2000 }
+instruments:
+  - { id: AAPL, symbol: AAPL, mic: XNAS, currency: USD, currency_scale: 2, price_source: { initial_price: "187.50" } }
+```
+
+An instrument's own `liquidity` overrides the default field by field; set `liquidity: { mode: off }` on one to leave
+it to client orders only.
+
 ## Webhooks
 
 | Key | Default | |

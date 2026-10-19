@@ -62,6 +62,15 @@ instruments: []
 price_sources:
   seed: 0                     # base of each instrument's derived synthetic seed
   default: { kind: none }
+# The built-in liquidity provider: a participant that quotes a ladder of limit orders around each instrument's
+# reference price. Off unless an instrument's liquidity (or the default here) sets mode: on. Fields: levels,
+# spread_bps, level_step_ticks, level_quantity (lots), level_quantity_growth, requote_threshold_ticks, refill_delay_ms
+# (simulated), skew_bps_per_lot, max_inventory (lots).
+liquidity:
+  participant_id: "LP"
+  # Publish its order lifecycle (accepted, filled, cancelled); its trades are published either way.
+  emit_order_events: false
+  default: { mode: off }
 ids:
   # "random": UUIDv7, different every run. "deterministic": every ID (orders, executions, events, deliveries,
   # subscriptions, reports) is derived from `seed` and the order of commands, so the same commands give the same IDs

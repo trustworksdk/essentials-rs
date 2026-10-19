@@ -10,6 +10,7 @@ use crate::domain::{
     Participant, ParticipantId, Side,
 };
 use crate::engine::{BookSnapshot, Level, RejectReason, SubmitOrder};
+use crate::liquidity::LiquiditySpec;
 use crate::pricing::{PriceSourceSpec, Reference};
 
 fn one() -> u64 {
@@ -31,6 +32,8 @@ pub struct InstrumentPatch {
     pub reference_symbol: Option<Option<String>>,
     #[serde(default, deserialize_with = "present")]
     pub price_source: Option<Option<PriceSourceSpec>>,
+    #[serde(default, deserialize_with = "present")]
+    pub liquidity: Option<Option<LiquiditySpec>>,
 }
 
 impl From<InstrumentPatch> for InstrumentChange {
@@ -39,6 +42,7 @@ impl From<InstrumentPatch> for InstrumentChange {
             enabled: p.enabled,
             reference_symbol: p.reference_symbol,
             price_source: p.price_source,
+            liquidity: p.liquidity,
         }
     }
 }
@@ -71,6 +75,7 @@ pub struct InstrumentRequest {
     pub enabled: bool,
     pub reference_symbol: Option<String>,
     pub price_source: Option<PriceSourceSpec>,
+    pub liquidity: Option<LiquiditySpec>,
 }
 
 impl From<InstrumentRequest> for Instrument {
@@ -88,6 +93,7 @@ impl From<InstrumentRequest> for Instrument {
             enabled: r.enabled,
             reference_symbol: r.reference_symbol,
             price_source: r.price_source,
+            liquidity: r.liquidity,
         }
     }
 }
@@ -109,6 +115,7 @@ pub struct InstrumentView {
     pub enabled: bool,
     pub reference_symbol: Option<String>,
     pub price_source: Option<PriceSourceSpec>,
+    pub liquidity: Option<LiquiditySpec>,
 }
 
 impl From<&Instrument> for InstrumentView {
@@ -127,6 +134,7 @@ impl From<&Instrument> for InstrumentView {
             enabled: i.enabled,
             reference_symbol: i.reference_symbol.clone(),
             price_source: i.price_source.clone(),
+            liquidity: i.liquidity.clone(),
         }
     }
 }

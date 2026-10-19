@@ -1815,6 +1815,48 @@ then 6.11, 6.12, 6.13–6.14.
   forced outcome not stored (the restart test); a following clock accepting changes; a follower moving backwards.
   Two first attempts were malformed (one did not compile, one could not move the clock back) and were redone.
 
+**6.7 — liquidity provider ✅ done (2026-10-19)**
+- **Delivered:**
+  - `src/liquidity`: `LiquiditySpec` (every field optional, merged field by field with `liquidity.default`, then
+    built-in defaults with `mode: off`) and `LiquiditySettings::ladder`, a pure function from reference price,
+    inventory and settings to the ladder. Spread from the skewed mid, rounded away from it (with a millionth-of-a-tick
+    tolerance, see below); levels stepping out; quantities in whole lots growing per level; the side that would grow
+    the position dropped at `max_inventory`.
+  - `liquidity` on instruments: API, configuration, events, storage (migration 017), `changes`. `liquidity:` in the
+    configuration: `participant_id` (default `LP`), `emit_order_events` (default `false`), `default`.
+  - In the exchange (`Provider`): the provider's orders are ordinary limit orders, so matching, storage, settlement and
+    clearing apply unchanged; it is registered as a participant the first time it quotes. `maintain_liquidity` runs
+    after every client order and cancellation, after instrument changes and on every tick. `requote` decides from the
+    reference move against `requote_threshold_ticks`, a refill due after `refill_delay_ms` of simulated time, or a
+    reason to pull (mode off, disabled, no reference). It replaces the ladder by cancelling the old orders and placing
+    the new ones in one commit group: its own, or the caller's when one is open. A ladder identical to the resting one
+    is left alone.
+  - `commit_and_apply` drops the provider's order events before stamping when `emit_order_events` is off, and
+    accounts its inventory from every execution it is party to. Metrics: `exchange_liquidity_quotes_total`,
+    `_requotes_total`, `_fills_total`.
+  - `openapi.yaml` (`Liquidity` schema), the README (Liquidity provider), the configuration guide, `config/default.yaml`.
+  - Tests: `tests/liquidity.rs` (11), unit tests in `src/liquidity` (5), a YAML config test.
+- **Decisions:**
+  - **Re-quoting runs on commands, not on a timer alone.** After every order or cancellation the touched instrument
+    is maintained; the tick handles time (reference moves, refill delays). On a frozen clock the provider's actions
+    depend only on the commands, so a run reproduces byte for byte (tested), which a timer-driven re-quote would
+    break.
+  - **The provider's orders live in the orders table** even when their events are not published. Executions
+    reference both orders, and recovery needs the book. D18 holds: its state is not stored, the inventory is
+    recomputed from its trades (`Store::net_positions`) and the first quote after a restart replaces whatever ladder
+    survived.
+  - **Registered lazily**, at its first quote, so an exchange without liquidity has no extra participant.
+  - **Floating-point tolerance.** `10000 × 1.003` is `10029.999999999998` in floating point. Without a tolerance a
+    short provider's bid came out one tick low; the test for SR-8 caught it.
+- **Deviation:** SR-9 (the stale and closed-market policy) is part of 6.9, as planned. Here the ladder is pulled only
+  for mode off, disabled trading or a missing reference price.
+- **Mutation checks**, each made a test fail: the provider's order events published; the inventory sign flipped; the
+  re-quote threshold ignored; the refill delay ignored; a disabled instrument still quoted; the inventory not
+  recovered; no maintenance after a client order; no inventory limit. Two first survived and exposed gaps in the
+  tests. Every test had the provider selling, so a new test has clients selling to it. The "disabled" case also
+  cleared the settings, so the ladder was pulled for `mode: off`; it now disables only, and asserts that no
+  provider order is refused one by one.
+
 ## Beyond the milestones
 
 **OpenAPI specifications ✅ done (2026-10-17, requested by the user)**
