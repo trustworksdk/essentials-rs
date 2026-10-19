@@ -9,6 +9,7 @@ use chrono::{DateTime, NaiveDate, SubsecRound, Utc};
 use rusqlite::Connection;
 use simulator_kit::calendar::{next_business_day, previous_business_day};
 use simulator_kit::clock::{Clock, ClockError, SystemClock, VirtualClock, wall_now};
+pub use simulator_kit::clock::{ClockChange, ClockState};
 use simulator_kit::events::NewEvent;
 use simulator_kit::ids::IdScheme;
 use simulator_kit::outbox::{self, Outbox};
@@ -37,6 +38,7 @@ pub const EVENT_TYPES: &[&str] = &[
     PAYMENT_FAILED,
     PAYMENT_RETURNED,
     statement::BANK_STATEMENT_ISSUED,
+    simulator_kit::clock::CLOCK_CHANGED,
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -90,25 +92,6 @@ pub struct GatewayOptions {
     pub delivery_signal: Option<Arc<tokio::sync::Notify>>,
     pub webhooks: Vec<DeclaredSubscription>,
     pub webhook_secret_grace: chrono::Duration,
-}
-
-/// How the gateway tells time, for the test-control API.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ClockState {
-    pub virtual_clock: bool,
-    pub running: bool,
-    pub speed: f64,
-    pub now: DateTime<Utc>,
-}
-
-/// A change to the virtual clock.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ClockChange {
-    Advance(chrono::Duration),
-    Set(DateTime<Utc>),
-    Freeze,
-    Resume,
-    Speed(f64),
 }
 
 /// The bank's statements: their policy, the last business date whose cutoff was handled, and late statements waiting.
@@ -520,17 +503,40 @@ impl Gateway {
     pub fn change_clock(&mut self, change: ClockChange) -> Result<ClockState, GatewayError> {
         let clock = self
             .virtual_clock
-            .as_ref()
+            .clone()
             .ok_or(GatewayError::ClockNotVirtual)?;
-        match change {
-            ClockChange::Advance(by) => clock.advance(by)?,
-            ClockChange::Set(to) => clock.set(to)?,
-            ClockChange::Freeze => clock.freeze(),
-            ClockChange::Resume => clock.resume(),
-            ClockChange::Speed(speed) => clock.set_speed(speed)?,
-        }
-        outbox::save_virtual_clock(&self.conn, clock.now(), clock.is_running())?;
+        let changed = change.apply(&clock)?;
+        // Whatever became due by the new time happens first, so the log stays in time order; then the new reading
+        // commits with its ClockChanged.
         self.tick()?;
+        if changed {
+            let mut event =
+                simulator_kit::clock::changed_event(&change, &clock, crate::payments::SOURCE);
+            let next = NewEvent::stamp(
+                std::slice::from_mut(&mut event),
+                self.next_event_sequence,
+                self.ids,
+            );
+            let outbox = Outbox {
+                subscriptions: self.webhooks.subscriptions(),
+                simulation_id: self.simulation_id.as_deref(),
+                ids: self.ids,
+                due: wall_now(),
+                schema_version: SCHEMA_VERSION,
+                parties: None,
+            };
+            store::commit_clock(
+                &mut self.conn,
+                clock.now(),
+                clock.is_running(),
+                &event,
+                outbox,
+            )?;
+            self.next_event_sequence = next;
+            ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type)
+                .increment(1);
+            self.signal_deliveries(self.webhooks.delivers(std::slice::from_ref(&event)));
+        }
         Ok(self.clock_state())
     }
 

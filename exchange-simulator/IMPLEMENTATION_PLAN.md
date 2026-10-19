@@ -1715,6 +1715,38 @@ then 6.11, 6.12, 6.13–6.14.
   redelivery ignoring the filter; trades' sides not read; the outcome report without `buyerId`; the gateway
   accepting a filter; a declared filter not reconciled; `PATCH` ignoring `participants`.
 
+**6.4 — operator clock API, `ClockChanged` ✅ done (2026-10-19)**
+- **Delivered:**
+  - The clock moved into `simulator-kit`: `ClockState`, `ClockChange` with `apply`, `VirtualClock::anchor`,
+    `changed_event`, and `api::clock` with a `ClockBackend` trait. `router` mounts `GET /api/clock` always, plus
+    `POST /api/clock/speed`, `/freeze` and `/resume` with `clock.operator_control` (D17). `test_router` mounts
+    `/test/clock*` as before. Both services implement the trait and lost their copies of the clock handlers.
+  - `ClockChanged` (aggregate ID `clock`, the service's own `source`): `change`, `mode`, `running`, `speed`, `now`
+    (the reading at the change) and `effectiveAt` (the real time of it). Both come from the clock's anchor, the exact
+    pair every change records, so a follower's `now + (real time − effectiveAt) × speed` has no skew, even at
+    1,000,000×. Committed in one transaction with the stored reading. Both services emit it; it is in both
+    services' event types, and in the back-office example's gateway subscription.
+  - Both `openapi.yaml` documents: the `/api/clock` routes, `ClockChangedPayload` (shared, identical) and a
+    `ClockChangedEvent` per service. The README has a new "The clock API" section; the configuration guide's demo
+    recipe now uses the operator routes; both default configs have `operator_control: false`.
+  - Tests: `tests/operator_clock.rs` (4); both contract tests exercise the operator routes.
+- **Decisions:**
+  - **What became due on the way comes first.** A clock move runs everything due by the new time, then commits
+    `ClockChanged`. The log stays in time order, which several existing tests check. The first version committed
+    the event first and broke them.
+  - **`effectiveAt` is `null` while the clock is frozen.** A follower then reads `now` and needs no real time, and
+    real time stays out of the byte-identical log of a reproducible run on a frozen clock (D6). The first version
+    always carried it and broke the reproducibility tests.
+  - **Changes that alter nothing publish nothing:** freezing a frozen clock, resuming a running one, the same speed.
+  - **A reset publishes nothing.** It empties the log; a follower reads `GET /api/clock` after one.
+  - **A speed set at runtime still lasts until a restart**, as before; the configuration's speed then applies.
+- **Deviation:** none from the 6.4 row.
+- **Mutation checks**, each made a test fail: no-op changes publishing; real time while frozen; `effectiveAt` off by
+  a minute (the follower test); the operator routes mounted without the switch; `ClockChanged` committed before what
+  became due (the time-order test); the gateway publishing nothing.
+- **Known limit:** on a running, very fast clock, an item that falls due between the change and the run of due work
+  can be stamped a little after `ClockChanged`'s `now`. A frozen clock, the reproducible setup, is exact.
+
 ## Beyond the milestones
 
 **OpenAPI specifications ✅ done (2026-10-17, requested by the user)**

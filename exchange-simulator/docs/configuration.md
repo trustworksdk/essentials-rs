@@ -238,8 +238,10 @@ is briefly down catches up as usual. Points to keep in mind:
   slower than the exchange's.
 - **A restart keeps simulated time** (it continues from the latest event) and the configured speed. For a fresh run,
   remove the database volume, or call `POST /test/reset` where test control is enabled.
-- **To change the speed during a demo**, enable test control and call `POST /test/clock/speed`. A showcase deployment
-  sets `clock.speed` in its configuration instead, so it does not expose `/test`.
+- **To change the speed during a demo**, set `clock.operator_control: true` and call `POST /api/clock/speed` (or
+  `/freeze` and `/resume`). This does not expose `/test`, so a showcase deployment can use it.
+- **To follow the exchange's time**, read `GET /api/clock` at startup and subscribe to `ClockChanged`; the
+  [README](../README.md#the-clock-api) has the formula.
 
 **Back-office demo: statements to reconcile, with a few breaks.** Add to the short-demo recipe:
 

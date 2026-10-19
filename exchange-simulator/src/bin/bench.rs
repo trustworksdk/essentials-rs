@@ -652,6 +652,7 @@ impl Service {
                 start: None,
                 running: false,
                 speed: 1.0,
+                operator_control: false,
             },
             ids: IdsConfig::default(),
             settlement: SettlementConfig::default(),

@@ -114,6 +114,9 @@ clock:
   # Virtual clock only: simulated seconds per real second while it runs. 1440 makes a day pass in a minute, for
   # demos that settle T+1 trades within a minute or two. The system clock accepts only 1.
   speed: 1
+  # Mounts POST /api/clock/speed, /freeze and /resume, for changing a showcase's clock without test control.
+  # GET /api/clock is always mounted.
+  operator_control: false
 test_control:
   # Mounts /test/... (virtual clock controls). Never enable outside test deployments.
   enabled: false

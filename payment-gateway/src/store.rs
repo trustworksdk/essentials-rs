@@ -94,6 +94,20 @@ fn upsert_payment(conn: &Connection, p: &Payment) -> rusqlite::Result<()> {
     .map(drop)
 }
 
+/// Stores the virtual clock's reading with its `ClockChanged` (and outbox rows), atomically.
+pub fn commit_clock(
+    conn: &mut Connection,
+    now: DateTime<Utc>,
+    running: bool,
+    event: &NewEvent,
+    outbox: Outbox<'_>,
+) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    simulator_kit::outbox::save_virtual_clock(&tx, now, running)?;
+    simulator_kit::outbox::write_events(&tx, std::slice::from_ref(event), &outbox)?;
+    tx.commit()
+}
+
 /// Writes payments' new states, the bookings they make and their events (with outbox rows), atomically.
 pub fn commit_payments(
     conn: &mut Connection,

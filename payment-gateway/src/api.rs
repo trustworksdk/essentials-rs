@@ -200,18 +200,24 @@ pub fn router(state: AppState) -> Router {
         .merge(simulator_kit::api::webhooks::router(state))
 }
 
+/// The shared clock routes run on the gateway.
+impl simulator_kit::api::clock::ClockBackend for AppState {
+    async fn clock_state(&self) -> Result<ClockState, ApiError> {
+        self.run(|g| Ok(g.clock_state())).await
+    }
+
+    async fn change_clock(&self, change: ClockChange) -> Result<ClockState, ApiError> {
+        self.run(move |g| g.change_clock(change)).await
+    }
+}
+
 /// The routes under `/test`: clock control, reset, statement breaks, and the shared webhook test routes.
 pub fn test_router(state: AppState) -> Router {
     Router::new()
-        .route("/test/clock", get(clock))
-        .route("/test/clock/advance", post(advance))
-        .route("/test/clock/set", post(set_clock))
-        .route("/test/clock/freeze", post(freeze))
-        .route("/test/clock/resume", post(resume))
-        .route("/test/clock/speed", post(speed))
         .route("/test/reset", post(reset))
         .route("/test/statements/breaks", get(breaks))
         .with_state(state.clone())
+        .merge(simulator_kit::api::clock::test_router(state.clone()))
         .merge(simulator_kit::api::webhooks::test_router(state))
 }
 
@@ -448,109 +454,6 @@ async fn breaks(
         .collect();
     views.sort_by(|a, b| (a.business_date, &a.currency).cmp(&(b.business_date, &b.currency)));
     Ok(Json(views))
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ClockView {
-    mode: &'static str,
-    running: bool,
-    speed: f64,
-    now: DateTime<Utc>,
-}
-
-impl From<ClockState> for ClockView {
-    fn from(state: ClockState) -> Self {
-        Self {
-            mode: if state.virtual_clock {
-                "virtual"
-            } else {
-                "system"
-            },
-            running: state.running,
-            speed: state.speed,
-            now: state.now,
-        }
-    }
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AdvanceRequest {
-    #[serde(default)]
-    days: u32,
-    #[serde(default)]
-    hours: u32,
-    #[serde(default)]
-    minutes: u32,
-    #[serde(default)]
-    seconds: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SetRequest {
-    to: DateTime<Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SpeedRequest {
-    speed: f64,
-}
-
-async fn clock(State(state): State<AppState>) -> Result<Json<ClockView>, ApiError> {
-    Ok(Json(state.run(|g| Ok(g.clock_state())).await?.into()))
-}
-
-async fn advance(
-    State(state): State<AppState>,
-    body: Result<Json<AdvanceRequest>, JsonRejection>,
-) -> Result<Json<ClockView>, ApiError> {
-    let Json(body) = body?;
-    let seconds =
-        i64::try_from(body.seconds).map_err(|_| ApiError::bad_request("seconds is too large"))?;
-    let by = chrono::Duration::days(i64::from(body.days))
-        + chrono::Duration::hours(i64::from(body.hours))
-        + chrono::Duration::minutes(i64::from(body.minutes))
-        + chrono::Duration::try_seconds(seconds)
-            .ok_or_else(|| ApiError::bad_request("seconds is too large"))?;
-    if by <= chrono::Duration::zero() {
-        return Err(ApiError::bad_request(
-            "advance by a positive amount of days, hours, minutes or seconds",
-        ));
-    }
-    change(&state, ClockChange::Advance(by)).await
-}
-
-async fn set_clock(
-    State(state): State<AppState>,
-    body: Result<Json<SetRequest>, JsonRejection>,
-) -> Result<Json<ClockView>, ApiError> {
-    let Json(body) = body?;
-    change(&state, ClockChange::Set(body.to)).await
-}
-
-async fn freeze(State(state): State<AppState>) -> Result<Json<ClockView>, ApiError> {
-    change(&state, ClockChange::Freeze).await
-}
-
-async fn resume(State(state): State<AppState>) -> Result<Json<ClockView>, ApiError> {
-    change(&state, ClockChange::Resume).await
-}
-
-async fn speed(
-    State(state): State<AppState>,
-    body: Result<Json<SpeedRequest>, JsonRejection>,
-) -> Result<Json<ClockView>, ApiError> {
-    let Json(body) = body?;
-    change(&state, ClockChange::Speed(body.speed)).await
-}
-
-async fn change(state: &AppState, change: ClockChange) -> Result<Json<ClockView>, ApiError> {
-    Ok(Json(
-        state.run(move |g| g.change_clock(change)).await?.into(),
-    ))
 }
 
 async fn reset(State(state): State<AppState>) -> Result<StatusCode, ApiError> {

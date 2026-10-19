@@ -443,13 +443,18 @@ async fn a_return_due_before_a_slow_payment_completes_comes_first_in_the_log() {
                 format!(
                     "{} {}",
                     e["eventType"].as_str().unwrap(),
-                    e["payload"]["idempotencyKey"].as_str().unwrap()
+                    e["payload"]["idempotencyKey"].as_str().unwrap_or("-")
                 ),
             )
         })
         .collect();
     assert!(log.is_sorted_by_key(|(at, _)| at.clone()), "{log:#?}");
-    assert_eq!(log.len(), 6, "{log:#?}");
+    assert_eq!(log.len(), 7, "{log:#?}");
+    assert_eq!(
+        log.last().unwrap().1,
+        "ClockChanged -",
+        "the clock move comes after what became due on the way"
+    );
     app.stop().await;
 }
 

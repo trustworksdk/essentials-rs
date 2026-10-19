@@ -29,6 +29,8 @@ pub const ORDER_CANCELLED: &str = "OrderCancelled";
 pub const TRADE_EXECUTED: &str = "TradeExecuted";
 /// An instrument was listed, through the API or from configuration.
 pub const INSTRUMENT_LISTED: &str = "InstrumentListed";
+/// The virtual clock changed: speed, freeze, resume, set or advance (`source: "exchange"`).
+pub use simulator_kit::clock::CLOCK_CHANGED;
 /// A listed instrument changed (trading enabled or disabled, reference symbol).
 pub const INSTRUMENT_UPDATED: &str = "InstrumentUpdated";
 
@@ -54,6 +56,7 @@ pub const EVENT_TYPES: &[&str] = &[
     TRADE_EXECUTED,
     INSTRUMENT_LISTED,
     INSTRUMENT_UPDATED,
+    CLOCK_CHANGED,
     SETTLEMENT_PENDING,
     SETTLEMENT_COMPLETED,
     SETTLEMENT_FAILED,

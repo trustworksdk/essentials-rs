@@ -30,7 +30,7 @@ variables (`__` between levels, e.g. `GATEWAY__SERVER__BIND=0.0.0.0:8081`).
 | `statement.tick_interval_ms` | `250` | How often due transitions and statements are looked for |
 | `webhooks.*` | as in the exchange simulator | Delivery timing and declared subscriptions; a `participants` filter is refused, since payments have no participants |
 | `ids.mode` / `ids.seed` | `random` / `0` | `deterministic` makes every ID reproducible |
-| `clock.mode`, `start`, `running`, `speed` | `system` | As in the exchange simulator; `speed: 1440` makes a day pass in a minute |
+| `clock.mode`, `start`, `running`, `speed`, `operator_control` | `system` | As in the exchange simulator; `speed: 1440` makes a day pass in a minute. `GET /api/clock` is always mounted, the operator routes and `ClockChanged` too (see the exchange's README, The clock API) |
 | `test_control.enabled` | `false` | Mounts `/test`; never in a real deployment |
 | `database.mode`, `path` | `durable`, `data/payment-gateway.db` | `durable`, `fast` or `memory`, as in the exchange simulator |
 

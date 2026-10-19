@@ -20,6 +20,6 @@ webhooks:
   subscriptions:
     - name: payments
       url: http://receiver:9000/hooks/gateway
-      event_types: [PaymentPending, PaymentCompleted, PaymentFailed, PaymentReturned, BankStatementIssued]
+      event_types: [PaymentPending, PaymentCompleted, PaymentFailed, PaymentReturned, BankStatementIssued, ClockChanged]
       secret_file: /run/secrets/webhook_secret
       ordered: true

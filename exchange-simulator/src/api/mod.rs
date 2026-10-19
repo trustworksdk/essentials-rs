@@ -96,6 +96,20 @@ pub fn router(state: AppState) -> Router {
         .merge(simulator_kit::api::webhooks::router(state))
 }
 
+/// The shared clock routes run on the exchange thread.
+impl simulator_kit::api::clock::ClockBackend for AppState {
+    async fn clock_state(&self) -> Result<crate::engine::ClockState, ApiError> {
+        Ok(self.dispatcher.clock_state().await?)
+    }
+
+    async fn change_clock(
+        &self,
+        change: crate::engine::ClockChange,
+    ) -> Result<crate::engine::ClockState, ApiError> {
+        Ok(self.dispatcher.change_clock(change).await?)
+    }
+}
+
 /// The shared webhook routes run on the exchange: changes through the dispatcher, queries on the read connection.
 impl simulator_kit::api::webhooks::WebhookBackend for AppState {
     async fn register(

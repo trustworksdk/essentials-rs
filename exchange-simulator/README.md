@@ -628,6 +628,30 @@ Event sequences are assigned by the single writer, and event IDs follow from the
 happens in the trade's own transaction, so where `SettlementPending` lands in the log depends on the commands alone,
 not on a background tick.
 
+## The clock API
+
+`GET /api/clock` is always mounted: `{ "mode": "virtual"|"system", "running", "speed", "now" }`, for a consumer that
+follows the exchange's simulated time. With `clock.operator_control: true` (decision D17), operators can also change
+it without enabling test control, which would expose reset and fault injection:
+
+| Method | Path | Body | Effect |
+|---|---|---|---|
+| POST | `/api/clock/speed` | `{ "speed": 1440 }` | Change the speed from the current reading on; out of range is `400 invalid_clock_speed` |
+| POST | `/api/clock/freeze` / `/api/clock/resume` | – | Stop the clock, or let it run at its speed |
+
+Setting and advancing the clock stay under `/test`. With the system clock every change is `409 clock_not_virtual`.
+
+**`ClockChanged`** (`source: "exchange"`, aggregate ID `clock`) is published for every change that alters the clock,
+from either API: `change` (`advance`, `set`, `freeze`, `resume`, `speed`), `mode`, `running`, `speed`, `now` (the
+reading at the change) and `effectiveAt` (the real time of it). A follower computes simulated time as
+`now + (real time − effectiveAt) × speed` while `running`, and `now` while frozen, without polling. Details:
+- **No-ops publish nothing:** freezing a frozen clock, resuming a running one, the speed it already has.
+- **`effectiveAt` is `null` while frozen**, when the follower does not need it, so real time stays out of the
+  reproducible log of a run on a frozen clock.
+- **What became due on the way comes first:** a clock move first issues everything due by the new time (settlement
+  transitions, statements), then `ClockChanged`, so the log stays in time order.
+- **A reset publishes nothing:** read `GET /api/clock` after one.
+
 ## Test control
 
 With `test_control.enabled: true`, routes under `/test` control simulated time, show webhook deliveries and attempts,
@@ -668,7 +692,8 @@ The `/test/clock` routes change the clock only with `clock.mode: virtual`; with 
   settlement dates and clearing cutoffs.
 - **It never moves backwards.** Its state is stored, so a restart resumes simulated time where it was: at the stored
   reading or the latest event the exchange or the simulator stamped, whichever is later. Running or frozen is kept;
-  the speed is the configured one again (a speed changed through `/test/clock/speed` lasts until a restart or reset).
+  the speed is the configured one again (a speed changed through `/api/clock/speed` or `/test/clock/speed` lasts until
+  a restart or reset).
 - **Speed:** a running virtual clock moves `clock.speed` simulated seconds per real second. Everything on domain time
   follows: order and event timestamps, T+N business days and weekends. With `speed: 1440`, `running: true` and the
   T+1 default, a trade made at 09:00 settles at the next midnight, about 37 real seconds later, with no clock calls.

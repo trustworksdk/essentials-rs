@@ -447,6 +447,20 @@ impl Store {
         outbox::save_virtual_clock(&self.conn, now, running)
     }
 
+    /// Stores the virtual clock's reading with its `ClockChanged`, in one transaction.
+    pub fn commit_clock(
+        &mut self,
+        now: DateTime<Utc>,
+        running: bool,
+        event: &NewEvent,
+        outbox: Outbox<'_>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        outbox::save_virtual_clock(&tx, now, running)?;
+        write_events(&tx, std::slice::from_ref(event), &outbox)?;
+        tx.commit()
+    }
+
     /// Settlement instructions with a transition still to come, for resuming the simulator.
     pub fn open_settlements(&self) -> rusqlite::Result<Vec<Instruction>> {
         self.conn

@@ -24,6 +24,7 @@ use crate::webhooks::{
     DeclaredSubscription, DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription,
     WebhookChange, WebhookError, WebhookHub,
 };
+pub use simulator_kit::clock::{ClockChange, ClockState};
 
 /// The settlement simulator's name in `consumer_offsets`.
 pub const SETTLEMENT_CONSUMER: &str = "settlement-simulator";
@@ -200,26 +201,6 @@ impl Default for ExchangeOptions {
                 .expect("the empty default is valid"),
         }
     }
-}
-
-/// How the exchange tells time, for the test-control API.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ClockState {
-    pub virtual_clock: bool,
-    pub running: bool,
-    /// Simulated seconds per real second while running; 1 for the system clock.
-    pub speed: f64,
-    pub now: DateTime<Utc>,
-}
-
-/// A change to the virtual clock.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ClockChange {
-    Advance(chrono::Duration),
-    Set(DateTime<Utc>),
-    Freeze,
-    Resume,
-    Speed(f64),
 }
 
 /// The persistence coordinator: owns the order books and the single SQLite writer, and serializes every command.
@@ -1226,19 +1207,35 @@ impl Exchange {
     pub fn change_clock(&mut self, change: ClockChange) -> Result<ClockState, ExchangeError> {
         let clock = self
             .virtual_clock
-            .as_ref()
+            .clone()
             .ok_or(ExchangeError::ClockNotVirtual)?;
-        match change {
-            ClockChange::Advance(by) => clock.advance(by)?,
-            ClockChange::Set(to) => clock.set(to)?,
-            ClockChange::Freeze => clock.freeze(),
-            ClockChange::Resume => clock.resume(),
-            ClockChange::Speed(speed) => clock.set_speed(speed)?,
-        }
-        self.store
-            .save_virtual_clock(clock.now(), clock.is_running())?;
-        // Whatever became due by the new time happens before the caller hears back.
+        let changed = change.apply(&clock)?;
+        // Whatever became due by the new time happens first, so the log stays in time order; then the new reading
+        // commits with its ClockChanged.
         self.tick()?;
+        if changed {
+            let mut event =
+                simulator_kit::clock::changed_event(&change, &clock, events::EXCHANGE_SOURCE);
+            let next = NewEvent::stamp(
+                std::slice::from_mut(&mut event),
+                self.next_event_sequence,
+                self.ids,
+            );
+            let outbox = Outbox {
+                subscriptions: self.webhooks.subscriptions(),
+                simulation_id: self.simulation_id.as_deref(),
+                ids: self.ids,
+                due: wall_now(),
+                schema_version: events::SCHEMA_VERSION,
+                parties: self.webhooks.parties(),
+            };
+            self.store
+                .commit_clock(clock.now(), clock.is_running(), &event, outbox)?;
+            self.next_event_sequence = next;
+            ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type)
+                .increment(1);
+            self.wake_delivery(std::slice::from_ref(&event));
+        }
         Ok(self.clock_state())
     }
 

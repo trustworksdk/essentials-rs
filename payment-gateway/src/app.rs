@@ -101,7 +101,13 @@ impl App {
             ),
         ];
         let state = AppState::new(writer, reader, metrics, mode);
-        let mut router = api::router(state.clone());
+        let mut router = api::router(state.clone()).merge(simulator_kit::api::clock::router(
+            state.clone(),
+            config.clock.operator_control,
+        ));
+        if config.clock.operator_control {
+            tracing::info!("clock operator control enabled under /api/clock");
+        }
         if config.test_control.enabled {
             tracing::warn!(
                 "test-control API enabled under /test; never expose this outside test deployments"

@@ -36,6 +36,8 @@ tags:
     description: The settlement simulator's instructions and externally reported outcomes.
   - name: clearing
     description: End-of-day clearing statements.
+  - name: clock
+    description: Simulated time, readable always; speed, freeze and resume with `clock.operator_control`.
   - name: webhooks
     description: Webhook subscriptions and their maintenance. Shared with the payment gateway.
   - name: test-control
@@ -637,6 +639,58 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/ClearingBreaks" }
         "400": { $ref: "#/components/responses/BadRequest" }
+  /api/clock:
+    get:
+      tags: [clock]
+      operationId: getOperatorClock
+      summary: How the service tells time
+      description: Always mounted, so a consumer can follow simulated time. Changes are also published as `ClockChanged`.
+      responses:
+        "200": { $ref: "#/components/responses/Clock" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /api/clock/freeze:
+    post:
+      tags: [clock]
+      operationId: freezeOperatorClock
+      summary: Stop the virtual clock
+      description: Only with `clock.operator_control`. Publishes `ClockChanged` unless the clock was already frozen.
+      responses:
+        "200": { $ref: "#/components/responses/Clock" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /api/clock/resume:
+    post:
+      tags: [clock]
+      operationId: resumeOperatorClock
+      summary: Let the virtual clock run at its speed
+      description: Only with `clock.operator_control`. Publishes `ClockChanged` unless the clock was already running.
+      responses:
+        "200": { $ref: "#/components/responses/Clock" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /api/clock/speed:
+    post:
+      tags: [clock]
+      operationId: setOperatorClockSpeed
+      summary: Change how fast the virtual clock runs
+      description: |
+        Only with `clock.operator_control`. From the current reading on; out of range is `400 invalid_clock_speed`.
+        Publishes `ClockChanged` unless the speed is unchanged. Setting and advancing the clock stay under `/test`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [speed]
+              properties:
+                speed: { type: number, exclusiveMinimum: 0, maximum: 1000000 }
+      responses:
+        "200": { $ref: "#/components/responses/Clock" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /test/clock:
     get:
       tags: [test-control]
@@ -881,6 +935,12 @@ webhooks:
       operationId: onInstrumentUpdated
       requestBody: { $ref: "#/components/requestBodies/InstrumentUpdatedEvent" }
       responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
+  ClockChanged:
+    post:
+      summary: The virtual clock changed speed, froze, resumed, or was set or advanced (`source` is `exchange`)
+      operationId: onClockChanged
+      requestBody: { $ref: "#/components/requestBodies/ClockChangedEvent" }
+      responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
   SettlementPending:
     post:
       summary: A settlement instruction was created
@@ -1020,6 +1080,8 @@ components:
       content: { application/json: { schema: { $ref: "#/components/schemas/InstrumentListedEvent" } } }
     InstrumentUpdatedEvent:
       content: { application/json: { schema: { $ref: "#/components/schemas/InstrumentUpdatedEvent" } } }
+    ClockChangedEvent:
+      content: { application/json: { schema: { $ref: "#/components/schemas/ClockChangedEvent" } } }
     SettlementPendingEvent:
       content: { application/json: { schema: { $ref: "#/components/schemas/SettlementPendingEvent" } } }
     SettlementCompletedEvent:
@@ -1463,7 +1525,7 @@ components:
 
     EventType:
       enum: [OrderAccepted, OrderRejected, OrderPartiallyFilled, OrderFilled, OrderCancelled, TradeExecuted,
-             InstrumentListed, InstrumentUpdated, SettlementPending, SettlementCompleted, SettlementFailed, SettlementRejected, SettlementDelayed,
+             InstrumentListed, InstrumentUpdated, ClockChanged, SettlementPending, SettlementCompleted, SettlementFailed, SettlementRejected, SettlementDelayed,
              SettlementCorrected, SettlementCancelled, SettlementOutcomeReported, ClearingStatementIssued]
     EventEnvelope:
       type: object
@@ -1627,6 +1689,32 @@ components:
         eventType: { const: TradeExecuted }
         source: { const: exchange }
         payload: { $ref: "#/components/schemas/TradeExecutedPayload" }
+    ClockChangedPayload:
+      type: object
+      additionalProperties: false
+      required: [change, mode, running, speed, now, effectiveAt]
+      description: |
+        The clock after a change. A follower computes simulated time as `now + (real time − effectiveAt) × speed`
+        while `running`, and `now` while frozen (then `effectiveAt` is `null`, so real time stays out of the log of a
+        reproducible run). Changes that alter nothing publish nothing; a reset publishes nothing
+        either (read `GET /api/clock` after one).
+      properties:
+        change: { enum: [advance, set, freeze, resume, speed] }
+        mode: { const: virtual }
+        running: { type: boolean }
+        speed: { type: number }
+        now: { $ref: "#/components/schemas/Timestamp" }
+        effectiveAt:
+          oneOf: [{ $ref: "#/components/schemas/Timestamp" }, { type: "null" }]
+          description: The real time the change took effect; `null` while frozen, when `now` is the reading.
+    ClockChangedEvent:
+      allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
+      properties:
+        eventType: { const: ClockChanged }
+        source: { const: exchange }
+        aggregateId: { const: clock }
+        correlationId: { const: null }
+        payload: { $ref: "#/components/schemas/ClockChangedPayload" }
     InstrumentListedEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
       properties:

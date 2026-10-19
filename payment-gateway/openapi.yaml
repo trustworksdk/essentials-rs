@@ -27,6 +27,8 @@ tags:
     description: The canonical event log, replayable by sequence.
   - name: statements
     description: The bank's end-of-day statements of the firm's client-money account.
+  - name: clock
+    description: Simulated time, readable always; speed, freeze and resume with `clock.operator_control`.
   - name: webhooks
     description: Webhook subscriptions and their maintenance. Shared with the exchange simulator.
   - name: test-control
@@ -385,6 +387,58 @@ paths:
         "204":
           description: Reset. The virtual clock is back at its first reading; only the configuration remains.
         "503": { $ref: "#/components/responses/Unavailable" }
+  /api/clock:
+    get:
+      tags: [clock]
+      operationId: getOperatorClock
+      summary: How the service tells time
+      description: Always mounted, so a consumer can follow simulated time. Changes are also published as `ClockChanged`.
+      responses:
+        "200": { $ref: "#/components/responses/Clock" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /api/clock/freeze:
+    post:
+      tags: [clock]
+      operationId: freezeOperatorClock
+      summary: Stop the virtual clock
+      description: Only with `clock.operator_control`. Publishes `ClockChanged` unless the clock was already frozen.
+      responses:
+        "200": { $ref: "#/components/responses/Clock" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /api/clock/resume:
+    post:
+      tags: [clock]
+      operationId: resumeOperatorClock
+      summary: Let the virtual clock run at its speed
+      description: Only with `clock.operator_control`. Publishes `ClockChanged` unless the clock was already running.
+      responses:
+        "200": { $ref: "#/components/responses/Clock" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /api/clock/speed:
+    post:
+      tags: [clock]
+      operationId: setOperatorClockSpeed
+      summary: Change how fast the virtual clock runs
+      description: |
+        Only with `clock.operator_control`. From the current reading on; out of range is `400 invalid_clock_speed`.
+        Publishes `ClockChanged` unless the speed is unchanged. Setting and advancing the clock stay under `/test`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [speed]
+              properties:
+                speed: { type: number, exclusiveMinimum: 0, maximum: 1000000 }
+      responses:
+        "200": { $ref: "#/components/responses/Clock" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /test/clock:
     get:
       tags: [test-control]
@@ -605,6 +659,12 @@ webhooks:
       operationId: onPaymentReturned
       requestBody: { $ref: "#/components/requestBodies/PaymentReturnedEvent" }
       responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
+  ClockChanged:
+    post:
+      summary: The virtual clock changed speed, froze, resumed, or was set or advanced (`source` is `payment-gateway`)
+      operationId: onClockChanged
+      requestBody: { $ref: "#/components/requestBodies/ClockChangedEvent" }
+      responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
   BankStatementIssued:
     post:
       summary: The bank's end-of-day statement for one currency (`source` is `bank`)
@@ -666,6 +726,8 @@ components:
       content: { application/json: { schema: { $ref: "#/components/schemas/PaymentFailedEvent" } } }
     PaymentReturnedEvent:
       content: { application/json: { schema: { $ref: "#/components/schemas/PaymentReturnedEvent" } } }
+    ClockChangedEvent:
+      content: { application/json: { schema: { $ref: "#/components/schemas/ClockChangedEvent" } } }
     BankStatementIssuedEvent:
       content: { application/json: { schema: { $ref: "#/components/schemas/BankStatementIssuedEvent" } } }
   schemas:
@@ -802,7 +864,7 @@ components:
               canonical: { description: What the canonical booking says. }
               reported: { description: What the statement says instead. }
 
-    EventType: { enum: [PaymentPending, PaymentCompleted, PaymentFailed, PaymentReturned, BankStatementIssued] }
+    EventType: { enum: [PaymentPending, PaymentCompleted, PaymentFailed, PaymentReturned, BankStatementIssued, ClockChanged] }
     PaymentPendingEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
       properties:
@@ -827,6 +889,32 @@ components:
         eventType: { const: PaymentReturned }
         source: { const: payment-gateway }
         payload: { allOf: [{ $ref: "#/components/schemas/PaymentFields" }], unevaluatedProperties: false }
+    ClockChangedPayload:
+      type: object
+      additionalProperties: false
+      required: [change, mode, running, speed, now, effectiveAt]
+      description: |
+        The clock after a change. A follower computes simulated time as `now + (real time − effectiveAt) × speed`
+        while `running`, and `now` while frozen (then `effectiveAt` is `null`, so real time stays out of the log of a
+        reproducible run). Changes that alter nothing publish nothing; a reset publishes nothing
+        either (read `GET /api/clock` after one).
+      properties:
+        change: { enum: [advance, set, freeze, resume, speed] }
+        mode: { const: virtual }
+        running: { type: boolean }
+        speed: { type: number }
+        now: { $ref: "#/components/schemas/Timestamp" }
+        effectiveAt:
+          oneOf: [{ $ref: "#/components/schemas/Timestamp" }, { type: "null" }]
+          description: The real time the change took effect; `null` while frozen, when `now` is the reading.
+    ClockChangedEvent:
+      allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
+      properties:
+        eventType: { const: ClockChanged }
+        source: { const: payment-gateway }
+        aggregateId: { const: clock }
+        correlationId: { const: null }
+        payload: { $ref: "#/components/schemas/ClockChangedPayload" }
     BankStatementIssuedEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
       properties:

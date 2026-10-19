@@ -96,6 +96,7 @@ fn the_document_describes_exactly_the_mounted_routes() {
         include_str!("../src/api/market_data.rs"),
         include_str!("../src/api/test_control.rs"),
         include_str!("../../simulator-kit/src/api/webhooks.rs"),
+        include_str!("../../simulator-kit/src/api/clock.rs"),
     ];
     // Path parameter names are the code's own (`{execution_id}` in a route is `{executionId}` in the document).
     assert_eq!(
@@ -114,6 +115,10 @@ fn the_parts_shared_with_the_payment_gateway_are_identical() {
         "/api/webhooks/{id}/deliveries",
         "/api/webhooks/{id}/redeliver",
         "/api/webhooks/{id}/dead-letters/retry",
+        "/api/clock",
+        "/api/clock/freeze",
+        "/api/clock/resume",
+        "/api/clock/speed",
         "/test/reset",
         "/test/clock",
         "/test/clock/advance",
@@ -142,6 +147,7 @@ fn the_parts_shared_with_the_payment_gateway_are_identical() {
         "schemas/NullableTimestamp",
         "schemas/Clock",
         "schemas/ClockAdvance",
+        "schemas/ClockChangedPayload",
         "schemas/EventEnvelope",
         "schemas/DeliveryStatus",
         "schemas/WebhookRequest",
@@ -168,6 +174,7 @@ async fn every_operation_and_event_matches_the_document() {
     let mut app = TestApp::start_with(|c| {
         c.clock.mode = ClockMode::Virtual;
         c.clock.start = Some("2030-01-07T09:00:00Z".parse().unwrap());
+        c.clock.operator_control = true;
         c.settlement.mode = SettlementMode::Both;
         c.settlement.seed = 3;
         c.settlement.reject_probability = 0.15;
@@ -493,6 +500,27 @@ async fn every_operation_and_event_matches_the_document() {
 
     // The clock: past the cutoff, the settlement dates and corrections.
     expect(a, s, 200, M::GET, "/test/clock", None).await;
+    expect(a, s, 200, M::GET, "/api/clock", None).await;
+    expect(
+        a,
+        s,
+        200,
+        M::POST,
+        "/api/clock/speed",
+        Some(json!({ "speed": 2 })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        400,
+        M::POST,
+        "/api/clock/speed",
+        Some(json!({ "speed": 0 })),
+    )
+    .await;
+    expect(a, s, 200, M::POST, "/api/clock/resume", None).await;
+    expect(a, s, 200, M::POST, "/api/clock/freeze", None).await;
     expect(
         a,
         s,
