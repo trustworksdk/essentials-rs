@@ -72,8 +72,11 @@ docker compose down -v     # also deletes it
 Build the image once from the workspace root (or let Compose build it, as the example does):
 
 ```sh
-docker build -f exchange-simulator/Dockerfile -t exchange-simulator:dev .
+scripts/build-images.sh exchange      # docker build -f exchange-simulator/Dockerfile -t exchange-simulator:dev .
 ```
+
+With the payment gateway as well, and the app in another project, follow
+[Running with your app](running-with-your-app.md) instead.
 
 Then add a service. Put your consumers on the same Compose network and address them by service name:
 

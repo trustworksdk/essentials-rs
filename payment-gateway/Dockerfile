@@ -23,6 +23,7 @@ ENV GATEWAY__SERVER__BIND=0.0.0.0:8081 \
     GATEWAY__LOGGING__FORMAT=json
 VOLUME /var/lib/gateway
 EXPOSE 8081
+# Follows the port in GATEWAY__SERVER__BIND, so overriding that variable moves the check with the service.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:8081/health || exit 1
+  CMD port="${GATEWAY__SERVER__BIND##*:}"; curl -fsS "http://127.0.0.1:${port:-8081}/health" || exit 1
 ENTRYPOINT ["/usr/local/bin/payment-gateway"]

@@ -1981,6 +1981,32 @@ then 6.11, 6.12, 6.13–6.14.
 
 ## Beyond the milestones
 
+**Running with an app in another project ✅ done (2026-10-19, requested by the user)**
+- **User decision:** the other project uses images built on the same machine, referred to by tag.
+- `scripts/build-images.sh` (workspace root) builds `exchange-simulator:<TAG>` and `payment-gateway:<TAG>` (default
+  `dev`), both or one, from the workspace root.
+- `examples/with-your-app`: both services from local images (`pull_policy: never`) next to a stand-in app (the
+  sample receiver), with configs: a virtual clock in real time with operator control, three synthetic instruments
+  quoted by the liquidity provider, simulated settlement and clearing, the gateway following the exchange's clock,
+  both delivering signed webhooks to `app`. `EXCHANGE_PORT`, `GATEWAY_PORT`, `APP_PORT`, `EXCHANGE_IMAGE`,
+  `GATEWAY_IMAGE` override.
+- `docs/running-with-your-app.md`: build, try, move into your project (or keep a separate project on a shared
+  network), secrets, clocks, ports. Linked from the guide index, getting started and the gateway README.
+- **Checks:** both example configs parse in unit tests (one per crate); the e2e test
+  `the_with_your_app_example_runs_from_local_images` brings it up healthy, trades against the provider, sees signed
+  deliveries from both services, and freezes the clocks together. The script was run for real.
+- **Found on the way:** the build script's image summary filtered on leading spaces that `docker image ls` strips;
+  fixed with reference filters. A follower clock freezes up to one poll interval ahead of the exchange, since it
+  never runs backwards (by design since 5.4b); the guide says so, and the test allows it.
+
+**Configurable ports in containers ✅ done (2026-10-19, requested by the user)**
+- `compose.yaml` maps `${EXCHANGE_PORT:-8080}:8080`, like the example Compose files (which already took
+  `EXCHANGE_PORT` and `GATEWAY_PORT`).
+- Both images' health checks read the port from `EXCHANGE__SERVER__BIND` / `GATEWAY__SERVER__BIND` (falling back to
+  8080 / 8081), so overriding the bind inside the container no longer leaves the container unhealthy. Checked under
+  the image's `dash` for an unset, an IPv4 and an IPv6 bind, and on the rebuilt image with the bind moved to 9090.
+- The payment gateway's `GATEWAY_CONFIG` now treats empty as unset, as `EXCHANGE_CONFIG` does.
+
 **Finnhub market file ✅ done (2026-10-19, requested by the user)**
 - **Delivered:** `config/finnhub-market.yaml`, a configuration file for `EXCHANGE_CONFIG`: 40 instruments on
   `price_sources.default.kind: finnhub`. 37 are large US stocks and ETFs (19 on XNAS, 17 on XNYS, SPY on ARCX); 3

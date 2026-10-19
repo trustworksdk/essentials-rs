@@ -1,4 +1,5 @@
 # docker compose -f exchange-simulator/compose.yaml up --build
+# EXCHANGE_PORT changes the host port (default 8080).
 services:
   exchange-simulator:
     build:
@@ -6,7 +7,7 @@ services:
       dockerfile: exchange-simulator/Dockerfile
     image: exchange-simulator:dev
     ports:
-      - "8080:8080"
+      - "${EXCHANGE_PORT:-8080}:8080"
     environment:
       RUST_LOG: ${RUST_LOG:-info}
       # Live prices (price source kind finnhub): taken from the host's environment; empty means no feed.

@@ -83,7 +83,8 @@ Use it when a consumer lost data, or to backfill a new consumer.
 ## Monitoring
 
 **Health:** `GET /health` gives `200 {"status":"ok","schemaVersion":…,"persistence":"durable"}`. The image's Docker
-`HEALTHCHECK` uses it, so `docker compose up --wait` and `depends_on: condition: service_healthy` work.
+`HEALTHCHECK` uses it, on the port in `EXCHANGE__SERVER__BIND`, so `docker compose up --wait` and
+`depends_on: condition: service_healthy` work.
 
 **Metrics:** `GET /metrics` is in Prometheus text format. The [README](../README.md#get-metrics) lists every series.
 The ones worth an alert:

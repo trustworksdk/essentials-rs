@@ -1,0 +1,68 @@
+# The exchange simulator and the payment gateway next to your app, from images built on this machine.
+#   scripts/build-images.sh                    # once, from the workspace root, and again after pulling changes
+#   docker compose up -d --wait                # from this directory
+# Copy this directory into your project and replace the `app` service with yours; see
+# docs/running-with-your-app.md. EXCHANGE_PORT, GATEWAY_PORT and APP_PORT change the host ports (8080, 8081, 9000).
+name: with-your-app
+
+services:
+  exchange:
+    image: ${EXCHANGE_IMAGE:-exchange-simulator:dev}
+    pull_policy: never            # a local image: build it with scripts/build-images.sh
+    ports:
+      - "${EXCHANGE_PORT:-8080}:8080"
+    environment:
+      EXCHANGE_CONFIG: /etc/exchange/exchange.yaml
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}   # only for instruments on price source kind finnhub
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./exchange.yaml:/etc/exchange/exchange.yaml:ro
+      - exchange-data:/var/lib/exchange      # durable state; drop the volume (down -v) to start over
+    secrets:
+      - webhook_secret
+
+  gateway:
+    image: ${GATEWAY_IMAGE:-payment-gateway:dev}
+    pull_policy: never
+    ports:
+      - "${GATEWAY_PORT:-8081}:8081"
+    environment:
+      GATEWAY_CONFIG: /etc/gateway/gateway.yaml
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./gateway.yaml:/etc/gateway/gateway.yaml:ro
+      - gateway-data:/var/lib/gateway
+    secrets:
+      - webhook_secret
+    depends_on:
+      exchange:
+        condition: service_healthy   # it follows the exchange's clock
+
+  # Stands in for your app: the sample receiver verifies and lists every webhook delivery (GET /received).
+  # Your app reaches the services at http://exchange:8080 and http://gateway:8081 on this network.
+  app:
+    image: python:3.13-slim
+    command: ["python", "-u", "/app/receiver.py"]
+    environment:
+      WEBHOOK_SECRET_FILE: /run/secrets/webhook_secret
+      EXCHANGE_URL: http://exchange:8080
+      GATEWAY_URL: http://gateway:8081
+    volumes:
+      - ../compose/receiver.py:/app/receiver.py:ro
+    ports:
+      - "${APP_PORT:-9000}:9000"
+    secrets:
+      - webhook_secret
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+secrets:
+  webhook_secret:
+    file: ./secrets/webhook-secret.txt   # shared by the services (signing) and your app (verifying)
+
+volumes:
+  exchange-data:
+  gateway-data:

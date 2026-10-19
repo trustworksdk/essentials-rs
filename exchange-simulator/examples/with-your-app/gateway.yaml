@@ -1,0 +1,18 @@
+# Mounted at /etc/gateway/gateway.yaml, layered over the built-in defaults (payment-gateway/config/default.yaml).
+clock:
+  # Same reading, speed and running state as the exchange's clock, read from its GET /api/clock.
+  mode: follow
+  follow:
+    url: http://exchange:8080
+    poll_interval_ms: 250
+statement:
+  cutoff: "17:30"
+  time_zone: Europe/Copenhagen
+  opening_balances: { USD: "1000000.00" }
+webhooks:
+  subscriptions:
+    - name: app
+      url: http://app:9000/hooks/gateway
+      event_types: [PaymentPending, PaymentCompleted, PaymentFailed, PaymentReturned, BankStatementIssued]
+      secret_file: /run/secrets/webhook_secret
+      ordered: true

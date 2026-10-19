@@ -14,7 +14,7 @@ webhook receiver, and operations. This README is the API reference.
 ```sh
 # from the workspace root
 cargo run -p exchange-simulator                       # http://127.0.0.1:8080, database in ./data/exchange.db
-docker compose -f exchange-simulator/compose.yaml up --build   # http://localhost:8080, database in a volume
+docker compose -f exchange-simulator/compose.yaml up --build   # http://localhost:8080 (EXCHANGE_PORT), database in a volume
 ```
 
 Configuration (`config/default.yaml` is compiled in) can be overridden with a YAML file named by `EXCHANGE_CONFIG`, or

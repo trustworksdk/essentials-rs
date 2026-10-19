@@ -16,6 +16,12 @@ Three sources, each overriding the one before:
 `EXCHANGE__DATABASE__PATH=/var/lib/exchange/exchange.db` and `EXCHANGE__LOGGING__FORMAT=json`. To change one of these
 in a container, set the variable rather than the file key.
 
+**Ports in a container:** to reach the service on another port of the host, change the mapping:
+`EXCHANGE_PORT=9080 docker compose -f exchange-simulator/compose.yaml up` (the example Compose files take
+`EXCHANGE_PORT` and `GATEWAY_PORT` too). To change the port inside the container, set
+`EXCHANGE__SERVER__BIND=0.0.0.0:<port>` and map to that port; the image's health check reads the port from that
+variable. The payment gateway works the same way with `GATEWAY__SERVER__BIND` (default `0.0.0.0:8081`).
+
 The service checks its configuration at startup and refuses to start, with a message, when something is wrong: an
 invalid webhook declaration, an unreadable secret file, settlement cancel, fail and delay probabilities that add up to more than 1.
 

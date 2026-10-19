@@ -1017,6 +1017,14 @@ webhooks:
                     "```\n"
                 ),
             ),
+            (
+                "examples/with-your-app/exchange.yaml",
+                concat!(
+                    "```yaml\n",
+                    include_str!("../examples/with-your-app/exchange.yaml"),
+                    "```\n"
+                ),
+            ),
             ("docs/operations.md", include_str!("../docs/operations.md")),
             (
                 "docs/webhook-receivers.md",

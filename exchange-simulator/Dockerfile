@@ -25,6 +25,7 @@ ENV EXCHANGE__SERVER__BIND=0.0.0.0:8080 \
     EXCHANGE__LOGGING__FORMAT=json
 VOLUME /var/lib/exchange
 EXPOSE 8080
+# Follows the port in EXCHANGE__SERVER__BIND, so overriding that variable moves the check with the service.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:8080/health || exit 1
+  CMD port="${EXCHANGE__SERVER__BIND##*:}"; curl -fsS "http://127.0.0.1:${port:-8080}/health" || exit 1
 ENTRYPOINT ["/usr/local/bin/exchange-simulator"]

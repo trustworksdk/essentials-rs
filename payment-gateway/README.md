@@ -15,7 +15,9 @@ cargo test -p payment-gateway -j 2
 ```
 
 Settings come from `config/default.yaml`, then a YAML file named by `GATEWAY_CONFIG`, then `GATEWAY__*` environment
-variables (`__` between levels, e.g. `GATEWAY__SERVER__BIND=0.0.0.0:8081`).
+variables (`__` between levels, e.g. `GATEWAY__SERVER__BIND=0.0.0.0:8081`). In the image, `GATEWAY__SERVER__BIND`
+sets the port inside the container and its health check follows it; in the back-office example Compose file,
+`GATEWAY_PORT` sets the port on the host.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -173,7 +175,10 @@ date, with no clocks to resume together by hand.
 
 ## Running it with the exchange
 
-`payment-gateway/Dockerfile` builds the image from the workspace root (`docker build -f payment-gateway/Dockerfile .`).
+`payment-gateway/Dockerfile` builds the image from the workspace root (`docker build -f payment-gateway/Dockerfile .`,
+or `scripts/build-images.sh gateway`). To run both services next to an app in another project, see
+[Running with your app](../exchange-simulator/docs/running-with-your-app.md) and
+[`examples/with-your-app`](../exchange-simulator/examples/with-your-app).
 [`exchange-simulator/examples/back-office`](../exchange-simulator/examples/back-office) runs it with the exchange
 simulator on an accelerated clock, and the
 [back-office chapter](../exchange-simulator/docs/back-office.md) of the exchange simulator's guide describes how a
