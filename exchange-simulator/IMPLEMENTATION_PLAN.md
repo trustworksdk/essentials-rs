@@ -2087,6 +2087,34 @@ then 6.11, 6.12, 6.13–6.14.
   race it guards against (a read on a running clock between the cutoff and its tick) cannot be staged reliably in an
   integration test, since a frozen clock's moves tick in the same command.
 
+**6.12 — liquidity runtime control ✅ done (2026-10-20)**
+- **Delivered:**
+  - `GET /api/liquidity[/{instrumentId}]` (`src/api/liquidity.rs`): per instrument the provider's participant, its
+    resolved settings and the instrument's own, its state, inventory, the reference it quoted around, its ladder (best
+    first), the price source, the reference price with source and staleness, and the session.
+  - `PATCH /api/liquidity/{instrumentId}`: settings field by field (`LiquiditySpec::patched`; `null` clears a field)
+    and optionally `priceSource`. Merged on the exchange thread (`Exchange::patch_liquidity`), then applied through
+    `update_instrument`, so it is stored, published as `InstrumentUpdated`, and re-quoted at once.
+  - Scenario step `set_liquidity` and expectation target `liquidity`; `scenarios/liquidity-control.yaml` drains the
+    ladder with a market order larger than it, refills it, widens the spread, switches the provider off and on, and
+    moves the instrument from a fixed to a synthetic price.
+  - `openapi.yaml` (`LiquidityStatus`, `LiquidityPatch`), the README, the scenario step table.
+  - Tests: `tests/liquidity_control.rs` (4), the contract test (all three operations), the scenario through
+    `tests/scenarios.rs`.
+- **Decisions:**
+  - **Field-by-field merge on its own endpoint**, unlike `PATCH /api/instruments`, which replaces `liquidity` as a
+    whole: a scenario "widens the spread" without restating every other setting.
+  - **Merged on the exchange thread**, so concurrent patches never lose each other's fields.
+  - **A declared instrument gets its configuration back at the next start**, as every declared field does (6.1);
+    runtime control is for the running service.
+- **Fixed on the way:** a settings change alone did not re-quote the ladder. `requote` only re-quoted on a reference
+  move, a refill, or a change in staleness or session, so a new `spreadBps` waited for the price to move. The
+  provider now remembers the settings it quoted with, and a change re-quotes at once. The 6.7 tests did not see it:
+  their settings changes also pulled the ladder.
+- **Mutation checks**, each made a test fail: a settings change not re-quoting; a patch replacing instead of merging;
+  an empty patch accepted; the price source ignored; the inventory shown as 0; bids worst first; no reference shown;
+  the own settings shown as the resolved ones. (One first did not compile and was rewritten.)
+
 ## Beyond the milestones
 
 **Running with an app in another project ✅ done (2026-10-19, requested by the user)**

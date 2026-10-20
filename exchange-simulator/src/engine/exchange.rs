@@ -294,6 +294,34 @@ pub struct Exchange {
     expiries: std::collections::BTreeSet<(DateTime<Utc>, u64, InstrumentId, Uuid)>,
 }
 
+/// The liquidity provider in one instrument, as `GET /api/liquidity` shows it (SR-11).
+#[derive(Clone, Debug)]
+pub struct LiquidityStatus {
+    pub instrument: Instrument,
+    /// The participant it quotes as; `None` when the service runs no provider.
+    pub provider: Option<ParticipantId>,
+    /// Its settings, resolved (own, then `liquidity.default`, then built-in).
+    pub settings: Option<LiquiditySettings>,
+    /// What it did when it last quoted (see `Exchange::liquidity_state`).
+    pub state: &'static str,
+    /// Its net position in units (positive long).
+    pub inventory: i64,
+    /// The reference price its current ladder was quoted around.
+    pub quoted_at: Option<i64>,
+    /// Its resting orders, bids best first, then asks best first.
+    pub ladder: Vec<Order>,
+    pub reference: Option<Reference>,
+    pub session_open: bool,
+}
+
+/// A change to one instrument's liquidity (`PATCH /api/liquidity/{id}`): settings by wire name (`null` clears one),
+/// and optionally a new price source.
+#[derive(Clone, Debug, Default)]
+pub struct LiquidityPatch {
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    pub price_source: Option<Option<crate::pricing::PriceSourceSpec>>,
+}
+
 /// The liquidity provider: its policy, and per instrument what it last quoted around and holds.
 struct Provider {
     policy: LiquidityPolicy,
@@ -313,6 +341,8 @@ struct Quoting {
     /// Whether the reference price was stale, and the market closed, when the current ladder was quoted (or pulled).
     quoted_stale: bool,
     quoted_closed: bool,
+    /// The settings the current ladder was quoted with: a change re-quotes it at once.
+    quoted_settings: Option<LiquiditySettings>,
     /// What it is doing, as the market data shows it (see [`Exchange::liquidity_state`]); `None` reads `off`.
     state: Option<&'static str>,
 }
@@ -809,6 +839,7 @@ impl Exchange {
         };
         let closed = !self.sessions.is_open(instrument.mic.as_deref(), now);
         let shown = Self::liquidity_state(&settings, &instrument, reference.as_ref(), closed);
+        let configured = settings.clone();
         // SR-9: in a closed market, or under a stale price, the ladder is quoted as it is (keep), with a wider spread
         // (widen), or not at all (pull). A closed market's policy takes precedence.
         let stale = reference.is_some_and(|r| r.stale);
@@ -835,6 +866,7 @@ impl Exchange {
                 (r - quoted).abs() >= i64::from(settings.requote_threshold_ticks)
                     || stale != state.quoted_stale
                     || closed != state.quoted_closed
+                    || state.quoted_settings.as_ref() != Some(&configured)
                     || state.filled_at.is_some_and(|at| {
                         now >= at + chrono::Duration::milliseconds(settings.refill_delay_ms as i64)
                     })
@@ -878,6 +910,7 @@ impl Exchange {
         quoting.filled_at = None;
         quoting.quoted_stale = stale;
         quoting.quoted_closed = closed;
+        quoting.quoted_settings = Some(configured);
         quoting.state = Some(shown);
         Ok(())
     }
@@ -889,6 +922,87 @@ impl Exchange {
             .quoting
             .entry(id.clone())
             .or_default()
+    }
+
+    /// The liquidity provider's status in every listed instrument (or only `id`'s), in ID order (SR-11).
+    pub fn liquidity(&mut self, id: Option<&InstrumentId>) -> Vec<LiquidityStatus> {
+        let now = self.now();
+        let mut ids: Vec<InstrumentId> = self
+            .books
+            .keys()
+            .filter(|i| id.is_none_or(|id| id == *i))
+            .cloned()
+            .collect();
+        ids.sort();
+        ids.into_iter()
+            .map(|id| {
+                let book = &self.books[&id];
+                let instrument = book.instrument().clone();
+                let provider = self.provider.as_ref().map(|p| p.policy.participant.clone());
+                let quoting = self
+                    .provider
+                    .as_ref()
+                    .and_then(|p| p.quoting.get(&id))
+                    .cloned()
+                    .unwrap_or_default();
+                let mut ladder: Vec<Order> = book
+                    .orders()
+                    .filter(|o| provider.as_ref() == Some(&o.participant_id))
+                    .cloned()
+                    .collect();
+                ladder.sort_by_key(|o| match o.side {
+                    Side::Buy => (0, -o.limit_price_ticks.unwrap_or(0)),
+                    Side::Sell => (1, o.limit_price_ticks.unwrap_or(0)),
+                });
+                LiquidityStatus {
+                    settings: self.liquidity_settings(&instrument),
+                    provider,
+                    state: quoting.state.unwrap_or("off"),
+                    inventory: quoting.inventory,
+                    quoted_at: quoting.quoted_at,
+                    ladder,
+                    reference: self.prices.reference(&id, now),
+                    session_open: self.sessions.is_open(instrument.mic.as_deref(), now),
+                    instrument,
+                }
+            })
+            .collect()
+    }
+
+    /// Changes one instrument's liquidity settings field by field, and its price source if given, durably (an
+    /// `InstrumentUpdated`), then returns the provider's status there. The merge runs here, on the exchange thread, so
+    /// concurrent patches never lose each other's fields.
+    pub fn patch_liquidity(
+        &mut self,
+        id: &InstrumentId,
+        patch: &LiquidityPatch,
+    ) -> Result<LiquidityStatus, ExchangeError> {
+        let book = self
+            .books
+            .get(id)
+            .ok_or_else(|| ExchangeError::UnknownInstrument(id.clone()))?;
+        let liquidity = if patch.fields.is_empty() {
+            None
+        } else {
+            let merged = book
+                .instrument()
+                .liquidity
+                .clone()
+                .unwrap_or_default()
+                .patched(&patch.fields)?;
+            Some((merged != Default::default()).then_some(merged))
+        };
+        let change = InstrumentChange {
+            enabled: None,
+            reference_symbol: None,
+            price_source: patch.price_source.clone(),
+            liquidity,
+        };
+        self.update_instrument(id, &change)?;
+        Ok(self
+            .liquidity(Some(id))
+            .pop()
+            .expect("the instrument is listed"))
     }
 
     /// The provider's settings for `instrument`, resolved; `None` when there is no provider.

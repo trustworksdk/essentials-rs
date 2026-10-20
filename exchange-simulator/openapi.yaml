@@ -32,6 +32,8 @@ tags:
     description: The canonical event log, replayable by sequence.
   - name: market-data
     description: Reference prices from each instrument's price source.
+  - name: liquidity
+    description: The built-in liquidity provider, inspected and steered at runtime.
   - name: settlements
     description: The settlement simulator's instructions and externally reported outcomes.
   - name: clearing
@@ -302,6 +304,61 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/MarketData" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /api/liquidity:
+    get:
+      tags: [liquidity]
+      operationId: listLiquidity
+      summary: The liquidity provider in every instrument, in instrument ID order
+      responses:
+        "200":
+          description: Its status per instrument.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/LiquidityStatus" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /api/liquidity/{instrumentId}:
+    get:
+      tags: [liquidity]
+      operationId: liquidity
+      summary: The liquidity provider in one instrument
+      parameters:
+        - { name: instrumentId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Its status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LiquidityStatus" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    patch:
+      tags: [liquidity]
+      operationId: patchLiquidity
+      summary: Change the provider's settings field by field, or the instrument's price source
+      description: |
+        Each settings field given replaces the instrument's own value; `null` clears it, so `liquidity.default` and
+        then the built-in default apply again; fields left out stay. `priceSource` replaces the price source as a whole
+        (`null` falls back to `price_sources.default`), as `PATCH /api/instruments` does; a switch to `synthetic` without
+        `initialPrice` continues from the current reference price. The provider re-quotes at once. Each change is
+        stored and published as `InstrumentUpdated`. A declared instrument gets its configuration back at the next start.
+      parameters:
+        - { name: instrumentId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LiquidityPatch" }
+      responses:
+        "200":
+          description: The provider's status after the change.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LiquidityStatus" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
         "503": { $ref: "#/components/responses/Unavailable" }
   /api/orderbooks/{instrumentId}:
@@ -1267,6 +1324,108 @@ components:
           default: pull
           description: Outside the instrument's trading session, keep the ladder as quoted, quote it with the spread times `closedWidenFactor`, or pull it. Takes precedence over `stalePolicy`.
         closedWidenFactor: { type: number, minimum: 1, maximum: 100, default: 2, description: "`widen`: the factor the spread is multiplied by while the market is closed." }
+    LiquidityPatch:
+      type: object
+      minProperties: 1
+      description: Any `Liquidity` field (`null` clears it), and optionally `priceSource`.
+      allOf: [{ $ref: "#/components/schemas/LiquidityFields" }]
+      properties:
+        priceSource:
+          oneOf:
+            - { type: "null" }
+            - $ref: "#/components/schemas/PriceSource"
+    LiquidityFields:
+      description: The `Liquidity` fields, each nullable.
+      type: object
+      properties:
+        mode: { enum: ["on", "off", null] }
+        levels: { type: [integer, "null"], minimum: 1, maximum: 50 }
+        spreadBps: { type: [number, "null"], minimum: 0 }
+        levelStepTicks: { type: [integer, "null"], minimum: 1 }
+        levelQuantity: { type: [integer, "null"], minimum: 1 }
+        levelQuantityGrowth: { type: [number, "null"] }
+        requoteThresholdTicks: { type: [integer, "null"], minimum: 0 }
+        refillDelayMs: { type: [integer, "null"], minimum: 0 }
+        skewBpsPerLot: { type: [number, "null"], minimum: 0 }
+        maxInventory: { type: [integer, "null"], minimum: 1 }
+        stalePolicy: { enum: [keep, widen, pull, null] }
+        staleWidenFactor: { type: [number, "null"], minimum: 1, maximum: 100 }
+        closedPolicy: { enum: [keep, widen, pull, null] }
+        closedWidenFactor: { type: [number, "null"], minimum: 1, maximum: 100 }
+    LiquidityStatus:
+      type: object
+      additionalProperties: false
+      required: [instrumentId, providerId, state, settings, own, inventory, quotedAround, ladder, priceSource, reference,
+                 session]
+      properties:
+        instrumentId: { type: string }
+        providerId: { type: [string, "null"], description: The participant the provider quotes as. }
+        state:
+          enum: ["off", no-reference, quoting, kept, widened, pulled]
+          description: What it did when it last quoted, as the market data's `liquidity` shows it.
+        settings:
+          description: Its settings, resolved (own, then `liquidity.default`, then built-in).
+          oneOf:
+            - { type: "null" }
+            - type: object
+              additionalProperties: false
+              required: [mode, levels, spreadBps, levelStepTicks, levelQuantity, levelQuantityGrowth,
+                         requoteThresholdTicks, refillDelayMs, skewBpsPerLot, maxInventory, stalePolicy,
+                         staleWidenFactor, closedPolicy, closedWidenFactor]
+              properties:
+                mode: { enum: ["on", "off"] }
+                levels: { type: integer }
+                spreadBps: { type: number }
+                levelStepTicks: { type: integer }
+                levelQuantity: { type: integer }
+                levelQuantityGrowth: { type: number }
+                requoteThresholdTicks: { type: integer }
+                refillDelayMs: { type: integer }
+                skewBpsPerLot: { type: number }
+                maxInventory: { type: integer }
+                stalePolicy: { enum: [keep, widen, pull] }
+                staleWidenFactor: { type: number }
+                closedPolicy: { enum: [keep, widen, pull] }
+                closedWidenFactor: { type: number }
+        own:
+          description: The instrument's own settings; `null` when it relies on the default only.
+          oneOf:
+            - { type: "null" }
+            - $ref: "#/components/schemas/Liquidity"
+        inventory: { type: integer, description: Its net position in units (positive long). }
+        quotedAround:
+          description: The reference price its current ladder was quoted around; `null` when it quotes nothing.
+          oneOf:
+            - { type: "null" }
+            - type: object
+              additionalProperties: false
+              required: [priceTicks, price]
+              properties:
+                priceTicks: { type: integer }
+                price: { $ref: "#/components/schemas/Amount" }
+        ladder:
+          type: object
+          additionalProperties: false
+          required: [bids, asks]
+          properties:
+            bids: { type: array, items: { $ref: "#/components/schemas/LiquidityQuote" }, description: Best first. }
+            asks: { type: array, items: { $ref: "#/components/schemas/LiquidityQuote" }, description: Best first. }
+        priceSource:
+          description: The instrument's own price source; `null` relies on `price_sources.default`.
+          oneOf:
+            - { type: "null" }
+            - $ref: "#/components/schemas/PriceSource"
+        reference: { $ref: "#/components/schemas/MarketDataReferencePrice" }
+        session: { enum: [open, closed] }
+    LiquidityQuote:
+      type: object
+      additionalProperties: false
+      required: [orderId, priceTicks, price, quantity]
+      properties:
+        orderId: { type: string, format: uuid }
+        priceTicks: { type: integer }
+        price: { $ref: "#/components/schemas/Amount" }
+        quantity: { type: integer, description: Remaining quantity. }
     PriceSource:
       type: object
       additionalProperties: false

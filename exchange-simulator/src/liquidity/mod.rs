@@ -141,10 +141,13 @@ pub enum LiquidityError {
         field: &'static str,
         range: &'static str,
     },
+    #[error("liquidity: {0}")]
+    Invalid(String),
 }
 
 /// The settings with every field resolved.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LiquiditySettings {
     pub mode: LiquidityMode,
     pub levels: u32,
@@ -232,6 +235,29 @@ impl LiquiditySpec {
             }
         }
         Ok(())
+    }
+
+    /// This spec with `patch` applied field by field (wire names, as the API takes them): a field given replaces
+    /// the current value, `null` clears it so the default applies again, a field left out stays (SR-11).
+    pub fn patched(
+        &self,
+        patch: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, LiquidityError> {
+        let mut fields = match serde_json::to_value(self).expect("a spec serializes") {
+            serde_json::Value::Object(fields) => fields,
+            _ => unreachable!("a spec is an object"),
+        };
+        for (field, value) in patch {
+            if value.is_null() {
+                fields.remove(field);
+            } else {
+                fields.insert(field.clone(), value.clone());
+            }
+        }
+        let patched: Self = serde_json::from_value(serde_json::Value::Object(fields))
+            .map_err(|e| LiquidityError::Invalid(e.to_string()))?;
+        patched.validate()?;
+        Ok(patched)
     }
 
     /// This spec with its missing fields taken from `default`.

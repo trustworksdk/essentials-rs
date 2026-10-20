@@ -376,6 +376,18 @@ impl Runner {
                     .await;
                 (description, check_response(response, set.expect.as_ref()))
             }
+            Step::SetLiquidity(set) => {
+                let description = format!(
+                    "set_liquidity {} {}",
+                    set.instrument,
+                    Value::Object(set.body.clone())
+                );
+                let uri = format!("/api/liquidity/{}", set.instrument);
+                let response = self
+                    .call(Method::PATCH, &uri, Some(Value::Object(set.body.clone())))
+                    .await;
+                (description, check_response(response, set.expect.as_ref()))
+            }
             Step::Market(market) => self.market(market).await,
             Step::Register(register) => {
                 let description = format!(
@@ -607,6 +619,13 @@ impl Runner {
             let description = format!("expect book {instrument}");
             let failures = self
                 .check_single(&format!("/api/orderbooks/{instrument}"), e.matches.as_ref())
+                .await;
+            return (description, failures);
+        }
+        if let Some(instrument) = &e.liquidity {
+            let description = format!("expect liquidity {instrument}");
+            let failures = self
+                .check_single(&format!("/api/liquidity/{instrument}"), e.matches.as_ref())
                 .await;
             return (description, failures);
         }

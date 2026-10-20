@@ -1,0 +1,37 @@
+name: Liquidity control
+description: >-
+  The liquidity provider steered at runtime: its ladder drained by a market order larger than it, refilled, its spread
+  widened, switched off and on, and the instrument moved from a fixed to a synthetic price.
+seed: 5
+instruments:
+  - { id: ACME, symbol: ACME, currency: USD, currencyScale: 2, priceSource: { kind: fixed, price: "100.00" },
+      liquidity: { mode: "on", levels: 2, spreadBps: 10, levelQuantity: 10, refillDelayMs: 3600000 } }
+participants:
+  - { id: A, name: A }
+steps:
+  - expect: { liquidity: ACME, matches: { state: quoting, inventory: 0,
+              ladder: { asks: [ { priceTicks: 10010, quantity: 10 }, { priceTicks: 10011, quantity: 10 } ] } } }
+  # Drain: a market buy larger than the ladder fills 20 and leaves 5 unfilled; the refill waits an hour.
+  - order: { participantId: A, side: BUY, type: MARKET, quantity: 25,
+             expect: { matches: { order: { status: CANCELLED, filledQuantity: 20, remainingQuantity: 5 } } } }
+  - expect: { liquidity: ACME, matches: { inventory: -20, ladder: { asks: [] } } }
+  # Clearing the delay refills at once.
+  - set_liquidity: { instrument: ACME, refillDelayMs: null,
+                     expect: { matches: { settings: { refillDelayMs: 0 } } } }
+  - expect: { liquidity: ACME, matches: { ladder: { asks: [ { priceTicks: 10010 }, { priceTicks: 10011 } ] } } }
+  # A wider spread, quoted at once.
+  - set_liquidity: { instrument: ACME, spreadBps: 50 }
+  - expect: { liquidity: ACME, matches: { settings: { spreadBps: 50.0 },
+              ladder: { bids: [ { priceTicks: 9950 }, { priceTicks: 9949 } ], asks: [ { priceTicks: 10050 }, { priceTicks: 10051 } ] } } }
+  # Off pulls the ladder; on quotes it again.
+  - set_liquidity: { instrument: ACME, mode: "off", expect: { matches: { state: "off", ladder: { bids: [], asks: [] } } } }
+  - order: { participantId: A, side: BUY, type: MARKET, quantity: 1,
+             expect: { matches: { order: { status: CANCELLED, filledQuantity: 0 } } } }
+  - set_liquidity: { instrument: ACME, mode: "on", expect: { matches: { state: quoting } } }
+  # A synthetic price that continues from the current reference price.
+  - set_liquidity: { instrument: ACME, priceSource: { kind: synthetic, volatility: 0.5 },
+                     expect: { matches: { priceSource: { kind: synthetic, initialPrice: "100.00" },
+                                          reference: { source: synthetic, price: "100.00" } } } }
+  - advance_clock: { hours: 1 }
+  - expect: { liquidity: ACME, matches: { state: quoting, reference: { source: synthetic } } }
+  - expect: { events: { eventType: InstrumentUpdated }, count: 5 }

@@ -152,6 +152,7 @@ fn the_document_describes_exactly_the_mounted_routes() {
         include_str!("../src/api/settlements.rs"),
         include_str!("../src/api/clearing.rs"),
         include_str!("../src/api/market_data.rs"),
+        include_str!("../src/api/liquidity.rs"),
         include_str!("../src/api/test_control.rs"),
         include_str!("../../simulator-kit/src/api/webhooks.rs"),
         include_str!("../../simulator-kit/src/api/clock.rs"),
@@ -335,6 +336,36 @@ async fn every_operation_and_event_matches_the_document() {
     expect(a, s, 200, M::GET, "/api/marketdata", None).await;
     expect(a, s, 200, M::GET, "/api/marketdata/SYN", None).await;
     expect(a, s, 404, M::GET, "/api/marketdata/NOPE", None).await;
+    expect(a, s, 200, M::GET, "/api/liquidity", None).await;
+    expect(a, s, 200, M::GET, "/api/liquidity/ACME", None).await;
+    expect(a, s, 404, M::GET, "/api/liquidity/NOPE", None).await;
+    expect(
+        a,
+        s,
+        200,
+        M::PATCH,
+        "/api/liquidity/ACME",
+        Some(json!({ "spreadBps": 12.0, "requoteThresholdTicks": null })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        400,
+        M::PATCH,
+        "/api/liquidity/ACME",
+        Some(json!({ "spreadBpz": 1 })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        404,
+        M::PATCH,
+        "/api/liquidity/NOPE",
+        Some(json!({ "levels": 2 })),
+    )
+    .await;
     expect(
         a,
         s,

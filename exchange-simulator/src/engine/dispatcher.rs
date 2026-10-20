@@ -86,6 +86,15 @@ enum Request {
         Option<InstrumentId>,
         oneshot::Sender<Vec<crate::market_data::Snapshot>>,
     ),
+    Liquidity(
+        Option<InstrumentId>,
+        oneshot::Sender<Vec<super::LiquidityStatus>>,
+    ),
+    PatchLiquidity(
+        InstrumentId,
+        super::LiquidityPatch,
+        Reply<super::LiquidityStatus>,
+    ),
     ClockState(oneshot::Sender<ClockState>),
     Tick(Reply<usize>),
     ReportSettlement(NewReport, Reply<(ExternalReport, bool)>),
@@ -113,6 +122,8 @@ impl Request {
             Self::Reset(..) => "reset",
             Self::UpdateInstrument(..) => "update_instrument",
             Self::MarketData(..) => "market_data",
+            Self::Liquidity(..) => "liquidity",
+            Self::PatchLiquidity(..) => "patch_liquidity",
             Self::ClockState(..) => "clock_state",
             Self::Tick(..) => "tick",
             Self::ReportSettlement(..) => "report_settlement",
@@ -244,6 +255,24 @@ impl Dispatcher {
         id: Option<InstrumentId>,
     ) -> Result<Vec<crate::market_data::Snapshot>, DispatchError> {
         self.ask(|reply| Request::MarketData(id, reply)).await
+    }
+
+    /// The liquidity provider's status in every listed instrument (or only `id`'s), in ID order.
+    pub async fn liquidity(
+        &self,
+        id: Option<InstrumentId>,
+    ) -> Result<Vec<super::LiquidityStatus>, DispatchError> {
+        self.ask(|reply| Request::Liquidity(id, reply)).await
+    }
+
+    /// Changes one instrument's liquidity (see [`Exchange::patch_liquidity`]).
+    pub async fn patch_liquidity(
+        &self,
+        id: InstrumentId,
+        patch: super::LiquidityPatch,
+    ) -> Result<super::LiquidityStatus, DispatchError> {
+        self.call(|reply| Request::PatchLiquidity(id, patch, reply))
+            .await
     }
 
     /// Changes a listed instrument (see [`Exchange::update_instrument`]).
@@ -541,6 +570,13 @@ fn handle(exchange: &mut Exchange, request: Request) -> &'static str {
         Request::ChangeClock(change, reply) => answer(reply, exchange.change_clock(change)),
         Request::UpdateInstrument(id, change, reply) => {
             answer(reply, exchange.update_instrument(&id, &change))
+        }
+        Request::Liquidity(id, reply) => {
+            let _ = reply.send(exchange.liquidity(id.as_ref()));
+            "ok"
+        }
+        Request::PatchLiquidity(id, patch, reply) => {
+            answer(reply, exchange.patch_liquidity(&id, &patch))
         }
         Request::MarketData(id, reply) => {
             let _ = reply.send(exchange.market_data(id.as_ref()));

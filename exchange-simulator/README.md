@@ -345,6 +345,45 @@ off unless an instrument's `liquidity` (or `liquidity.default`) sets `mode: on`:
 - **After a restart or reset** it quotes afresh: its inventory comes from its trades, its old ladder is replaced
   (decision D18). On a frozen clock what it does depends only on the commands, so reproducible runs stay byte-identical.
 
+### `GET /api/liquidity` and `GET /api/liquidity/{instrumentId}`
+
+What the liquidity provider is doing in each instrument (in instrument ID order), or in one (`404` for an unknown one):
+
+```json
+{ "instrumentId": "AAPL", "providerId": "LP", "state": "quoting", "inventory": -40,
+  "settings": { "mode": "on", "levels": 5, "spreadBps": 10.0, "...": "every field, resolved" },
+  "own": { "mode": "on", "spreadBps": 10.0 },
+  "quotedAround": { "priceTicks": 18750, "price": "187.50" },
+  "ladder": { "bids": [ { "orderId": "…", "priceTicks": 18731, "price": "187.31", "quantity": 100 } ],
+              "asks": [ { "orderId": "…", "priceTicks": 18769, "price": "187.69", "quantity": 100 } ] },
+  "priceSource": { "kind": "synthetic", "initialPrice": "187.50" },
+  "reference": { "price": "187.52", "priceTicks": 18752, "source": "synthetic", "sourceTimestamp": "…", "stale": false },
+  "session": "open" }
+```
+
+`settings` are the resolved settings (own, then `liquidity.default`, then built-in), `own` the instrument's own
+(`null` without any), `inventory` its net position in units, `state` as the market data's `liquidity`, `ladder` its
+resting orders best first, `reference` the reference price with its source and staleness.
+
+### `PATCH /api/liquidity/{instrumentId}`
+
+Changes the provider's settings for one instrument while the service runs, field by field, and optionally the
+instrument's price source:
+
+```json
+{ "spreadBps": 50, "refillDelayMs": null, "priceSource": { "kind": "synthetic", "volatility": 0.3 } }
+```
+
+- A settings field given replaces the instrument's own value; `null` clears it, so the default applies again; a field
+  left out stays. `PATCH /api/instruments` with `liquidity`, by contrast, replaces all of them.
+- `priceSource` replaces the price source as a whole (`null` falls back to `price_sources.default`); a switch to
+  `synthetic` without `initialPrice` continues from the current reference price, so switching a live instrument to a
+  synthetic one at the close carries the last price on.
+- The provider re-quotes at once, and the change is stored and published as `InstrumentUpdated`. A declared
+  instrument gets its configuration back at the next start, as for every declared field.
+- `200` with the new status; `400` for an empty body, an unknown field or an invalid value (nothing changes); `404`
+  for an unknown instrument.
+
 ### `GET /api/marketdata` and `GET /api/marketdata/{instrumentId}`
 
 ```json
@@ -948,13 +987,14 @@ steps:
 | `advance_clock: { days, hours, minutes, seconds }` / `set_clock: { to }` | Move the virtual clock |
 | `report_settlement: { execution, expect?, ...body }` | `POST /api/settlements/{executionId}/outcomes` |
 | `set_instrument: { instrument, enabled, expect? }` | `PATCH /api/instruments/{id}` |
+| `set_liquidity: { instrument, <settings>…, priceSource?, expect? }` | `PATCH /api/liquidity/{id}`: drain, widen, switch off or move to another price source mid-scenario |
 | `register: { instruments, participants, webhooks }` | Registers more, as in the setup (e.g. after a reset) |
 | `reset: {}` | `POST /test/reset`; order and webhook references are forgotten too |
 | `redeliver: { url, after, expect? }` | Redelivers the webhook's events after `after` |
 | `retry_dead_letters: { url?, expect? }` | Retries the webhook's dead letters, or all |
 | `set_faults: { url, faults }` | Set the fault policy of the webhook registered for `url`; `faults: null` clears it |
 | `market: { ...random market }` | A seeded random market; see below |
-| `expect: { order \| book \| settlement: ref, matches }` | `GET` the one resource; it must contain `matches` |
+| `expect: { order \| book \| liquidity \| settlement: ref, matches }` | `GET` the one resource (`liquidity`: `GET /api/liquidity/{instrument}`); it must contain `matches` |
 | `expect: { trades \| events \| deliveries \| attempts: filter, count? \| all? }` | The items containing `filter`: exactly `count`, at least one, or with `all: true` every item (and at least one) |
 
 - **References:** `as: name` names an order. Later steps use `name` for its order ID and `name#i` for the ID of the
