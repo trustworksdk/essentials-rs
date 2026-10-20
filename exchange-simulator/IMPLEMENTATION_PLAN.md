@@ -2183,8 +2183,16 @@ then 6.11, 6.12, 6.13–6.14.
 ### Milestone 6 status
 
 All steps of the milestone are done (6.1–6.14 with 6.9a, 2026-10-18 to 2026-10-20). Not planned: SR-18 (FX, LATER).
-Still pending outside the code: the manual SR-2 acceptance against the real Finnhub, which needs a key (D19). Still
-on hold from Milestone 4: 4.6d (the containerized benchmark).
+Still on hold from Milestone 4: 4.6d (the containerized benchmark).
+
+**SR-2 manual acceptance against the real Finnhub ✅ done (2026-10-20, D19).** `config/finnhub-market.yaml` (40
+symbols), the key from `api_key_file` (outside the repository), the provider on with `stale_policy: pull`, at 07:30
+New York time (US market closed, crypto trading). Within a minute: connected, all 40 instruments priced and none
+stale, the provider quoting every one; the crypto pairs and pre-market MSFT followed the websocket (457 websocket
+updates, BTCUSD 63 reference moves in a minute), the other stocks were seeded over REST with the previous close (77
+REST calls, all `ok`, within 60 a minute). A client market order on BTCUSD filled against the provider. The key
+appeared in no answer (`/api/marketdata`, `/api/instruments`, `/api/liquidity`, `/metrics`, `/health`) and not in the
+log. Reconnects and staleness were not staged against the real service; the mock tests cover them.
 
 ## Beyond the milestones
 
