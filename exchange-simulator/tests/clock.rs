@@ -75,6 +75,11 @@ async fn simulated_time_stamps_orders_trades_and_events() {
         .unwrap()
         .iter()
         .partition(|e| e["eventType"] == "BusinessDayClosed");
+    // The day's closing price is stamped at its cutoff too.
+    let others: Vec<&Value> = others
+        .into_iter()
+        .filter(|e| e["eventType"] != "ClosingPriceIssued")
+        .collect();
     assert_eq!(
         closes
             .iter()

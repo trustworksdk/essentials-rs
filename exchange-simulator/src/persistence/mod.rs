@@ -5,7 +5,9 @@ mod store;
 
 pub use simulator_kit::outbox::{AttemptRow, DeliveryRecord, DeliveryStats, Outbox};
 pub use simulator_kit::persistence::{PersistenceMode, configure, open_reader, schema_version};
-pub use store::{ExecutionFilter, InstrumentFilter, OrderRecord, SettlementWrite, Store};
+pub use store::{
+    DayTrading, ExecutionFilter, InstrumentFilter, OrderRecord, SettlementWrite, Store,
+};
 
 use std::path::Path;
 use std::time::Duration;

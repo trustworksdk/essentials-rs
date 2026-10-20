@@ -986,6 +986,12 @@ webhooks:
       operationId: onBusinessDayClosed
       requestBody: { $ref: "#/components/requestBodies/BusinessDayClosedEvent" }
       responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
+  ClosingPriceIssued:
+    post:
+      summary: An instrument's closing price for a business day, right after its `BusinessDayClosed`
+      operationId: onClosingPriceIssued
+      requestBody: { $ref: "#/components/requestBodies/ClosingPriceIssuedEvent" }
+      responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
   SettlementPending:
     post:
       summary: A settlement instruction was created
@@ -1131,6 +1137,8 @@ components:
       content: { application/json: { schema: { $ref: "#/components/schemas/ClockChangedEvent" } } }
     BusinessDayClosedEvent:
       content: { application/json: { schema: { $ref: "#/components/schemas/BusinessDayClosedEvent" } } }
+    ClosingPriceIssuedEvent:
+      content: { application/json: { schema: { $ref: "#/components/schemas/ClosingPriceIssuedEvent" } } }
     SettlementPendingEvent:
       content: { application/json: { schema: { $ref: "#/components/schemas/SettlementPendingEvent" } } }
     SettlementCompletedEvent:
@@ -1710,7 +1718,7 @@ components:
 
     EventType:
       enum: [OrderAccepted, OrderRejected, OrderPartiallyFilled, OrderFilled, OrderCancelled, OrderExpired, TradeExecuted,
-             InstrumentListed, InstrumentUpdated, ClockChanged, BusinessDayClosed, SettlementPending, SettlementCompleted, SettlementFailed, SettlementRejected, SettlementDelayed,
+             InstrumentListed, InstrumentUpdated, ClockChanged, BusinessDayClosed, ClosingPriceIssued, SettlementPending, SettlementCompleted, SettlementFailed, SettlementRejected, SettlementDelayed,
              SettlementCorrected, SettlementCancelled, SettlementOutcomeReported, ClearingStatementIssued]
     EventEnvelope:
       type: object
@@ -1940,6 +1948,30 @@ components:
             cutoffAt: { $ref: "#/components/schemas/Timestamp" }
             nextBusinessDate: { $ref: "#/components/schemas/Date" }
             timeZone: { type: string, description: The IANA time zone of the cutoff. }
+    ClosingPriceIssuedEvent:
+      allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
+      description: |
+        One per instrument at each business day's cutoff, right after `BusinessDayClosed`, in instrument ID order: for
+        every instrument that traded in the day's window (its last trade then, basis `LAST_TRADE`) or has a reference
+        price (that price at the cutoff, basis `REFERENCE`). An instrument with neither has no closing price. Stamped
+        at the cutoff; the aggregate is the instrument, the correlation ID the business date. Exactly once per day and
+        instrument, and reproducible in a seeded run.
+      properties:
+        eventType: { const: ClosingPriceIssued }
+        source: { const: exchange }
+        correlationId: { $ref: "#/components/schemas/Date" }
+        payload:
+          type: object
+          additionalProperties: false
+          required: [instrumentId, businessDate, closingPrice, closingPriceTicks, currency, basis, volume]
+          properties:
+            instrumentId: { type: string }
+            businessDate: { $ref: "#/components/schemas/Date" }
+            closingPrice: { $ref: "#/components/schemas/Amount" }
+            closingPriceTicks: { type: integer, minimum: 1 }
+            currency: { type: string }
+            basis: { enum: [LAST_TRADE, REFERENCE] }
+            volume: { type: integer, minimum: 0, description: Quantity traded in the business day's window; 0 for `REFERENCE`. }
     InstrumentListedEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
       properties:

@@ -341,73 +341,27 @@ impl PriceSources {
     /// `None` for an unknown instrument or a `none` source.
     pub fn reference(&mut self, id: &InstrumentId, now: DateTime<Utc>) -> Option<Reference> {
         let live = self.live.clone();
-        let active = self.active.get_mut(id)?;
-        match &mut active.state {
-            State::None => None,
-            State::Fixed { ticks } => Some(Reference {
-                kind: PriceSourceKind::Fixed,
-                ticks: *ticks,
-                source_timestamp: active.since,
-                stale: false,
-            }),
-            State::Synthetic {
-                params,
-                rng,
-                ticks,
-                step,
-            } => {
-                let interval_ms = params.interval.num_milliseconds();
-                let elapsed_ms = (now - active.since).num_milliseconds().max(0);
-                let target = u64::try_from(elapsed_ms / interval_ms).unwrap_or(0);
-                let dt = interval_ms as f64 / 1_000.0 / YEAR_SECONDS;
-                let mean = (params.drift - params.volatility * params.volatility / 2.0) * dt;
-                let scale = params.volatility * dt.sqrt();
-                while *step < target {
-                    *ticks *= (mean + scale * rng.normal()).exp();
-                    *step += 1;
-                }
-                let offset = i64::try_from(*step)
-                    .ok()
-                    .and_then(|step| step.checked_mul(interval_ms))
-                    .map_or(Duration::MAX, Duration::milliseconds);
-                let at = active.since + offset;
-                Some(Reference {
-                    kind: PriceSourceKind::Synthetic,
-                    ticks: publish(*ticks),
-                    source_timestamp: at,
-                    stale: false,
-                })
-            }
-            State::Live {
-                symbol,
-                ticks_per_unit,
-                adopted,
-            } => {
-                let live = live?;
-                let latest = live.feed.latest(symbol);
-                if let Some(latest) = latest {
-                    let newer = adopted.is_none_or(|a| {
-                        a.received != latest.received && a.at.elapsed() >= live.min_interval
-                    });
-                    if newer {
-                        *adopted = Some(Adopted {
-                            ticks: publish(latest.price * *ticks_per_unit),
-                            source_timestamp: latest.source_timestamp,
-                            at: std::time::Instant::now(),
-                            received: latest.received,
-                        });
-                    }
-                }
-                let adopted = (*adopted)?;
-                let last_heard = latest.map_or(adopted.received, |l| l.received);
-                Some(Reference {
-                    kind: PriceSourceKind::Finnhub,
-                    ticks: adopted.ticks,
-                    source_timestamp: adopted.source_timestamp,
-                    stale: last_heard.elapsed() > live.stale_after,
-                })
-            }
+        read(self.active.get_mut(id)?, live, now)
+    }
+
+    /// The instrument's reference price at `at`, which may be in the past, without moving the source: a synthetic
+    /// walk already beyond `at` is replayed from its start, so the answer does not depend on when it was read before
+    /// (closing prices, SR-14). A live source can only answer with its latest price.
+    pub fn reference_at(&self, id: &InstrumentId, at: DateTime<Utc>) -> Option<Reference> {
+        let mut active = self.active.get(id)?.clone();
+        if let State::Synthetic {
+            params,
+            rng,
+            ticks,
+            step,
+        } = &mut active.state
+            && *step > steps_until(params, active.since, at)
+        {
+            *rng = Rng::new(params.seed);
+            *ticks = params.initial_ticks;
+            *step = 0;
         }
+        read(&mut active, self.live.clone(), at)
     }
 
     /// Forgets every source (after a reset).
@@ -470,6 +424,81 @@ impl PriceSources {
             }
         })
     }
+}
+
+/// Evaluates one source at `now`, catching a synthetic walk up to the last step at or before it.
+fn read(active: &mut Active, live: Option<LiveSource>, now: DateTime<Utc>) -> Option<Reference> {
+    match &mut active.state {
+        State::None => None,
+        State::Fixed { ticks } => Some(Reference {
+            kind: PriceSourceKind::Fixed,
+            ticks: *ticks,
+            source_timestamp: active.since,
+            stale: false,
+        }),
+        State::Synthetic {
+            params,
+            rng,
+            ticks,
+            step,
+        } => {
+            let interval_ms = params.interval.num_milliseconds();
+            let target = steps_until(params, active.since, now);
+            let dt = interval_ms as f64 / 1_000.0 / YEAR_SECONDS;
+            let mean = (params.drift - params.volatility * params.volatility / 2.0) * dt;
+            let scale = params.volatility * dt.sqrt();
+            while *step < target {
+                *ticks *= (mean + scale * rng.normal()).exp();
+                *step += 1;
+            }
+            let offset = i64::try_from(*step)
+                .ok()
+                .and_then(|step| step.checked_mul(interval_ms))
+                .map_or(Duration::MAX, Duration::milliseconds);
+            let at = active.since + offset;
+            Some(Reference {
+                kind: PriceSourceKind::Synthetic,
+                ticks: publish(*ticks),
+                source_timestamp: at,
+                stale: false,
+            })
+        }
+        State::Live {
+            symbol,
+            ticks_per_unit,
+            adopted,
+        } => {
+            let live = live?;
+            let latest = live.feed.latest(symbol);
+            if let Some(latest) = latest {
+                let newer = adopted.is_none_or(|a| {
+                    a.received != latest.received && a.at.elapsed() >= live.min_interval
+                });
+                if newer {
+                    *adopted = Some(Adopted {
+                        ticks: publish(latest.price * *ticks_per_unit),
+                        source_timestamp: latest.source_timestamp,
+                        at: std::time::Instant::now(),
+                        received: latest.received,
+                    });
+                }
+            }
+            let adopted = (*adopted)?;
+            let last_heard = latest.map_or(adopted.received, |l| l.received);
+            Some(Reference {
+                kind: PriceSourceKind::Finnhub,
+                ticks: adopted.ticks,
+                source_timestamp: adopted.source_timestamp,
+                stale: last_heard.elapsed() > live.stale_after,
+            })
+        }
+    }
+}
+
+/// The whole steps of a synthetic walk started at `since` by `at`.
+fn steps_until(params: &Synthetic, since: DateTime<Utc>, at: DateTime<Utc>) -> u64 {
+    let elapsed_ms = (at - since).num_milliseconds().max(0);
+    u64::try_from(elapsed_ms / params.interval.num_milliseconds()).unwrap_or(0)
 }
 
 enum Resolved {
@@ -546,6 +575,35 @@ mod tests {
                     .ticks
             })
             .collect()
+    }
+
+    #[test]
+    fn a_past_reference_is_the_same_however_far_the_walk_has_gone() {
+        let instrument = acme(synthetic(0.8));
+        let mut ahead = PriceSources::new(Default::default(), 7).unwrap();
+        ahead.start(&instrument, t0()).unwrap();
+        let mut fresh = ahead.clone();
+        let id = InstrumentId("ACME".into());
+        let later = ahead.reference(&id, t0() + Duration::hours(5)).unwrap();
+        let close = t0() + Duration::hours(2) + Duration::milliseconds(1_500);
+        assert_eq!(
+            ahead.reference_at(&id, close),
+            fresh.reference(&id, close),
+            "replayed from the start"
+        );
+        assert_eq!(
+            ahead.reference(&id, t0() + Duration::hours(5)).unwrap(),
+            later,
+            "and the walk itself did not move"
+        );
+        let mut third = PriceSources::new(Default::default(), 7).unwrap();
+        third.start(&instrument, t0()).unwrap();
+        let onward = close + Duration::hours(1);
+        assert_eq!(
+            fresh.reference_at(&id, onward),
+            third.reference(&id, onward),
+            "forward of the walk, it steps on in a copy"
+        );
     }
 
     #[test]

@@ -737,6 +737,22 @@ consumer's end-of-day work (statements, valuation, closing books):
   `settlement.tick_interval_ms`). Cutoffs passed while the service was down are closed at startup, once.
 - **From now on:** a new database, or a reset, starts with the current business day; no earlier day is closed.
 
+Right after it, in the same commit, one **`ClosingPriceIssued`** per instrument, in instrument ID order (aggregate
+ID the instrument, correlation ID the business date, `occurredAt` the cutoff): `instrumentId`, `businessDate`,
+`closingPrice` (decimal) and `closingPriceTicks`, `currency`, `basis` and `volume`.
+
+```json
+{ "instrumentId": "AAPL", "businessDate": "2030-01-07", "closingPrice": "188.40", "closingPriceTicks": 18840,
+  "currency": "USD", "basis": "LAST_TRADE", "volume": 1250 }
+```
+
+- **`LAST_TRADE`:** the instrument traded in the business day's window (from the previous cutoff to this one); the
+  price of its last trade then, and `volume` the quantity traded.
+- **`REFERENCE`:** it did not trade; its reference price at the cutoff, and `volume` 0. An instrument with neither a
+  trade that day nor a price source has no closing price.
+- **Reproducible:** the reference price is taken as of the cutoff, however late the cutoff is handled, so two seeded
+  runs give byte-identical closing prices. Use them for end-of-day valuation, statements and closing books.
+
 ## Clearing
 
 With `clearing.enabled: true`, a clearinghouse issues end-of-day statements on the exchange clock. It plays an outside

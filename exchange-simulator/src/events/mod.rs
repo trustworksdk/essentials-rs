@@ -33,6 +33,8 @@ pub const TRADE_EXECUTED: &str = "TradeExecuted";
 pub const INSTRUMENT_LISTED: &str = "InstrumentListed";
 /// A business day ended at its cutoff (`source: "exchange"`), also on days without trades.
 pub const BUSINESS_DAY_CLOSED: &str = "BusinessDayClosed";
+/// An instrument's closing price for a business day, right after its `BusinessDayClosed` (SR-14).
+pub const CLOSING_PRICE_ISSUED: &str = "ClosingPriceIssued";
 /// The virtual clock changed: speed, freeze, resume, set or advance (`source: "exchange"`).
 pub use simulator_kit::clock::CLOCK_CHANGED;
 /// A listed instrument changed (trading enabled or disabled, reference symbol).
@@ -63,6 +65,7 @@ pub const EVENT_TYPES: &[&str] = &[
     INSTRUMENT_UPDATED,
     CLOCK_CHANGED,
     BUSINESS_DAY_CLOSED,
+    CLOSING_PRICE_ISSUED,
     SETTLEMENT_PENDING,
     SETTLEMENT_COMPLETED,
     SETTLEMENT_FAILED,
@@ -94,6 +97,48 @@ pub fn business_day_closed(
             "cutoffAt": cutoff_at,
             "nextBusinessDate": simulator_kit::calendar::next_business_day(date),
             "timeZone": calendar.time_zone.name(),
+        }),
+    }
+}
+
+/// Where a closing price comes from (SR-14).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClosingBasis {
+    /// The instrument's last trade of the business day.
+    LastTrade,
+    /// No trade that day: its reference price at the cutoff.
+    Reference,
+}
+
+/// `ClosingPriceIssued` for `instrument` on business date `date`, stamped at the cutoff. Aggregate: the instrument;
+/// correlation: the business date.
+pub fn closing_price(
+    instrument: &Instrument,
+    date: chrono::NaiveDate,
+    cutoff_at: DateTime<Utc>,
+    price_ticks: i64,
+    basis: ClosingBasis,
+    volume: u64,
+) -> NewEvent {
+    NewEvent {
+        event_id: Uuid::nil(),
+        sequence: 0,
+        event_type: CLOSING_PRICE_ISSUED,
+        source: EXCHANGE_SOURCE,
+        aggregate_id: instrument.id.0.clone(),
+        correlation_id: Some(date.to_string()),
+        occurred_at: cutoff_at,
+        payload: json!({
+            "instrumentId": instrument.id,
+            "businessDate": date,
+            "closingPrice": instrument.ticks_to_price(price_ticks),
+            "closingPriceTicks": price_ticks,
+            "currency": instrument.currency,
+            "basis": match basis {
+                ClosingBasis::LastTrade => "LAST_TRADE",
+                ClosingBasis::Reference => "REFERENCE",
+            },
+            "volume": volume,
         }),
     }
 }

@@ -2060,6 +2060,33 @@ then 6.11, 6.12, 6.13–6.14.
   closes; the closed policy ignored; a close not causing a re-quote; sessions on weekends; `close_after` not strictly
   after; `DAY` never ending without a session; the snapshot always `open`.
 
+**6.11 — `ClosingPriceIssued` ✅ done (2026-10-20)**
+- **Delivered:**
+  - At each business day's cutoff, in the same commit as `BusinessDayClosed` and right after it, one
+    `ClosingPriceIssued` per instrument in ID order: `instrumentId`, `businessDate`, `closingPrice`,
+    `closingPriceTicks`, `currency`, `basis` (`LAST_TRADE` or `REFERENCE`), `volume`. Aggregate the instrument,
+    correlation the business date, `occurredAt` the cutoff. Exactly once with the business-day cursor.
+  - `Store::day_trading`: per instrument, the last trade and the volume in the day's window.
+  - `PriceSources::reference_at`: a reference price as of a past instant without moving the source; a synthetic walk
+    already beyond it is replayed from its start in a copy.
+  - `openapi.yaml` (the event and its schema), the README (Business days), the back-office guide.
+  - Tests: `tests/closing_prices.rs` (2): both bases, the day's window (a trade after the cutoff counts the next
+    day), order after `BusinessDayClosed`, exactly once across a restart; two seeded runs over three days with
+    synthetic prices and the liquidity provider giving a byte-identical event log (SR-3's acceptance, closing prices
+    included). A unit test for `reference_at`.
+- **Decisions:**
+  - **One per instrument that traded or has a reference price**, not only per traded instrument: the plan row says
+    "per traded instrument" but also gives the reference price as the fallback, which only an untraded instrument
+    needs. A portfolio can then be valued on a quiet day. An instrument with neither gets none, rather than carrying
+    an old trade forward under a basis the requirement does not name.
+  - **The reference price is read as of the cutoff.** A synthetic walk only steps forward, so a read on a running
+    clock between the cutoff and the tick that handles it would otherwise move the closing price.
+- **Mutation checks**, each made a test fail (all 6 on the first run): no closing prices; closing prices before
+  `BusinessDayClosed`; trades ignored (always the reference); the window starting at the beginning of time; the first
+  trade instead of the last; the reference read from the current walk. The last is caught by the unit test only: the
+  race it guards against (a read on a running clock between the cutoff and its tick) cannot be staged reliably in an
+  integration test, since a frozen clock's moves tick in the same command.
+
 ## Beyond the milestones
 
 **Running with an app in another project ✅ done (2026-10-19, requested by the user)**

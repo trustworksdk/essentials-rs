@@ -66,6 +66,14 @@ pub struct TradeSummary {
     pub volume_since: u64,
 }
 
+/// An instrument's trading in one business day ([`Store::day_trading`]).
+#[derive(Debug)]
+pub struct DayTrading {
+    pub instrument_id: InstrumentId,
+    pub last_price_ticks: i64,
+    pub volume: u64,
+}
+
 /// An execution stored before executions carried dates ([`Store::executions_without_dates`]).
 #[derive(Debug)]
 pub struct UndatedExecution {
@@ -657,15 +665,17 @@ impl Store {
     }
 
     /// Closes a business day: its `BusinessDayClosed` and the moved cursor, in one transaction.
+    /// Closes a business day: its cursor and its events (`BusinessDayClosed`, then the closing prices), in one
+    /// transaction.
     pub fn commit_business_day(
         &mut self,
         date: chrono::NaiveDate,
-        event: &NewEvent,
+        events: &[NewEvent],
         outbox: Outbox<'_>,
     ) -> rusqlite::Result<()> {
         let tx = self.conn.transaction()?;
         save_business_day_cursor(&tx, date)?;
-        write_events(&tx, std::slice::from_ref(event), &outbox)?;
+        write_events(&tx, events, &outbox)?;
         tx.commit()
     }
 
@@ -759,6 +769,31 @@ impl Store {
             [execution_id.to_string()],
             |row| from_sql(row, 0),
         )
+    }
+
+    /// Per instrument that traded in `[from, until)`: the price of its last trade then, and the quantity traded, in
+    /// instrument ID order (closing prices, SR-14).
+    pub fn day_trading(
+        &self,
+        from: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> rusqlite::Result<Vec<DayTrading>> {
+        self.conn
+            .prepare_cached(
+                "SELECT e.instrument_id, e.price_ticks, d.volume
+                 FROM (SELECT instrument_id, MAX(rowid) AS last, SUM(quantity) AS volume FROM executions
+                       WHERE executed_at >= ?1 AND executed_at < ?2 GROUP BY instrument_id) d
+                 JOIN executions e ON e.rowid = d.last
+                 ORDER BY e.instrument_id",
+            )?
+            .query_map([timestamp(from), timestamp(until)], |row| {
+                Ok(DayTrading {
+                    instrument_id: InstrumentId(row.get(0)?),
+                    last_price_ticks: row.get(1)?,
+                    volume: from_sql(row, 2)?,
+                })
+            })?
+            .collect()
     }
 
     /// Per instrument that traded: its last trade and the quantity traded since `since`, in instrument ID order.

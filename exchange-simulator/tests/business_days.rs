@@ -110,7 +110,12 @@ async fn the_day_closes_before_its_clearing_statements() {
     assert_eq!(end_of_day[0], ("BusinessDayClosed", "2030-01-07"));
     assert_eq!(
         end_of_day[1..].iter().map(|(t, _)| *t).collect::<Vec<_>>(),
-        ["ClearingStatementIssued", "ClearingStatementIssued"]
+        [
+            "ClosingPriceIssued",
+            "ClearingStatementIssued",
+            "ClearingStatementIssued"
+        ],
+        "the day closes, its closing prices follow, then its statements"
     );
     app.stop().await;
 }

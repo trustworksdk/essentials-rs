@@ -30,7 +30,8 @@ Both services run on their own domain clock, which in a demo runs fast (`clock.s
 Take every date and time from the events: `executedAt`, `tradeDate`, `intendedSettlementDate`, `occurredAt`,
 `completedAt`, `businessDate`. Never use your own clock to decide what day a trade or payment belongs to, or whether
 a statement is due. The end of a business day is `BusinessDayClosed` from the exchange: start end-of-day work on it,
-before the day's clearing statements arrive. It is published on days without trades too.
+before the day's clearing statements arrive. It is published on days without trades too. Right after it come the
+day's `ClosingPriceIssued` events, one per instrument: value positions at their `closingPrice`.
 
 The gateway's clock follows the exchange's (`clock.mode: follow`): it reads the exchange's `GET /api/clock` every
 `clock.follow.poll_interval_ms` and takes its speed, running state and reading, so both services agree on the date.

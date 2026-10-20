@@ -1572,12 +1572,10 @@ impl Exchange {
     fn close_business_day(&mut self) -> Result<usize, ExchangeError> {
         let days = self.days.as_ref().expect("business days run");
         let date = next_business_day(days.cursor);
-        let mut event = events::business_day_closed(date, &days.calendar);
-        let next = NewEvent::stamp(
-            std::slice::from_mut(&mut event),
-            self.next_event_sequence,
-            self.ids,
-        );
+        let calendar = days.calendar;
+        let mut new_events = vec![events::business_day_closed(date, &calendar)];
+        new_events.extend(self.closing_prices(date, &calendar)?);
+        let next = NewEvent::stamp(&mut new_events, self.next_event_sequence, self.ids);
         let outbox = Outbox {
             subscriptions: self.webhooks.subscriptions(),
             simulation_id: self.simulation_id.as_deref(),
@@ -1586,12 +1584,56 @@ impl Exchange {
             schema_version: events::SCHEMA_VERSION,
             parties: self.webhooks.parties(),
         };
-        self.store.commit_business_day(date, &event, outbox)?;
+        self.store.commit_business_day(date, &new_events, outbox)?;
         self.next_event_sequence = next;
-        ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type).increment(1);
+        for event in &new_events {
+            ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type)
+                .increment(1);
+        }
         self.days.as_mut().expect("business days run").cursor = date;
-        self.wake_delivery(std::slice::from_ref(&event));
-        Ok(1)
+        self.wake_delivery(&new_events);
+        Ok(new_events.len())
+    }
+
+    /// `ClosingPriceIssued` for business date `date`, in instrument ID order (SR-14): every listed instrument that
+    /// traded in the day's window closes at its last trade then; one that did not, at its reference price at the
+    /// cutoff; one with neither has no closing price. The reference is read as of the cutoff without moving the
+    /// source, so the event is the same however late the cutoff is handled.
+    fn closing_prices(
+        &self,
+        date: chrono::NaiveDate,
+        calendar: &simulator_kit::calendar::CutoffCalendar,
+    ) -> Result<Vec<NewEvent>, ExchangeError> {
+        let (from, cutoff_at) = calendar.window(date);
+        let traded: HashMap<InstrumentId, crate::persistence::DayTrading> = self
+            .store
+            .day_trading(from, cutoff_at)?
+            .into_iter()
+            .map(|t| (t.instrument_id.clone(), t))
+            .collect();
+        let mut ids: Vec<&InstrumentId> = self.books.keys().collect();
+        ids.sort();
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| {
+                let instrument = self.books[id].instrument();
+                let (price, basis, volume) = match traded.get(id) {
+                    Some(day) => (
+                        day.last_price_ticks,
+                        events::ClosingBasis::LastTrade,
+                        day.volume,
+                    ),
+                    None => (
+                        self.prices.reference_at(id, cutoff_at)?.ticks,
+                        events::ClosingBasis::Reference,
+                        0,
+                    ),
+                };
+                Some(events::closing_price(
+                    instrument, date, cutoff_at, price, basis, volume,
+                ))
+            })
+            .collect())
     }
 
     /// One clearing step at `at`, the earliest instant something is due: the cutoff's statements (those not drafted
