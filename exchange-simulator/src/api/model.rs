@@ -300,6 +300,9 @@ pub struct TradeView {
     pub quantity: u64,
     pub currency: String,
     pub executed_at: DateTime<Utc>,
+    /// The business day the trade belongs to, and the day it is meant to settle (SR-29).
+    pub trade_date: chrono::NaiveDate,
+    pub intended_settlement_date: chrono::NaiveDate,
 }
 
 impl TradeView {
@@ -316,6 +319,8 @@ impl TradeView {
             quantity: e.quantity,
             currency: instrument.currency.clone(),
             executed_at: e.executed_at,
+            trade_date: e.trade_date,
+            intended_settlement_date: e.intended_settlement_date,
         }
     }
 }

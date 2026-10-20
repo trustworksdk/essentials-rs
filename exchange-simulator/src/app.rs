@@ -126,6 +126,10 @@ impl App {
                 business_days: Some(config.business_calendar().map_err(anyhow::Error::msg)?),
                 liquidity: Some(config.liquidity.policy().map_err(anyhow::Error::msg)?),
                 market_data: Some(market_data.clone()),
+                trade_dating: crate::settlement::TradeDating {
+                    calendar: Some(config.business_calendar().map_err(anyhow::Error::msg)?),
+                    cycles: config.settlement.policy(),
+                },
             },
         )
         .context("recovering order books")?;

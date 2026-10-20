@@ -40,11 +40,13 @@ gateway holds until the exchange catches up, and a reset of the exchange needs a
 
 ## Trading and settlement
 
-- **`TradeExecuted`** carries both parties, quantity, price (`priceTicks` and `price`), currency and `executedAt`.
-  A buy commits cash and adds a position; a sell the reverse. Until settlement these are pending.
+- **`TradeExecuted`** carries both parties, quantity, price (`priceTicks` and `price`), currency, `executedAt`, and
+  the trade's `tradeDate` and `intendedSettlementDate`. Book the trade into the day `tradeDate` names; the fill
+  events and the order result carry the same dates. A buy commits cash and adds a position; a sell the reverse.
+  Until settlement these are pending.
 - **The settlement cycle is T+1 by default**, per market where it differs (`settlement.market_settlement_days`).
-  With clearing enabled, a trade after the cutoff or on a weekend is dated the next business day, so it settles a
-  business day after that.
+  A trade after the cutoff or on a weekend has the next business day as its `tradeDate`, so it settles a business
+  day after that. The exchange decides this; never derive the dates from `executedAt` yourself.
 - **`SettlementPending`** comes in the same transaction as the trade, with the `intendedSettlementDate`.
   `SettlementCompleted` arrives at 00:00 UTC on that date; `SettlementFailed`, `SettlementDelayed` (with a new date)
   and the others follow their probabilities (all 0 in the example).

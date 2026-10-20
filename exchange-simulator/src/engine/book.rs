@@ -215,6 +215,8 @@ impl OrderBook {
                     price_ticks: price,
                     quantity,
                     executed_at: ctx.now,
+                    trade_date: ctx.dates.trade_date,
+                    intended_settlement_date: ctx.dates.intended_settlement_date,
                 });
                 fills.push(maker);
             }

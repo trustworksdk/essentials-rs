@@ -1417,7 +1417,7 @@ components:
       type: object
       additionalProperties: false
       required: [executionId, instrumentId, buyOrderId, sellOrderId, buyerId, sellerId, priceTicks, price, quantity,
-                 currency, executedAt]
+                 currency, executedAt, tradeDate, intendedSettlementDate]
       properties:
         executionId: { type: string, format: uuid }
         instrumentId: { type: string }
@@ -1430,6 +1430,21 @@ components:
         quantity: { type: integer }
         currency: { type: string }
         executedAt: { $ref: "#/components/schemas/Timestamp" }
+        tradeDate: { $ref: "#/components/schemas/TradeDate" }
+        intendedSettlementDate: { $ref: "#/components/schemas/IntendedSettlementDate" }
+    TradeDate:
+      type: string
+      format: date
+      description: >-
+        The business day the trade belongs to (FIX tag 75): its date on the business-day calendar
+        (`clearing.cutoff` in `clearing.time_zone`, whether or not clearing runs). A trade at or after the cutoff, or
+        on a weekend, belongs to the next business day. The same for an execution on every event and response.
+    IntendedSettlementDate:
+      type: string
+      format: date
+      description: >-
+        The day the trade is meant to settle (FIX tag 64): `tradeDate` plus the instrument's market cycle
+        (`settlement.settlement_days`, `market_settlement_days`) in business days, in every settlement mode.
     Book:
       type: object
       additionalProperties: false
@@ -1708,11 +1723,16 @@ components:
         rejectReason: { enum: [SELF_TRADE, INSTRUMENT_DISABLED] }
         cancelReason: { enum: [REQUESTED, MARKET_REMAINDER] }
         executionId: { type: string, format: uuid, description: On a resting order's fill event. }
+        tradeDate:
+          $ref: "#/components/schemas/TradeDate"
+          description: On fill events, the execution's (one command's executions share their dates).
+        intendedSettlementDate: { $ref: "#/components/schemas/IntendedSettlementDate" }
     TradeExecutedPayload:
       type: object
       additionalProperties: false
       required: [executionId, instrumentId, instrument, buyOrderId, sellOrderId, buyerId, sellerId, buyerSettlement,
-                 sellerSettlement, priceTicks, price, quantity, currency, currencyScale, tickSizeMinor, executedAt]
+                 sellerSettlement, priceTicks, price, quantity, currency, currencyScale, tickSizeMinor, executedAt,
+                 tradeDate, intendedSettlementDate]
       properties:
         executionId: { type: string, format: uuid }
         instrumentId: { type: string }
@@ -1741,6 +1761,8 @@ components:
         currencyScale: { type: integer }
         tickSizeMinor: { type: integer }
         executedAt: { $ref: "#/components/schemas/Timestamp" }
+        tradeDate: { $ref: "#/components/schemas/TradeDate" }
+        intendedSettlementDate: { $ref: "#/components/schemas/IntendedSettlementDate" }
     InstrumentEventPayload:
       type: object
       required: [instrumentId, symbol, mic, isin, cusip, currency, currencyScale, tickSizeMinor, tickSize, lotSize,
@@ -1813,13 +1835,17 @@ components:
       properties:
         eventType: { const: OrderPartiallyFilled }
         source: { const: exchange }
-        payload: { $ref: "#/components/schemas/OrderEventPayload" }
+        payload:
+          allOf: [{ $ref: "#/components/schemas/OrderEventPayload" }]
+          required: [tradeDate, intendedSettlementDate]
     OrderFilledEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
       properties:
         eventType: { const: OrderFilled }
         source: { const: exchange }
-        payload: { $ref: "#/components/schemas/OrderEventPayload" }
+        payload:
+          allOf: [{ $ref: "#/components/schemas/OrderEventPayload" }]
+          required: [tradeDate, intendedSettlementDate]
     OrderCancelledEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
       properties:

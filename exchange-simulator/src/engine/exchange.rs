@@ -190,6 +190,8 @@ pub struct ExchangeOptions {
     pub liquidity: Option<LiquidityPolicy>,
     /// Where market-data messages go (plan item 6.8); `None` publishes nothing, the snapshot still works.
     pub market_data: Option<crate::market_data::Sender>,
+    /// How executions are dated (SR-29). The default dates by UTC date and settles T+1.
+    pub trade_dating: crate::settlement::TradeDating,
 }
 
 /// How the liquidity provider runs (`liquidity:` in the configuration).
@@ -224,6 +226,7 @@ impl Default for ExchangeOptions {
             business_days: None,
             liquidity: None,
             market_data: None,
+            trade_dating: Default::default(),
         }
     }
 }
@@ -277,6 +280,7 @@ pub struct Exchange {
     market_data_sender: Option<crate::market_data::Sender>,
     /// Instruments to publish once the open commit group is durable.
     market_data_due: std::collections::BTreeSet<InstrumentId>,
+    trade_dating: crate::settlement::TradeDating,
 }
 
 /// The liquidity provider: its policy, and per instrument what it last quoted around and holds.
@@ -468,6 +472,7 @@ impl Exchange {
             market_data: HashMap::new(),
             market_data_sender: options.market_data,
             market_data_due: Default::default(),
+            trade_dating: options.trade_dating,
         };
         exchange.start_price_sources()?;
         exchange.reconcile_webhooks()?;
@@ -503,6 +508,7 @@ impl Exchange {
             };
             exchange.days = Some(BusinessDays { calendar, cursor });
         }
+        exchange.date_old_executions()?;
         exchange.load_market_data()?;
         // Trades committed while the simulator was off (or before it existed) are taken in now, before any command,
         // so intake order does not depend on when a background tick happens to run. Cutoffs passed while the service
@@ -1022,6 +1028,30 @@ impl Exchange {
             .map_or_else(|| at.date_naive(), |d| d.calendar.business_date(at))
     }
 
+    /// Dates the executions stored before executions carried dates (migration 018), on the current calendar and
+    /// cycles, so every execution has both dates from here on.
+    fn date_old_executions(&mut self) -> Result<(), ExchangeError> {
+        let undated = self.store.executions_without_dates()?;
+        if undated.is_empty() {
+            return Ok(());
+        }
+        let dated: Vec<_> = undated
+            .into_iter()
+            .map(|e| {
+                (
+                    e.id,
+                    self.trade_dating.dates(e.executed_at, e.mic.as_deref()),
+                )
+            })
+            .collect();
+        tracing::info!(
+            executions = dated.len(),
+            "dating executions stored before they carried dates"
+        );
+        self.store.set_execution_dates(&dated)?;
+        Ok(())
+    }
+
     /// Rebuilds the market data a restart lost: each instrument's last trade and its volume on the current business
     /// date. The `mdSequence` starts again from 0.
     fn load_market_data(&mut self) -> Result<(), ExchangeError> {
@@ -1125,7 +1155,14 @@ impl Exchange {
             status: OrderStatus::Open,
         };
         let started = std::time::Instant::now();
-        let update = book.plan_submit(order, &mut MatchContext { now, ids: self.ids })?;
+        let mut ctx = MatchContext {
+            now,
+            ids: self.ids,
+            dates: self
+                .trade_dating
+                .dates(now, book.instrument().mic.as_deref()),
+        };
+        let update = book.plan_submit(order, &mut ctx)?;
         ::metrics::histogram!(crate::metrics::MATCH_DURATION).record(started.elapsed());
         self.commit_and_apply(Command::Submit, update, now)
     }

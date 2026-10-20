@@ -155,6 +155,37 @@ impl SettlementPolicy {
     }
 }
 
+/// How an execution is dated (SR-29): its trade date is the business day it belongs to on the business-day
+/// calendar (`clearing.cutoff` in `clearing.time_zone`, whether or not clearing runs), and its intended settlement
+/// date that plus its market's cycle in business days, in every settlement mode. Every event and response that
+/// carries the dates takes them from the execution, so they agree.
+#[derive(Clone, Debug, Default)]
+pub struct TradeDating {
+    /// `None` dates by the UTC calendar date (for callers without a business calendar).
+    pub calendar: Option<calendar::CutoffCalendar>,
+    /// The settlement cycles (`settlement_days`, `market_settlement_days`).
+    pub cycles: SettlementPolicy,
+}
+
+impl TradeDating {
+    pub fn dates(
+        &self,
+        executed_at: DateTime<Utc>,
+        mic: Option<&str>,
+    ) -> crate::domain::TradeDates {
+        let trade_date = self
+            .calendar
+            .map_or(executed_at.date_naive(), |c| c.business_date(executed_at));
+        crate::domain::TradeDates {
+            trade_date,
+            intended_settlement_date: calendar::add_business_days(
+                trade_date,
+                self.cycles.settlement_days_for(mic),
+            ),
+        }
+    }
+}
+
 /// A settlement outcome reported by an external service. It is stored and published as is, beside (never merged
 /// into) any simulated instruction for the same execution.
 #[derive(Clone, Debug, PartialEq)]
@@ -212,6 +243,8 @@ pub struct TradeFacts {
     pub currency_scale: u8,
     pub tick_size_minor: u64,
     pub executed_at: DateTime<Utc>,
+    /// The execution's own dates (SR-29); `None` for trades committed before executions carried them.
+    pub dates: Option<crate::domain::TradeDates>,
 }
 
 impl TradeFacts {
@@ -247,6 +280,18 @@ impl TradeFacts {
             executed_at: text("executedAt")?
                 .parse()
                 .map_err(|e| format!("executedAt: {e}"))?,
+            dates: match (
+                p["tradeDate"].as_str(),
+                p["intendedSettlementDate"].as_str(),
+            ) {
+                (Some(trade), Some(settles)) => Some(crate::domain::TradeDates {
+                    trade_date: trade.parse().map_err(|e| format!("tradeDate: {e}"))?,
+                    intended_settlement_date: settles
+                        .parse()
+                        .map_err(|e| format!("intendedSettlementDate: {e}"))?,
+                }),
+                _ => None,
+            },
         })
     }
 }

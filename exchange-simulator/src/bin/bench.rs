@@ -316,7 +316,7 @@ fn bench_matching(options: &Options, report: &mut Report) {
     let started = Instant::now();
     for order in orders {
         let update = book
-            .submit(order, &mut MatchContext { now, ids })
+            .submit(order, &mut MatchContext::utc(now, ids))
             .expect("valid order");
         executions += update.executions.len();
     }

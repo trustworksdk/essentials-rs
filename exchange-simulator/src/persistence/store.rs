@@ -66,6 +66,15 @@ pub struct TradeSummary {
     pub volume_since: u64,
 }
 
+/// An execution stored before executions carried dates ([`Store::executions_without_dates`]).
+#[derive(Debug)]
+pub struct UndatedExecution {
+    pub id: Uuid,
+    pub executed_at: DateTime<Utc>,
+    /// The instrument's market, which picks the settlement cycle.
+    pub mic: Option<String>,
+}
+
 impl Store {
     pub fn new(conn: Connection) -> Self {
         Self {
@@ -216,7 +225,7 @@ impl Store {
         self.conn
             .prepare_cached(
                 "SELECT id, instrument_id, buy_order_id, sell_order_id, buyer_id, seller_id, price_ticks, quantity,
-                        executed_at
+                        executed_at, trade_date, intended_settlement_date
                  FROM executions
                  WHERE (?1 IS NULL OR instrument_id = ?1)
                    AND (?2 IS NULL OR buyer_id = ?2 OR seller_id = ?2)
@@ -242,10 +251,51 @@ impl Store {
                         price_ticks: row.get(6)?,
                         quantity: from_sql(row, 7)?,
                         executed_at: parsed(row, 8)?,
+                        trade_date: parsed(row, 9)?,
+                        intended_settlement_date: parsed(row, 10)?,
                     })
                 },
             )?
             .collect()
+    }
+
+    /// Executions stored before they carried dates (migration 018).
+    pub fn executions_without_dates(&self) -> rusqlite::Result<Vec<UndatedExecution>> {
+        self.conn
+            .prepare_cached(
+                "SELECT e.id, e.executed_at, i.mic FROM executions e JOIN instruments i ON i.id = e.instrument_id
+                 WHERE e.trade_date IS NULL OR e.intended_settlement_date IS NULL
+                 ORDER BY e.rowid",
+            )?
+            .query_map([], |row| {
+                Ok(UndatedExecution {
+                    id: parsed(row, 0)?,
+                    executed_at: parsed(row, 1)?,
+                    mic: row.get(2)?,
+                })
+            })?
+            .collect()
+    }
+
+    /// Dates the executions [`Self::executions_without_dates`] found, in one transaction.
+    pub fn set_execution_dates(
+        &mut self,
+        dates: &[(Uuid, crate::domain::TradeDates)],
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut update = tx.prepare_cached(
+                "UPDATE executions SET trade_date = ?2, intended_settlement_date = ?3 WHERE id = ?1",
+            )?;
+            for (id, d) in dates {
+                update.execute(params![
+                    id.to_string(),
+                    d.trade_date.to_string(),
+                    d.intended_settlement_date.to_string()
+                ])?;
+            }
+        }
+        tx.commit()
     }
 
     pub fn insert_participant(&self, participant: &Participant) -> rusqlite::Result<()> {
@@ -359,8 +409,8 @@ impl Store {
             }
             let mut insert_execution = tx.prepare_cached(
                 "INSERT INTO executions (id, instrument_id, buy_order_id, sell_order_id, buyer_id, seller_id,
-                                         price_ticks, quantity, executed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                         price_ticks, quantity, executed_at, trade_date, intended_settlement_date)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             for execution in &update.executions {
                 insert_execution.execute(params![
@@ -373,6 +423,8 @@ impl Store {
                     execution.price_ticks,
                     to_sql(execution.quantity),
                     timestamp(execution.executed_at),
+                    execution.trade_date.to_string(),
+                    execution.intended_settlement_date.to_string(),
                 ])?;
             }
             write_events(&tx, new_events, &outbox)?;

@@ -1591,6 +1591,7 @@ it.
 | 6.7 | Liquidity provider | 3 | L | **SR-6, SR-7, SR-8, SR-10, D18.** A participant created by the simulator (`LP` by default), quoting a ladder around the reference price per instrument: `levels`, `spread_bps`, `level_step_ticks`, `level_quantity` (optionally growing with depth), `requote_threshold_ticks`. Prices rounded away from the reference price. Re-quoting happens atomically inside the exchange thread. Refill after `refill_delay` (simulated time); inventory skew by `skew_bps_per_lot`; at `max_inventory` the side that would increase it is not quoted. It never trades with itself. `liquidity.emit_order_events` (default off) keeps its order lifecycle out of the event log and webhooks; its trades, settlement and clearing are always emitted. Metrics for quotes, re-quotes and fills. |
 | 6.8 | Market-data snapshot and stream | 3 | L | **SR-12, SR-13.** The full snapshot: reference price and staleness, best bid and ask with quantity, last trade, session volume, a per-instrument `mdSequence`. Server-sent events at `GET /api/marketdata/stream?instruments=`: `quote`, `trade` (anonymous prints) and `reference`, each with `mdSequence`, conflated per instrument and kind to `conflation_interval_ms`. The exchange thread publishes into a bounded, conflating channel and never waits on a consumer; a consumer that falls behind is conflated harder, then closed. Not in the event log, not on webhooks. |
 | 6.9 | Finnhub source, stale policy | 3 | L | **SR-2, SR-9, D19.** The trades websocket per `referenceSymbol`, seeded and refreshed from the REST quote endpoint. The key from a secret file or environment variable, never logged, returned or used in a metric label. Reconnect with backoff and jitter, re-subscribe after reconnect; a source that is down never stops the exchange. Ticks applied at the virtual clock's time with the provider's `sourceTimestamp`, conflated to `max_updates_per_second`. Prices older than `stale_after` are marked stale; the provider keeps, widens or pulls its ladder per instrument (SR-9). Symbol and call limits are checked at startup where possible, else logged and counted. Tests run against a local mock websocket and REST server, never the real network. |
+| 6.9a | Trade and settlement dates on executions | 3 | M | **SR-29** (added to the requirements 2026-10-19, planned before 6.10 at the user's request). `tradeDate` and `intendedSettlementDate` on `TradeExecuted`, the fill events, the order result and `GET /api/trades`, from the business-day calendar whether or not clearing runs and the market cycle in every settlement mode; identical on every event and response that carries them, the settlement events and clearing lines included. |
 | 6.10 | Trading sessions, time in force | 3 | M | **SR-16, SR-17.** Opening and closing times per MIC in local time on business days (`none`, always open, stays the default). Outside a session new orders are rejected with `MARKET_CLOSED`, and the provider applies its closed-market policy. `timeInForce`: `DAY` (default when sessions are on), `GTC`, `IOC`. `DAY` orders open at the close get `OrderExpired`; an `IOC` remainder is cancelled with `IOC_REMAINDER`. |
 | 6.11 | `ClosingPriceIssued` | 4 | S | **SR-14.** At the cutoff, after `BusinessDayClosed`, one event per traded instrument: `instrumentId`, `businessDate`, `closingPrice` (last trade, else the reference price), `basis` (`LAST_TRADE` or `REFERENCE`) and the day's volume. Reproducible: two seeded synthetic runs give a byte-identical event log, closing prices included (the SR-3 acceptance). |
 | 6.12 | Liquidity runtime control | 5 | M | **SR-11.** `GET /api/liquidity[/{instrumentId}]` (settings, inventory, current ladder, source, staleness) and `PATCH /api/liquidity/{instrumentId}` for any setting, the price source and `mode` (`on`/`off`) included. A scenario step for it, so scenarios can drain liquidity, widen spreads, or switch an instrument from `finnhub` to `synthetic` at the close. |
@@ -1978,6 +1979,43 @@ then 6.11, 6.12, 6.13–6.14.
   - With ticks running, the next tick recorded the provider's state anyway. A test without ticks reads the snapshot
     right after the first quote.
 - **Not done here:** manual acceptance of SR-2 against the real Finnhub needs a key from the user (D19).
+
+**6.9a — trade and settlement dates on executions ✅ done (2026-10-19)**
+- **Delivered:**
+  - `Execution` carries `trade_date` and `intended_settlement_date`. `settlement::TradeDating` (the business-day
+    calendar and the settlement cycles) dates a command once; `MatchContext::dates` hands the result to the book,
+    which stamps every fill. Stored with the execution (migration 018).
+  - `tradeDate` and `intendedSettlementDate` on `TradeExecuted`, on both fill events (the maker's carries its
+    `executionId`; the taker's the dates its executions share), on `Trade` (`GET /api/trades` and the order result).
+  - The settlement simulator and the clearinghouse take the dates from the `TradeExecuted` payload
+    (`TradeFacts::dates`) instead of computing their own. Only trades from before this step, whose events lack the
+    dates, are still dated the old way.
+  - At startup, executions without dates (stored before migration 018) are dated on the current calendar.
+  - `openapi.yaml` (`TradeDate`, `IntendedSettlementDate`, required on `Trade`, `TradeExecuted` and the fill events),
+    the README (Trade dates), the back-office guide.
+  - Tests: `tests/trade_dates.rs` (4): SR-29's three acceptance cases, the two dates equal on `TradeExecuted`, both
+    fill events, `GET /api/trades`, the order result, `SettlementPending` and both clearing statement lines; without
+    clearing, in external and simulated mode, with a T+2 market; a changed cycle dating new trades only; the startup
+    backfill. `tests/events.rs` asserts the
+    payloads.
+- **Decisions:**
+  - **Stored, not computed on read.** A trade's dates must not move when the cutoff or a cycle is changed later; the
+    settlement instructions already store theirs. A configuration change dates new trades only.
+  - **Without clearing, settlement now dates by the business-day calendar too.** Before, the simulator used the UTC
+    date of execution when clearing was off. SR-29 says the business-day rule does not depend on `clearing.enabled`,
+    so a trade after the cutoff now belongs to the next business day in every configuration.
+  - **The taker's fill event carries the dates** although it names no `executionId`: all executions of one command
+    share them, being dated at one instant on one instrument.
+  - **`schemaVersion` stays 1:** additive fields, as for `referenceSymbol` and `liquidity` before.
+- **Note:** the requirement text reached this branch inside commit 3427344 (ports and with-your-app), committed by
+  mistake with that work; its content is unchanged.
+- **Mutation checks**, each made a test fail: the book ignoring the context's dates; dating ignoring the calendar;
+  dating ignoring the market cycle; the service giving no calendar; the settlement simulator ignoring the execution's
+  dates; fill events without dates; the taker's fill without dates; the settlement date stored as the trade date; no
+  backfill at startup; the clearinghouse ignoring the execution's dates. Two first survived and exposed gaps. Settlement
+  ignoring the dates was hidden by clearing, whose calendar gave the old path the same answer; a test now runs the
+  simulator without clearing. Clearing ignoring the dates gives the same answer under one configuration;
+  `a_changed_cycle_dates_new_trades_only` moves a market from T+1 to T+2 between a trade and its statement.
 
 ## Beyond the milestones
 

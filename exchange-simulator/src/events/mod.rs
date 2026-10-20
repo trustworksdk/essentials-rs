@@ -222,18 +222,17 @@ pub fn for_update(
             execution.id.to_string(),
             trade_payload(execution, instrument, settlement),
         );
-        push(
-            fill_event(maker),
-            maker.id.to_string(),
-            order_payload(maker, instrument, None, Some(execution.id)),
-        );
+        let mut payload = order_payload(maker, instrument, None, Some(execution.id));
+        add_dates(&mut payload, execution);
+        push(fill_event(maker), maker.id.to_string(), payload);
     }
     if order.filled_quantity() > 0 {
-        push(
-            fill_event(order),
-            order.id.to_string(),
-            order_payload(order, instrument, None, None),
-        );
+        let mut payload = order_payload(order, instrument, None, None);
+        // Every execution of one command has the same dates.
+        if let Some(execution) = update.executions.first() {
+            add_dates(&mut payload, execution);
+        }
+        push(fill_event(order), order.id.to_string(), payload);
     }
     if order.status == OrderStatus::Cancelled && order.order_type == OrderType::Market {
         push(
@@ -243,6 +242,12 @@ pub fn for_update(
         );
     }
     events
+}
+
+/// The execution's trade and intended settlement dates (SR-29), on a fill event.
+fn add_dates(payload: &mut Value, execution: &Execution) {
+    payload["tradeDate"] = json!(execution.trade_date);
+    payload["intendedSettlementDate"] = json!(execution.intended_settlement_date);
 }
 
 fn fill_event(order: &Order) -> &'static str {
@@ -314,5 +319,7 @@ fn trade_payload(
         "currencyScale": instrument.currency_scale,
         "tickSizeMinor": instrument.tick_size_minor,
         "executedAt": execution.executed_at,
+        "tradeDate": execution.trade_date,
+        "intendedSettlementDate": execution.intended_settlement_date,
     })
 }

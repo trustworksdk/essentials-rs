@@ -379,7 +379,8 @@ curl -N 'localhost:8080/api/marketdata/stream?instruments=AAPL'
 
 Executions in the order they were created. `participantId` matches either buyer or seller, and `orderId` either
 order. `limit` is 1–1000 (default 100). `Trade`: `executionId`, `instrumentId`, `buyOrderId`, `sellOrderId`,
-`buyerId`, `sellerId`, `priceTicks`, `price`, `quantity`, `currency`, `executedAt`.
+`buyerId`, `sellerId`, `priceTicks`, `price`, `quantity`, `currency`, `executedAt`, `tradeDate`,
+`intendedSettlementDate` (see Trade dates below). The same `Trade` is in `executions` of an order's result.
 
 ### `GET /health`
 
@@ -407,9 +408,26 @@ Event types and payloads (`schemaVersion` 1):
 |---|---|---|
 | `OrderAccepted` | order | order as accepted (status `OPEN`, nothing filled) |
 | `OrderRejected` | order | order with `rejectReason` |
-| `TradeExecuted` | execution | `executionId`, `instrumentId`, `instrument` {`id`, `symbol`, `mic`, `isin`, `cusip`, `currency`}, `buyOrderId`, `sellOrderId`, `buyerId`, `sellerId`, `buyerSettlement`, `sellerSettlement` (each party's settlement details at execution time, or `null`), `priceTicks`, `price`, `quantity`, `currency`, `currencyScale`, `tickSizeMinor`, `executedAt` |
-| `OrderPartiallyFilled` / `OrderFilled` | order | order after the fill; for a resting order also `executionId` |
+| `TradeExecuted` | execution | `executionId`, `instrumentId`, `instrument` {`id`, `symbol`, `mic`, `isin`, `cusip`, `currency`}, `buyOrderId`, `sellOrderId`, `buyerId`, `sellerId`, `buyerSettlement`, `sellerSettlement` (each party's settlement details at execution time, or `null`), `priceTicks`, `price`, `quantity`, `currency`, `currencyScale`, `tickSizeMinor`, `executedAt`, `tradeDate`, `intendedSettlementDate` |
+| `OrderPartiallyFilled` / `OrderFilled` | order | order after the fill, with the execution's `tradeDate` and `intendedSettlementDate`; for a resting order also `executionId` |
 | `OrderCancelled` | order | order with `cancelReason`: `REQUESTED` or `MARKET_REMAINDER` |
+
+**Trade dates.** Every execution carries the business day it belongs to, `tradeDate` (FIX tag 75), and the day it is
+meant to settle, `intendedSettlementDate` (tag 64), so a consumer never needs its own calendar to book or reconcile a
+trade:
+- **`tradeDate`** is the execution's date on the business-day calendar: `clearing.cutoff` in `clearing.time_zone`,
+  on weekdays, whether or not clearing runs. A trade at or after the cutoff, or on a weekend, belongs to the next
+  business day; the same calendar closes business days (`BusinessDayClosed`). With a 17:30 Copenhagen cutoff, a trade
+  at 17:29 on Tuesday is Tuesday's, one at 17:30 is Wednesday's, and one on Friday evening is Monday's.
+- **`intendedSettlementDate`** is `tradeDate` plus the instrument's market cycle (`settlement.settlement_days`, or
+  `market_settlement_days` for its MIC) in business days, in every settlement mode: in `external` mode it is the date
+  the exchange expects.
+- **One answer:** an execution's dates are set when it is committed and stored with it. `TradeExecuted`, the fill
+  events, `GET /api/trades`, the order result, `SettlementPending` and later settlement events, and the clearing
+  statement line all carry the same two dates (until a `SettlementDelayed` moves the settlement date of later
+  settlement events). A later change to the cutoff or a cycle dates new trades only. Executions stored before
+  executions carried dates are dated once, at the next startup, on the then-current calendar.
+- Both are domain time, so on a virtual clock they follow it, like `executedAt`.
 
 Settlement lifecycle events come from the optional settlement simulator (`source: "settlement-simulator"`). Their
 aggregate and correlation ID is the `executionId`, and their `occurredAt` is the scheduled instant: the trade time at
@@ -699,7 +717,7 @@ the guide's [Back office](docs/back-office.md) chapter.
 - **Which trades:** a trade's business date is the first business day whose cutoff is after it. Trades after the
   cutoff, or on a weekend, are on the next business day's statement, and that date is also their trade date: T+N
   counts from it, in the statement and in the settlement simulator, so nothing settles before the statement that
-  clears it (T+0 aside). Without clearing, the trade date is the UTC date of execution.
+  clears it (T+0 aside). The trade date is the same without clearing (see Trade dates).
 - **What:** one statement per participant that traded since the previous cutoff, ID `CS:<businessDate>:<participant>`:
   `statementId`, `businessDate`, `participantId`, `timeZone`, `tradesFrom` and `cutoffAt` (the window of execution
   times, start included), `issuedAt`, then
