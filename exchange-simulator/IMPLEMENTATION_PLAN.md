@@ -2143,6 +2143,49 @@ then 6.11, 6.12, 6.13–6.14.
   recorded; any symbol accepted; `sourceTimestamp` fixed at the start; a row playing just after its time; no CSV
   header check.
 
+**6.14 — market-data metrics, load profile with the provider ✅ done (2026-10-20)**
+- **Delivered:**
+  - **SR-15, per instrument** (label `instrument`): `exchange_reference_updates_total` (each new reference price
+    published), `exchange_reference_stale` (1 while stale) and `exchange_reference_age_seconds` (simulated time
+    since `sourceTimestamp`, as of the last publication); `exchange_market_data_messages_total` gains `instrument`;
+    new `exchange_market_data_subscribers`, `exchange_market_data_sent_total{instrument,kind}` and
+    `exchange_market_data_conflated_total{instrument,kind}`; `exchange_market_data_streams_closed_total` gains
+    `instrument`. Every series now has a `# HELP` line, the provider's and the feed's included.
+  - **Source health** was already there from 6.9 (`exchange_price_feed_connected`, `…_reconnects_total`,
+    `…_updates_total{via}`, `…_rest_calls_total{outcome}`); rate-limit hits are the `rate_limited` (own limit) and
+    `throttled` (HTTP 429) outcomes, now documented as such.
+  - **SR-20:** `bench provider` runs the open loop at each `--rates` rate twice on the same workload: without, then
+    with the provider quoting ACME around a generated, seeded replay file (a row every 100 ms, looping). The provider
+    rows add its reference moves, re-quotes, orders placed and fills. Results in `bench/README.md` (two runs at
+    1,000/2,000/4,000 orders/s, VM disk): about 40–50 µs more exchange-thread time per order; invisible in the ack up
+    to 2,000/s; at 4,000/s client p50 +0.3–0.6 ms and p99 +2.5–5 ms, no refusals.
+  - The README's `GET /metrics` list (now complete), alerts in `docs/operations.md`, `docs/benchmarking.md`.
+  - Tests: `tests/market_data.rs` (3 new): subscribers per instrument and under each instrument of a multi-instrument
+    stream, released on close; published, sent and conflated counts; a stream closed for falling behind; reference
+    updates (a fixed price is one update), staleness and age. `tests/finnhub.rs`: the stale gauge goes to 1 and back,
+    and updates count prices, not staleness changes.
+- **Decisions:**
+  - **Streams are labelled by the instruments they asked for**, `all` without a filter, and a multi-instrument
+    stream counts under each, so a per-instrument dashboard sees every stream that carries the instrument. Summing
+    over labels therefore overcounts streams; the README says so.
+  - **"Reference updates" are new prices**, not every `reference` message: a change in staleness is visible on the
+    stale gauge instead.
+  - **Conflation is counted where it happens, in the subscriber,** so a subscriber that reads nothing has skipped
+    nothing yet; its backlog is in the channel, and is either collapsed (counted) or closes the stream (counted).
+  - **The bench stresses re-quoting** (re-quote on every tick of movement, refill at once) rather than modelling a
+    quiet market, so the figure is an upper bound for these settings. Re-quotes come mostly from refills after fills
+    (about 0.2 per client order), not from reference moves.
+- **Mutation checks**, each made a test fail (all 9): every publication counted as an update; staleness never set;
+  age always 0; a subscriber never released; subscribers always under `all`; conflated messages not counted as sent;
+  every conflation counted, replacement or not; closed streams not labelled per instrument; published messages
+  without the instrument label. (One mutation's pattern first missed after formatting and was rerun.)
+
+### Milestone 6 status
+
+All steps of the milestone are done (6.1–6.14 with 6.9a, 2026-10-18 to 2026-10-20). Not planned: SR-18 (FX, LATER).
+Still pending outside the code: the manual SR-2 acceptance against the real Finnhub, which needs a key (D19). Still
+on hold from Milestone 4: 4.6d (the containerized benchmark).
+
 ## Beyond the milestones
 
 **Running with an app in another project ✅ done (2026-10-19, requested by the user)**

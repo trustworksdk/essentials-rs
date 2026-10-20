@@ -308,8 +308,10 @@ whenever it has been quiet for `price_sources.finnhub.refresh_after_ms` (a close
 - **Recording:** `price_sources.finnhub.record_to` appends every price the exchange takes in to a file in the replay
   format (below), stamped with the exchange's time, so a live session can be replayed later.
 - **Changing `referenceSymbol`** of a `finnhub` instrument unsubscribes the old symbol and subscribes the new one.
-- **Metrics:** `exchange_price_feed_connected`, `exchange_price_feed_reconnects_total`,
+- **Metrics (source health):** `exchange_price_feed_connected`, `exchange_price_feed_reconnects_total`,
   `exchange_price_feed_updates_total{via}` (`websocket`, `rest`), `exchange_price_feed_rest_calls_total{outcome}`.
+  Rate-limit hits are its `outcome="rate_limited"` (a call skipped at `rest_calls_per_minute`) and
+  `outcome="throttled"` (Finnhub answered 429). Per instrument, see [`GET /metrics`](#get-metrics).
 
 #### Replay
 
@@ -470,8 +472,7 @@ data: {"instrumentId":"AAPL","mdSequence":44,"reference":{"price":"187.40",...,"
   intermediate values; prints left out remain in `GET /api/trades`.
 - **Slow subscribers** never slow the exchange. More than half of `market_data.stream_buffer` behind, a subscriber's
   backlog collapses to the latest message per instrument and kind; a whole buffer behind, its stream is closed.
-  Reconnect and start again from the snapshot. Metrics: `exchange_market_data_messages_total{kind}`,
-  `exchange_market_data_catch_ups_total`, `exchange_market_data_streams_closed_total`.
+  Reconnect and start again from the snapshot. Metrics: see [`GET /metrics`](#get-metrics), market data.
 - Market data is not in the event log and not delivered over webhooks.
 
 ```bash
@@ -721,6 +722,23 @@ Prometheus text format, with these series:
   `exchange_events_total{event_type}`.
 - **Webhooks:** `webhook_delivery_attempts_total{outcome}`, `webhook_delivery_duration_seconds`, and the outbox
   backlog `webhook_outbox_deliveries{status}`, read from SQLite at scrape time.
+- **Reference prices, per instrument** (label `instrument`): `exchange_reference_updates_total` (each new price
+  published; a change in staleness alone is not one), `exchange_reference_stale` (1 while stale) and
+  `exchange_reference_age_seconds` (simulated time since its `sourceTimestamp`, as of the last publication, which
+  every tick makes).
+- **Market data, per instrument:** `exchange_market_data_messages_total{instrument,kind}` (published),
+  `exchange_market_data_sent_total{instrument,kind}` (handed to subscribers, summed over them),
+  `exchange_market_data_conflated_total{instrument,kind}` (skipped by a subscriber for a newer message of the same
+  instrument and kind, by conflation or catch-up), `exchange_market_data_subscribers{instrument}` (open streams) and
+  `exchange_market_data_streams_closed_total{instrument}` (closed for falling a whole buffer behind). For the last
+  two, a stream without an instrument filter counts under `instrument="all"`, and a stream for several instruments
+  under each of them. `exchange_market_data_catch_ups_total` counts backlogs collapsed.
+- **Liquidity provider:** `exchange_liquidity_quotes_total`, `exchange_liquidity_requotes_total{instrument}`,
+  `exchange_liquidity_fills_total{instrument}`.
+- **Live price feed (source health):** `exchange_price_feed_connected`, `exchange_price_feed_reconnects_total`,
+  `exchange_price_feed_updates_total{via}` and `exchange_price_feed_rest_calls_total{outcome}`, whose
+  `rate_limited` and `throttled` outcomes are the rate-limit hits.
+- **Settlement:** `settlement_open_instructions`.
 
 ## Settlement
 

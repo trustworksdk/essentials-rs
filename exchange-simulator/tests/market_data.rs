@@ -400,3 +400,176 @@ async fn the_snapshot_publishes_what_moved_since_the_last_tick_first() {
     assert_eq!(body["reference"], md["reference"]);
     app.stop().await;
 }
+
+/// The value of one `/metrics` series, whatever the order of its labels; `None` when it is not there.
+async fn metric(app: &TestApp, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+    let response = app
+        .router()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    text.lines().find_map(|line| {
+        let (series, value) = line.rsplit_once(' ')?;
+        let (series_name, rest) = series.split_once('{').unwrap_or((series, "}"));
+        let found: Vec<&str> = rest
+            .trim_end_matches('}')
+            .split(',')
+            .filter(|l| !l.is_empty())
+            .collect();
+        let wanted: Vec<String> = labels.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
+        (series_name == name
+            && found.len() == wanted.len()
+            && wanted.iter().all(|w| found.contains(&w.as_str())))
+        .then(|| value.parse().unwrap())
+    })
+}
+
+/// Lists an instrument like ACME under another ID, so its per-instrument metrics belong to one test alone.
+async fn list(app: &TestApp, id: &str) {
+    let mut instrument = common::acme();
+    instrument["id"] = json!(id);
+    instrument["symbol"] = json!(id);
+    let (status, body) = app.post("/api/instruments", instrument).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+async fn order_on(app: &TestApp, id: &str, price: i64) {
+    let (status, body) = app
+        .post(
+            "/api/orders",
+            json!({ "instrumentId": id, "participantId": "A", "side": "BUY", "type": "LIMIT",
+                    "priceTicks": price, "quantity": 1 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn subscribers_and_messages_sent_and_conflated_are_counted_per_instrument() {
+    use exchange_simulator::metrics::{
+        MARKET_DATA_CONFLATED, MARKET_DATA_MESSAGES, MARKET_DATA_SENT, MARKET_DATA_SUBSCRIBERS,
+    };
+    let mut app = TestApp::start_with(|c| c.market_data.conflation_interval_ms = 300).await;
+    app.seed().await;
+    list(&app, "MDM1").await;
+    let mdm1 = [("instrument", "MDM1")];
+    let quotes = [("instrument", "MDM1"), ("kind", "quote")];
+    let feed = Feed::open(&app, "?instruments=MDM1").await;
+    let mut both = Feed::open(&app, "?instruments=MDM1,ACME").await;
+    assert_eq!(
+        metric(&app, MARKET_DATA_SUBSCRIBERS, &mdm1).await,
+        Some(2.0)
+    );
+    assert_eq!(
+        metric(&app, MARKET_DATA_SUBSCRIBERS, &[("instrument", "ACME")]).await,
+        Some(1.0),
+        "a stream for two instruments counts under each"
+    );
+
+    for price in [100, 101, 102] {
+        order_on(&app, "MDM1", price).await;
+    }
+    let (kind, _, quote) = both.next().await;
+    assert_eq!(
+        (kind.as_str(), &quote["bestBid"]["priceTicks"]),
+        ("quote", &json!(102))
+    );
+    assert_eq!(
+        metric(&app, MARKET_DATA_MESSAGES, &quotes).await,
+        Some(4.0),
+        "the empty quote at listing, then three"
+    );
+    assert_eq!(
+        metric(&app, MARKET_DATA_SENT, &quotes).await,
+        Some(1.0),
+        "only the subscriber that read was handed one"
+    );
+    assert_eq!(
+        metric(&app, MARKET_DATA_CONFLATED, &quotes).await,
+        Some(2.0),
+        "two skipped by the subscriber that read; the other has read nothing yet, so skipped nothing"
+    );
+
+    drop(feed);
+    assert_eq!(
+        metric(&app, MARKET_DATA_SUBSCRIBERS, &mdm1).await,
+        Some(1.0),
+        "a closed stream no longer counts"
+    );
+    drop(both);
+    assert_eq!(
+        metric(&app, MARKET_DATA_SUBSCRIBERS, &mdm1).await,
+        Some(0.0)
+    );
+    app.stop().await;
+}
+
+#[tokio::test]
+async fn a_stream_closed_for_falling_behind_is_counted_under_its_instruments() {
+    use exchange_simulator::metrics::{MARKET_DATA_STREAMS_CLOSED, MARKET_DATA_SUBSCRIBERS};
+    let mut app = TestApp::start_with(|c| c.market_data.stream_buffer = 8).await;
+    app.seed().await;
+    list(&app, "MDM2").await;
+    let mdm2 = [("instrument", "MDM2")];
+    let mut closed = Feed::open(&app, "?instruments=MDM2").await;
+    for price in 100..110 {
+        order_on(&app, "MDM2", price).await;
+    }
+    assert!(closed.ended_within(Duration::from_secs(5)).await);
+    assert_eq!(
+        metric(&app, MARKET_DATA_STREAMS_CLOSED, &mdm2).await,
+        Some(1.0)
+    );
+    assert_eq!(
+        metric(&app, MARKET_DATA_SUBSCRIBERS, &mdm2).await,
+        Some(0.0)
+    );
+    app.stop().await;
+}
+
+#[tokio::test]
+async fn reference_updates_staleness_and_age_are_counted_per_instrument() {
+    use exchange_simulator::metrics::{REFERENCE_AGE, REFERENCE_STALE, REFERENCE_UPDATES};
+    let mut app = TestApp::start_with(|c| {
+        frozen(c);
+        c.instruments = vec![synthetic("MDWALK"), synthetic("MDFIX")];
+        c.instruments[1].price_source = Some(PriceSourceSpec {
+            kind: Some(PriceSourceKind::Fixed),
+            price: Some("50.00".into()),
+            ..Default::default()
+        });
+    })
+    .await;
+    let walk = [("instrument", "MDWALK")];
+    let fixed = [("instrument", "MDFIX")];
+    assert_eq!(
+        metric(&app, REFERENCE_UPDATES, &walk).await,
+        Some(1.0),
+        "the first price"
+    );
+    let (status, _) = app
+        .post("/test/clock/advance", json!({ "seconds": 30 }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let moves = metric(&app, REFERENCE_UPDATES, &walk).await.unwrap();
+    assert!(moves > 1.0, "the walk moved: {moves}");
+    assert_eq!(
+        metric(&app, REFERENCE_UPDATES, &fixed).await,
+        Some(1.0),
+        "a fixed price is one update however often it is published"
+    );
+    assert_eq!(metric(&app, REFERENCE_STALE, &fixed).await, Some(0.0));
+    assert_eq!(
+        metric(&app, REFERENCE_AGE, &fixed).await,
+        Some(30.0),
+        "set at the start, read 30 simulated seconds later"
+    );
+    assert_eq!(
+        metric(&app, REFERENCE_AGE, &walk).await,
+        Some(0.0),
+        "a step on the second"
+    );
+    app.stop().await;
+}

@@ -1131,13 +1131,12 @@ impl Exchange {
             let instrument = book.instrument().clone();
             let quote = self.top_of_book(&id);
             let reference = self.prices.reference(&id, now);
-            let messages =
-                self.market_data
-                    .entry(id)
-                    .or_default()
-                    .publish(&instrument, quote, reference);
+            let state = self.market_data.entry(id).or_default();
+            let before = state.reference.flatten().map(|(ticks, ..)| ticks);
+            let messages = state.publish(&instrument, quote, reference);
+            record_reference(&instrument.id, before, reference, now);
             for message in messages {
-                ::metrics::counter!(crate::metrics::MARKET_DATA_MESSAGES, "kind" => message.kind)
+                ::metrics::counter!(crate::metrics::MARKET_DATA_MESSAGES, "instrument" => message.instrument_id.0.clone(), "kind" => message.kind)
                     .increment(1);
                 if let Some(sender) = &self.market_data_sender {
                     // No subscribers is not an error; a full subscriber loses its place, never blocks this.
@@ -2221,4 +2220,26 @@ fn same_terms(order: &Order, command: &SubmitOrder) -> bool {
         && command
             .time_in_force
             .is_none_or(|t| t == order.time_in_force)
+}
+
+/// The reference-price metrics after one publication: an update when the published price moved from `before`, and
+/// the staleness and age of what is published now.
+fn record_reference(
+    id: &InstrumentId,
+    before: Option<i64>,
+    reference: Option<Reference>,
+    now: DateTime<Utc>,
+) {
+    use crate::metrics::{REFERENCE_AGE, REFERENCE_STALE, REFERENCE_UPDATES};
+    let Some(reference) = reference else {
+        ::metrics::gauge!(REFERENCE_STALE, "instrument" => id.0.clone()).set(0.0);
+        return;
+    };
+    if before != Some(reference.ticks) {
+        ::metrics::counter!(REFERENCE_UPDATES, "instrument" => id.0.clone()).increment(1);
+    }
+    ::metrics::gauge!(REFERENCE_STALE, "instrument" => id.0.clone())
+        .set(f64::from(u8::from(reference.stale)));
+    let age = (now - reference.source_timestamp).num_milliseconds().max(0) as f64 / 1000.0;
+    ::metrics::gauge!(REFERENCE_AGE, "instrument" => id.0.clone()).set(age);
 }

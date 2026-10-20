@@ -98,6 +98,9 @@ The ones worth an alert:
 | `exchange_command_ack_seconds` (p99) | above your budget | Orders wait in the queue; see [Benchmarking](benchmarking.md) |
 | `exchange_wal_frames` | stays far above `checkpoint_pages` | Checkpoints cannot finish, usually because of a long-running read |
 | `exchange_persistence_mode{mode="durable"}` | 0 in an environment that must be durable | The mode is set wrong |
+| `exchange_reference_stale` | 1 for minutes | A live price source is down or the symbol is quiet; the liquidity provider applies its stale policy |
+| `exchange_price_feed_connected` | 0 for minutes | The Finnhub websocket cannot connect: key, network, or Finnhub |
+| `rate(exchange_market_data_streams_closed_total[5m])` | sustained | A market-data consumer cannot keep up; raise `conflation_interval_ms` or `stream_buffer` |
 
 **Logs:** the image writes JSON lines (`logging.format: json`). Startup logs the database, its mode, the recovered
 books, and every declared subscription created, updated or disabled. Set `RUST_LOG=debug` for more.

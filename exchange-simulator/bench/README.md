@@ -263,3 +263,48 @@ and `results/2026-10-16-persistence-*-open-loop-vm-disk.md`.
   - Leave headroom for `memory` runs under the container limit (see the README), and do not benchmark while a build or
     an indexer is running.
 
+
+## The liquidity provider under load (step 6.14, SR-20)
+
+`bench provider` runs the open loop at each rate in `--rates` twice, on the same seeded workload: once without a
+price source and liquidity, then with ACME playing a generated replay file and the liquidity provider quoting it.
+The provider's settings stress re-quoting: five levels a side, 10 bps from the reference price, one tick apart, 100
+lots each, re-quoted on every move of a tick, refilled at once (`refillDelayMs: 0`). The replay is a seeded walk
+around 100.00, the workload's mid: one row every 100 ms, each a move of -2 to +2 ticks, kept within ±20 ticks. The
+service ticks every 100 ms to read it. The notes of the provider rows count its reference moves, re-quotes, orders
+placed and fills during the run.
+
+```sh
+cargo run --release -p exchange-simulator --bin bench -- provider --rates 1000,2000,4000 --seconds 10 --dir /path/on/real/disk
+```
+
+### Results, 2026-10-20
+
+Same devcontainer, VM disk (fsync about 310 µs), `durable`, group commit on (256), two runs. Full reports:
+[`results/2026-10-20-provider-open-loop-vm-disk.md`](results/2026-10-20-provider-open-loop-vm-disk.md) and
+[`results/2026-10-20-provider-open-loop-vm-disk-2.md`](results/2026-10-20-provider-open-loop-vm-disk-2.md).
+
+| Target rate | Provider | Client p50 | Client p99 | Server ack, mean | Exchange thread per order, mean | Provider per 10 s |
+|---:|---|---:|---:|---:|---:|---|
+| 1,000/s | off | 1.4 ms | 4.3 ms | 0.89 ms | 78 µs | |
+| 1,000/s | on | 1.6 ms | 3.2 ms | 0.63 ms | 126 µs | 2,199 re-quotes, 20,570 orders, 2,143 fills |
+| 2,000/s | off | 1.7 / 1.8 ms | 5.8 / 4.6 ms | 0.99 / 0.80 ms | 75 / 73 µs | |
+| 2,000/s | on | 1.7 / 2.1 ms | 4.6 / 4.8 ms | 0.91 / 0.97 ms | 115 / 115 µs | 4,067 re-quotes, 37,950 orders, 4,014 fills |
+| 4,000/s | off | 1.8 / 1.9 ms | 7.2 / 7.0 ms | 1.19 / 1.16 ms | 64 / 62 µs | |
+| 4,000/s | on | 2.3 / 2.2 ms | 12.2 / 9.5 ms | 1.87 / 1.56 ms | 106 / 103 µs | 7,750 re-quotes, 71,470 orders, 7,690 fills |
+
+Where two values are given, they are the first and the second run. The second run's 1,000/s pair hit VM-disk fsync
+stalls of about a second in both modes (p99 1.07 s off, 374 ms on; commit p99 up to 25 ms), which says nothing about
+the provider and is left out of the table.
+
+**What this says:**
+- **The provider costs about 40–50 µs of exchange-thread time per client order**, about 65 % more, at every rate. A
+  re-quote replaces about ten resting orders, and a client order causes about 0.2 re-quotes. Most re-quotes are
+  refills after fills, not reference moves: with a reference move every 100 ms there are only about 75 moves per
+  run, against 2,000–7,700 re-quotes.
+- **Up to 2,000 orders/s the cost does not show in the acknowledgement:** it is smaller than the commit and the
+  run-to-run noise of the VM disk.
+- **At 4,000 orders/s it does:** client p50 +0.3–0.6 ms, p99 +2.5–5 ms, server ack mean +0.4–0.7 ms, and no order was
+  refused. The exchange thread is busier, so commands wait longer in the queue (mean 353 → 560 µs in the first run).
+- **The provider's own orders are not durable events** (`emit_order_events: false`, the default), so the commit
+  grows only with its fills. With `emit_order_events: true`, each re-quote would write about twenty more events.

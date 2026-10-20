@@ -220,6 +220,15 @@ struct Subscriber {
     done: bool,
 }
 
+impl Drop for Subscriber {
+    fn drop(&mut self) {
+        for label in self.labels() {
+            ::metrics::gauge!(crate::metrics::MARKET_DATA_SUBSCRIBERS, "instrument" => label)
+                .decrement(1.0);
+        }
+    }
+}
+
 /// A subscriber's view of the channel: messages for `instruments` (all when `None`), conflated per instrument and
 /// kind to one per `options.conflation`. Ends when the subscriber lagged behind the buffer, or the exchange stopped.
 pub fn subscribe(
@@ -237,9 +246,14 @@ pub fn subscribe(
         flush_at: None,
         done: false,
     };
+    for label in subscriber.labels() {
+        ::metrics::gauge!(crate::metrics::MARKET_DATA_SUBSCRIBERS, "instrument" => label)
+            .increment(1.0);
+    }
     futures_util::stream::unfold(subscriber, |mut s| async move {
         loop {
             if let Some(message) = s.ready.pop_front() {
+                sent(&message);
                 return Some((message, s));
             }
             if s.done {
@@ -267,6 +281,7 @@ pub fn subscribe(
                     }
                     if s.conflation.is_zero() {
                         if s.wants(&message) {
+                            sent(&message);
                             return Some((message, s));
                         }
                         continue;
@@ -278,7 +293,10 @@ pub fn subscribe(
                     }
                 }
                 Some(Err(broadcast::error::RecvError::Lagged(skipped))) => {
-                    ::metrics::counter!(crate::metrics::MARKET_DATA_STREAMS_CLOSED).increment(1);
+                    for label in s.labels() {
+                        ::metrics::counter!(crate::metrics::MARKET_DATA_STREAMS_CLOSED, "instrument" => label)
+                            .increment(1);
+                    }
                     tracing::info!(
                         skipped,
                         "market-data subscriber fell behind the buffer; closing its stream"
@@ -295,7 +313,21 @@ pub fn subscribe(
     })
 }
 
+/// Counts a message handed to a subscriber.
+fn sent(message: &Message) {
+    ::metrics::counter!(crate::metrics::MARKET_DATA_SENT, "instrument" => message.instrument_id.0.clone(), "kind" => message.kind)
+        .increment(1);
+}
+
 impl Subscriber {
+    /// The `instrument` labels this subscriber counts under: each instrument it asked for, or `all`.
+    fn labels(&self) -> Vec<String> {
+        match &self.instruments {
+            Some(ids) => ids.iter().map(|id| id.0.clone()).collect(),
+            None => vec!["all".into()],
+        }
+    }
+
     fn wants(&self, message: &Message) -> bool {
         self.instruments
             .as_ref()
@@ -304,9 +336,13 @@ impl Subscriber {
 
     /// Keeps `message` for the next flush, replacing an older one of its instrument and kind.
     fn conflate(&mut self, message: Arc<Message>) {
-        if self.wants(&message) {
-            self.pending
-                .insert((message.instrument_id.clone(), message.kind), message);
+        if self.wants(&message)
+            && let Some(skipped) = self
+                .pending
+                .insert((message.instrument_id.clone(), message.kind), message)
+        {
+            ::metrics::counter!(crate::metrics::MARKET_DATA_CONFLATED, "instrument" => skipped.instrument_id.0.clone(), "kind" => skipped.kind)
+                .increment(1);
         }
     }
 

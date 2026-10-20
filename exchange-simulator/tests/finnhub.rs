@@ -380,19 +380,20 @@ async fn a_feed_that_goes_away_marks_prices_stale_and_recovers_without_a_restart
     let mock = Mock::start().await;
     mock.quote("AAPL", 100.0, 1_900_000_000);
     let mut app = start(&mock, |c| {
-        c.instruments = vec![live("APPLE", "AAPL", Some(provider(StalePolicy::Pull)))];
+        c.instruments = vec![live("STALE", "AAPL", Some(provider(StalePolicy::Pull)))];
     })
     .await;
-    let md = until(&app, "APPLE", "quoting", |md| md["liquidity"] == "quoting").await;
+    let md = until(&app, "STALE", "quoting", |md| md["liquidity"] == "quoting").await;
     assert_eq!(md["bestAsk"]["priceTicks"], 10_010);
 
     mock.kill();
-    let md = until(&app, "APPLE", "stale once the feed is gone", |md| {
+    let md = until(&app, "STALE", "stale once the feed is gone", |md| {
         md["reference"]["stale"] == true
     })
     .await;
     assert_eq!(price(&md), "100.00", "the last price is kept, marked stale");
-    let md = until(&app, "APPLE", "the ladder pulled", |md| {
+    until_metric(&app, r#"exchange_reference_stale{instrument="STALE"} 1"#).await;
+    let md = until(&app, "STALE", "the ladder pulled", |md| {
         md["liquidity"] == "pulled" && md["bestAsk"].is_null()
     })
     .await;
@@ -400,7 +401,7 @@ async fn a_feed_that_goes_away_marks_prices_stale_and_recovers_without_a_restart
 
     mock.quote("AAPL", 101.0, 1_900_000_600);
     mock.revive();
-    let md = until(&app, "APPLE", "fresh again after a reconnect", |md| {
+    let md = until(&app, "STALE", "fresh again after a reconnect", |md| {
         md["reference"]["stale"] == false && price(md) == "101.00" && md["liquidity"] == "quoting"
     })
     .await;
@@ -408,6 +409,13 @@ async fn a_feed_that_goes_away_marks_prices_stale_and_recovers_without_a_restart
         md["bestAsk"]["priceTicks"], 10_111,
         "quoted around the new price"
     );
+    until_metric(&app, r#"exchange_reference_stale{instrument="STALE"} 0"#).await;
+    // 100.00, then 101.00.
+    until_metric(
+        &app,
+        r#"exchange_reference_updates_total{instrument="STALE"} 2"#,
+    )
+    .await;
     let subscribed = mock
         .subscriptions()
         .iter()
@@ -549,6 +557,17 @@ async fn rest_calls_stay_within_the_limit() {
         "counted"
     );
     app.stop().await;
+}
+
+/// Waits until `/metrics` has the line `series value`; the metrics follow the next publication, not the snapshot.
+async fn until_metric(app: &TestApp, line: &str) {
+    for _ in 0..100 {
+        if text(app, "/metrics").await.lines().any(|l| l == line) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no {line} in\n{}", text(app, "/metrics").await);
 }
 
 async fn text(app: &TestApp, uri: &str) -> String {
