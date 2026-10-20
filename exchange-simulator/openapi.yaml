@@ -1435,8 +1435,8 @@ components:
         not use are ignored. Prices are decimal strings in major units, on the instrument's tick grid.
       properties:
         kind:
-          enum: [none, fixed, synthetic, finnhub]
-          description: "`none`: no reference price. `fixed`: `price`. `synthetic`: a seeded geometric Brownian motion. `finnhub`: live trade prices for the instrument's `referenceSymbol` (else its `symbol`); needs a Finnhub API key in the service's configuration."
+          enum: [none, fixed, synthetic, finnhub, replay]
+          description: "`none`: no reference price. `fixed`: `price`. `synthetic`: a seeded geometric Brownian motion. `finnhub`: live trade prices for the instrument's `referenceSymbol` (else its `symbol`); needs a Finnhub API key in the service's configuration. `replay`: that symbol's rows of the replay file (`price_sources.replay.file`), played on the exchange's clock."
         price: { $ref: "#/components/schemas/Amount" }
         initialPrice:
           $ref: "#/components/schemas/Amount"
@@ -1483,7 +1483,7 @@ components:
           properties:
             price: { $ref: "#/components/schemas/Amount" }
             priceTicks: { type: integer, minimum: 1 }
-            source: { enum: [fixed, synthetic, finnhub] }
+            source: { enum: [fixed, synthetic, finnhub, replay] }
             sourceTimestamp:
               $ref: "#/components/schemas/Timestamp"
               description: When the price was produced, on the exchange's clock.

@@ -382,6 +382,44 @@ pub struct PriceSourcesConfig {
     /// The Finnhub live source (plan item 6.9).
     #[serde(default)]
     pub finnhub: FinnhubConfig,
+    /// The replay source (plan item 6.13).
+    #[serde(default)]
+    pub replay: ReplayConfig,
+}
+
+/// The replay source (see [`crate::pricing::replay`]): the file instruments of kind `replay` play.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayConfig {
+    /// CSV (`.csv`) or JSON lines; unset refuses `replay` sources.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Start the file over after its last row.
+    #[serde(default, rename = "loop")]
+    pub looping: bool,
+    /// With `loop`: simulated milliseconds between the last row and the first row of the next pass.
+    #[serde(default = "replay_loop_gap_ms")]
+    pub loop_gap_ms: u64,
+}
+
+fn replay_loop_gap_ms() -> u64 {
+    1_000
+}
+
+impl ReplayConfig {
+    /// The loaded replay file, or `None` without one; an unreadable or malformed file is an error naming the line.
+    pub fn load(&self) -> Result<Option<crate::pricing::replay::Replay>, String> {
+        self.file
+            .as_deref()
+            .map(|file| {
+                crate::pricing::replay::Replay::load(
+                    std::path::Path::new(file),
+                    self.looping.then_some(self.loop_gap_ms),
+                )
+                .map_err(|e| format!("price_sources.replay.file {e}"))
+            })
+            .transpose()
+    }
 }
 
 impl PriceSourcesConfig {
@@ -422,6 +460,10 @@ pub struct FinnhubConfig {
     pub reconnect_initial_ms: u64,
     #[serde(default = "finnhub_reconnect_max_ms")]
     pub reconnect_max_ms: u64,
+    /// Appends every adopted price to this file in the replay format (`.csv` or JSON lines), for replaying later.
+    /// Keep it under `recordings/`, which is gitignored: vendor data must not be committed.
+    #[serde(default)]
+    pub record_to: Option<String>,
 }
 
 fn finnhub_ws_url() -> String {
@@ -469,6 +511,7 @@ impl Default for FinnhubConfig {
             request_timeout_ms: finnhub_request_timeout_ms(),
             reconnect_initial_ms: finnhub_reconnect_initial_ms(),
             reconnect_max_ms: finnhub_reconnect_max_ms(),
+            record_to: None,
         }
     }
 }
@@ -525,6 +568,12 @@ impl FinnhubConfig {
                 stale_after: ms(self.stale_after_ms),
                 min_interval: Duration::from_secs(1) / self.max_updates_per_second,
                 max_symbols: self.max_symbols,
+                recorder: self
+                    .record_to
+                    .as_deref()
+                    .map(|path| crate::pricing::replay::Recorder::start(std::path::Path::new(path)))
+                    .transpose()
+                    .map_err(|e| format!("price_sources.finnhub.record_to {e}"))?,
             },
             settings: crate::pricing::finnhub::FeedSettings {
                 ws_url: self.ws_url.clone(),

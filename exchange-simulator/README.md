@@ -31,6 +31,8 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `price_sources.finnhub.stale_after_ms` / `refresh_after_ms` | `120000` / `60000` | Real time without an update before a live price is stale / before a symbol is refreshed over REST |
 | `price_sources.finnhub.max_updates_per_second`, `max_symbols`, `rest_calls_per_minute` | `4`, `50`, `60` | Live price conflation per instrument; Finnhub free-tier limits |
 | `price_sources.finnhub.ws_url`, `rest_url`, `request_timeout_ms`, `reconnect_initial_ms` / `reconnect_max_ms` | Finnhub's, `10000`, `1000` / `60000` | Endpoints, timeout and reconnect backoff |
+| `price_sources.finnhub.record_to` | unset | Appends every adopted live price to this file in the replay format; keep it under `recordings/` (gitignored) |
+| `price_sources.replay.file`, `loop`, `loop_gap_ms` | unset, `false`, `1000` | The file `replay` sources play; start it over after its last row (see Replay) |
 | `sessions` | `{}` | Trading sessions by MIC, e.g. `{ XNAS: { open: "09:30", close: "16:00", time_zone: America/New_York } }`; a market not listed is always open (see Trading sessions and time in force) |
 | `market_data.conflation_interval_ms` / `stream_buffer` | `0` / `1024` | Market-data stream: at most one message per instrument and kind per interval (`0`: every message); how far a subscriber may fall behind before its stream is closed (see `GET /api/marketdata/stream`) |
 | `webhooks.poll_interval_ms` | `250` | How often due deliveries (retries) are looked for; new events are sent at once |
@@ -259,6 +261,7 @@ will quote around and the market data publishes. The demo never pushes prices in
 | `fixed` | A constant price | `price` |
 | `synthetic` | A seeded geometric Brownian motion on simulated time | `initialPrice`, `drift`, `volatility`, `tickIntervalMs`, `seed` |
 | `finnhub` | Live trade prices from Finnhub for the instrument's `referenceSymbol` (else its `symbol`) | – (the service needs an API key, below) |
+| `replay` | A recorded price path for that symbol, played on the exchange's clock | – (the service needs a replay file, below) |
 
 ```json
 "priceSource": { "kind": "synthetic", "initialPrice": "187.50", "drift": 0.05, "volatility": 0.3,
@@ -302,9 +305,35 @@ whenever it has been quiet for `price_sources.finnhub.refresh_after_ms` (a close
 - **A ready-made market** of 40 instruments (large US stocks and ETFs, three crypto pairs) is
   [`config/finnhub-market.yaml`](config/finnhub-market.yaml), shipped in the image at
   `/etc/exchange/finnhub-market.yaml`: `FINNHUB_API_KEY=… EXCHANGE_CONFIG=/etc/exchange/finnhub-market.yaml docker compose up`.
+- **Recording:** `price_sources.finnhub.record_to` appends every price the exchange takes in to a file in the replay
+  format (below), stamped with the exchange's time, so a live session can be replayed later.
 - **Changing `referenceSymbol`** of a `finnhub` instrument unsubscribes the old symbol and subscribes the new one.
 - **Metrics:** `exchange_price_feed_connected`, `exchange_price_feed_reconnects_total`,
   `exchange_price_feed_updates_total{via}` (`websocket`, `rest`), `exchange_price_feed_rest_calls_total{outcome}`.
+
+#### Replay
+
+`replay` plays a file of recorded prices (`price_sources.replay.file`) on the exchange's clock, for realistic price
+paths in load tests and demos without a live feed:
+
+```text
+timestamp,referenceSymbol,price,volume
+2029-11-05T14:30:00Z,AAPL,187.50,100
+2029-11-05T14:30:02.250Z,MSFT,410.00,10
+```
+
+CSV with that header (`.csv`), or JSON lines with the same fields (any other extension); timestamps are RFC 3339.
+- **Timing:** the file's first row lands when the instrument's source starts (at startup, the clock's start), every
+  later row that much later on the clock, so a virtual clock at speed 60 plays an hour of recording in a minute. The
+  price is that of the symbol's last row by then; before its first row the instrument has no reference price.
+  `sourceTimestamp` is when the row played, on the exchange's clock.
+- **Loop:** `price_sources.replay.loop: true` starts the file over `loop_gap_ms` (default 1000) after its last row.
+- **Reproducible:** the price is a function of the clock alone, so a replay gives the same prices, and with
+  deterministic IDs the same event log, every run.
+- **Symbols:** an instrument plays its `referenceSymbol`, else its `symbol`; a symbol the file lacks, or no file, is
+  refused like a missing Finnhub key.
+- **Recorded files stay local.** Recordings of live data are the vendor's data: keep them under `recordings/`, which is
+  gitignored, and never commit them.
 
 ### Liquidity provider
 

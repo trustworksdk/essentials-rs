@@ -77,6 +77,15 @@ price_sources:
     request_timeout_ms: 10000
     reconnect_initial_ms: 1000  # backoff, doubled per failure up to reconnect_max_ms, with jitter
     reconnect_max_ms: 60000
+    # Append every adopted price to this file in the replay format, to replay the session later. Keep recordings
+    # under recordings/ (gitignored): vendor data must not be committed.
+    record_to: null
+  # Recorded prices for kind replay: CSV (timestamp,referenceSymbol,price,volume) or JSON lines, played on the clock
+  # from when each instrument's source starts.
+  replay:
+    file: null
+    loop: false
+    loop_gap_ms: 1000
 # The built-in liquidity provider: a participant that quotes a ladder of limit orders around each instrument's
 # reference price. Off unless an instrument's liquidity (or the default here) sets mode: on. Fields: levels,
 # spread_bps, level_step_ticks, level_quantity (lots), level_quantity_growth, requote_threshold_ticks, refill_delay_ms

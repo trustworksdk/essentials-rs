@@ -93,6 +93,14 @@ impl App {
         if let Some(live) = &live {
             price_sources = price_sources.with_live(live.source.clone());
         }
+        if let Some(replay) = config
+            .price_sources
+            .replay
+            .load()
+            .map_err(anyhow::Error::msg)?
+        {
+            price_sources = price_sources.with_replay(replay);
+        }
         let exchange = Exchange::recover(
             store,
             ExchangeOptions {

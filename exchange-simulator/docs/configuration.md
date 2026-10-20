@@ -154,6 +154,29 @@ secret where that matters. The defaults for
 `stale_after_ms` must be longer than `refresh_after_ms`, or a closed market's prices would go stale between REST
 refreshes. Automated tests never call Finnhub; they run against a local mock (`tests/finnhub.rs`).
 
+### Replaying recorded prices
+
+Record a live session, then replay it on an accelerated clock ([README](../README.md#replay)):
+
+```yaml
+# Recording: a live run
+price_sources:
+  finnhub:
+    record_to: recordings/2026-10-20.csv    # recordings/ is gitignored
+```
+
+```yaml
+# Replaying it: no key, no network, the same path at speed 60
+clock: { mode: virtual, running: true, speed: 60 }
+price_sources:
+  default: { kind: replay }
+  replay:
+    file: recordings/2026-10-20.csv
+    loop: true
+```
+
+The replay's instruments must use the recorded symbols (`reference_symbol`, else `symbol`). Never commit a recording.
+
 ## Liquidity provider
 
 A built-in participant quotes a ladder around each instrument's reference price ([README](../README.md#liquidity-provider)).

@@ -19,6 +19,7 @@
 //! field, and then from the built-in defaults (`none`, drift 0, volatility 0.2, a step a second).
 
 pub mod finnhub;
+pub mod replay;
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -43,6 +44,7 @@ pub enum PriceSourceKind {
     Fixed,
     Synthetic,
     Finnhub,
+    Replay,
 }
 
 impl PriceSourceKind {
@@ -52,6 +54,7 @@ impl PriceSourceKind {
             Self::Fixed => "fixed",
             Self::Synthetic => "synthetic",
             Self::Finnhub => "finnhub",
+            Self::Replay => "replay",
         }
     }
 }
@@ -115,6 +118,10 @@ pub enum PriceSourceError {
         "priceSource.kind finnhub: at most {max} symbols can stream (price_sources.finnhub.max_symbols)"
     )]
     SymbolLimit { max: usize },
+    #[error("priceSource.kind replay needs a replay file (price_sources.replay.file)")]
+    NoReplayFile,
+    #[error("priceSource.kind replay: the replay file has no rows for {0}")]
+    ReplaySymbol(String),
     #[error("priceSource.{field}: {error}")]
     Price {
         field: &'static str,
@@ -180,6 +187,8 @@ pub struct LiveSource {
     /// The least real time between two adopted prices of one instrument (`1 / max_updates_per_second`).
     pub min_interval: std::time::Duration,
     pub max_symbols: usize,
+    /// Appends every adopted price to a replay file (`price_sources.finnhub.record_to`).
+    pub recorder: Option<replay::Recorder>,
 }
 
 /// A live price taken in as the reference price.
@@ -222,6 +231,10 @@ enum State {
         ticks_per_unit: f64,
         adopted: Option<Adopted>,
     },
+    Replay {
+        symbol: String,
+        ticks_per_unit: f64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -238,6 +251,8 @@ pub struct PriceSources {
     active: HashMap<InstrumentId, Active>,
     /// `None` without an API key: `finnhub` sources are then refused.
     live: Option<LiveSource>,
+    /// `None` without a replay file: `replay` sources are then refused.
+    replay: Option<std::sync::Arc<replay::Replay>>,
 }
 
 impl PriceSources {
@@ -250,7 +265,14 @@ impl PriceSources {
             seed,
             active: HashMap::new(),
             live: None,
+            replay: None,
         })
+    }
+
+    /// These sources with `replay` prices from `replay`.
+    pub fn with_replay(mut self, replay: replay::Replay) -> Self {
+        self.replay = Some(std::sync::Arc::new(replay));
+        self
     }
 
     /// These sources with `finnhub` prices from `live`.
@@ -311,6 +333,13 @@ impl PriceSources {
                 ticks_per_unit,
                 adopted: None,
             },
+            Resolved::Replay {
+                symbol,
+                ticks_per_unit,
+            } => State::Replay {
+                symbol,
+                ticks_per_unit,
+            },
         };
         self.active
             .insert(instrument.id.clone(), Active { since, state });
@@ -340,8 +369,8 @@ impl PriceSources {
     /// The instrument's reference price at `now`, catching a synthetic walk up to the last step at or before `now`;
     /// `None` for an unknown instrument or a `none` source.
     pub fn reference(&mut self, id: &InstrumentId, now: DateTime<Utc>) -> Option<Reference> {
-        let live = self.live.clone();
-        read(self.active.get_mut(id)?, live, now)
+        let (live, replay) = (self.live.clone(), self.replay.clone());
+        read(self.active.get_mut(id)?, live, replay, now, true)
     }
 
     /// The instrument's reference price at `at`, which may be in the past, without moving the source: a synthetic
@@ -361,7 +390,14 @@ impl PriceSources {
             *ticks = params.initial_ticks;
             *step = 0;
         }
-        read(&mut active, self.live.clone(), at)
+        // A copy: nothing it adopts is recorded.
+        read(
+            &mut active,
+            self.live.clone(),
+            self.replay.clone(),
+            at,
+            false,
+        )
     }
 
     /// Forgets every source (after a reset).
@@ -422,12 +458,34 @@ impl PriceSources {
                         / instrument.tick_size_minor as f64,
                 }
             }
+            PriceSourceKind::Replay => {
+                let replay = self.replay.as_ref().ok_or(PriceSourceError::NoReplayFile)?;
+                let symbol = instrument
+                    .reference_symbol
+                    .clone()
+                    .unwrap_or_else(|| instrument.symbol.clone());
+                if !replay.has_symbol(&symbol) {
+                    return Err(PriceSourceError::ReplaySymbol(symbol));
+                }
+                Resolved::Replay {
+                    symbol,
+                    ticks_per_unit: 10f64.powi(i32::from(instrument.currency_scale))
+                        / instrument.tick_size_minor as f64,
+                }
+            }
         })
     }
 }
 
-/// Evaluates one source at `now`, catching a synthetic walk up to the last step at or before it.
-fn read(active: &mut Active, live: Option<LiveSource>, now: DateTime<Utc>) -> Option<Reference> {
+/// Evaluates one source at `now`, catching a synthetic walk up to the last step at or before it. With `recording`, a
+/// live price taken in is appended to the recorder.
+fn read(
+    active: &mut Active,
+    live: Option<LiveSource>,
+    replay: Option<std::sync::Arc<replay::Replay>>,
+    now: DateTime<Utc>,
+    recording: bool,
+) -> Option<Reference> {
     match &mut active.state {
         State::None => None,
         State::Fixed { ticks } => Some(Reference {
@@ -481,6 +539,14 @@ fn read(active: &mut Active, live: Option<LiveSource>, now: DateTime<Utc>) -> Op
                         at: std::time::Instant::now(),
                         received: latest.received,
                     });
+                    if recording && let Some(recorder) = &live.recorder {
+                        recorder.record(replay::Row {
+                            timestamp: now,
+                            reference_symbol: symbol.clone(),
+                            price: latest.price,
+                            volume: latest.volume,
+                        });
+                    }
                 }
             }
             let adopted = (*adopted)?;
@@ -490,6 +556,19 @@ fn read(active: &mut Active, live: Option<LiveSource>, now: DateTime<Utc>) -> Op
                 ticks: adopted.ticks,
                 source_timestamp: adopted.source_timestamp,
                 stale: last_heard.elapsed() > live.stale_after,
+            })
+        }
+        State::Replay {
+            symbol,
+            ticks_per_unit,
+        } => {
+            let elapsed_ms = (now - active.since).num_milliseconds();
+            let (price, played_ms) = replay?.price_at(symbol, elapsed_ms)?;
+            Some(Reference {
+                kind: PriceSourceKind::Replay,
+                ticks: publish(price * *ticks_per_unit),
+                source_timestamp: active.since + Duration::milliseconds(played_ms),
+                stale: false,
             })
         }
     }
@@ -506,6 +585,7 @@ enum Resolved {
     Fixed(i64),
     Synthetic(Synthetic),
     Live { symbol: String, ticks_per_unit: f64 },
+    Replay { symbol: String, ticks_per_unit: f64 },
 }
 
 /// Rounds the walk to the nearest tick, never below one tick.

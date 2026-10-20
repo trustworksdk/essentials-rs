@@ -2115,6 +2115,34 @@ then 6.11, 6.12, 6.13–6.14.
   an empty patch accepted; the price source ignored; the inventory shown as 0; bids worst first; no reference shown;
   the own settings shown as the resolved ones. (One first did not compile and was rewritten.)
 
+**6.13 — replay source and recorder ✅ done (2026-10-20)**
+- **Delivered:**
+  - `src/pricing/replay`: `Replay` loads a file of `(timestamp, referenceSymbol, price, volume)` rows, CSV (`.csv`,
+    header required) or JSON lines, with errors naming the line; `price_at(symbol, elapsed)` is the symbol's last row
+    by then, `None` before its first, looping with a gap when asked. `Recorder` appends rows on its own thread.
+  - Price source kind `replay`: the instrument plays its `referenceSymbol` (else `symbol`) from when its source
+    starts; `sourceTimestamp` is when the row played. Refused without a file or without rows for the symbol.
+  - `price_sources.replay` (`file`, `loop`, `loop_gap_ms`) and `price_sources.finnhub.record_to`: every adopted live
+    price (after conflation, only on the exchange's own reads, never on `reference_at` copies) is recorded with the
+    exchange's time and the trade's volume (now kept on `LivePrice`).
+  - `recordings/` and `*.recording.{csv,jsonl}` are gitignored.
+  - `openapi.yaml` (the kind), the README (Replay, Recording), the configuration guide, `config/default.yaml`.
+  - Tests: `tests/replay.rs` (5): the clock anchor and a symbol before its first row, looping, SR-4's acceptance (at
+    speed 60 the prices seen follow the recorded path; replaying a session with the provider and client orders twice
+    gives a byte-identical event log, closing prices included), and the refusals. `tests/finnhub.rs` records a
+    session from the mock and replays its path. Unit tests in `src/pricing/replay` (4).
+- **Decisions:**
+  - **Anchored where the source starts**, which is the clock's start for instruments listed at startup (SR-4's
+    wording); a switch to `replay` mid-run then starts at the file's first row instead of somewhere inside it.
+  - **`sourceTimestamp` is when the row played** on the exchange's clock, not the recorded time: a looping replay
+    would otherwise go back in time.
+  - **The recorder stamps the exchange's time** of adoption, so a recording replays the path the exchange actually
+    used, conflation included.
+  - **One file for all replayed instruments**, chosen by symbol, as recordings hold every symbol of a session.
+- **Mutation checks**, each made a test fail (all 7 on the first run): the replay ignoring the clock; no loop; nothing
+  recorded; any symbol accepted; `sourceTimestamp` fixed at the start; a row playing just after its time; no CSV
+  header check.
+
 ## Beyond the milestones
 
 **Running with an app in another project ✅ done (2026-10-19, requested by the user)**

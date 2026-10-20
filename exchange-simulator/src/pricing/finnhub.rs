@@ -34,6 +34,8 @@ pub struct LivePrice {
     pub price: f64,
     /// The provider's own time for the price.
     pub source_timestamp: DateTime<Utc>,
+    /// The trade's volume (0 for a REST quote), kept for the recorder.
+    pub volume: f64,
     /// When it arrived (real time): the measure of staleness.
     pub received: Instant,
 }
@@ -85,7 +87,7 @@ impl LiveFeed {
     }
 
     /// Records a price for a wanted symbol (others are dropped: an unsubscribe may still be in flight).
-    pub fn record(&self, symbol: &str, price: f64, source_timestamp: DateTime<Utc>) {
+    pub fn record(&self, symbol: &str, price: f64, volume: f64, source_timestamp: DateTime<Utc>) {
         if !price.is_finite() || price <= 0.0 {
             return;
         }
@@ -96,6 +98,7 @@ impl LiveFeed {
                 LivePrice {
                     price,
                     source_timestamp,
+                    volume,
                     received: Instant::now(),
                 },
             );
@@ -264,6 +267,8 @@ struct Trade {
     /// Milliseconds since the epoch.
     #[serde(rename = "t")]
     timestamp_ms: i64,
+    #[serde(rename = "v", default)]
+    volume: f64,
 }
 
 /// Handles one websocket text message: the latest trade per symbol of a batch becomes its price.
@@ -283,7 +288,7 @@ fn receive(feed: &LiveFeed, text: &str) {
             }
             for (symbol, trade) in latest {
                 if let Some(at) = DateTime::from_timestamp_millis(trade.timestamp_ms) {
-                    feed.record(symbol, trade.price, at);
+                    feed.record(symbol, trade.price, trade.volume, at);
                     ::metrics::counter!(metrics::PRICE_FEED_UPDATES, "via" => "websocket")
                         .increment(1);
                 }
@@ -348,7 +353,7 @@ impl Rest {
         self.calls.push_back(now);
         let outcome = match self.quote(symbol).await {
             Ok(Some((price, at))) => {
-                feed.record(symbol, price, at);
+                feed.record(symbol, price, 0.0, at);
                 ::metrics::counter!(metrics::PRICE_FEED_UPDATES, "via" => "rest").increment(1);
                 "ok"
             }

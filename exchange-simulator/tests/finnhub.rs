@@ -667,3 +667,56 @@ async fn the_finnhub_market_file_starts_and_subscribes_every_symbol() {
     assert_eq!(listed.as_array().unwrap().len(), count);
     app.stop().await;
 }
+
+#[tokio::test]
+async fn a_recorded_session_replays_its_price_path() {
+    let mock = Mock::start().await;
+    mock.quote("AAPL", 100.0, 1_900_000_000);
+    let recording = std::env::temp_dir()
+        .join(format!("exchange-recording-{}", uuid::Uuid::now_v7()))
+        .join("recordings")
+        .join("session.csv");
+    let file = recording.display().to_string();
+    let mut app = start(&mock, move |c| {
+        c.price_sources.finnhub.record_to = Some(file);
+        c.instruments = vec![live("APPLE", "AAPL", None)];
+    })
+    .await;
+    until(&app, "APPLE", "seeded", |md| price(md) == "100.00").await;
+    for (i, p) in [100.5, 101.25, 100.75].into_iter().enumerate() {
+        mock.trade("AAPL", p, 1_900_000_001_000 + i as i64 * 1_000);
+        let expected = format!("{p:.2}");
+        until(&app, "APPLE", "a recorded trade", |md| {
+            price(md) == expected
+        })
+        .await;
+    }
+    app.stop().await;
+
+    // The recording holds the adopted prices, in order, in the replay format.
+    let replay = exchange_simulator::pricing::replay::Replay::load(&recording, None).unwrap();
+    let text = std::fs::read_to_string(&recording).unwrap();
+    let rows: Vec<(chrono::DateTime<chrono::Utc>, f64)> = text
+        .lines()
+        .skip(1)
+        .map(|l| {
+            let fields: Vec<&str> = l.split(',').collect();
+            assert_eq!(fields[1], "AAPL", "{l}");
+            (fields[0].parse().unwrap(), fields[2].parse().unwrap())
+        })
+        .collect();
+    let prices: Vec<f64> = rows.iter().map(|(_, p)| *p).collect();
+    assert_eq!(prices, [100.0, 100.5, 101.25, 100.75], "{text}");
+    assert!(!text.contains(KEY));
+
+    // Replayed, it reproduces the path at the recorded offsets.
+    let first = rows[0].0;
+    for (at, price) in &rows {
+        let offset = (*at - first).num_milliseconds();
+        assert_eq!(
+            replay.price_at("AAPL", offset).map(|(p, _)| p),
+            Some(*price)
+        );
+    }
+    let _ = std::fs::remove_dir_all(recording.parent().unwrap().parent().unwrap());
+}
