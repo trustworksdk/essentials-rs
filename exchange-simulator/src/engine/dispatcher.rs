@@ -848,6 +848,7 @@ mod tests {
                 order_type: OrderType::Limit,
                 limit_price_ticks: Some(10_000 + (i * 7 % 11) as i64 - 5),
                 quantity,
+                time_in_force: None,
             }
         }
 

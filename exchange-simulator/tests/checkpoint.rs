@@ -104,6 +104,7 @@ fn trade(exchange: &mut Exchange) {
                 order_type: OrderType::Limit,
                 limit_price_ticks: Some(10_000),
                 quantity: 10,
+                time_in_force: None,
             })
             .unwrap();
         exchange.store().request_checkpoint_if_due();

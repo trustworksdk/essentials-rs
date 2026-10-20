@@ -59,13 +59,19 @@ pub(crate) use wire_enum;
 wire_enum!(Side, "side" { Buy => "BUY", Sell => "SELL" });
 wire_enum!(OrderType, "order type" { Limit => "LIMIT", Market => "MARKET" });
 wire_enum!(
+    /// How long an order stays on the book (SR-17): until the session closes, until cancelled, or not at all.
+    TimeInForce, "time in force" { Day => "DAY", Gtc => "GTC", Ioc => "IOC" }
+);
+wire_enum!(
     /// `Cancelled` keeps the unfilled `remaining_quantity` it had when cancelled, so filled = quantity - remaining.
+    /// `Expired` is a `DAY` order still open when its session closed (SR-17), likewise keeping its remainder.
     OrderStatus, "order status" {
         Open => "OPEN",
         PartiallyFilled => "PARTIALLY_FILLED",
         Filled => "FILLED",
         Cancelled => "CANCELLED",
         Rejected => "REJECTED",
+        Expired => "EXPIRED",
     }
 );
 
@@ -102,6 +108,7 @@ pub struct Order {
     pub remaining_quantity: u64,
     pub sequence: u64,
     pub status: OrderStatus,
+    pub time_in_force: TimeInForce,
 }
 
 impl Order {

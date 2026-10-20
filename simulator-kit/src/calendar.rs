@@ -94,9 +94,109 @@ impl CutoffCalendar {
     }
 }
 
+/// A market's trading session: open from `open` to `close` local time in `time_zone`, on business days (Monday to
+/// Friday). Sessions do not span midnight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DailySession {
+    pub open: NaiveTime,
+    pub close: NaiveTime,
+    pub time_zone: Tz,
+}
+
+impl DailySession {
+    /// Parses `open` and `close` as `HH:MM` and `time_zone` as an IANA name such as `America/New_York`.
+    pub fn parse(open: &str, close: &str, time_zone: &str) -> Result<Self, String> {
+        let time = |field: &str, text: &str| {
+            NaiveTime::parse_from_str(text, "%H:%M")
+                .map_err(|_| format!("{field} must be HH:MM, got {text:?}"))
+        };
+        let session = Self {
+            open: time("open", open)?,
+            close: time("close", close)?,
+            time_zone: time_zone
+                .parse()
+                .map_err(|_| format!("time_zone is not a known time zone: {time_zone:?}"))?,
+        };
+        if session.open >= session.close {
+            return Err(format!("open ({open}) must be before close ({close})"));
+        }
+        Ok(session)
+    }
+
+    fn at(&self, date: NaiveDate, time: NaiveTime) -> DateTime<Utc> {
+        let local = date.and_time(time);
+        self.time_zone
+            .from_local_datetime(&local)
+            .earliest()
+            .or_else(|| {
+                self.time_zone
+                    .from_local_datetime(&(local + chrono::Duration::hours(1)))
+                    .earliest()
+            })
+            .expect("a local time an hour after a gap exists")
+            .with_timezone(&Utc)
+    }
+
+    /// Whether the market is open at `at`: a business day in its time zone, at or after the open, before the close.
+    pub fn is_open(&self, at: DateTime<Utc>) -> bool {
+        let date = at.with_timezone(&self.time_zone).date_naive();
+        is_business_day(date) && self.at(date, self.open) <= at && at < self.at(date, self.close)
+    }
+
+    /// The first close strictly after `after`.
+    pub fn close_after(&self, after: DateTime<Utc>) -> DateTime<Utc> {
+        let mut date = after.with_timezone(&self.time_zone).date_naive();
+        loop {
+            if is_business_day(date) {
+                let close = self.at(date, self.close);
+                if close > after {
+                    return close;
+                }
+            }
+            date = date.succ_opt().expect("date in range");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_is_open_on_business_days_in_its_own_time_zone() {
+        let nasdaq = DailySession::parse("09:30", "16:00", "America/New_York").unwrap();
+        let at = |text: &str| text.parse::<DateTime<Utc>>().unwrap();
+        // Monday 2030-01-07; New York is UTC-5 in winter.
+        assert!(!nasdaq.is_open(at("2030-01-07T14:29:59Z")));
+        assert!(
+            nasdaq.is_open(at("2030-01-07T14:30:00Z")),
+            "09:30 local opens"
+        );
+        assert!(nasdaq.is_open(at("2030-01-07T20:59:59Z")));
+        assert!(
+            !nasdaq.is_open(at("2030-01-07T21:00:00Z")),
+            "16:00 local closes"
+        );
+        assert!(!nasdaq.is_open(at("2030-01-12T15:00:00Z")), "Saturday");
+        // Summer: UTC-4.
+        assert!(nasdaq.is_open(at("2030-07-01T13:30:00Z")));
+        assert_eq!(
+            nasdaq.close_after(at("2030-01-07T15:00:00Z")),
+            at("2030-01-07T21:00:00Z")
+        );
+        assert_eq!(
+            nasdaq.close_after(at("2030-01-07T21:00:00Z")),
+            at("2030-01-08T21:00:00Z"),
+            "strictly after: at the close, the next day's"
+        );
+        assert_eq!(
+            nasdaq.close_after(at("2030-01-11T22:00:00Z")),
+            at("2030-01-14T21:00:00Z"),
+            "Friday evening: Monday's"
+        );
+        assert!(DailySession::parse("16:00", "09:30", "UTC").is_err());
+        assert!(DailySession::parse("09:30", "16:00", "Mars/Olympus").is_err());
+    }
 
     fn d(text: &str) -> NaiveDate {
         text.parse().unwrap()

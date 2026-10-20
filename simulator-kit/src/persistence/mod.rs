@@ -148,15 +148,45 @@ pub fn configure(conn: &Connection, busy_timeout: Duration) -> rusqlite::Result<
     conn.busy_timeout(busy_timeout)
 }
 
+/// A migration starting with this line runs with foreign keys off, as SQLite's procedure for rebuilding a table
+/// requires (a referenced table cannot be dropped and recreated otherwise). Its result is checked with
+/// `PRAGMA foreign_key_check` before it commits, and foreign keys are switched on again afterwards.
+pub const FOREIGN_KEYS_OFF: &str = "-- foreign_keys: off";
+
 /// Applies every migration newer than the database's `user_version`, each in its own transaction. `migrations` is the
 /// simulator's ordered list; the index + 1 is the version recorded in `PRAGMA user_version`.
 pub fn migrate(conn: &mut Connection, migrations: &[&str]) -> rusqlite::Result<()> {
     let current = schema_version(conn)?;
     for (version, sql) in (1_u32..).zip(migrations).skip(current as usize) {
-        let tx = conn.transaction()?;
-        tx.execute_batch(sql)?;
-        tx.pragma_update(None, "user_version", version)?;
-        tx.commit()?;
+        // The pragma is a no-op inside a transaction, so it is switched before the migration's transaction starts.
+        let rebuild = sql.starts_with(FOREIGN_KEYS_OFF);
+        if rebuild {
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+        }
+        let applied = (|| {
+            let tx = conn.transaction()?;
+            tx.execute_batch(sql)?;
+            if rebuild {
+                let violations: i64 =
+                    tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get(0)
+                    })?;
+                if violations > 0 {
+                    return Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                        Some(format!(
+                            "migration {version} left {violations} foreign key violations"
+                        )),
+                    ));
+                }
+            }
+            tx.pragma_update(None, "user_version", version)?;
+            tx.commit()
+        })();
+        if rebuild {
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+        }
+        applied?;
         tracing::info!(version, "applied schema migration");
     }
     Ok(())
@@ -165,4 +195,79 @@ pub fn migrate(conn: &mut Connection, migrations: &[&str]) -> rusqlite::Result<(
 /// The schema version recorded in the database.
 pub fn schema_version(conn: &Connection) -> rusqlite::Result<u32> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SCHEMA: &str = "CREATE TABLE parent (id INTEGER PRIMARY KEY, status TEXT CHECK (status IN ('A')));
+        CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parent(id));
+        INSERT INTO parent VALUES (1, 'A'); INSERT INTO child VALUES (1, 1);";
+
+    /// Widens the parent's CHECK by rebuilding it, as SQLite requires.
+    const REBUILD: &str = "-- foreign_keys: off
+        CREATE TABLE parent_new (id INTEGER PRIMARY KEY, status TEXT CHECK (status IN ('A', 'B')));
+        INSERT INTO parent_new SELECT * FROM parent;
+        DROP TABLE parent;
+        ALTER TABLE parent_new RENAME TO parent;";
+
+    fn connection() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn, Duration::from_secs(1)).unwrap();
+        conn
+    }
+
+    fn foreign_keys(conn: &Connection) -> i64 {
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_marked_migration_rebuilds_a_referenced_table() {
+        let mut conn = connection();
+        migrate(&mut conn, &[SCHEMA, REBUILD]).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 2);
+        conn.execute("UPDATE parent SET status = 'B'", []).unwrap();
+        assert_eq!(foreign_keys(&conn), 1, "foreign keys are on again");
+        assert!(
+            conn.execute("INSERT INTO child VALUES (2, 99)", [])
+                .is_err(),
+            "and enforced"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_that_breaks_a_reference_is_rolled_back() {
+        let mut conn = connection();
+        let losing = "-- foreign_keys: off
+            CREATE TABLE parent_new (id INTEGER PRIMARY KEY, status TEXT);
+            DROP TABLE parent;
+            ALTER TABLE parent_new RENAME TO parent;";
+        let error = migrate(&mut conn, &[SCHEMA, losing]).unwrap_err();
+        assert!(
+            error.to_string().contains("foreign key violations"),
+            "{error}"
+        );
+        assert_eq!(
+            schema_version(&conn).unwrap(),
+            1,
+            "the migration did not apply"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM parent", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(foreign_keys(&conn), 1);
+    }
+
+    #[test]
+    fn without_the_marker_a_rebuild_is_refused() {
+        let mut conn = connection();
+        let unmarked = REBUILD.replacen(FOREIGN_KEYS_OFF, "", 1);
+        assert!(migrate(&mut conn, &[SCHEMA, &unmarked]).is_err());
+        assert_eq!(schema_version(&conn).unwrap(), 1);
+    }
 }

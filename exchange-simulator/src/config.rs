@@ -36,6 +36,9 @@ pub struct Config {
     /// The market-data stream (plan item 6.8).
     #[serde(default)]
     pub market_data: MarketDataConfig,
+    /// Trading sessions by MIC (plan item 6.10); a market not listed is always open.
+    #[serde(default)]
+    pub sessions: BTreeMap<String, SessionConfig>,
     pub ids: IdsConfig,
     pub settlement: SettlementConfig,
     #[serde(default)]
@@ -237,6 +240,27 @@ impl Config {
             .map_err(|e| format!("clearing.{e}"))
     }
 
+    /// The trading sessions, keyed by uppercase MIC (environment variables arrive lowercased), with the business-day
+    /// calendar ending `DAY` orders on markets without one.
+    pub fn trading_sessions(&self) -> Result<crate::sessions::TradingSessions, String> {
+        let markets = self
+            .sessions
+            .iter()
+            .map(|(mic, s)| {
+                let mic = mic.to_ascii_uppercase();
+                crate::domain::validate_mic(&mic).map_err(|e| format!("sessions: {e}"))?;
+                let session =
+                    simulator_kit::calendar::DailySession::parse(&s.open, &s.close, &s.time_zone)
+                        .map_err(|e| format!("sessions.{mic}: {e}"))?;
+                Ok((mic, session))
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(crate::sessions::TradingSessions::new(
+            markets,
+            Some(self.business_calendar()?),
+        ))
+    }
+
     /// The clearinghouse's policy when clearing is enabled; an error for an invalid cutoff, time zone or break
     /// policy.
     pub fn clearing_policy(&self) -> Result<Option<crate::clearing::ClearingPolicy>, String> {
@@ -263,6 +287,16 @@ pub enum SettlementMode {
     Simulated,
     /// The simulator and externally reported outcomes, side by side.
     Both,
+}
+
+/// A market's trading session (see [`crate::sessions`]): `open` and `close` as `HH:MM` local time in `time_zone`, on
+/// business days.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConfig {
+    pub open: String,
+    pub close: String,
+    pub time_zone: String,
 }
 
 /// The market-data stream (see [`crate::market_data`]).

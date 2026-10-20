@@ -97,6 +97,7 @@ fn order(participant: &str, side: Side, price: Option<i64>, quantity: u64) -> Su
         },
         limit_price_ticks: price,
         quantity,
+        time_in_force: None,
     }
 }
 

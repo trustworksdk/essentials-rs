@@ -190,6 +190,7 @@ pub struct OrderRequest {
     /// Limit price in ticks; required for `LIMIT`, absent for `MARKET`.
     pub price_ticks: Option<i64>,
     pub quantity: u64,
+    pub time_in_force: Option<crate::domain::TimeInForce>,
 }
 
 impl From<OrderRequest> for SubmitOrder {
@@ -202,6 +203,7 @@ impl From<OrderRequest> for SubmitOrder {
             order_type: r.order_type,
             limit_price_ticks: r.price_ticks,
             quantity: r.quantity,
+            time_in_force: r.time_in_force,
         }
     }
 }
@@ -223,6 +225,7 @@ pub struct OrderView {
     pub filled_quantity: u64,
     pub status: OrderStatus,
     pub sequence: u64,
+    pub time_in_force: crate::domain::TimeInForce,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reject_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,6 +252,7 @@ impl OrderView {
             filled_quantity: order.filled_quantity(),
             status: order.status,
             sequence: order.sequence,
+            time_in_force: order.time_in_force,
             reject_reason: None,
             created_at: None,
             updated_at: None,

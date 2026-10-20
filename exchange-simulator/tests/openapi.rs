@@ -462,6 +462,21 @@ async fn every_operation_and_event_matches_the_document() {
         ["quote", "reference", "trade"].map(String::from).into(),
         "every kind of market-data event"
     );
+    // Time in force: a DAY order rests until the business day's cutoff (ACME's market has no session), where the
+    // clock move below expires it; an IOC remainder is cancelled; a market order is always IOC.
+    let mut day = order("C", "BUY", 9_001, 3);
+    day["timeInForce"] = json!("DAY");
+    let day = expect(a, s, 201, M::POST, "/api/orders", Some(day)).await;
+    assert_eq!(day["order"]["status"], "OPEN");
+    let mut ioc = order("C", "BUY", 9_002, 3);
+    ioc["timeInForce"] = json!("IOC");
+    let ioc = expect(a, s, 201, M::POST, "/api/orders", Some(ioc)).await;
+    assert_eq!(ioc["order"]["status"], "CANCELLED");
+    let mut gtc_market = order("C", "BUY", 0, 1);
+    gtc_market["type"] = json!("MARKET");
+    gtc_market["priceTicks"] = Value::Null;
+    gtc_market["timeInForce"] = json!("GTC");
+    expect(a, s, 400, M::POST, "/api/orders", Some(gtc_market)).await;
     let mut unknown = order("A", "SELL", 10_000, 1);
     unknown["instrumentId"] = json!("NOPE");
     expect(a, s, 422, M::POST, "/api/orders", Some(unknown)).await;

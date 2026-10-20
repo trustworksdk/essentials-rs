@@ -72,6 +72,7 @@ impl TestApp {
             price_sources: Default::default(),
             liquidity: Default::default(),
             market_data: Default::default(),
+            sessions: Default::default(),
             database: DatabaseConfig {
                 mode: Default::default(),
                 memory_max_mib: 1024,

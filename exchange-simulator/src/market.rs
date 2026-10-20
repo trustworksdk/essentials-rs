@@ -283,6 +283,7 @@ impl Iterator for Generator<'_> {
                 },
                 limit_price_ticks: price,
                 quantity,
+                time_in_force: None,
             }),
         })
     }

@@ -69,6 +69,7 @@ impl Harness {
             remaining_quantity: quantity,
             sequence: self.sequence,
             status: OrderStatus::Open,
+            time_in_force: exchange_simulator::domain::TimeInForce::Gtc,
         }
     }
 

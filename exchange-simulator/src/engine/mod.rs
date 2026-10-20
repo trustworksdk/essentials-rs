@@ -26,6 +26,8 @@ pub struct MatchContext {
     pub now: DateTime<Utc>,
     pub ids: IdScheme,
     pub dates: crate::domain::TradeDates,
+    /// The instrument's market is outside its session: client orders are rejected (SR-16).
+    pub market_closed: bool,
 }
 
 impl MatchContext {
@@ -35,6 +37,7 @@ impl MatchContext {
             now,
             ids,
             dates: crate::settlement::TradeDating::default().dates(now, None),
+            market_closed: false,
         }
     }
 }

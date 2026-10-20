@@ -174,6 +174,25 @@ An instrument's own `liquidity` overrides the default field by field; set `liqui
 it to client orders only. `stale_policy` (`pull` by default, `widen` with `stale_widen_factor`, or `keep`) decides
 what happens to the ladder while a live reference price is stale.
 
+## Trading sessions
+
+Opening hours per market, by MIC, in each market's own time zone ([README](../README.md#trading-sessions-and-time-in-force)):
+
+```yaml
+sessions:
+  XNAS: { open: "09:30", close: "16:00", time_zone: America/New_York }
+  XNYS: { open: "09:30", close: "16:00", time_zone: America/New_York }
+  XCSE: { open: "09:00", close: "17:00", time_zone: Europe/Copenhagen }
+liquidity:
+  default: { mode: on, closed_policy: widen, closed_widen_factor: 3 }   # quote wider while clients cannot trade
+```
+
+Outside its session an instrument refuses client orders (`MARKET_CLOSED`) and expires its `DAY` orders at the close;
+`DAY` becomes the default time in force there. Markets not listed stay always open, so adding sessions changes nothing
+for them. Sessions are weekdays only; holidays, half days and auctions are not modelled. With a virtual clock,
+`POST /test/clock/set` across an open or a close behaves as if the time had passed: the provider re-quotes, and
+`DAY` orders expire with `occurredAt` at the close.
+
 ## Market data
 
 The snapshot (`GET /api/marketdata`) needs no setting. The stream (`GET /api/marketdata/stream`, [README](../README.md#get-apimarketdatastreaminstruments))

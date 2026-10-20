@@ -10,7 +10,7 @@ use crate::clearing::{ClearingPolicy, StoredStatement, next_business_day, previo
 use crate::clock::{ClockError, SystemClock, VirtualClock};
 use crate::domain::{
     IdentifierPolicy, Instrument, InstrumentChange, InstrumentError, InstrumentId, Order,
-    OrderStatus, OrderType, Participant, ParticipantId, Side,
+    OrderStatus, OrderType, Participant, ParticipantId, Side, TimeInForce,
 };
 use crate::events::NewEvent;
 use crate::events::{self, Command};
@@ -43,6 +43,8 @@ pub struct SubmitOrder {
     pub order_type: OrderType,
     pub limit_price_ticks: Option<i64>,
     pub quantity: u64,
+    /// `None` takes the default: `IOC` for a market order, `DAY` on a market with a session, else `GTC` (SR-17).
+    pub time_in_force: Option<TimeInForce>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +97,8 @@ pub enum ExchangeError {
     },
     #[error("client order ID must be 1 to 64 characters")]
     InvalidClientOrderId,
+    #[error("a market order is always IOC; timeInForce {0} is not allowed")]
+    InvalidTimeInForce(TimeInForce),
     #[error("invalid participant: {0}")]
     InvalidParticipant(String),
     #[error("invalid webhook subscription: {0}")]
@@ -192,6 +196,8 @@ pub struct ExchangeOptions {
     pub market_data: Option<crate::market_data::Sender>,
     /// How executions are dated (SR-29). The default dates by UTC date and settles T+1.
     pub trade_dating: crate::settlement::TradeDating,
+    /// Trading sessions by market (plan item 6.10). The default has none: every market is always open.
+    pub sessions: crate::sessions::TradingSessions,
 }
 
 /// How the liquidity provider runs (`liquidity:` in the configuration).
@@ -227,6 +233,7 @@ impl Default for ExchangeOptions {
             liquidity: None,
             market_data: None,
             trade_dating: Default::default(),
+            sessions: Default::default(),
         }
     }
 }
@@ -281,6 +288,10 @@ pub struct Exchange {
     /// Instruments to publish once the open commit group is durable.
     market_data_due: std::collections::BTreeSet<InstrumentId>,
     trade_dating: crate::settlement::TradeDating,
+    sessions: crate::sessions::TradingSessions,
+    /// Resting `DAY` orders by when they expire: (expiry, sequence, instrument, order). An entry whose order is no
+    /// longer active when it comes due is dropped.
+    expiries: std::collections::BTreeSet<(DateTime<Utc>, u64, InstrumentId, Uuid)>,
 }
 
 /// The liquidity provider: its policy, and per instrument what it last quoted around and holds.
@@ -299,8 +310,9 @@ struct Quoting {
     quoted_at: Option<i64>,
     /// When it last traded, until the ladder is refilled.
     filled_at: Option<DateTime<Utc>>,
-    /// Whether the reference price was stale when the current ladder was quoted (or pulled).
+    /// Whether the reference price was stale, and the market closed, when the current ladder was quoted (or pulled).
     quoted_stale: bool,
+    quoted_closed: bool,
     /// What it is doing, as the market data shows it (see [`Exchange::liquidity_state`]); `None` reads `off`.
     state: Option<&'static str>,
 }
@@ -473,9 +485,12 @@ impl Exchange {
             market_data_sender: options.market_data,
             market_data_due: Default::default(),
             trade_dating: options.trade_dating,
+            sessions: options.sessions,
+            expiries: Default::default(),
         };
         exchange.start_price_sources()?;
         exchange.reconcile_webhooks()?;
+        exchange.schedule_expiries()?;
         exchange.start_liquidity()?;
         exchange.reconcile_instruments()?;
         if let Some(policy) = options.clearing {
@@ -792,14 +807,23 @@ impl Exchange {
             (crate::liquidity::LiquidityMode::On, true) => self.prices.reference(id, now),
             _ => None,
         };
-        let shown = Self::liquidity_state(&settings, &instrument, reference.as_ref());
-        // SR-9: a stale price is quoted as it is (keep), with a wider spread (widen), or not at all (pull).
+        let closed = !self.sessions.is_open(instrument.mic.as_deref(), now);
+        let shown = Self::liquidity_state(&settings, &instrument, reference.as_ref(), closed);
+        // SR-9: in a closed market, or under a stale price, the ladder is quoted as it is (keep), with a wider spread
+        // (widen), or not at all (pull). A closed market's policy takes precedence.
         let stale = reference.is_some_and(|r| r.stale);
-        if stale && settings.stale_policy == StalePolicy::Widen {
-            settings.spread_bps *= settings.stale_widen_factor;
+        let degraded = if closed {
+            Some((settings.closed_policy, settings.closed_widen_factor))
+        } else if stale {
+            Some((settings.stale_policy, settings.stale_widen_factor))
+        } else {
+            None
+        };
+        if let Some((StalePolicy::Widen, factor)) = degraded {
+            settings.spread_bps *= factor;
         }
         let reference = reference
-            .filter(|r| !(r.stale && settings.stale_policy == StalePolicy::Pull))
+            .filter(|_| !matches!(degraded, Some((StalePolicy::Pull, _))))
             .map(|r| r.ticks);
         let lot = instrument.lot_size;
         let wanted =
@@ -810,6 +834,7 @@ impl Exchange {
             (Some(r), Some(quoted)) => {
                 (r - quoted).abs() >= i64::from(settings.requote_threshold_ticks)
                     || stale != state.quoted_stale
+                    || closed != state.quoted_closed
                     || state.filled_at.is_some_and(|at| {
                         now >= at + chrono::Duration::milliseconds(settings.refill_delay_ms as i64)
                     })
@@ -852,6 +877,7 @@ impl Exchange {
         quoting.quoted_at = reference;
         quoting.filled_at = None;
         quoting.quoted_stale = stale;
+        quoting.quoted_closed = closed;
         quoting.state = Some(shown);
         Ok(())
     }
@@ -879,24 +905,27 @@ impl Exchange {
     }
 
     /// What the provider does in an instrument, for the market data: `off` (mode off or trading disabled),
-    /// `no-reference`, `quoting`, or under a stale price its policy: `kept`, `widened` or `pulled`. Recorded when it
-    /// quotes, so the snapshot never shows a state whose ladder is not in the book yet.
+    /// `no-reference`, `quoting`, or in a closed market or under a stale price that policy: `kept`, `widened` or
+    /// `pulled`. Recorded when it quotes, so the snapshot never shows a state whose ladder is not in the book yet.
     fn liquidity_state(
         settings: &LiquiditySettings,
         instrument: &Instrument,
         reference: Option<&Reference>,
+        closed: bool,
     ) -> &'static str {
         if settings.mode == crate::liquidity::LiquidityMode::Off || !instrument.enabled {
             return "off";
         }
-        match reference {
-            None => "no-reference",
-            Some(r) if r.stale => match settings.stale_policy {
-                StalePolicy::Keep => "kept",
-                StalePolicy::Widen => "widened",
-                StalePolicy::Pull => "pulled",
-            },
-            Some(_) => "quoting",
+        let policy = match reference {
+            None => return "no-reference",
+            Some(_) if closed => settings.closed_policy,
+            Some(r) if r.stale => settings.stale_policy,
+            Some(_) => return "quoting",
+        };
+        match policy {
+            StalePolicy::Keep => "kept",
+            StalePolicy::Widen => "widened",
+            StalePolicy::Pull => "pulled",
         }
     }
 
@@ -920,6 +949,7 @@ impl Exchange {
                 order_type: OrderType::Limit,
                 limit_price_ticks: Some(quote.price_ticks),
                 quantity: quote.quantity,
+                time_in_force: None,
             })?;
         }
         Ok(())
@@ -944,6 +974,7 @@ impl Exchange {
                 let (best_bid, best_ask) = self.top_of_book(&id);
                 let state = self.market_data.get(&id).cloned().unwrap_or_default();
                 let instrument = self.books[&id].instrument().clone();
+                let instrument_mic = instrument.mic.clone();
                 crate::market_data::Snapshot {
                     liquidity: self
                         .provider
@@ -958,6 +989,7 @@ impl Exchange {
                     best_ask,
                     last_trade: state.last_trade,
                     session_volume: state.volume_on(today),
+                    session_open: self.sessions.is_open(instrument_mic.as_deref(), now),
                 }
             })
             .collect()
@@ -1141,6 +1173,24 @@ impl Exchange {
         }
 
         let now = self.now();
+        let mic = book.instrument().mic.clone();
+        let time_in_force = match (command.order_type, command.time_in_force) {
+            (OrderType::Market, None | Some(TimeInForce::Ioc)) => TimeInForce::Ioc,
+            (OrderType::Market, Some(other)) => {
+                return Err(ExchangeError::InvalidTimeInForce(other));
+            }
+            (OrderType::Limit, Some(given)) => given,
+            (OrderType::Limit, None) if self.sessions.session(mic.as_deref()).is_some() => {
+                TimeInForce::Day
+            }
+            (OrderType::Limit, None) => TimeInForce::Gtc,
+        };
+        // The liquidity provider is not a client: it follows its closed-market policy instead (SR-9).
+        let provider = self
+            .provider
+            .as_ref()
+            .is_some_and(|p| p.policy.participant == command.participant_id);
+        let market_closed = !provider && !self.sessions.is_open(mic.as_deref(), now);
         let order = Order {
             id: self.ids.order(self.last_sequence + 1),
             client_order_id: command.client_order_id,
@@ -1153,18 +1203,71 @@ impl Exchange {
             remaining_quantity: command.quantity,
             sequence: self.last_sequence + 1,
             status: OrderStatus::Open,
+            time_in_force,
         };
         let started = std::time::Instant::now();
         let mut ctx = MatchContext {
             now,
             ids: self.ids,
-            dates: self
-                .trade_dating
-                .dates(now, book.instrument().mic.as_deref()),
+            dates: self.trade_dating.dates(now, mic.as_deref()),
+            market_closed,
         };
         let update = book.plan_submit(order, &mut ctx)?;
         ::metrics::histogram!(crate::metrics::MATCH_DURATION).record(started.elapsed());
-        self.commit_and_apply(Command::Submit, update, now)
+        let outcome = self.commit_and_apply(Command::Submit, update, now)?;
+        if let SubmitOutcome::Processed(update) = &outcome
+            && update.order.time_in_force == TimeInForce::Day
+            && update.order.status.is_active()
+        {
+            self.schedule_expiry(&update.order, mic.as_deref(), now);
+        }
+        Ok(outcome)
+    }
+
+    /// Schedules a resting `DAY` order's expiry (SR-17).
+    fn schedule_expiry(&mut self, order: &Order, mic: Option<&str>, accepted_at: DateTime<Utc>) {
+        if let Some(due) = self.sessions.day_expiry(mic, accepted_at) {
+            self.expiries
+                .insert((due, order.sequence, order.instrument_id.clone(), order.id));
+        }
+    }
+
+    /// Rebuilds the expiry schedule from the stored active `DAY` orders, at recovery and after a failed commit.
+    fn schedule_expiries(&mut self) -> Result<(), ExchangeError> {
+        self.expiries.clear();
+        for record in self.store.active_day_orders()? {
+            let mic = self
+                .books
+                .get(&record.order.instrument_id)
+                .and_then(|b| b.instrument().mic.clone());
+            self.schedule_expiry(&record.order, mic.as_deref(), record.created_at);
+        }
+        Ok(())
+    }
+
+    /// Expires the `DAY` orders due at `due` that are still active, each in its own commit with `OrderExpired` stamped
+    /// at `due`, the close. Returns the number of events.
+    fn expire_due(&mut self, due: DateTime<Utc>) -> Result<usize, ExchangeError> {
+        let mut events = 0;
+        while let Some(entry) = self.expiries.first().cloned() {
+            if entry.0 > due {
+                break;
+            }
+            self.expiries.remove(&entry);
+            let (_, _, instrument, order_id) = entry;
+            let Some(book) = self.books.get(&instrument) else {
+                continue;
+            };
+            if book.order(order_id).is_none() {
+                continue; // Filled or cancelled since.
+            }
+            let update = book.plan_expire(order_id)?;
+            self.commit_and_apply(Command::Expire, update, due)?;
+            events += 1;
+            self.maintain_liquidity(Some(&instrument))?;
+            self.publish_market_data(Some(&instrument));
+        }
+        Ok(events)
     }
 
     /// Opens a commit group: the following [`Exchange::submit`]s and [`Exchange::cancel`]s become durable together
@@ -1212,6 +1315,7 @@ impl Exchange {
     /// Rebuilds what commands change in memory (books, sequences, the settlement simulator) from storage.
     fn reload(&mut self) -> Result<(), ExchangeError> {
         self.books = load_books(&self.store)?;
+        self.schedule_expiries()?;
         // The group's trades are gone: forget their prints, and take the last trade and volume from storage again.
         for state in self.market_data.values_mut() {
             state.pending.clear();
@@ -1364,6 +1468,7 @@ impl Exchange {
     pub fn reset(&mut self) -> Result<(), ExchangeError> {
         self.store.reset()?;
         self.books.clear();
+        self.expiries.clear();
         self.prices.clear();
         self.market_data.clear();
         self.participants.clear();
@@ -1437,9 +1542,14 @@ impl Exchange {
             let now = self.now();
             let close = self.days.as_ref().map(BusinessDays::due);
             let clearing = self.clearing.as_ref().map(Clearing::due);
-            match close.into_iter().chain(clearing).min() {
+            let expiry = self.expiries.first().map(|e| e.0);
+            match close.into_iter().chain(clearing).chain(expiry).min() {
                 Some(due) if due <= now => {
                     total += self.settlement_step(due)?;
+                    // DAY orders end with their trading day, before the business day closes.
+                    if expiry == Some(due) {
+                        total += self.expire_due(due)?;
+                    }
                     if close == Some(due) {
                         total += self.close_business_day()?;
                     }
@@ -1952,4 +2062,7 @@ fn same_terms(order: &Order, command: &SubmitOrder) -> bool {
         && order.order_type == command.order_type
         && order.limit_price_ticks == command.limit_price_ticks
         && order.quantity == command.quantity
+        && command
+            .time_in_force
+            .is_none_or(|t| t == order.time_in_force)
 }

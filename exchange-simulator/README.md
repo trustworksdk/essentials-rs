@@ -31,6 +31,7 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `price_sources.finnhub.stale_after_ms` / `refresh_after_ms` | `120000` / `60000` | Real time without an update before a live price is stale / before a symbol is refreshed over REST |
 | `price_sources.finnhub.max_updates_per_second`, `max_symbols`, `rest_calls_per_minute` | `4`, `50`, `60` | Live price conflation per instrument; Finnhub free-tier limits |
 | `price_sources.finnhub.ws_url`, `rest_url`, `request_timeout_ms`, `reconnect_initial_ms` / `reconnect_max_ms` | Finnhub's, `10000`, `1000` / `60000` | Endpoints, timeout and reconnect backoff |
+| `sessions` | `{}` | Trading sessions by MIC, e.g. `{ XNAS: { open: "09:30", close: "16:00", time_zone: America/New_York } }`; a market not listed is always open (see Trading sessions and time in force) |
 | `market_data.conflation_interval_ms` / `stream_buffer` | `0` / `1024` | Market-data stream: at most one message per instrument and kind per interval (`0`: every message); how far a subscriber may fall behind before its stream is closed (see `GET /api/marketdata/stream`) |
 | `webhooks.poll_interval_ms` | `250` | How often due deliveries (retries) are looked for; new events are sent at once |
 | `webhooks.batch_size` / `concurrency` | `100` / `16` | Deliveries claimed per round / concurrent requests |
@@ -184,11 +185,14 @@ or custodian. It is copied into every `TradeExecuted` the participant is party t
 
 ```json
 { "clientOrderId": "c-1", "instrumentId": "ACME", "participantId": "participant-a",
-  "side": "BUY", "type": "LIMIT", "priceTicks": 10025, "quantity": 150 }
+  "side": "BUY", "type": "LIMIT", "priceTicks": 10025, "quantity": 150, "timeInForce": "DAY" }
 ```
 
 `side` is `BUY`/`SELL`; `type` is `LIMIT` (needs `priceTicks`) or `MARKET` (no `priceTicks`). `clientOrderId` is
-optional, 1–64 characters, and unique per participant.
+optional, 1–64 characters, and unique per participant. `timeInForce` is optional (see Trading sessions and time in
+force): `DAY`, `GTC` or `IOC`; left out, `DAY` on a market with a trading session and `GTC` otherwise. A `MARKET` order
+is always `IOC` (`DAY` or `GTC` on one is a `400 invalid_order`). Outside the instrument's session the order is
+recorded as `REJECTED` with `rejectReason: "MARKET_CLOSED"`.
 
 - `201`: the order was processed (including `REJECTED`). Body: `{ "order": Order, "executions": [Trade], "duplicate": false }`.
 - `200`: `clientOrderId` was already used with the same terms. Body: the existing order in its current state, with
@@ -197,7 +201,33 @@ optional, 1–64 characters, and unique per participant.
 
 `Order`: `orderId`, `clientOrderId`, `instrumentId`, `participantId`, `side`, `type`, `priceTicks`, `price`,
 `quantity`, `remainingQuantity`, `filledQuantity`, `status` (`OPEN`, `PARTIALLY_FILLED`, `FILLED`, `CANCELLED`,
-`REJECTED`), `sequence`, and `rejectReason` when rejected.
+`REJECTED`, `EXPIRED`), `sequence`, `timeInForce`, and `rejectReason` (`SELF_TRADE`, `INSTRUMENT_DISABLED`,
+`MARKET_CLOSED`) when rejected.
+
+### Trading sessions and time in force
+
+Each market (by MIC) can have a trading session, `open` to `close` local time in its `time_zone`, on weekdays:
+
+```yaml
+sessions:
+  XNAS: { open: "09:30", close: "16:00", time_zone: America/New_York }
+  XCSE: { open: "09:00", close: "17:00", time_zone: Europe/Copenhagen }
+```
+
+A market without one (and an instrument without a MIC) is always open, the default. Holidays are not modelled.
+- **Outside the session** a client order is sequenced, stored and published as a rejection (`201`, status
+  `REJECTED`, `rejectReason: "MARKET_CLOSED"`, an `OrderRejected` event). Cancellations keep working. The liquidity
+  provider is not a client: it applies its `closedPolicy` instead (see Liquidity provider). The market data's
+  `session` says `open` or `closed`.
+- **`DAY`** (the default on a market with a session) rests until the session closes, then expires: status `EXPIRED`
+  with its remainder, and an `OrderExpired` event stamped at the close, before that day's `BusinessDayClosed`. On a
+  market without a session a `DAY` order expires at the end of its business day (`clearing.cutoff`). Expiries survive
+  a restart, and a clock move expires every order whose close it passes, in time order.
+- **`GTC`** (the default elsewhere) rests until filled or cancelled.
+- **`IOC`** trades what it can at once; the remainder is cancelled with `OrderCancelled`,
+  `cancelReason: "IOC_REMAINDER"`. A market order behaves this way already (`MARKET_REMAINDER`), so it is always
+  `IOC`.
+- Orders placed before time in force existed are `GTC` (market orders `IOC`).
 
 ### `GET /api/orders/{id}`
 
@@ -205,8 +235,8 @@ The stored order, plus `createdAt` and `updatedAt`.
 
 ### `DELETE /api/orders/{id}`
 
-Cancels the remaining quantity of an `OPEN` or `PARTIALLY_FILLED` order. Returns `200` with the same body as
-`POST /api/orders`; `409 order_not_active` if the order is already done.
+Cancels the remaining quantity of an `OPEN` or `PARTIALLY_FILLED` order, also outside its session. Returns `200`
+with the same body as `POST /api/orders`; `409 order_not_active` if the order is already done (expired included).
 
 ### `GET /api/orderbooks/{instrumentId}`
 
@@ -285,7 +315,8 @@ off unless an instrument's `liquidity` (or `liquidity.default`) sets `mode: on`:
 ```json
 "liquidity": { "mode": "on", "levels": 5, "spreadBps": 10, "levelStepTicks": 1, "levelQuantity": 100,
                "levelQuantityGrowth": 1, "requoteThresholdTicks": 1, "refillDelayMs": 0, "skewBpsPerLot": 0,
-               "maxInventory": 10000, "stalePolicy": "pull", "staleWidenFactor": 2 }
+               "maxInventory": 10000, "stalePolicy": "pull", "staleWidenFactor": 2, "closedPolicy": "pull",
+               "closedWidenFactor": 2 }
 ```
 
 - **Ladder:** `levels` limit orders a side. The best bid and ask are `spreadBps` from the mid, rounded away from it to
@@ -303,6 +334,9 @@ off unless an instrument's `liquidity` (or `liquidity.default`) sets `mode: on`:
 - **Stale reference price** (a live source gone quiet): `stalePolicy` `pull` (the default) cancels the ladder until
   the price is fresh, `widen` quotes it with the spread times `staleWidenFactor`, `keep` leaves it as it was quoted.
   The market data's `liquidity` says which applies: `kept`, `widened` or `pulled`.
+- **Closed market** (outside the instrument's trading session): `closedPolicy` and `closedWidenFactor` likewise,
+  `pull` by default. A closed market takes precedence over a stale price. Its orders are never refused as
+  `MARKET_CLOSED`, so `widen` quotes a wider ladder while clients cannot trade; at the open it quotes normally again.
 - **Events:** its order lifecycle (accepted, filled, cancelled) stays out of the event log and webhooks unless
   `liquidity.emit_order_events` is true. Its trades are always published (`TradeExecuted` with it as buyer or seller),
   and it settles and appears on clearing statements like any participant. Metrics count its quotes
@@ -320,7 +354,7 @@ off unless an instrument's `liquidity` (or `liquidity.default`) sets `mode: on`:
   "bestBid": { "priceTicks": 18733, "price": "187.33", "quantity": 100 },
   "bestAsk": { "priceTicks": 18771, "price": "187.71", "quantity": 100 },
   "lastTrade": { "priceTicks": 18771, "price": "187.71", "quantity": 25, "executedAt": "2030-01-07T09:01:12Z" },
-  "sessionVolume": 1250, "liquidity": "quoting" }
+  "sessionVolume": 1250, "liquidity": "quoting", "session": "open" }
 ```
 
 Each instrument's market data, in instrument ID order; `404` for an unknown instrument.
@@ -331,7 +365,8 @@ Each instrument's market data, in instrument ID order; `404` for an unknown inst
   participants; `null` before the first trade.
 - `sessionVolume` is the quantity traded on the current business date, which ends at `clearing.cutoff`.
 - `liquidity` is what the liquidity provider did when it last quoted: `off` (no provider, mode `off`, or trading
-  disabled), `no-reference`, `quoting`, or under a stale price `kept`, `widened` or `pulled`.
+  disabled), `no-reference`, `quoting`, or in a closed market or under a stale price `kept`, `widened` or `pulled`.
+- `session` is `open` or `closed` (see Trading sessions and time in force); always `open` without a session.
 - `mdSequence` is that of the last stream message about the instrument (below), so the snapshot and the stream line
   up.
 
@@ -410,7 +445,8 @@ Event types and payloads (`schemaVersion` 1):
 | `OrderRejected` | order | order with `rejectReason` |
 | `TradeExecuted` | execution | `executionId`, `instrumentId`, `instrument` {`id`, `symbol`, `mic`, `isin`, `cusip`, `currency`}, `buyOrderId`, `sellOrderId`, `buyerId`, `sellerId`, `buyerSettlement`, `sellerSettlement` (each party's settlement details at execution time, or `null`), `priceTicks`, `price`, `quantity`, `currency`, `currencyScale`, `tickSizeMinor`, `executedAt`, `tradeDate`, `intendedSettlementDate` |
 | `OrderPartiallyFilled` / `OrderFilled` | order | order after the fill, with the execution's `tradeDate` and `intendedSettlementDate`; for a resting order also `executionId` |
-| `OrderCancelled` | order | order with `cancelReason`: `REQUESTED` or `MARKET_REMAINDER` |
+| `OrderCancelled` | order | order with `cancelReason`: `REQUESTED`, `MARKET_REMAINDER` or `IOC_REMAINDER` |
+| `OrderExpired` | order | a `DAY` order at its session's close, with status `EXPIRED` and its remainder; `occurredAt` is the close |
 
 **Trade dates.** Every execution carries the business day it belongs to, `tradeDate` (FIX tag 75), and the day it is
 meant to settle, `intendedSettlementDate` (tag 64), so a consumer never needs its own calendar to book or reconcile a

@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod persistence;
 pub mod pricing;
 pub mod scenario;
+pub mod sessions;
 pub mod settlement;
 
 /// Shared with the other simulators (see `simulator_kit`), re-exported under their old paths.

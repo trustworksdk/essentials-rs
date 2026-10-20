@@ -950,6 +950,12 @@ webhooks:
       operationId: onOrderCancelled
       requestBody: { $ref: "#/components/requestBodies/OrderCancelledEvent" }
       responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
+  OrderExpired:
+    post:
+      summary: A DAY order still open when its session closed (status EXPIRED, remainder kept)
+      operationId: onOrderExpired
+      requestBody: { $ref: "#/components/requestBodies/OrderExpiredEvent" }
+      responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
   TradeExecuted:
     post:
       summary: A trade, with everything a settlement consumer needs
@@ -1113,6 +1119,8 @@ components:
       content: { application/json: { schema: { $ref: "#/components/schemas/OrderFilledEvent" } } }
     OrderCancelledEvent:
       content: { application/json: { schema: { $ref: "#/components/schemas/OrderCancelledEvent" } } }
+    OrderExpiredEvent:
+      content: { application/json: { schema: { $ref: "#/components/schemas/OrderExpiredEvent" } } }
     TradeExecutedEvent:
       content: { application/json: { schema: { $ref: "#/components/schemas/TradeExecutedEvent" } } }
     InstrumentListedEvent:
@@ -1176,7 +1184,7 @@ components:
 
     Side: { enum: [BUY, SELL] }
     OrderType: { enum: [LIMIT, MARKET] }
-    OrderStatus: { enum: [OPEN, PARTIALLY_FILLED, FILLED, CANCELLED, REJECTED] }
+    OrderStatus: { enum: [OPEN, PARTIALLY_FILLED, FILLED, CANCELLED, REJECTED, EXPIRED] }
     InstrumentRequest:
       type: object
       additionalProperties: false
@@ -1246,6 +1254,11 @@ components:
           default: pull
           description: While the reference price is stale, keep the ladder as quoted, quote it with the spread times `staleWidenFactor`, or pull it.
         staleWidenFactor: { type: number, minimum: 1, maximum: 100, default: 2, description: "`widen`: the factor the spread is multiplied by while the price is stale." }
+        closedPolicy:
+          enum: [keep, widen, pull]
+          default: pull
+          description: Outside the instrument's trading session, keep the ladder as quoted, quote it with the spread times `closedWidenFactor`, or pull it. Takes precedence over `stalePolicy`.
+        closedWidenFactor: { type: number, minimum: 1, maximum: 100, default: 2, description: "`widen`: the factor the spread is multiplied by while the market is closed." }
     PriceSource:
       type: object
       additionalProperties: false
@@ -1268,7 +1281,7 @@ components:
     MarketData:
       type: object
       additionalProperties: false
-      required: [instrumentId, mdSequence, reference, bestBid, bestAsk, lastTrade, sessionVolume, liquidity]
+      required: [instrumentId, mdSequence, reference, bestBid, bestAsk, lastTrade, sessionVolume, liquidity, session]
       properties:
         instrumentId: { type: string }
         mdSequence:
@@ -1289,7 +1302,10 @@ components:
           description: Quantity traded on the current business date (the business day ends at `clearing.cutoff`).
         liquidity:
           enum: ["off", no-reference, quoting, kept, widened, pulled]
-          description: What the liquidity provider did when it last quoted the instrument. `off` without a provider, with mode `off` or with trading disabled; `kept`, `widened` and `pulled` apply its `stalePolicy` to a stale reference price.
+          description: What the liquidity provider did when it last quoted the instrument. `off` without a provider, with mode `off` or with trading disabled; `kept`, `widened` and `pulled` apply its `closedPolicy` in a closed market, else its `stalePolicy` to a stale reference price.
+        session:
+          enum: [open, closed]
+          description: Whether the instrument's market is in its trading session (`sessions` by MIC); always `open` for a market without one.
     MarketDataReferencePrice:
       description: "`null` when the price source is `none`."
       oneOf:
@@ -1381,11 +1397,22 @@ components:
         type: { $ref: "#/components/schemas/OrderType" }
         priceTicks: { type: [integer, "null"], description: Required for `LIMIT`, absent for `MARKET`. }
         quantity: { type: integer, minimum: 1 }
+        timeInForce:
+          $ref: "#/components/schemas/TimeInForce"
+          description: >-
+            Left out: `DAY` on a market with a trading session, else `GTC`. A `MARKET` order is always `IOC`;
+            `DAY` or `GTC` on one is a `400`.
+    TimeInForce:
+      enum: [DAY, GTC, IOC]
+      description: >-
+        `DAY` rests until its session closes (on a market without a session, until the business day's cutoff), then
+        expires (`OrderExpired`, status `EXPIRED`). `GTC` rests until filled or cancelled. `IOC` trades what it can at
+        once; its remainder is cancelled (`cancelReason: IOC_REMAINDER`).
     Order:
       type: object
       additionalProperties: false
       required: [orderId, clientOrderId, instrumentId, participantId, side, type, priceTicks, price, quantity,
-                 remainingQuantity, filledQuantity, status, sequence]
+                 remainingQuantity, filledQuantity, status, sequence, timeInForce]
       properties:
         orderId: { type: string, format: uuid }
         clientOrderId: { type: [string, "null"] }
@@ -1400,7 +1427,8 @@ components:
         filledQuantity: { type: integer }
         status: { $ref: "#/components/schemas/OrderStatus" }
         sequence: { type: integer }
-        rejectReason: { enum: [SELF_TRADE, INSTRUMENT_DISABLED], description: Only on a rejection. }
+        timeInForce: { $ref: "#/components/schemas/TimeInForce" }
+        rejectReason: { enum: [SELF_TRADE, INSTRUMENT_DISABLED, MARKET_CLOSED], description: Only on a rejection. }
         createdAt: { $ref: "#/components/schemas/Timestamp", description: "Only from `GET /api/orders/{id}`." }
         updatedAt: { $ref: "#/components/schemas/Timestamp", description: "Only from `GET /api/orders/{id}`." }
     OrderResult:
@@ -1681,7 +1709,7 @@ components:
         seconds: { type: integer, minimum: 0 }
 
     EventType:
-      enum: [OrderAccepted, OrderRejected, OrderPartiallyFilled, OrderFilled, OrderCancelled, TradeExecuted,
+      enum: [OrderAccepted, OrderRejected, OrderPartiallyFilled, OrderFilled, OrderCancelled, OrderExpired, TradeExecuted,
              InstrumentListed, InstrumentUpdated, ClockChanged, BusinessDayClosed, SettlementPending, SettlementCompleted, SettlementFailed, SettlementRejected, SettlementDelayed,
              SettlementCorrected, SettlementCancelled, SettlementOutcomeReported, ClearingStatementIssued]
     EventEnvelope:
@@ -1705,7 +1733,7 @@ components:
       type: object
       additionalProperties: false
       required: [orderId, clientOrderId, instrumentId, participantId, side, type, priceTicks, price, quantity,
-                 remainingQuantity, filledQuantity, status, sequence]
+                 remainingQuantity, filledQuantity, status, sequence, timeInForce]
       properties:
         orderId: { type: string, format: uuid }
         clientOrderId: { type: [string, "null"] }
@@ -1720,8 +1748,9 @@ components:
         filledQuantity: { type: integer }
         status: { $ref: "#/components/schemas/OrderStatus" }
         sequence: { type: integer }
-        rejectReason: { enum: [SELF_TRADE, INSTRUMENT_DISABLED] }
-        cancelReason: { enum: [REQUESTED, MARKET_REMAINDER] }
+        timeInForce: { $ref: "#/components/schemas/TimeInForce" }
+        rejectReason: { enum: [SELF_TRADE, INSTRUMENT_DISABLED, MARKET_CLOSED] }
+        cancelReason: { enum: [REQUESTED, MARKET_REMAINDER, IOC_REMAINDER] }
         executionId: { type: string, format: uuid, description: On a resting order's fill event. }
         tradeDate:
           $ref: "#/components/schemas/TradeDate"
@@ -1852,6 +1881,12 @@ components:
         eventType: { const: OrderCancelled }
         source: { const: exchange }
         payload: { allOf: [{ $ref: "#/components/schemas/OrderEventPayload" }], required: [cancelReason] }
+    OrderExpiredEvent:
+      allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
+      properties:
+        eventType: { const: OrderExpired }
+        source: { const: exchange }
+        payload: { $ref: "#/components/schemas/OrderEventPayload" }
     TradeExecutedEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
       properties:

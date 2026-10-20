@@ -53,7 +53,7 @@ pub struct OrderRecord {
 }
 
 const ORDER_COLUMNS: &str = "id, client_order_id, instrument_id, participant_id, side, order_type, limit_price_ticks, \
-                             quantity, remaining_quantity, sequence, status, created_at, updated_at";
+                             quantity, remaining_quantity, sequence, status, created_at, updated_at, time_in_force";
 
 /// An instrument's last trade and recent volume ([`Store::trade_summary`]).
 #[derive(Debug)]
@@ -338,6 +338,17 @@ impl Store {
             .collect()
     }
 
+    /// Active `DAY` orders, with when they were accepted, so their expiry can be scheduled again after a restart.
+    pub fn active_day_orders(&self) -> rusqlite::Result<Vec<OrderRecord>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {ORDER_COLUMNS} FROM orders
+                 WHERE status IN ('OPEN', 'PARTIALLY_FILLED') AND time_in_force = 'DAY' ORDER BY sequence"
+            ))?
+            .query_map([], order_record)?
+            .collect()
+    }
+
     /// The highest order sequence ever accepted (rejected orders included), or 0 for an empty database.
     pub fn max_sequence(&self) -> rusqlite::Result<u64> {
         self.conn
@@ -385,7 +396,8 @@ impl Store {
         let tx = self.conn.savepoint()?;
         {
             let mut upsert = tx.prepare_cached(&format!(
-                "INSERT INTO orders ({ORDER_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+                "INSERT INTO orders ({ORDER_COLUMNS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13)
                  ON CONFLICT (id) DO UPDATE SET remaining_quantity = excluded.remaining_quantity,
                                                 status = excluded.status,
                                                 updated_at = excluded.updated_at"
@@ -405,6 +417,7 @@ impl Store {
                     to_sql(order.sequence),
                     order.status.as_str(),
                     now,
+                    order.time_in_force.as_str(),
                 ])?;
             }
             let mut insert_execution = tx.prepare_cached(
@@ -1185,6 +1198,7 @@ fn order_record(row: &Row<'_>) -> rusqlite::Result<OrderRecord> {
             remaining_quantity: from_sql(row, 8)?,
             sequence: from_sql(row, 9)?,
             status: parsed(row, 10)?,
+            time_in_force: parsed(row, 13)?,
         },
         created_at: parsed(row, 11)?,
         updated_at: parsed(row, 12)?,

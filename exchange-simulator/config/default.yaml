@@ -81,12 +81,18 @@ price_sources:
 # reference price. Off unless an instrument's liquidity (or the default here) sets mode: on. Fields: levels,
 # spread_bps, level_step_ticks, level_quantity (lots), level_quantity_growth, requote_threshold_ticks, refill_delay_ms
 # (simulated), skew_bps_per_lot, max_inventory (lots), stale_policy (keep, widen or pull; default pull),
-# stale_widen_factor.
+# stale_widen_factor, closed_policy (the same, outside the market's session), closed_widen_factor.
 liquidity:
   participant_id: "LP"
   # Publish its order lifecycle (accepted, filled, cancelled); its trades are published either way.
   emit_order_events: false
   default: { mode: off }
+# Trading sessions by MIC: open and close local time on weekdays. Outside a session client orders are rejected
+# (MARKET_CLOSED), DAY orders expire at the close, and the liquidity provider applies its closed_policy. A market not
+# listed is always open. For example:
+#   sessions:
+#     XNAS: { open: "09:30", close: "16:00", time_zone: America/New_York }
+sessions: {}
 market_data:
   # Per subscriber, instrument and kind (quote, trade, reference), at most one stream message this often, the latest;
   # 0 sends every message. The snapshot is never conflated.

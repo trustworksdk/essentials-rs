@@ -2017,6 +2017,49 @@ then 6.11, 6.12, 6.13–6.14.
   simulator without clearing. Clearing ignoring the dates gives the same answer under one configuration;
   `a_changed_cycle_dates_new_trades_only` moves a market from T+1 to T+2 between a trade and its statement.
 
+**6.10 — trading sessions, time in force ✅ done (2026-10-20)**
+- **Delivered:**
+  - `sessions:` in the configuration: per MIC, `open` and `close` local time in a `time_zone`, on weekdays
+    (`simulator_kit::calendar::DailySession`, daylight saving followed). `src/sessions::TradingSessions` answers
+    whether a market is open and when a `DAY` order accepted at a given instant expires.
+  - Outside the session a client order is recorded as `REJECTED` with `MARKET_CLOSED` (`MatchContext::market_closed`,
+    like `INSTRUMENT_DISABLED`); cancellations keep working; the liquidity provider's own orders are exempt.
+  - `timeInForce` (`DAY`, `GTC`, `IOC`) on orders: request, `Order`, order event payloads, stored (migration 019).
+    Left out, `DAY` on a market with a session and `GTC` otherwise; a market order is always `IOC` (`DAY` or `GTC` on
+    one is a `400`). An `IOC` remainder is cancelled with `IOC_REMAINDER`.
+  - `DAY` expiry: a schedule of resting `DAY` orders by expiry instant, run by the tick in time order with
+    settlement, business-day closes (before them) and clearing. Each expiry is its own commit, status `EXPIRED`
+    (remainder kept), `OrderExpired` stamped at the close. Rebuilt from the stored orders at recovery and after a
+    failed group commit; an entry whose order is gone by then is dropped.
+  - SR-9's closed-market half: liquidity settings `closedPolicy` and `closedWidenFactor` (default `pull`, 2), taking
+    precedence over the stale policy; opening and closing are reasons to re-quote. The snapshot gains `session`.
+  - The shared migration runner accepts `-- foreign_keys: off` migrations (SQLite's table-rebuild procedure),
+    checked with `PRAGMA foreign_key_check` before commit. Migration 019 uses it to widen the orders table's status
+    CHECK.
+  - `openapi.yaml` (`TimeInForce`, `OrderExpired`, the new reasons and status, `session`, the closed policy), the
+    README (Trading sessions and time in force), the configuration guide, `config/default.yaml`.
+  - Tests: `tests/sessions.rs` (5), the contract test (a `DAY` order expiring at the cutoff, `IOC`, a refused market
+    `GTC`), unit tests for `DailySession`, `TradingSessions`, the runner (3) and the 019 upgrade.
+- **Decisions:**
+  - **A market without a session is always open**, and an instrument without a MIC too: existing setups are
+    unchanged, and `GTC` stays their default.
+  - **`DAY` on a market without a session ends with the business day** (`clearing.cutoff`), so `DAY` means "this
+    trading day" everywhere instead of being refused or silently `GTC`.
+  - **Market orders are always `IOC`**; they never rested, and a `DAY` or `GTC` market order is refused rather than
+    reinterpreted.
+  - **`EXPIRED` is its own status**, as FIX `OrdStatus=C`, not a cancellation, which needed the table rebuild and so
+    the runner change.
+  - **The provider is not a client**: its orders bypass `MARKET_CLOSED`, so `widen` and `keep` work outside the
+    session. A closed market takes precedence over a stale price.
+  - **No session events**: the snapshot's `session` shows the state, and `OrderExpired` and the provider's re-quote
+    mark the close. Holidays, half days and auctions are not modelled.
+- **Mutation checks**, each made a test fail (all 16 on the first run): the market never closed; the provider not
+  exempt; an `IOC` order resting; an `IOC` remainder reported as `MARKET_REMAINDER`; `DAY` not the default with a
+  session; a market order taking any time in force; no expiry scheduled on submission; expiries not rebuilt at
+  recovery; an expiry stamped when the clock move ran instead of at the close; expiries after the business day
+  closes; the closed policy ignored; a close not causing a re-quote; sessions on weekends; `close_after` not strictly
+  after; `DAY` never ending without a session; the snapshot always `open`.
+
 ## Beyond the milestones
 
 **Running with an app in another project ✅ done (2026-10-19, requested by the user)**

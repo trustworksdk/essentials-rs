@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use uuid::Uuid;
 
 use super::MatchContext;
-use crate::domain::{Execution, Instrument, InstrumentId, Order, OrderStatus, OrderType, Side};
+use crate::domain::{
+    Execution, Instrument, InstrumentId, Order, OrderStatus, OrderType, Side, TimeInForce,
+};
 use crate::ids::ExchangeIds;
 
 /// Why an order is malformed. These are input errors: such an order is never accepted, sequenced or persisted.
@@ -29,6 +31,8 @@ pub enum RejectReason {
     SelfTrade,
     #[error("trading in the instrument is disabled")]
     InstrumentDisabled,
+    #[error("the instrument's market is closed")]
+    MarketClosed,
 }
 
 impl RejectReason {
@@ -37,6 +41,7 @@ impl RejectReason {
         match self {
             Self::SelfTrade => "SELF_TRADE",
             Self::InstrumentDisabled => "INSTRUMENT_DISABLED",
+            Self::MarketClosed => "MARKET_CLOSED",
         }
     }
 }
@@ -176,6 +181,9 @@ impl OrderBook {
         if !self.instrument.enabled {
             return Ok(self.rejection(order, RejectReason::InstrumentDisabled));
         }
+        if ctx.market_closed {
+            return Ok(self.rejection(order, RejectReason::MarketClosed));
+        }
 
         let mut taker = order;
         let mut fills = Vec::new();
@@ -222,11 +230,13 @@ impl OrderBook {
             }
         }
 
-        taker.status = match (taker.remaining_quantity, taker.order_type) {
+        // A market order and an IOC limit order never rest: their remainder is cancelled.
+        let rests = taker.order_type == OrderType::Limit && taker.time_in_force != TimeInForce::Ioc;
+        taker.status = match (taker.remaining_quantity, rests) {
             (0, _) => OrderStatus::Filled,
-            (_, OrderType::Market) => OrderStatus::Cancelled,
-            (remaining, OrderType::Limit) if remaining == taker.quantity => OrderStatus::Open,
-            (_, OrderType::Limit) => OrderStatus::PartiallyFilled,
+            (_, false) => OrderStatus::Cancelled,
+            (remaining, true) if remaining == taker.quantity => OrderStatus::Open,
+            (_, true) => OrderStatus::PartiallyFilled,
         };
         Ok(BookUpdate {
             base_version: self.version,
@@ -240,12 +250,22 @@ impl OrderBook {
     /// Plans cancelling the remaining quantity of an active resting order.
     #[must_use = "a planned update changes nothing until it is applied"]
     pub fn plan_cancel(&self, order_id: Uuid) -> Result<BookUpdate, BookError> {
+        self.plan_end(order_id, OrderStatus::Cancelled)
+    }
+
+    /// Plans expiring an active resting `DAY` order at its session's close (SR-17).
+    #[must_use = "a planned update changes nothing until it is applied"]
+    pub fn plan_expire(&self, order_id: Uuid) -> Result<BookUpdate, BookError> {
+        self.plan_end(order_id, OrderStatus::Expired)
+    }
+
+    fn plan_end(&self, order_id: Uuid, status: OrderStatus) -> Result<BookUpdate, BookError> {
         let mut order = self
             .orders
             .get(&order_id)
             .ok_or(BookError::UnknownOrder(order_id))?
             .clone();
-        order.status = OrderStatus::Cancelled;
+        order.status = status;
         Ok(BookUpdate {
             base_version: self.version,
             order,

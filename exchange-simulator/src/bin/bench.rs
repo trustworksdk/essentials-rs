@@ -308,6 +308,7 @@ fn bench_matching(options: &Options, report: &mut Report) {
             remaining_quantity: c.quantity,
             sequence: i as u64 + 1,
             status: OrderStatus::Open,
+            time_in_force: exchange_simulator::domain::TimeInForce::Gtc,
         })
         .collect();
     let mut book = OrderBook::new(acme());
@@ -631,6 +632,7 @@ impl Service {
             price_sources: Default::default(),
             liquidity: Default::default(),
             market_data: Default::default(),
+            sessions: Default::default(),
             webhooks: WebhooksConfig {
                 subscriptions: Vec::new(),
                 secret_grace_seconds: 3600,

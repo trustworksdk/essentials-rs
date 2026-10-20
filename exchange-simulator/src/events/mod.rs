@@ -26,6 +26,8 @@ pub const ORDER_REJECTED: &str = "OrderRejected";
 pub const ORDER_PARTIALLY_FILLED: &str = "OrderPartiallyFilled";
 pub const ORDER_FILLED: &str = "OrderFilled";
 pub const ORDER_CANCELLED: &str = "OrderCancelled";
+/// A `DAY` order still open when its session closed (SR-17).
+pub const ORDER_EXPIRED: &str = "OrderExpired";
 pub const TRADE_EXECUTED: &str = "TradeExecuted";
 /// An instrument was listed, through the API or from configuration.
 pub const INSTRUMENT_LISTED: &str = "InstrumentListed";
@@ -55,6 +57,7 @@ pub const EVENT_TYPES: &[&str] = &[
     ORDER_PARTIALLY_FILLED,
     ORDER_FILLED,
     ORDER_CANCELLED,
+    ORDER_EXPIRED,
     TRADE_EXECUTED,
     INSTRUMENT_LISTED,
     INSTRUMENT_UPDATED,
@@ -107,15 +110,18 @@ pub fn parties(_event_type: &str, payload: &Value) -> Vec<String> {
 
 /// Why an order was cancelled, carried in `OrderCancelled` payloads.
 pub const CANCEL_MARKET_REMAINDER: &str = "MARKET_REMAINDER";
+pub const CANCEL_IOC_REMAINDER: &str = "IOC_REMAINDER";
 pub const CANCEL_REQUESTED: &str = "REQUESTED";
 
 pub use simulator_kit::events::{EventEnvelope, NewEvent};
 
-/// Whether a command was a new order or a cancellation, which decides how a `CANCELLED` result is explained.
+/// Whether a command was a new order, a cancellation or an expiry, which decides the events an update gives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Submit,
     Cancel,
+    /// A `DAY` order expiring at its session's close.
+    Expire,
 }
 
 /// `InstrumentListed` (no `changes`) or `InstrumentUpdated` with the wire names of the fields that changed. The payload
@@ -201,6 +207,14 @@ pub fn for_update(
         );
         return events;
     }
+    if command == Command::Expire {
+        push(
+            ORDER_EXPIRED,
+            order.id.to_string(),
+            order_payload(order, instrument, None, None),
+        );
+        return events;
+    }
     if let Some(reason) = update.rejection {
         let mut payload = order_payload(order, instrument, None, None);
         payload["rejectReason"] = json!(reason.code());
@@ -234,11 +248,17 @@ pub fn for_update(
         }
         push(fill_event(order), order.id.to_string(), payload);
     }
-    if order.status == OrderStatus::Cancelled && order.order_type == OrderType::Market {
+    // A market or IOC order's remainder is cancelled as part of the submission.
+    if order.status == OrderStatus::Cancelled {
+        let reason = if order.order_type == OrderType::Market {
+            CANCEL_MARKET_REMAINDER
+        } else {
+            CANCEL_IOC_REMAINDER
+        };
         push(
             ORDER_CANCELLED,
             order.id.to_string(),
-            order_payload(order, instrument, Some(CANCEL_MARKET_REMAINDER), None),
+            order_payload(order, instrument, Some(reason), None),
         );
     }
     events
@@ -278,6 +298,7 @@ fn order_payload(
         "filledQuantity": order.filled_quantity(),
         "status": order.status,
         "sequence": order.sequence,
+        "timeInForce": order.time_in_force,
     });
     if let Some(reason) = cancel_reason {
         payload["cancelReason"] = json!(reason);

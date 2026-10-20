@@ -42,7 +42,9 @@ impl From<ExchangeError> for ApiError {
             | E::Instrument(_)
             | E::PriceSource(_)
             | E::Liquidity(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
-            E::Book(BookError::Invalid(_)) => (StatusCode::BAD_REQUEST, "invalid_order"),
+            E::Book(BookError::Invalid(_)) | E::InvalidTimeInForce(_) => {
+                (StatusCode::BAD_REQUEST, "invalid_order")
+            }
             E::ClockNotVirtual => (StatusCode::CONFLICT, "clock_not_virtual"),
             E::ExternalOutcomesDisabled => (StatusCode::CONFLICT, "external_outcomes_disabled"),
             E::UnknownExecution(_) => (StatusCode::NOT_FOUND, "not_found"),

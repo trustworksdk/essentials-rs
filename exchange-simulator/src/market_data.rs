@@ -68,6 +68,8 @@ pub struct Snapshot {
     pub session_volume: u64,
     /// What the liquidity provider is doing (see `Exchange::liquidity_state`).
     pub liquidity: &'static str,
+    /// Whether the instrument's market is in its trading session (always, without one).
+    pub session_open: bool,
 }
 
 /// What the exchange keeps per instrument: what it last published, and the trades since.
@@ -164,6 +166,7 @@ impl Snapshot {
             "lastTrade": self.last_trade.as_ref().map(|p| print_json(i, p)),
             "sessionVolume": self.session_volume,
             "liquidity": self.liquidity,
+            "session": if self.session_open { "open" } else { "closed" },
         })
     }
 }
