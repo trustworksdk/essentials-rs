@@ -66,6 +66,7 @@ fn the_document_describes_exactly_the_mounted_routes() {
     let sources = [
         include_str!("../src/api.rs"),
         include_str!("../../simulator-kit/src/api/webhooks.rs"),
+        include_str!("../../simulator-kit/src/api/clock.rs"),
     ];
     assert_eq!(
         without_parameter_names(&routes_in_source(&sources)),
@@ -77,6 +78,7 @@ fn the_document_describes_exactly_the_mounted_routes() {
 async fn every_operation_and_event_matches_the_document() {
     let spec = spec();
     let mut app = TestApp::start_with(|c| {
+        c.clock.operator_control = true;
         c.payments.seed = 5;
         c.payments.deposit.fail_probability = 0.3;
         c.payments.return_probability = 0.5;
@@ -96,6 +98,7 @@ async fn every_operation_and_event_matches_the_document() {
             ordered: false,
             enabled: true,
             paused: false,
+            participants: None,
         });
     })
     .await;
@@ -209,6 +212,27 @@ async fn every_operation_and_event_matches_the_document() {
 
     // Two business days: outcomes, returns and statements.
     expect(a, s, 200, M::GET, "/test/clock", None).await;
+    expect(a, s, 200, M::GET, "/api/clock", None).await;
+    expect(
+        a,
+        s,
+        200,
+        M::POST,
+        "/api/clock/speed",
+        Some(json!({ "speed": 2 })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        400,
+        M::POST,
+        "/api/clock/speed",
+        Some(json!({ "speed": 0 })),
+    )
+    .await;
+    expect(a, s, 200, M::POST, "/api/clock/resume", None).await;
+    expect(a, s, 200, M::POST, "/api/clock/freeze", None).await;
     expect(
         a,
         s,
@@ -577,6 +601,57 @@ async fn every_operation_and_event_matches_the_document() {
         seen.insert(event["eventType"].as_str().unwrap().to_string());
     }
     assert_eq!(seen, spec.event_types(), "every event type occurs");
+
+    // Forced outcomes.
+    let forced = expect(
+        a,
+        s,
+        201,
+        M::POST,
+        "/api/payments",
+        Some(payment("forced", "DEPOSIT", "10.00", "DKK")),
+    )
+    .await;
+    let outcome = format!(
+        "/test/payments/{}/outcome",
+        forced["paymentId"].as_str().unwrap()
+    );
+    expect(
+        a,
+        s,
+        200,
+        M::POST,
+        &outcome,
+        Some(json!({ "outcome": "FAILED", "reason": "TEST", "delaySeconds": 0 })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        409,
+        M::POST,
+        &outcome,
+        Some(json!({ "outcome": "COMPLETED" })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        400,
+        M::POST,
+        &outcome,
+        Some(json!({ "outcome": "COMPLETED", "reason": "x" })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        404,
+        M::POST,
+        "/test/payments/00000000-0000-0000-0000-000000000000/outcome",
+        Some(json!({ "outcome": "COMPLETED" })),
+    )
+    .await;
 
     expect(a, s, 204, M::POST, "/test/reset", None).await;
     assert_eq!(

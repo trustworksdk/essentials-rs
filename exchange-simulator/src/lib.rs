@@ -10,10 +10,14 @@ pub mod domain;
 pub mod engine;
 pub mod events;
 pub mod ids;
+pub mod liquidity;
 pub mod market;
+pub mod market_data;
 pub mod metrics;
 pub mod persistence;
+pub mod pricing;
 pub mod scenario;
+pub mod sessions;
 pub mod settlement;
 
 /// Shared with the other simulators (see `simulator_kit`), re-exported under their old paths.

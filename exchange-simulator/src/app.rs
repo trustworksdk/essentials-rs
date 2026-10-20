@@ -32,6 +32,11 @@ impl App {
     pub fn start(config: &Config) -> anyhow::Result<Self> {
         crate::clock::validate_speed(config.clock.speed).context("clock.speed")?;
         let clearing = config.clearing_policy().map_err(anyhow::Error::msg)?;
+        if config.clock.mode == ClockMode::Follow {
+            anyhow::bail!(
+                "clock.mode: follow is for the payment gateway; the exchange keeps its own clock"
+            );
+        }
         if config.clock.mode == ClockMode::System && config.clock.speed != 1.0 {
             anyhow::bail!(
                 "clock.speed needs clock.mode: virtual; the system clock runs at real time"
@@ -74,6 +79,28 @@ impl App {
                 .checkpoint_in_background(busy_timeout, config.database.checkpoint_pages)
                 .context("starting background checkpoints")?;
         }
+        let stream_options = crate::market_data::StreamOptions {
+            conflation: Duration::from_millis(config.market_data.conflation_interval_ms),
+            buffer: config.market_data.stream_buffer.max(2),
+        };
+        let (market_data, _) = tokio::sync::broadcast::channel(stream_options.buffer);
+        let live = config
+            .price_sources
+            .finnhub
+            .live()
+            .map_err(anyhow::Error::msg)?;
+        let mut price_sources = config.price_sources.sources().map_err(anyhow::Error::msg)?;
+        if let Some(live) = &live {
+            price_sources = price_sources.with_live(live.source.clone());
+        }
+        if let Some(replay) = config
+            .price_sources
+            .replay
+            .load()
+            .map_err(anyhow::Error::msg)?
+        {
+            price_sources = price_sources.with_replay(replay);
+        }
         let exchange = Exchange::recover(
             store,
             ExchangeOptions {
@@ -102,6 +129,16 @@ impl App {
                 webhook_secret_grace: chrono::Duration::seconds(
                     i64::try_from(config.webhooks.secret_grace_seconds).unwrap_or(i64::MAX / 1000),
                 ),
+                instruments: config.declared_instruments().map_err(anyhow::Error::msg)?,
+                price_sources,
+                business_days: Some(config.business_calendar().map_err(anyhow::Error::msg)?),
+                liquidity: Some(config.liquidity.policy().map_err(anyhow::Error::msg)?),
+                market_data: Some(market_data.clone()),
+                sessions: config.trading_sessions().map_err(anyhow::Error::msg)?,
+                trade_dating: crate::settlement::TradeDating {
+                    calendar: Some(config.business_calendar().map_err(anyhow::Error::msg)?),
+                    cycles: config.settlement.policy(),
+                },
             },
         )
         .context("recovering order books")?;
@@ -135,13 +172,33 @@ impl App {
             config.webhooks.worker(),
             stopped.clone(),
         )];
-        if config.settlement.simulator_policy().is_some() || config.clearing.enabled {
-            let interval = Duration::from_millis(config.settlement.tick_interval_ms.max(1));
-            background.push(spawn_domain_ticker(dispatcher.clone(), interval, stopped));
+        if let Some(live) = live {
+            tracing::info!(
+                symbols = live.source.feed.wanted().len(),
+                "Finnhub price feed running"
+            );
+            background.push(tokio::spawn(crate::pricing::finnhub::run(
+                live.source.feed,
+                live.settings,
+                live.key,
+                stopped.clone(),
+            )));
+        }
+        // Business days close on domain time whatever else runs, so the ticker always does.
+        let interval = Duration::from_millis(config.settlement.tick_interval_ms.max(1));
+        background.push(spawn_domain_ticker(dispatcher.clone(), interval, stopped));
+        if config.settlement.simulator_policy().is_some() {
             tracing::info!(mode = ?config.settlement.mode, "settlement simulator running");
         }
-        let state = AppState::new(dispatcher, Store::new(reader), metrics, mode);
-        let mut router = api::router(state.clone());
+        let state = AppState::new(dispatcher, Store::new(reader), metrics, mode)
+            .with_market_data(market_data, stream_options);
+        let mut router = api::router(state.clone()).merge(simulator_kit::api::clock::router(
+            state.clone(),
+            config.clock.operator_control,
+        ));
+        if config.clock.operator_control {
+            tracing::info!("clock operator control enabled under /api/clock");
+        }
         if config.test_control.enabled {
             tracing::warn!(
                 "test-control API enabled under /test; never expose this outside test deployments"
@@ -184,7 +241,7 @@ impl App {
     }
 }
 
-/// Runs everything due on domain time (settlement, clearing) every `interval` until `stop` turns true or the exchange stops. A full command queue just
+/// Runs everything due on domain time (settlement, business days, clearing) every `interval` until `stop` turns true or the exchange stops. A full command queue just
 /// skips a beat.
 fn spawn_domain_ticker(
     dispatcher: crate::engine::Dispatcher,

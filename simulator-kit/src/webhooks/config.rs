@@ -56,6 +56,9 @@ pub struct SubscriptionConfig {
     /// `true` holds its deliveries: they are recorded and sent, in order, once it is unpaused.
     #[serde(default)]
     pub paused: bool,
+    /// Only events involving one of these participants, plus events that involve none.
+    #[serde(default)]
+    pub participants: Option<Vec<String>>,
 }
 
 fn enabled_by_default() -> bool {
@@ -91,6 +94,7 @@ impl SubscriptionConfig {
                 event_types: self.event_types.clone(),
                 secret,
                 ordered: self.ordered,
+                participants: self.participants.clone(),
             },
             enabled: self.enabled,
             paused: self.paused,

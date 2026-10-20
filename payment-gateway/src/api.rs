@@ -25,7 +25,7 @@ use simulator_kit::webhooks::{
 use uuid::Uuid;
 
 use crate::gateway::{ClockChange, ClockState, Gateway, GatewayError, PaymentRequest};
-use crate::payments::{BankAccount, PaymentType, payment_view};
+use crate::payments::{BankAccount, ForcedOutcome, PaymentType, payment_view};
 use crate::statement::{Break, Statement};
 use crate::store;
 
@@ -35,7 +35,10 @@ impl From<GatewayError> for ApiError {
         let (status, code) = match &error {
             E::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             E::IdempotencyConflict { .. } => (StatusCode::CONFLICT, "idempotency_conflict"),
+            E::UnknownPayment(_) => (StatusCode::NOT_FOUND, "not_found"),
+            E::PaymentSettled { .. } => (StatusCode::CONFLICT, "payment_settled"),
             E::ClockNotVirtual => (StatusCode::CONFLICT, "clock_not_virtual"),
+            E::ClockFollows => (StatusCode::CONFLICT, "clock_follows"),
             E::Clock(ClockError::Speed(_)) => (StatusCode::BAD_REQUEST, "invalid_clock_speed"),
             E::Clock(_) => (StatusCode::CONFLICT, "clock_backwards"),
             E::Webhook(_) => {
@@ -200,18 +203,25 @@ pub fn router(state: AppState) -> Router {
         .merge(simulator_kit::api::webhooks::router(state))
 }
 
+/// The shared clock routes run on the gateway.
+impl simulator_kit::api::clock::ClockBackend for AppState {
+    async fn clock_state(&self) -> Result<ClockState, ApiError> {
+        self.run(|g| Ok(g.clock_state())).await
+    }
+
+    async fn change_clock(&self, change: ClockChange) -> Result<ClockState, ApiError> {
+        self.run(move |g| g.change_clock(change)).await
+    }
+}
+
 /// The routes under `/test`: clock control, reset, statement breaks, and the shared webhook test routes.
 pub fn test_router(state: AppState) -> Router {
     Router::new()
-        .route("/test/clock", get(clock))
-        .route("/test/clock/advance", post(advance))
-        .route("/test/clock/set", post(set_clock))
-        .route("/test/clock/freeze", post(freeze))
-        .route("/test/clock/resume", post(resume))
-        .route("/test/clock/speed", post(speed))
         .route("/test/reset", post(reset))
+        .route("/test/payments/{id}/outcome", post(force_outcome))
         .route("/test/statements/breaks", get(breaks))
         .with_state(state.clone())
+        .merge(simulator_kit::api::clock::test_router(state.clone()))
         .merge(simulator_kit::api::webhooks::test_router(state))
 }
 
@@ -450,107 +460,70 @@ async fn breaks(
     Ok(Json(views))
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ClockView {
-    mode: &'static str,
-    running: bool,
-    speed: f64,
-    now: DateTime<Utc>,
+/// `POST /test/payments/{id}/outcome`: the outcome to force (decision D20).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForceRequest {
+    outcome: ForcedKind,
+    /// `FAILED` only; default `REFUSED_BY_BANK`.
+    reason: Option<String>,
+    /// `RETURNED` only: how long after completing it is returned; default a day.
+    return_after_seconds: Option<u64>,
+    /// A pending payment's outcome happens this long from now instead of when it was scheduled; 0 is at once.
+    delay_seconds: Option<u64>,
 }
 
-impl From<ClockState> for ClockView {
-    fn from(state: ClockState) -> Self {
-        Self {
-            mode: if state.virtual_clock {
-                "virtual"
-            } else {
-                "system"
-            },
-            running: state.running,
-            speed: state.speed,
-            now: state.now,
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ForcedKind {
+    Completed,
+    Failed,
+    Returned,
+}
+
+async fn force_outcome(
+    State(state): State<AppState>,
+    id: Result<Path<Uuid>, PathRejection>,
+    body: Result<Json<ForceRequest>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Path(id) = id?;
+    let Json(body) = body?;
+    let seconds = |name: &str, value: u64| {
+        if value > crate::payments::MAX_DELAY_SECONDS {
+            Err(ApiError::bad_request(format!(
+                "{name} must be at most {}",
+                crate::payments::MAX_DELAY_SECONDS
+            )))
+        } else {
+            Ok(chrono::Duration::seconds(value as i64))
         }
-    }
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AdvanceRequest {
-    #[serde(default)]
-    days: u32,
-    #[serde(default)]
-    hours: u32,
-    #[serde(default)]
-    minutes: u32,
-    #[serde(default)]
-    seconds: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SetRequest {
-    to: DateTime<Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SpeedRequest {
-    speed: f64,
-}
-
-async fn clock(State(state): State<AppState>) -> Result<Json<ClockView>, ApiError> {
-    Ok(Json(state.run(|g| Ok(g.clock_state())).await?.into()))
-}
-
-async fn advance(
-    State(state): State<AppState>,
-    body: Result<Json<AdvanceRequest>, JsonRejection>,
-) -> Result<Json<ClockView>, ApiError> {
-    let Json(body) = body?;
-    let seconds =
-        i64::try_from(body.seconds).map_err(|_| ApiError::bad_request("seconds is too large"))?;
-    let by = chrono::Duration::days(i64::from(body.days))
-        + chrono::Duration::hours(i64::from(body.hours))
-        + chrono::Duration::minutes(i64::from(body.minutes))
-        + chrono::Duration::try_seconds(seconds)
-            .ok_or_else(|| ApiError::bad_request("seconds is too large"))?;
-    if by <= chrono::Duration::zero() {
-        return Err(ApiError::bad_request(
-            "advance by a positive amount of days, hours, minutes or seconds",
-        ));
-    }
-    change(&state, ClockChange::Advance(by)).await
-}
-
-async fn set_clock(
-    State(state): State<AppState>,
-    body: Result<Json<SetRequest>, JsonRejection>,
-) -> Result<Json<ClockView>, ApiError> {
-    let Json(body) = body?;
-    change(&state, ClockChange::Set(body.to)).await
-}
-
-async fn freeze(State(state): State<AppState>) -> Result<Json<ClockView>, ApiError> {
-    change(&state, ClockChange::Freeze).await
-}
-
-async fn resume(State(state): State<AppState>) -> Result<Json<ClockView>, ApiError> {
-    change(&state, ClockChange::Resume).await
-}
-
-async fn speed(
-    State(state): State<AppState>,
-    body: Result<Json<SpeedRequest>, JsonRejection>,
-) -> Result<Json<ClockView>, ApiError> {
-    let Json(body) = body?;
-    change(&state, ClockChange::Speed(body.speed)).await
-}
-
-async fn change(state: &AppState, change: ClockChange) -> Result<Json<ClockView>, ApiError> {
-    Ok(Json(
-        state.run(move |g| g.change_clock(change)).await?.into(),
-    ))
+    };
+    let outcome = match (body.outcome, body.reason, body.return_after_seconds) {
+        (ForcedKind::Completed, None, None) => ForcedOutcome::Completed,
+        (ForcedKind::Failed, reason, None) => ForcedOutcome::Failed {
+            reason: reason.unwrap_or_else(|| "REFUSED_BY_BANK".into()),
+        },
+        (ForcedKind::Returned, None, after) => {
+            let after = after.unwrap_or(86_400);
+            seconds("returnAfterSeconds", after)?;
+            ForcedOutcome::Returned {
+                return_after_seconds: after,
+            }
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "reason is for FAILED and returnAfterSeconds for RETURNED only",
+            ));
+        }
+    };
+    let delay = body
+        .delay_seconds
+        .map(|d| seconds("delaySeconds", d))
+        .transpose()?;
+    let payment = state
+        .run(move |g| g.force_outcome(id, outcome, delay))
+        .await?;
+    Ok(Json(payment_view(&payment)))
 }
 
 async fn reset(State(state): State<AppState>) -> Result<StatusCode, ApiError> {

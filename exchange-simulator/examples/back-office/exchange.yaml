@@ -1,8 +1,7 @@
 # Mounted at /etc/exchange/exchange.yaml, layered over the built-in defaults.
 clock:
-  # Both services start frozen at the same simulated instant, a Monday morning; resuming both clocks together keeps
-  # them within a fraction of a simulated minute of each other. EXCHANGE__CLOCK__SPEED (SPEED in compose.yaml) sets
-  # the speed: 1440 makes a simulated day pass in a real minute.
+  # Frozen at a Monday morning until resumed. The gateway follows this clock (clock.mode: follow in gateway.yaml).
+  # EXCHANGE__CLOCK__SPEED (SPEED in compose.yaml) sets the speed: 1440 makes a simulated day pass in a real minute.
   mode: virtual
   start: "2030-01-07T08:00:00Z"
   running: false

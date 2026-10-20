@@ -6,9 +6,11 @@ mod instrument;
 mod order;
 
 pub use identifiers::{IdentifierError, validate_cusip, validate_isin, validate_mic};
-pub use instrument::{IdentifierPolicy, Instrument, InstrumentError, PriceError};
+pub use instrument::{IdentifierPolicy, Instrument, InstrumentChange, InstrumentError, PriceError};
 pub(crate) use order::wire_enum;
-pub use order::{Execution, Order, OrderStatus, OrderType, ParseEnumError, Side};
+pub use order::{
+    Execution, Order, OrderStatus, OrderType, ParseEnumError, Side, TimeInForce, TradeDates,
+};
 
 use serde::{Deserialize, Serialize};
 

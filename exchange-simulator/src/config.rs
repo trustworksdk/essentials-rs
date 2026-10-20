@@ -24,6 +24,21 @@ pub struct Config {
     #[serde(default)]
     pub events: EventsConfig,
     pub webhooks: WebhooksConfig,
+    /// Instruments listed at startup and after a reset (plan item 6.1).
+    #[serde(default)]
+    pub instruments: Vec<InstrumentConfig>,
+    /// Reference prices (plan item 6.2).
+    #[serde(default)]
+    pub price_sources: PriceSourcesConfig,
+    /// The built-in liquidity provider (plan item 6.7).
+    #[serde(default)]
+    pub liquidity: LiquidityConfig,
+    /// The market-data stream (plan item 6.8).
+    #[serde(default)]
+    pub market_data: MarketDataConfig,
+    /// Trading sessions by MIC (plan item 6.10); a market not listed is always open.
+    #[serde(default)]
+    pub sessions: BTreeMap<String, SessionConfig>,
     pub ids: IdsConfig,
     pub settlement: SettlementConfig,
     #[serde(default)]
@@ -202,17 +217,57 @@ impl Default for ClearingConfig {
 }
 
 impl Config {
+    /// The declared instruments, in order; an error when an ID is declared twice. Field values are validated when
+    /// the exchange lists them, as for the API.
+    pub fn declared_instruments(&self) -> Result<Vec<crate::domain::Instrument>, String> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.instruments
+            .iter()
+            .map(|c| {
+                if seen.insert(c.id.as_str()) {
+                    Ok(c.into())
+                } else {
+                    Err(format!("instruments: {} is declared twice", c.id))
+                }
+            })
+            .collect()
+    }
+
+    /// The business-day calendar: `clearing.cutoff` in `clearing.time_zone`, on weekdays. Business days close on it
+    /// (`BusinessDayClosed`) whether or not clearing is enabled.
+    pub fn business_calendar(&self) -> Result<crate::clearing::ClearingCalendar, String> {
+        crate::clearing::ClearingCalendar::parse(&self.clearing.cutoff, &self.clearing.time_zone)
+            .map_err(|e| format!("clearing.{e}"))
+    }
+
+    /// The trading sessions, keyed by uppercase MIC (environment variables arrive lowercased), with the business-day
+    /// calendar ending `DAY` orders on markets without one.
+    pub fn trading_sessions(&self) -> Result<crate::sessions::TradingSessions, String> {
+        let markets = self
+            .sessions
+            .iter()
+            .map(|(mic, s)| {
+                let mic = mic.to_ascii_uppercase();
+                crate::domain::validate_mic(&mic).map_err(|e| format!("sessions: {e}"))?;
+                let session =
+                    simulator_kit::calendar::DailySession::parse(&s.open, &s.close, &s.time_zone)
+                        .map_err(|e| format!("sessions.{mic}: {e}"))?;
+                Ok((mic, session))
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(crate::sessions::TradingSessions::new(
+            markets,
+            Some(self.business_calendar()?),
+        ))
+    }
+
     /// The clearinghouse's policy when clearing is enabled; an error for an invalid cutoff, time zone or break
     /// policy.
     pub fn clearing_policy(&self) -> Result<Option<crate::clearing::ClearingPolicy>, String> {
         if !self.clearing.enabled {
             return Ok(None);
         }
-        let calendar = crate::clearing::ClearingCalendar::parse(
-            &self.clearing.cutoff,
-            &self.clearing.time_zone,
-        )
-        .map_err(|e| format!("clearing.{e}"))?;
+        let calendar = self.business_calendar()?;
         self.clearing.breaks.validate()?;
         Ok(Some(crate::clearing::ClearingPolicy {
             calendar,
@@ -232,6 +287,364 @@ pub enum SettlementMode {
     Simulated,
     /// The simulator and externally reported outcomes, side by side.
     Both,
+}
+
+/// A market's trading session (see [`crate::sessions`]): `open` and `close` as `HH:MM` local time in `time_zone`, on
+/// business days.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConfig {
+    pub open: String,
+    pub close: String,
+    pub time_zone: String,
+}
+
+/// The market-data stream (see [`crate::market_data`]).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketDataConfig {
+    /// Per subscriber, per instrument and message kind, at most one message this often; 0 sends every message.
+    #[serde(default)]
+    pub conflation_interval_ms: u64,
+    /// Messages a subscriber may fall behind before its stream is closed.
+    #[serde(default = "stream_buffer")]
+    pub stream_buffer: usize,
+}
+
+fn stream_buffer() -> usize {
+    1024
+}
+
+impl Default for MarketDataConfig {
+    fn default() -> Self {
+        Self {
+            conflation_interval_ms: 0,
+            stream_buffer: stream_buffer(),
+        }
+    }
+}
+
+/// The built-in liquidity provider (see [`crate::liquidity`]).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiquidityConfig {
+    /// The participant it trades as.
+    #[serde(default = "provider_id")]
+    pub participant_id: String,
+    /// Publish its order lifecycle in the event log and over webhooks; its trades are published either way.
+    #[serde(default)]
+    pub emit_order_events: bool,
+    /// What an instrument's own `liquidity` leaves out, field by field.
+    #[serde(default)]
+    pub default: crate::liquidity::LiquiditySpec,
+}
+
+fn provider_id() -> String {
+    "LP".into()
+}
+
+impl Default for LiquidityConfig {
+    fn default() -> Self {
+        Self {
+            participant_id: provider_id(),
+            emit_order_events: false,
+            default: Default::default(),
+        }
+    }
+}
+
+impl LiquidityConfig {
+    pub fn policy(&self) -> Result<crate::engine::LiquidityPolicy, String> {
+        if self.participant_id.trim().is_empty() {
+            return Err("liquidity.participant_id must not be blank".into());
+        }
+        self.default
+            .validate()
+            .map_err(|e| format!("liquidity.default: {e}"))?;
+        Ok(crate::engine::LiquidityPolicy {
+            participant: crate::domain::ParticipantId(self.participant_id.clone()),
+            emit_order_events: self.emit_order_events,
+            default: self.default.clone(),
+        })
+    }
+}
+
+/// Defaults for instruments' price sources (see [`crate::pricing`]).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceSourcesConfig {
+    /// The base of each instrument's derived synthetic seed.
+    #[serde(default)]
+    pub seed: u64,
+    /// What an instrument's own price source leaves out, field by field.
+    #[serde(default)]
+    pub default: crate::pricing::PriceSourceSpec,
+    /// The Finnhub live source (plan item 6.9).
+    #[serde(default)]
+    pub finnhub: FinnhubConfig,
+    /// The replay source (plan item 6.13).
+    #[serde(default)]
+    pub replay: ReplayConfig,
+}
+
+/// The replay source (see [`crate::pricing::replay`]): the file instruments of kind `replay` play.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayConfig {
+    /// CSV (`.csv`) or JSON lines; unset refuses `replay` sources.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Start the file over after its last row.
+    #[serde(default, rename = "loop")]
+    pub looping: bool,
+    /// With `loop`: simulated milliseconds between the last row and the first row of the next pass.
+    #[serde(default = "replay_loop_gap_ms")]
+    pub loop_gap_ms: u64,
+}
+
+fn replay_loop_gap_ms() -> u64 {
+    1_000
+}
+
+impl ReplayConfig {
+    /// The loaded replay file, or `None` without one; an unreadable or malformed file is an error naming the line.
+    pub fn load(&self) -> Result<Option<crate::pricing::replay::Replay>, String> {
+        self.file
+            .as_deref()
+            .map(|file| {
+                crate::pricing::replay::Replay::load(
+                    std::path::Path::new(file),
+                    self.looping.then_some(self.loop_gap_ms),
+                )
+                .map_err(|e| format!("price_sources.replay.file {e}"))
+            })
+            .transpose()
+    }
+}
+
+impl PriceSourcesConfig {
+    pub fn sources(&self) -> Result<crate::pricing::PriceSources, String> {
+        crate::pricing::PriceSources::new(self.default.clone(), self.seed)
+            .map_err(|e| format!("price_sources.default: {e}"))
+    }
+}
+
+/// The Finnhub live source (see [`crate::pricing::finnhub`]). It runs when an API key is found: in the environment
+/// variable `FINNHUB_API_KEY` (how the compose files deliver it), or in the file `api_key_file`, which wins when set. The limits default to Finnhub's free tier
+/// (checked 2026-10-19: 60 REST calls a minute, 50 websocket symbols).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinnhubConfig {
+    #[serde(default)]
+    pub api_key_file: Option<String>,
+    #[serde(default = "finnhub_ws_url")]
+    pub ws_url: String,
+    #[serde(default = "finnhub_rest_url")]
+    pub rest_url: String,
+    /// Real time without an update after which a reference price is stale.
+    #[serde(default = "finnhub_stale_after_ms")]
+    pub stale_after_ms: u64,
+    /// Real time without an update after which a symbol is refreshed over REST.
+    #[serde(default = "finnhub_refresh_after_ms")]
+    pub refresh_after_ms: u64,
+    /// Reference price updates adopted per instrument and second, at most; the latest price wins.
+    #[serde(default = "finnhub_max_updates_per_second")]
+    pub max_updates_per_second: u32,
+    #[serde(default = "finnhub_max_symbols")]
+    pub max_symbols: usize,
+    #[serde(default = "finnhub_rest_calls_per_minute")]
+    pub rest_calls_per_minute: u32,
+    #[serde(default = "finnhub_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    #[serde(default = "finnhub_reconnect_initial_ms")]
+    pub reconnect_initial_ms: u64,
+    #[serde(default = "finnhub_reconnect_max_ms")]
+    pub reconnect_max_ms: u64,
+    /// Appends every adopted price to this file in the replay format (`.csv` or JSON lines), for replaying later.
+    /// Keep it under `recordings/`, which is gitignored: vendor data must not be committed.
+    #[serde(default)]
+    pub record_to: Option<String>,
+}
+
+fn finnhub_ws_url() -> String {
+    "wss://ws.finnhub.io".into()
+}
+fn finnhub_rest_url() -> String {
+    "https://finnhub.io/api/v1".into()
+}
+fn finnhub_stale_after_ms() -> u64 {
+    120_000
+}
+fn finnhub_refresh_after_ms() -> u64 {
+    60_000
+}
+fn finnhub_max_updates_per_second() -> u32 {
+    4
+}
+fn finnhub_max_symbols() -> usize {
+    50
+}
+fn finnhub_rest_calls_per_minute() -> u32 {
+    60
+}
+fn finnhub_request_timeout_ms() -> u64 {
+    10_000
+}
+fn finnhub_reconnect_initial_ms() -> u64 {
+    1_000
+}
+fn finnhub_reconnect_max_ms() -> u64 {
+    60_000
+}
+
+impl Default for FinnhubConfig {
+    fn default() -> Self {
+        Self {
+            api_key_file: None,
+            ws_url: finnhub_ws_url(),
+            rest_url: finnhub_rest_url(),
+            stale_after_ms: finnhub_stale_after_ms(),
+            refresh_after_ms: finnhub_refresh_after_ms(),
+            max_updates_per_second: finnhub_max_updates_per_second(),
+            max_symbols: finnhub_max_symbols(),
+            rest_calls_per_minute: finnhub_rest_calls_per_minute(),
+            request_timeout_ms: finnhub_request_timeout_ms(),
+            reconnect_initial_ms: finnhub_reconnect_initial_ms(),
+            reconnect_max_ms: finnhub_reconnect_max_ms(),
+            record_to: None,
+        }
+    }
+}
+
+/// A live source ready to run: what the exchange reads, and what the feed task needs.
+pub struct LiveConfig {
+    pub source: crate::pricing::LiveSource,
+    pub settings: crate::pricing::finnhub::FeedSettings,
+    pub key: crate::pricing::finnhub::ApiKey,
+}
+
+impl FinnhubConfig {
+    /// The live source, or `None` when no API key is found. A key file that cannot be read, or settings that
+    /// contradict each other, are errors.
+    pub fn live(&self) -> Result<Option<LiveConfig>, String> {
+        self.live_with(|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::live`] with `env` for the environment.
+    fn live_with(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<LiveConfig>, String> {
+        let key = match &self.api_key_file {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("price_sources.finnhub.api_key_file {path}: {e}"))?,
+            ),
+            None => env("FINNHUB_API_KEY"),
+        };
+        let Some(key) = key.and_then(crate::pricing::finnhub::ApiKey::new) else {
+            return Ok(None);
+        };
+        if self.max_updates_per_second == 0
+            || self.rest_calls_per_minute == 0
+            || self.max_symbols == 0
+        {
+            return Err(
+                "price_sources.finnhub: max_updates_per_second, rest_calls_per_minute and max_symbols must be at least 1"
+                    .into(),
+            );
+        }
+        if self.stale_after_ms <= self.refresh_after_ms {
+            return Err(
+                "price_sources.finnhub.stale_after_ms must be longer than refresh_after_ms, or a closed market's prices \
+                 go stale between refreshes"
+                    .into(),
+            );
+        }
+        let ms = Duration::from_millis;
+        Ok(Some(LiveConfig {
+            source: crate::pricing::LiveSource {
+                feed: Default::default(),
+                stale_after: ms(self.stale_after_ms),
+                min_interval: Duration::from_secs(1) / self.max_updates_per_second,
+                max_symbols: self.max_symbols,
+                recorder: self
+                    .record_to
+                    .as_deref()
+                    .map(|path| crate::pricing::replay::Recorder::start(std::path::Path::new(path)))
+                    .transpose()
+                    .map_err(|e| format!("price_sources.finnhub.record_to {e}"))?,
+            },
+            settings: crate::pricing::finnhub::FeedSettings {
+                ws_url: self.ws_url.clone(),
+                rest_url: self.rest_url.clone(),
+                refresh_after: ms(self.refresh_after_ms),
+                rest_calls_per_minute: self.rest_calls_per_minute,
+                request_timeout: ms(self.request_timeout_ms),
+                reconnect_initial: ms(self.reconnect_initial_ms.max(1)),
+                reconnect_max: ms(self.reconnect_max_ms.max(self.reconnect_initial_ms.max(1))),
+            },
+            key,
+        }))
+    }
+}
+
+/// An instrument declared in configuration: the fields of `POST /api/instruments`, in snake_case.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentConfig {
+    pub id: String,
+    pub symbol: String,
+    #[serde(default)]
+    pub mic: Option<String>,
+    #[serde(default)]
+    pub isin: Option<String>,
+    #[serde(default)]
+    pub cusip: Option<String>,
+    pub currency: String,
+    pub currency_scale: u8,
+    #[serde(default = "one")]
+    pub tick_size_minor: u64,
+    #[serde(default = "one")]
+    pub lot_size: u64,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub reference_symbol: Option<String>,
+    /// The instrument's own price source; fields left out come from `price_sources.default`.
+    #[serde(default)]
+    pub price_source: Option<crate::pricing::PriceSourceSpec>,
+    /// The instrument's own liquidity settings; fields left out come from `liquidity.default`.
+    #[serde(default)]
+    pub liquidity: Option<crate::liquidity::LiquiditySpec>,
+}
+
+fn one() -> u64 {
+    1
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl From<&InstrumentConfig> for crate::domain::Instrument {
+    fn from(c: &InstrumentConfig) -> Self {
+        Self {
+            id: crate::domain::InstrumentId(c.id.clone()),
+            symbol: c.symbol.clone(),
+            mic: c.mic.clone(),
+            isin: c.isin.clone(),
+            cusip: c.cusip.clone(),
+            currency: c.currency.clone(),
+            currency_scale: c.currency_scale,
+            tick_size_minor: c.tick_size_minor,
+            lot_size: c.lot_size,
+            enabled: c.enabled,
+            reference_symbol: c.reference_symbol.clone(),
+            price_source: c.price_source.clone(),
+            liquidity: c.liquidity.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -296,11 +709,14 @@ pub enum LogFormat {
 }
 
 impl Config {
-    /// Loads the defaults, the file named by [`CONFIG_FILE_ENV`] if set, and `EXCHANGE__*` environment variables.
+    /// Loads the defaults, the file named by [`CONFIG_FILE_ENV`] if set (empty counts as unset, as Compose passes an
+    /// unset variable), and `EXCHANGE__*` environment variables.
     pub fn load() -> Result<Self, config::ConfigError> {
         let mut builder = config::Config::builder()
             .add_source(config::File::from_str(DEFAULTS, config::FileFormat::Yaml));
-        if let Ok(path) = std::env::var(CONFIG_FILE_ENV) {
+        if let Ok(path) = std::env::var(CONFIG_FILE_ENV)
+            && !path.is_empty()
+        {
             builder = builder.add_source(config::File::with_name(&path));
         }
         builder
@@ -317,6 +733,68 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_finnhub_market_file_lists_valid_live_instruments_within_the_free_tier() {
+        let config: Config = config::Config::builder()
+            .add_source(config::File::from_str(DEFAULTS, config::FileFormat::Yaml))
+            .add_source(config::File::from_str(
+                include_str!("../config/finnhub-market.yaml"),
+                config::FileFormat::Yaml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(
+            config.price_sources.default.kind,
+            Some(crate::pricing::PriceSourceKind::Finnhub)
+        );
+        let instruments = config.declared_instruments().unwrap();
+        assert_eq!(instruments.len(), 40);
+        for instrument in &instruments {
+            instrument
+                .validate(IdentifierPolicy::Strict)
+                .unwrap_or_else(|e| panic!("{}: {e}", instrument.id));
+        }
+        let symbols: std::collections::BTreeSet<&str> = instruments
+            .iter()
+            .map(|i| i.reference_symbol.as_deref().unwrap_or(&i.symbol))
+            .collect();
+        assert_eq!(symbols.len(), instruments.len(), "no symbol streams twice");
+        assert!(symbols.len() <= FinnhubConfig::default().max_symbols);
+    }
+
+    #[test]
+    fn the_finnhub_key_comes_from_the_environment_unless_a_file_is_named() {
+        let finnhub = FinnhubConfig::default();
+        let env = |key: &'static str| {
+            move |name: &str| (name == "FINNHUB_API_KEY").then(|| key.to_string())
+        };
+        assert!(
+            finnhub.live_with(env("from-env")).unwrap().is_some(),
+            "compose passes it as FINNHUB_API_KEY"
+        );
+        assert!(
+            finnhub.live_with(env("")).unwrap().is_none(),
+            "compose passes an unset variable as empty"
+        );
+        assert!(finnhub.live_with(|_| None).unwrap().is_none());
+
+        let dir = std::env::temp_dir().join(format!("exchange-sim-key-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("key");
+        std::fs::write(&file, "").unwrap();
+        let from_file = FinnhubConfig {
+            api_key_file: Some(file.display().to_string()),
+            ..Default::default()
+        };
+        assert!(
+            from_file.live_with(env("from-env")).unwrap().is_none(),
+            "a named file wins, even when empty"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn defaults_parse() {
@@ -364,6 +842,93 @@ mod tests {
             "Default matches config/default.yaml"
         );
         assert!(!config.test_control.enabled);
+    }
+
+    #[test]
+    fn instruments_and_price_sources_read_in_snake_case() {
+        let config = with_overlay(
+            r#"
+price_sources:
+  seed: 7
+  default: { kind: synthetic, volatility: 0.3, tick_interval_ms: 500 }
+instruments:
+  - id: AAPL
+    symbol: AAPL
+    mic: XNAS
+    currency: USD
+    currency_scale: 2
+    reference_symbol: AAPL
+    price_source: { initial_price: "187.50" }
+  - id: MSFT
+    symbol: MSFT
+    currency: USD
+    currency_scale: 2
+    price_source: { kind: fixed, price: "410.00" }
+"#,
+        )
+        .unwrap();
+        let instruments = config.declared_instruments().unwrap();
+        let aapl = instruments[0].price_source.as_ref().unwrap();
+        assert_eq!(aapl.initial_price.as_deref(), Some("187.50"));
+        assert_eq!(instruments[0].reference_symbol.as_deref(), Some("AAPL"));
+        let msft = instruments[1].price_source.as_ref().unwrap();
+        assert_eq!(msft.kind, Some(crate::pricing::PriceSourceKind::Fixed));
+        assert_eq!(config.price_sources.seed, 7);
+        assert_eq!(config.price_sources.default.tick_interval_ms, Some(500));
+        config.price_sources.sources().unwrap();
+
+        let invalid = with_overlay("price_sources: { default: { volatility: -1 } }").unwrap();
+        assert_eq!(
+            invalid.price_sources.sources().unwrap_err(),
+            "price_sources.default: priceSource.volatility must not be negative"
+        );
+        assert!(
+            with_overlay("instruments: [ { id: A, symbol: A, currency: USD, currency_scale: 2, colour: red } ]")
+                .is_err(),
+            "unknown fields are rejected"
+        );
+    }
+
+    #[test]
+    fn liquidity_reads_in_snake_case() {
+        let config = with_overlay(
+            r#"
+liquidity:
+  participant_id: MM
+  emit_order_events: true
+  default: { mode: on, spread_bps: 5, level_quantity: 20, refill_delay_ms: 500 }
+instruments:
+  - { id: A, symbol: A, currency: USD, currency_scale: 2, liquidity: { levels: 2, skew_bps_per_lot: 0.5 } }
+"#,
+        )
+        .unwrap();
+        let policy = config.liquidity.policy().unwrap();
+        assert_eq!(policy.participant.0, "MM");
+        assert!(policy.emit_order_events);
+        let own = config.declared_instruments().unwrap()[0]
+            .liquidity
+            .clone()
+            .unwrap();
+        let resolved = own.or(&policy.default).resolve();
+        assert_eq!(
+            (
+                resolved.mode,
+                resolved.levels,
+                resolved.spread_bps,
+                resolved.level_quantity,
+                resolved.refill_delay_ms,
+                resolved.skew_bps_per_lot
+            ),
+            (crate::liquidity::LiquidityMode::On, 2, 5.0, 20, 500, 0.5)
+        );
+        let invalid = with_overlay("liquidity: { default: { levels: 0 } }").unwrap();
+        assert!(
+            invalid
+                .liquidity
+                .policy()
+                .unwrap_err()
+                .contains("liquidity.levels")
+        );
     }
 
     fn with_overlay(yaml: &str) -> Result<Config, config::ConfigError> {
@@ -467,6 +1032,7 @@ webhooks:
             ordered: false,
             enabled: true,
             paused: false,
+            participants: None,
         };
         let secret = |entry: SubscriptionConfig| entry.resolve().map(|d| d.subscription.secret);
         assert_eq!(secret(base.clone()).unwrap(), None);
@@ -531,6 +1097,14 @@ webhooks:
                 concat!(
                     "```yaml\n",
                     include_str!("../examples/back-office/exchange.yaml"),
+                    "```\n"
+                ),
+            ),
+            (
+                "examples/with-your-app/exchange.yaml",
+                concat!(
+                    "```yaml\n",
+                    include_str!("../examples/with-your-app/exchange.yaml"),
                     "```\n"
                 ),
             ),

@@ -5,7 +5,9 @@ mod store;
 
 pub use simulator_kit::outbox::{AttemptRow, DeliveryRecord, DeliveryStats, Outbox};
 pub use simulator_kit::persistence::{PersistenceMode, configure, open_reader, schema_version};
-pub use store::{ExecutionFilter, InstrumentFilter, OrderRecord, SettlementWrite, Store};
+pub use store::{
+    DayTrading, ExecutionFilter, InstrumentFilter, OrderRecord, SettlementWrite, Store,
+};
 
 use std::path::Path;
 use std::time::Duration;
@@ -26,6 +28,13 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/010_named_subscriptions.sql"),
     include_str!("../../migrations/011_webhook_maintenance.sql"),
     include_str!("../../migrations/012_clearing.sql"),
+    include_str!("../../migrations/013_instrument_reference_symbol.sql"),
+    include_str!("../../migrations/014_price_sources.sql"),
+    include_str!("../../migrations/015_webhook_participant_filter.sql"),
+    include_str!("../../migrations/016_business_days.sql"),
+    include_str!("../../migrations/017_liquidity.sql"),
+    include_str!("../../migrations/018_trade_dates.sql"),
+    include_str!("../../migrations/019_time_in_force.sql"),
 ];
 
 /// A fresh name for an in-memory exchange database (see [`simulator_kit::persistence::memory_location`]).
@@ -75,10 +84,14 @@ mod tests {
         let exchange = memory();
         let shared = Connection::open_in_memory().unwrap();
         shared.execute_batch(simulator_kit::outbox::SCHEMA).unwrap();
+        shared
+            .execute_batch(simulator_kit::outbox::PARTICIPANT_FILTER)
+            .unwrap();
         assert_eq!(
             simulator_kit::outbox::shared_schema(&exchange).unwrap(),
             simulator_kit::outbox::shared_schema(&shared).unwrap(),
-            "the exchange's events, webhook and virtual clock tables differ from simulator_kit::outbox::SCHEMA"
+            "the exchange's events, webhook and virtual clock tables differ from simulator_kit::outbox::SCHEMA and \
+             PARTICIPANT_FILTER"
         );
     }
 
@@ -97,6 +110,7 @@ mod tests {
         assert_eq!(
             tables,
             [
+                "business_day_cursor",
                 "clearing_cursor",
                 "clearing_statements",
                 "consumer_offsets",
@@ -205,6 +219,76 @@ mod tests {
                 .is_err(),
             "secrets are 16 to 256 characters"
         );
+    }
+
+    #[test]
+    fn upgrading_to_version_19_keeps_orders_and_executions_and_makes_old_orders_gtc() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn, Duration::from_secs(1)).unwrap();
+        simulator_kit::persistence::migrate(&mut conn, &MIGRATIONS[..18]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO instruments (id, symbol, currency, currency_scale, tick_size_minor, lot_size)
+               VALUES ('ACME', 'ACME', 'DKK', 2, 1, 1);
+             INSERT INTO participants (id, name) VALUES ('A', 'A'), ('B', 'B');
+             INSERT INTO orders (id, instrument_id, participant_id, side, order_type, limit_price_ticks, quantity,
+                                 remaining_quantity, sequence, status, created_at, updated_at)
+               VALUES ('o1', 'ACME', 'A', 'SELL', 'LIMIT', 100, 10, 4, 1, 'PARTIALLY_FILLED', 't', 't'),
+                      ('o2', 'ACME', 'B', 'BUY', 'MARKET', NULL, 6, 0, 2, 'FILLED', 't', 't');
+             INSERT INTO executions (id, instrument_id, buy_order_id, sell_order_id, buyer_id, seller_id, price_ticks,
+                                     quantity, executed_at)
+               VALUES ('e1', 'ACME', 'o2', 'o1', 'B', 'A', 100, 6, 't');",
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap() as usize, MIGRATIONS.len());
+        let time_in_force = |id: &str| -> String {
+            conn.query_row(
+                "SELECT time_in_force FROM orders WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            (time_in_force("o1"), time_in_force("o2")),
+            ("GTC".into(), "IOC".into())
+        );
+        let execution_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM executions e JOIN orders o ON o.id = e.sell_order_id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            execution_count, 1,
+            "the execution still references its orders"
+        );
+        conn.execute("UPDATE orders SET status = 'EXPIRED' WHERE id = 'o1'", [])
+            .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE orders SET time_in_force = 'FOK' WHERE id = 'o1'",
+                []
+            )
+            .is_err(),
+            "the time in force is checked"
+        );
+        assert!(
+            conn.execute("DELETE FROM orders WHERE id = 'o2'", [])
+                .is_err(),
+            "foreign keys are enforced again"
+        );
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'orders'
+                 AND name IN ('idx_orders_client_order_id', 'idx_orders_active')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 2, "the indexes are rebuilt");
     }
 
     #[test]

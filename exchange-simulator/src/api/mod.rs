@@ -3,6 +3,8 @@
 
 pub mod clearing;
 mod error;
+pub mod liquidity;
+pub mod market_data;
 mod model;
 pub mod settlements;
 pub mod test_control;
@@ -22,7 +24,7 @@ use uuid::Uuid;
 pub use error::ApiError;
 pub use model::*;
 
-use crate::domain::{Instrument, InstrumentId, Participant};
+use crate::domain::{Instrument, InstrumentChange, InstrumentId, Participant};
 use crate::engine::{DispatchError, Dispatcher, ExchangeError, SubmitOutcome};
 use crate::events::EventEnvelope;
 use crate::persistence::{ExecutionFilter, InstrumentFilter, PersistenceMode, Store};
@@ -34,6 +36,11 @@ pub struct AppState {
     reader: Arc<Mutex<Store>>,
     metrics: PrometheusHandle,
     persistence: PersistenceMode,
+    /// Where the exchange publishes market data, and how the stream serves subscribers.
+    market_data: Option<(
+        crate::market_data::Sender,
+        crate::market_data::StreamOptions,
+    )>,
 }
 
 impl AppState {
@@ -49,7 +56,18 @@ impl AppState {
             reader: Arc::new(Mutex::new(reader)),
             metrics,
             persistence,
+            market_data: None,
         }
+    }
+
+    /// Serves `GET /api/marketdata/stream` from `sender`.
+    pub fn with_market_data(
+        mut self,
+        sender: crate::market_data::Sender,
+        options: crate::market_data::StreamOptions,
+    ) -> Self {
+        self.market_data = Some((sender, options));
+        self
     }
 
     /// Runs a query on the read connection off the async runtime.
@@ -91,7 +109,23 @@ pub fn router(state: AppState) -> Router {
         .with_state(state.clone())
         .merge(settlements::router(state.clone()))
         .merge(clearing::router(state.clone()))
+        .merge(market_data::router(state.clone()))
+        .merge(liquidity::router(state.clone()))
         .merge(simulator_kit::api::webhooks::router(state))
+}
+
+/// The shared clock routes run on the exchange thread.
+impl simulator_kit::api::clock::ClockBackend for AppState {
+    async fn clock_state(&self) -> Result<crate::engine::ClockState, ApiError> {
+        Ok(self.dispatcher.clock_state().await?)
+    }
+
+    async fn change_clock(
+        &self,
+        change: crate::engine::ClockChange,
+    ) -> Result<crate::engine::ClockState, ApiError> {
+        Ok(self.dispatcher.change_clock(change).await?)
+    }
 }
 
 /// The shared webhook routes run on the exchange: changes through the dispatcher, queries on the read connection.
@@ -235,16 +269,23 @@ async fn list_instruments(
     Ok(Json(instruments.iter().map(InstrumentView::from).collect()))
 }
 
-/// Changes an instrument's trading status. Resting orders stay; cancels keep working while it is disabled.
+/// Changes an instrument's trading status or reference symbol. Resting orders stay; cancels keep working while it is
+/// disabled.
 async fn update_instrument(
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Result<Json<InstrumentPatch>, JsonRejection>,
 ) -> Result<Json<InstrumentView>, ApiError> {
     let Json(patch) = body?;
+    let change = InstrumentChange::from(patch);
+    if change.is_empty() {
+        return Err(ApiError::bad_request(
+            "give at least one of enabled, referenceSymbol",
+        ));
+    }
     let instrument = state
         .dispatcher
-        .set_instrument_enabled(InstrumentId(id), patch.enabled)
+        .update_instrument(InstrumentId(id), change)
         .await
         .map_err(|error| match error {
             DispatchError::Exchange(ExchangeError::UnknownInstrument(id)) => {

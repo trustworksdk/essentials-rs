@@ -766,9 +766,20 @@ async fn queue_a_large_number_of_messages() {
     }
     tx.commit().await.unwrap();
 
-    // Java asserts 20000 queued right after the commit; the running consumer may already have taken some.
+    // Java asserts 20000 queued right after the commit; the running consumer may already have taken some. A message
+    // is deleted only after its handler returns, so a handled message can still be in the table: with one consumer,
+    // at most one. Each bound reads `handled` on the side of the count that makes it hold.
+    let handled_before = handled.load(Ordering::SeqCst) as i64;
     let queued = db.count("SELECT count(*) FROM durable_queues").await;
-    assert_eq!(queued + handled.load(Ordering::SeqCst) as i64, MESSAGES);
+    let handled_after = handled.load(Ordering::SeqCst) as i64;
+    assert!(
+        queued + handled_after >= MESSAGES,
+        "none lost: {queued} queued + {handled_after} handled"
+    );
+    assert!(
+        queued + handled_before <= MESSAGES + 1,
+        "none extra: {queued} queued + {handled_before} handled, at most one handled but not yet deleted"
+    );
     tokio::time::timeout(Duration::from_secs(5), async {
         while handled.load(Ordering::SeqCst) <= 10 {
             tokio::time::sleep(Duration::from_millis(20)).await;

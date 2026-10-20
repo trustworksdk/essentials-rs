@@ -9,6 +9,7 @@ use chrono::{DateTime, NaiveDate, SubsecRound, Utc};
 use rusqlite::Connection;
 use simulator_kit::calendar::{next_business_day, previous_business_day};
 use simulator_kit::clock::{Clock, ClockError, SystemClock, VirtualClock, wall_now};
+pub use simulator_kit::clock::{ClockChange, ClockState};
 use simulator_kit::events::NewEvent;
 use simulator_kit::ids::IdScheme;
 use simulator_kit::outbox::{self, Outbox};
@@ -21,8 +22,8 @@ use uuid::Uuid;
 use crate::iban;
 use crate::money::{Currencies, parse_amount};
 use crate::payments::{
-    BankAccount, Booking, PAYMENT_COMPLETED, PAYMENT_FAILED, PAYMENT_PENDING, PAYMENT_RETURNED,
-    Payment, PaymentPolicy, PaymentStatus, PaymentType,
+    BankAccount, Booking, ForcedOutcome, PAYMENT_COMPLETED, PAYMENT_FAILED, PAYMENT_PENDING,
+    PAYMENT_RETURNED, Payment, PaymentPolicy, PaymentStatus, PaymentType,
 };
 use crate::statement::{self, StatementPolicy, StoredStatement};
 use crate::store;
@@ -37,6 +38,7 @@ pub const EVENT_TYPES: &[&str] = &[
     PAYMENT_FAILED,
     PAYMENT_RETURNED,
     statement::BANK_STATEMENT_ISSUED,
+    simulator_kit::clock::CLOCK_CHANGED,
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -45,8 +47,20 @@ pub enum GatewayError {
     Invalid(String),
     #[error("idempotency key {key} was already used by payment {existing} with different details")]
     IdempotencyConflict { key: String, existing: Uuid },
+    #[error("unknown payment {0}")]
+    UnknownPayment(Uuid),
+    #[error("payment {id} is {status}: {why}")]
+    PaymentSettled {
+        id: Uuid,
+        status: &'static str,
+        why: &'static str,
+    },
     #[error("the gateway uses the system clock; configure clock.mode = virtual to control time")]
     ClockNotVirtual,
+    #[error(
+        "the gateway's clock follows the exchange (clock.mode = follow); change the exchange's clock instead"
+    )]
+    ClockFollows,
     #[error(transparent)]
     Clock(#[from] ClockError),
     #[error(transparent)]
@@ -90,25 +104,16 @@ pub struct GatewayOptions {
     pub delivery_signal: Option<Arc<tokio::sync::Notify>>,
     pub webhooks: Vec<DeclaredSubscription>,
     pub webhook_secret_grace: chrono::Duration,
+    /// The virtual clock follows another simulator's ([`Gateway::follow`]) and refuses changes through the clock API.
+    pub follow: bool,
 }
 
-/// How the gateway tells time, for the test-control API.
+/// Another simulator's clock as read from its `GET /api/clock`, `now` already corrected for the request's latency.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ClockState {
-    pub virtual_clock: bool,
+pub struct RemoteClock {
     pub running: bool,
     pub speed: f64,
     pub now: DateTime<Utc>,
-}
-
-/// A change to the virtual clock.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ClockChange {
-    Advance(chrono::Duration),
-    Set(DateTime<Utc>),
-    Freeze,
-    Resume,
-    Speed(f64),
 }
 
 /// The bank's statements: their policy, the last business date whose cutoff was handled, and late statements waiting.
@@ -153,6 +158,10 @@ pub struct Gateway {
     delivery_signal: Option<Arc<tokio::sync::Notify>>,
     /// Counts resets; delivery results claimed before one are dropped.
     epoch: u64,
+    /// The virtual clock follows another simulator's.
+    follow: bool,
+    /// Whether the followed clock was last seen behind ours, so the warning is logged once per episode.
+    behind: bool,
 }
 
 impl Gateway {
@@ -172,6 +181,7 @@ impl Gateway {
             options.webhooks,
             options.webhook_secret_grace,
             EVENT_TYPES,
+            None,
         )?;
         let mut clock = options.clock;
         let clock_start = options
@@ -216,6 +226,8 @@ impl Gateway {
             simulation_id: options.simulation_id,
             delivery_signal: options.delivery_signal,
             epoch: 0,
+            follow: options.follow,
+            behind: false,
         };
         gateway.reconcile_webhooks()?;
         if let Some(policy) = options.statements {
@@ -318,6 +330,7 @@ impl Gateway {
             failed_at: None,
             returned_at: None,
             updated_at: now,
+            forced: None,
         };
         payment.due_at = Some(self.policy.outcome_due(&payment));
         let mut events = vec![self.policy.initiated(&payment)];
@@ -341,6 +354,64 @@ impl Gateway {
         }
     }
 
+    /// Forces a payment's outcome for a test (decision D20): `outcome` replaces its seeded draws. A pending payment
+    /// takes any outcome, due at its scheduled time or `delay` from now; a completed one not yet returned takes only
+    /// `RETURNED`, due `returnAfterSeconds` from now. Whatever is due at once happens before this returns the payment.
+    pub fn force_outcome(
+        &mut self,
+        id: Uuid,
+        outcome: ForcedOutcome,
+        delay: Option<chrono::Duration>,
+    ) -> Result<Payment, GatewayError> {
+        if let ForcedOutcome::Failed { reason } = &outcome
+            && (reason.trim().is_empty() || reason.chars().count() > 64)
+        {
+            return Err(GatewayError::Invalid(
+                "reason must be 1 to 64 characters".into(),
+            ));
+        }
+        let mut payment =
+            store::payment(&self.conn, id)?.ok_or(GatewayError::UnknownPayment(id))?;
+        let now = self.now();
+        let settled = |why| GatewayError::PaymentSettled {
+            id,
+            status: payment.status.as_str(),
+            why,
+        };
+        match (payment.status, &outcome) {
+            (PaymentStatus::Pending, _) => {
+                if let Some(delay) = delay {
+                    payment.due_at = Some(now + delay);
+                }
+            }
+            (
+                PaymentStatus::Completed,
+                ForcedOutcome::Returned {
+                    return_after_seconds,
+                },
+            ) if delay.is_none() => {
+                payment.due_at =
+                    Some(now + chrono::Duration::seconds(*return_after_seconds as i64));
+            }
+            (PaymentStatus::Completed, ForcedOutcome::Returned { .. }) => {
+                return Err(GatewayError::Invalid(
+                    "a completed payment takes returnAfterSeconds, not delaySeconds".into(),
+                ));
+            }
+            (PaymentStatus::Completed, _) => {
+                return Err(settled("only RETURNED can still apply"));
+            }
+            (PaymentStatus::Failed | PaymentStatus::Returned, _) => {
+                return Err(settled("its outcome is final"));
+            }
+        }
+        payment.forced = Some(outcome);
+        self.commit_payments(&[&payment], &[], &mut [])?;
+        self.schedule(payment);
+        self.tick()?;
+        Ok(store::payment(&self.conn, id)?.expect("just stored"))
+    }
+
     /// Stamps `events`, commits them with the payments and bookings, and moves the event sequence on.
     fn commit_payments(
         &mut self,
@@ -355,6 +426,7 @@ impl Gateway {
             ids: self.ids,
             due: wall_now(),
             schema_version: SCHEMA_VERSION,
+            parties: None,
         };
         store::commit_payments(&mut self.conn, payments, bookings, events, outbox)?;
         self.next_event_sequence = next;
@@ -472,6 +544,7 @@ impl Gateway {
             ids: self.ids,
             due: wall_now(),
             schema_version: SCHEMA_VERSION,
+            parties: None,
         };
         let rows: Vec<&StoredStatement> = issue.iter().chain(&waiting).collect();
         store::commit_statements(&mut self.conn, &rows, cursor, &events, outbox)?;
@@ -513,22 +586,95 @@ impl Gateway {
         }
     }
 
-    /// Changes the virtual clock, persists it, and runs whatever became due before answering.
+    /// Changes the virtual clock, persists it, and runs whatever became due before answering. A following clock
+    /// refuses: it moves with the clock it follows.
     pub fn change_clock(&mut self, change: ClockChange) -> Result<ClockState, GatewayError> {
+        if self.follow {
+            return Err(GatewayError::ClockFollows);
+        }
         let clock = self
             .virtual_clock
-            .as_ref()
+            .clone()
             .ok_or(GatewayError::ClockNotVirtual)?;
-        match change {
-            ClockChange::Advance(by) => clock.advance(by)?,
-            ClockChange::Set(to) => clock.set(to)?,
-            ClockChange::Freeze => clock.freeze(),
-            ClockChange::Resume => clock.resume(),
-            ClockChange::Speed(speed) => clock.set_speed(speed)?,
-        }
-        outbox::save_virtual_clock(&self.conn, clock.now(), clock.is_running())?;
-        self.tick()?;
+        let changed = change.apply(&clock)?;
+        self.clock_changed(change.name(), &clock, changed)?;
         Ok(self.clock_state())
+    }
+
+    /// Brings the following clock to `remote`: its speed and running state, and its reading when that is ahead. The
+    /// clock never moves backwards, so when the followed clock is behind (it slowed or froze between two reads, or
+    /// was reset), this one holds its reading and a warning is logged. A change of speed or running state, or a jump
+    /// of more than a simulated minute (or a real second at the followed speed), publishes `ClockChanged` with
+    /// `change: follow`; small corrections between reads publish nothing. Returns whether it published.
+    pub fn follow(&mut self, remote: RemoteClock) -> Result<bool, GatewayError> {
+        let clock = self
+            .virtual_clock
+            .clone()
+            .ok_or(GatewayError::ClockNotVirtual)?;
+        let (running, speed, now) = (clock.is_running(), clock.speed(), clock.now());
+        if remote.speed != speed {
+            clock.set_speed(remote.speed)?;
+        }
+        match (remote.running, running) {
+            (true, false) => clock.resume(),
+            (false, true) => clock.freeze(),
+            _ => {}
+        }
+        let mut jumped = false;
+        if remote.now > now {
+            clock.set(remote.now.max(clock.now()))?;
+            let threshold = chrono::Duration::minutes(1).max(chrono::Duration::milliseconds(
+                (remote.speed * 1_000.0) as i64,
+            ));
+            jumped = remote.now - now > threshold;
+            self.behind = false;
+        } else if now - remote.now > chrono::Duration::seconds(1) && !self.behind {
+            self.behind = true;
+            tracing::warn!(followed = %remote.now, ours = %now, "the followed clock is behind this one (it slowed, froze or was reset); holding until it catches up");
+        }
+        let changed = jumped || remote.speed != speed || remote.running != running;
+        self.clock_changed("follow", &clock, changed)?;
+        Ok(changed)
+    }
+
+    /// After a clock change: runs whatever became due by the new time, then (when `changed`) commits the new reading
+    /// with its `ClockChanged`, so the log stays in time order.
+    fn clock_changed(
+        &mut self,
+        change: &'static str,
+        clock: &VirtualClock,
+        changed: bool,
+    ) -> Result<(), GatewayError> {
+        self.tick()?;
+        if changed {
+            let mut event =
+                simulator_kit::clock::changed_event(change, clock, crate::payments::SOURCE);
+            let next = NewEvent::stamp(
+                std::slice::from_mut(&mut event),
+                self.next_event_sequence,
+                self.ids,
+            );
+            let outbox = Outbox {
+                subscriptions: self.webhooks.subscriptions(),
+                simulation_id: self.simulation_id.as_deref(),
+                ids: self.ids,
+                due: wall_now(),
+                schema_version: SCHEMA_VERSION,
+                parties: None,
+            };
+            store::commit_clock(
+                &mut self.conn,
+                clock.now(),
+                clock.is_running(),
+                &event,
+                outbox,
+            )?;
+            self.next_event_sequence = next;
+            ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type)
+                .increment(1);
+            self.signal_deliveries(self.webhooks.delivers(std::slice::from_ref(&event)));
+        }
+        Ok(())
     }
 
     /// Clears all state, as on a new database; the virtual clock goes back to its first reading.
@@ -663,6 +809,7 @@ impl Default for GatewayOptions {
             delivery_signal: None,
             webhooks: Vec::new(),
             webhook_secret_grace: chrono::Duration::hours(1),
+            follow: false,
         }
     }
 }

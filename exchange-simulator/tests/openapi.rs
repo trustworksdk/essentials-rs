@@ -87,14 +87,75 @@ async fn expect(
     value
 }
 
+/// Opens `GET uri`, a server-sent event stream, and checks it answered `200` as `text/event-stream`.
+async fn open_stream(app: &TestApp, uri: &str) -> Body {
+    let request = Request::get(uri).body(Body::empty()).unwrap();
+    let response = app.router().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), 200, "GET {uri}");
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    response.into_body()
+}
+
+/// Reads what the stream sent until it is quiet for a moment, validates the response and each event's `data` against
+/// the schema for its kind, and returns the kinds seen.
+async fn drain_stream(
+    spec: &Spec,
+    uri: &str,
+    mut body: Body,
+) -> std::collections::BTreeSet<String> {
+    let mut text = String::new();
+    while let Ok(Some(frame)) =
+        tokio::time::timeout(std::time::Duration::from_millis(300), body.frame()).await
+    {
+        if let Ok(bytes) = frame.unwrap().into_data() {
+            text.push_str(std::str::from_utf8(&bytes).unwrap());
+        }
+    }
+    spec.check_response("GET", uri, 200, &json!(text));
+    let mut kinds = std::collections::BTreeSet::new();
+    for block in text.split("\n\n").filter(|b| b.contains("data:")) {
+        let field = |name: &str| {
+            block
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("{name}:")))
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        let (kind, data) = (field("event"), field("data"));
+        let data: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(
+            field("id"),
+            data["mdSequence"].to_string(),
+            "`id:` is the mdSequence"
+        );
+        let schema = match kind.as_str() {
+            "quote" => "MarketDataQuote",
+            "trade" => "MarketDataTrade",
+            "reference" => "MarketDataReference",
+            other => panic!("undocumented market-data event {other}"),
+        };
+        spec.validate(
+            &json!({ "$ref": format!("#/components/schemas/{schema}") }),
+            &data,
+            &format!("market-data event {kind}"),
+        );
+        kinds.insert(kind);
+    }
+    kinds
+}
+
 #[test]
 fn the_document_describes_exactly_the_mounted_routes() {
     let sources = [
         include_str!("../src/api/mod.rs"),
         include_str!("../src/api/settlements.rs"),
         include_str!("../src/api/clearing.rs"),
+        include_str!("../src/api/market_data.rs"),
+        include_str!("../src/api/liquidity.rs"),
         include_str!("../src/api/test_control.rs"),
         include_str!("../../simulator-kit/src/api/webhooks.rs"),
+        include_str!("../../simulator-kit/src/api/clock.rs"),
     ];
     // Path parameter names are the code's own (`{execution_id}` in a route is `{executionId}` in the document).
     assert_eq!(
@@ -113,6 +174,10 @@ fn the_parts_shared_with_the_payment_gateway_are_identical() {
         "/api/webhooks/{id}/deliveries",
         "/api/webhooks/{id}/redeliver",
         "/api/webhooks/{id}/dead-letters/retry",
+        "/api/clock",
+        "/api/clock/freeze",
+        "/api/clock/resume",
+        "/api/clock/speed",
         "/test/reset",
         "/test/clock",
         "/test/clock/advance",
@@ -141,6 +206,7 @@ fn the_parts_shared_with_the_payment_gateway_are_identical() {
         "schemas/NullableTimestamp",
         "schemas/Clock",
         "schemas/ClockAdvance",
+        "schemas/ClockChangedPayload",
         "schemas/EventEnvelope",
         "schemas/DeliveryStatus",
         "schemas/WebhookRequest",
@@ -167,6 +233,7 @@ async fn every_operation_and_event_matches_the_document() {
     let mut app = TestApp::start_with(|c| {
         c.clock.mode = ClockMode::Virtual;
         c.clock.start = Some("2030-01-07T09:00:00Z".parse().unwrap());
+        c.clock.operator_control = true;
         c.settlement.mode = SettlementMode::Both;
         c.settlement.seed = 3;
         c.settlement.reject_probability = 0.15;
@@ -187,6 +254,7 @@ async fn every_operation_and_event_matches_the_document() {
             ordered: false,
             enabled: true,
             paused: false,
+            participants: None,
         });
     })
     .await;
@@ -216,13 +284,86 @@ async fn every_operation_and_event_matches_the_document() {
     assert_eq!(status, 400);
     expect(a, s, 200, M::GET, "/api/instruments?mic=XCSE", None).await;
     expect(a, s, 400, M::GET, "/api/instruments?colour=red", None).await;
+    for patch in [
+        json!({ "enabled": false }),
+        json!({ "enabled": true, "referenceSymbol": "ACME.CO" }),
+        json!({ "referenceSymbol": null }),
+    ] {
+        expect(a, s, 200, M::PATCH, "/api/instruments/ACME", Some(patch)).await;
+    }
+    let synthetic = json!({ "id": "SYN", "symbol": "SYN", "currency": "USD", "currencyScale": 2,
+        "priceSource": { "kind": "synthetic", "initialPrice": "100.00", "drift": 0.05, "volatility": 0.4,
+                         "tickIntervalMs": 1000, "seed": 3 } });
+    expect(a, s, 201, M::POST, "/api/instruments", Some(synthetic)).await;
+    let stream_uri = "/api/marketdata/stream?instruments=ACME,SYN";
+    let stream = open_stream(a, stream_uri).await;
+    expect(
+        a,
+        s,
+        400,
+        M::GET,
+        "/api/marketdata/stream?instruments=NOPE",
+        None,
+    )
+    .await;
     expect(
         a,
         s,
         200,
         M::PATCH,
         "/api/instruments/ACME",
-        Some(json!({ "enabled": true })),
+        Some(json!({ "priceSource": { "kind": "fixed", "price": "100.25" } })),
+    )
+    .await;
+    // Every liquidity field; mode off, so the orders below meet no provider.
+    let liquidity = json!({ "mode": "off", "levels": 3, "spreadBps": 10.0, "levelStepTicks": 1, "levelQuantity": 10,
+        "levelQuantityGrowth": 1.5, "requoteThresholdTicks": 2, "refillDelayMs": 500, "skewBpsPerLot": 0.5,
+        "maxInventory": 100, "stalePolicy": "widen", "staleWidenFactor": 3.0 });
+    expect(
+        a,
+        s,
+        200,
+        M::PATCH,
+        "/api/instruments/ACME",
+        Some(json!({ "liquidity": liquidity })),
+    )
+    .await;
+    s.check_request(
+        "PATCH",
+        "/api/instruments/ACME",
+        &json!({ "liquidity": { "mode": "on" } }),
+    );
+    expect(a, s, 200, M::GET, "/api/marketdata", None).await;
+    expect(a, s, 200, M::GET, "/api/marketdata/SYN", None).await;
+    expect(a, s, 404, M::GET, "/api/marketdata/NOPE", None).await;
+    expect(a, s, 200, M::GET, "/api/liquidity", None).await;
+    expect(a, s, 200, M::GET, "/api/liquidity/ACME", None).await;
+    expect(a, s, 404, M::GET, "/api/liquidity/NOPE", None).await;
+    expect(
+        a,
+        s,
+        200,
+        M::PATCH,
+        "/api/liquidity/ACME",
+        Some(json!({ "spreadBps": 12.0, "requoteThresholdTicks": null })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        400,
+        M::PATCH,
+        "/api/liquidity/ACME",
+        Some(json!({ "spreadBpz": 1 })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        404,
+        M::PATCH,
+        "/api/liquidity/NOPE",
+        Some(json!({ "levels": 2 })),
     )
     .await;
     expect(
@@ -347,6 +488,26 @@ async fn every_operation_and_event_matches_the_document() {
     market["type"] = json!("MARKET");
     market["priceTicks"] = Value::Null;
     expect(a, s, 201, M::POST, "/api/orders", Some(market)).await;
+    assert_eq!(
+        drain_stream(s, stream_uri, stream).await,
+        ["quote", "reference", "trade"].map(String::from).into(),
+        "every kind of market-data event"
+    );
+    // Time in force: a DAY order rests until the business day's cutoff (ACME's market has no session), where the
+    // clock move below expires it; an IOC remainder is cancelled; a market order is always IOC.
+    let mut day = order("C", "BUY", 9_001, 3);
+    day["timeInForce"] = json!("DAY");
+    let day = expect(a, s, 201, M::POST, "/api/orders", Some(day)).await;
+    assert_eq!(day["order"]["status"], "OPEN");
+    let mut ioc = order("C", "BUY", 9_002, 3);
+    ioc["timeInForce"] = json!("IOC");
+    let ioc = expect(a, s, 201, M::POST, "/api/orders", Some(ioc)).await;
+    assert_eq!(ioc["order"]["status"], "CANCELLED");
+    let mut gtc_market = order("C", "BUY", 0, 1);
+    gtc_market["type"] = json!("MARKET");
+    gtc_market["priceTicks"] = Value::Null;
+    gtc_market["timeInForce"] = json!("GTC");
+    expect(a, s, 400, M::POST, "/api/orders", Some(gtc_market)).await;
     let mut unknown = order("A", "SELL", 10_000, 1);
     unknown["instrumentId"] = json!("NOPE");
     expect(a, s, 422, M::POST, "/api/orders", Some(unknown)).await;
@@ -477,6 +638,27 @@ async fn every_operation_and_event_matches_the_document() {
 
     // The clock: past the cutoff, the settlement dates and corrections.
     expect(a, s, 200, M::GET, "/test/clock", None).await;
+    expect(a, s, 200, M::GET, "/api/clock", None).await;
+    expect(
+        a,
+        s,
+        200,
+        M::POST,
+        "/api/clock/speed",
+        Some(json!({ "speed": 2 })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        400,
+        M::POST,
+        "/api/clock/speed",
+        Some(json!({ "speed": 0 })),
+    )
+    .await;
+    expect(a, s, 200, M::POST, "/api/clock/resume", None).await;
+    expect(a, s, 200, M::POST, "/api/clock/freeze", None).await;
     expect(
         a,
         s,

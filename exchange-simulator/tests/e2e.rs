@@ -975,10 +975,8 @@ async fn back_office_days(http: &Http, demo: &BackOffice) -> Vec<Value> {
         )
         .await;
     }
-    // Both clocks start frozen at Monday 08:00 and run from here, together.
+    // Both clocks start frozen at Monday 08:00; the gateway's follows the exchange's, which runs from here.
     http.post(format!("{exchange}/test/clock/resume"), json!({}))
-        .await;
-    http.post(format!("{gateway}/test/clock/resume"), json!({}))
         .await;
     let pay = |key: String, kind: &str, account: &str, amount: &str| {
         json!({ "idempotencyKey": key, "type": kind, "accountId": account,
@@ -1320,4 +1318,128 @@ async fn the_back_office_demo_reconciles_on_an_accelerated_clock() {
             "{findings:#?}"
         );
     }
+}
+
+/// The with-your-app example (`examples/with-your-app`): both services from local images, wired to a stand-in app.
+/// Ports and images are overridden the way the guide describes; torn down on drop.
+struct WithYourApp {
+    project: String,
+    exchange: u16,
+    gateway: u16,
+    app: u16,
+}
+
+impl WithYourApp {
+    fn compose(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("docker")
+            .args(["compose", "-p", &self.project])
+            .args(args)
+            .current_dir(format!("{EXAMPLES}/with-your-app"))
+            .env("EXCHANGE_IMAGE", format!("{IMAGE}:{TAG}"))
+            .env("GATEWAY_IMAGE", format!("{GATEWAY_IMAGE}:{TAG}"))
+            .env("EXCHANGE_PORT", self.exchange.to_string())
+            .env("GATEWAY_PORT", self.gateway.to_string())
+            .env("APP_PORT", self.app.to_string())
+            .output()
+            .expect("run docker compose")
+    }
+}
+
+impl Drop for WithYourApp {
+    fn drop(&mut self) {
+        let _ = self.compose(&["down", "-v", "--remove-orphans"]);
+    }
+}
+
+#[tokio::test]
+async fn the_with_your_app_example_runs_from_local_images() {
+    build_image();
+    build_gateway_image();
+    let example = WithYourApp {
+        project: format!("exsim-withapp-{}", uuid::Uuid::now_v7().simple()),
+        exchange: ComposeExample::free_port(),
+        gateway: ComposeExample::free_port(),
+        app: ComposeExample::free_port(),
+    };
+    let output = example.compose(&["up", "-d", "--wait"]);
+    assert!(
+        output.status.success(),
+        "docker compose up (healthy within --wait): {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let http = Http {
+        client: reqwest::Client::new(),
+    };
+    let exchange = format!("http://127.0.0.1:{}", example.exchange);
+    let gateway = format!("http://127.0.0.1:{}", example.gateway);
+    let app = format!("http://127.0.0.1:{}", example.app);
+
+    // The guide's steps: a quoted market, a participant, a market order against the liquidity provider.
+    let aapl = eventually("AAPL quoted", async || {
+        let md = http.get(format!("{exchange}/api/marketdata/AAPL")).await;
+        (md["liquidity"] == "quoting" && !md["bestAsk"].is_null()).then_some(md)
+    })
+    .await;
+    assert_eq!(aapl["reference"]["source"], "synthetic");
+    http.post(
+        format!("{exchange}/api/participants"),
+        json!({ "id": "demo", "name": "Demo" }),
+    )
+    .await;
+    let order = http
+        .post(
+            format!("{exchange}/api/orders"),
+            json!({ "instrumentId": "AAPL", "participantId": "demo", "side": "BUY", "type": "MARKET",
+                    "quantity": 10 }),
+        )
+        .await;
+    assert_eq!(order["order"]["status"], "FILLED");
+    http.post(
+        format!("{gateway}/api/payments"),
+        json!({ "idempotencyKey": "dep-1", "type": "DEPOSIT", "accountId": "demo",
+                "bankAccount": { "iban": "DE89370400440532013000", "holderName": "Demo" },
+                "amount": "1000.00", "currency": "USD" }),
+    )
+    .await;
+
+    // Both services deliver to the app, signed with the shared secret.
+    let received = eventually("deliveries from both services", async || {
+        let list = http
+            .get(format!("{app}/received"))
+            .await
+            .as_array()?
+            .clone();
+        let has = |hook: &str, event: &str| {
+            list.iter()
+                .any(|d| d["hook"] == hook && d["eventType"] == event)
+        };
+        (has("exchange", "TradeExecuted") && has("gateway", "PaymentPending")).then_some(list)
+    })
+    .await;
+    assert!(
+        received.iter().all(|d| d["verified"] == true),
+        "every delivery verifies: {received:?}"
+    );
+
+    // The gateway follows the exchange's clock, and the exchange's clock takes operator control. A follower never
+    // runs backwards, so it freezes where it was at the poll that saw the freeze: at most one interval ahead.
+    http.post(format!("{exchange}/api/clock/freeze"), json!({}))
+        .await;
+    let instant = |clock: &Value| {
+        clock["now"]
+            .as_str()
+            .unwrap()
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+    };
+    let frozen = instant(&http.get(format!("{exchange}/api/clock")).await);
+    eventually("the gateway frozen with the exchange", async || {
+        let followed = http.get(format!("{gateway}/api/clock")).await;
+        let ahead = instant(&followed) - frozen;
+        (followed["running"] == false
+            && ahead >= chrono::Duration::zero()
+            && ahead < chrono::Duration::seconds(1))
+        .then_some(())
+    })
+    .await;
 }

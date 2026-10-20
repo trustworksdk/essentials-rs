@@ -14,7 +14,7 @@ webhook receiver, and operations. This README is the API reference.
 ```sh
 # from the workspace root
 cargo run -p exchange-simulator                       # http://127.0.0.1:8080, database in ./data/exchange.db
-docker compose -f exchange-simulator/compose.yaml up --build   # http://localhost:8080, database in a volume
+docker compose -f exchange-simulator/compose.yaml up --build   # http://localhost:8080 (EXCHANGE_PORT), database in a volume
 ```
 
 Configuration (`config/default.yaml` is compiled in) can be overridden with a YAML file named by `EXCHANGE_CONFIG`, or
@@ -27,6 +27,14 @@ with environment variables such as `EXCHANGE__SERVER__BIND=0.0.0.0:9000`. Settin
 | `exchange.command_queue_capacity` | `10000` | Commands waiting for the exchange thread; when full, requests get `503 overloaded` |
 | `exchange.group_commit.max_commands` / `max_wait_us` | `256` / `0` | Group commit: most orders and cancellations per commit (`1` commits each on its own); how long to wait for more once the queue is empty |
 | `events.simulation_id` | unset | Stamped on every event as `simulationId` |
+| `price_sources.finnhub.api_key_file` | unset | File holding the Finnhub API key; else `FINNHUB_API_KEY`. Without a key the feed does not run (see Finnhub live prices) |
+| `price_sources.finnhub.stale_after_ms` / `refresh_after_ms` | `120000` / `60000` | Real time without an update before a live price is stale / before a symbol is refreshed over REST |
+| `price_sources.finnhub.max_updates_per_second`, `max_symbols`, `rest_calls_per_minute` | `4`, `50`, `60` | Live price conflation per instrument; Finnhub free-tier limits |
+| `price_sources.finnhub.ws_url`, `rest_url`, `request_timeout_ms`, `reconnect_initial_ms` / `reconnect_max_ms` | Finnhub's, `10000`, `1000` / `60000` | Endpoints, timeout and reconnect backoff |
+| `price_sources.finnhub.record_to` | unset | Appends every adopted live price to this file in the replay format; keep it under `recordings/` (gitignored) |
+| `price_sources.replay.file`, `loop`, `loop_gap_ms` | unset, `false`, `1000` | The file `replay` sources play; start it over after its last row (see Replay) |
+| `sessions` | `{}` | Trading sessions by MIC, e.g. `{ XNAS: { open: "09:30", close: "16:00", time_zone: America/New_York } }`; a market not listed is always open (see Trading sessions and time in force) |
+| `market_data.conflation_interval_ms` / `stream_buffer` | `0` / `1024` | Market-data stream: at most one message per instrument and kind per interval (`0`: every message); how far a subscriber may fall behind before its stream is closed (see `GET /api/marketdata/stream`) |
 | `webhooks.poll_interval_ms` | `250` | How often due deliveries (retries) are looked for; new events are sent at once |
 | `webhooks.batch_size` / `concurrency` | `100` / `16` | Deliveries claimed per round / concurrent requests |
 | `webhooks.request_timeout_ms` | `5000` | Per request; a timeout is a failed attempt |
@@ -135,12 +143,19 @@ All bodies are JSON with camelCase fields. Errors look like `{"error": "<code>",
 
 ```json
 { "id": "ACME", "symbol": "ACME", "mic": "XCSE", "isin": "DK0010274414", "cusip": null,
-  "currency": "DKK", "currencyScale": 2, "tickSizeMinor": 1, "lotSize": 1, "enabled": true }
+  "currency": "DKK", "currencyScale": 2, "tickSizeMinor": 1, "lotSize": 1, "enabled": true,
+  "referenceSymbol": null, "priceSource": { "kind": "fixed", "price": "100.25" } }
 ```
 
 `mic`, `isin`, `cusip` are optional; `tickSizeMinor` and `lotSize` default to 1, and `enabled` to `true`. `id` is the immutable key that
 orders reference. `(mic, symbol)` must be unique when `mic` is given; ISIN and CUSIP may be shared by several
-listings. Returns `201` with the instrument, plus `tickSize` as a decimal string.
+listings. `referenceSymbol` (optional, 1 to 64 printable characters without spaces) is the symbol a price source
+quotes the instrument under, e.g. `AAPL`, when it differs from `symbol`. Returns `201` with the instrument, plus
+`tickSize` as a decimal string, and publishes `InstrumentListed`. `priceSource` (optional) is the instrument's own
+price source; see [Price sources](#price-sources).
+
+Instruments can also be declared in configuration (`instruments:`, see
+[Configuration](docs/configuration.md#instruments)); they are listed at startup and again after a reset.
 
 ### `GET /api/instruments?symbol=&mic=&isin=&cusip=`
 
@@ -148,14 +163,18 @@ All filters are optional and combined with AND. External identifiers can match s
 
 ### `PATCH /api/instruments/{id}`
 
-`{ "enabled": false }` halts trading and `{ "enabled": true }` resumes it. It returns `200` with the instrument, or
-`404` for an unknown ID; `enabled` is the only field that can change. While an instrument is disabled:
+Changes `enabled`, `referenceSymbol`, `priceSource`, or any of them; absent fields stay as they are, `null` clears
+`referenceSymbol` or `priceSource` (which then falls back to the default), and an empty body is a `400`. A new
+`priceSource` restarts the source at once. `{ "enabled": false }` halts trading and `{ "enabled": true }` resumes it. It returns
+`200` with the instrument, or `404` for an unknown ID; no other field can change. A change that alters a value
+publishes `InstrumentUpdated`; one that alters nothing publishes nothing. A declared instrument can be changed too,
+but the configuration wins again at the next start. While an instrument is disabled:
 - **Orders are recorded rejections:** every new order is sequenced and stored with status `REJECTED` and
   `rejectReason: "INSTRUMENT_DISABLED"`, and an `OrderRejected` event is emitted (`201`, like a self-trade).
 - **Cancels keep working.**
 - **Resting orders stay** on the book, and trade again once the instrument is re-enabled.
 
-The flag survives restarts. Switching it emits no event (there is no instrument-status event type yet).
+The flag survives restarts.
 
 ### `POST /api/participants`
 
@@ -168,11 +187,14 @@ or custodian. It is copied into every `TradeExecuted` the participant is party t
 
 ```json
 { "clientOrderId": "c-1", "instrumentId": "ACME", "participantId": "participant-a",
-  "side": "BUY", "type": "LIMIT", "priceTicks": 10025, "quantity": 150 }
+  "side": "BUY", "type": "LIMIT", "priceTicks": 10025, "quantity": 150, "timeInForce": "DAY" }
 ```
 
 `side` is `BUY`/`SELL`; `type` is `LIMIT` (needs `priceTicks`) or `MARKET` (no `priceTicks`). `clientOrderId` is
-optional, 1–64 characters, and unique per participant.
+optional, 1–64 characters, and unique per participant. `timeInForce` is optional (see Trading sessions and time in
+force): `DAY`, `GTC` or `IOC`; left out, `DAY` on a market with a trading session and `GTC` otherwise. A `MARKET` order
+is always `IOC` (`DAY` or `GTC` on one is a `400 invalid_order`). Outside the instrument's session the order is
+recorded as `REJECTED` with `rejectReason: "MARKET_CLOSED"`.
 
 - `201`: the order was processed (including `REJECTED`). Body: `{ "order": Order, "executions": [Trade], "duplicate": false }`.
 - `200`: `clientOrderId` was already used with the same terms. Body: the existing order in its current state, with
@@ -181,7 +203,33 @@ optional, 1–64 characters, and unique per participant.
 
 `Order`: `orderId`, `clientOrderId`, `instrumentId`, `participantId`, `side`, `type`, `priceTicks`, `price`,
 `quantity`, `remainingQuantity`, `filledQuantity`, `status` (`OPEN`, `PARTIALLY_FILLED`, `FILLED`, `CANCELLED`,
-`REJECTED`), `sequence`, and `rejectReason` when rejected.
+`REJECTED`, `EXPIRED`), `sequence`, `timeInForce`, and `rejectReason` (`SELF_TRADE`, `INSTRUMENT_DISABLED`,
+`MARKET_CLOSED`) when rejected.
+
+### Trading sessions and time in force
+
+Each market (by MIC) can have a trading session, `open` to `close` local time in its `time_zone`, on weekdays:
+
+```yaml
+sessions:
+  XNAS: { open: "09:30", close: "16:00", time_zone: America/New_York }
+  XCSE: { open: "09:00", close: "17:00", time_zone: Europe/Copenhagen }
+```
+
+A market without one (and an instrument without a MIC) is always open, the default. Holidays are not modelled.
+- **Outside the session** a client order is sequenced, stored and published as a rejection (`201`, status
+  `REJECTED`, `rejectReason: "MARKET_CLOSED"`, an `OrderRejected` event). Cancellations keep working. The liquidity
+  provider is not a client: it applies its `closedPolicy` instead (see Liquidity provider). The market data's
+  `session` says `open` or `closed`.
+- **`DAY`** (the default on a market with a session) rests until the session closes, then expires: status `EXPIRED`
+  with its remainder, and an `OrderExpired` event stamped at the close, before that day's `BusinessDayClosed`. On a
+  market without a session a `DAY` order expires at the end of its business day (`clearing.cutoff`). Expiries survive
+  a restart, and a clock move expires every order whose close it passes, in time order.
+- **`GTC`** (the default elsewhere) rests until filled or cancelled.
+- **`IOC`** trades what it can at once; the remainder is cancelled with `OrderCancelled`,
+  `cancelReason: "IOC_REMAINDER"`. A market order behaves this way already (`MARKET_REMAINDER`), so it is always
+  `IOC`.
+- Orders placed before time in force existed are `GTC` (market orders `IOC`).
 
 ### `GET /api/orders/{id}`
 
@@ -189,8 +237,8 @@ The stored order, plus `createdAt` and `updatedAt`.
 
 ### `DELETE /api/orders/{id}`
 
-Cancels the remaining quantity of an `OPEN` or `PARTIALLY_FILLED` order. Returns `200` with the same body as
-`POST /api/orders`; `409 order_not_active` if the order is already done.
+Cancels the remaining quantity of an `OPEN` or `PARTIALLY_FILLED` order, also outside its session. Returns `200`
+with the same body as `POST /api/orders`; `409 order_not_active` if the order is already done (expired included).
 
 ### `GET /api/orderbooks/{instrumentId}`
 
@@ -202,11 +250,241 @@ Cancels the remaining quantity of an `OPEN` or `PARTIALLY_FILLED` order. Returns
 Levels are listed best first. `enabled` shows whether the instrument is trading. `lastSequence` is the sequence of the
 last order processed before the snapshot.
 
+### Price sources
+
+Each instrument has a price source that produces its **reference price**, the price the built-in liquidity provider
+will quote around and the market data publishes. The demo never pushes prices into the exchange; it reads them.
+
+| `kind` | Produces | Fields |
+|---|---|---|
+| `none` | No reference price; the instrument trades only on client orders (the default) | – |
+| `fixed` | A constant price | `price` |
+| `synthetic` | A seeded geometric Brownian motion on simulated time | `initialPrice`, `drift`, `volatility`, `tickIntervalMs`, `seed` |
+| `finnhub` | Live trade prices from Finnhub for the instrument's `referenceSymbol` (else its `symbol`) | – (the service needs an API key, below) |
+| `replay` | A recorded price path for that symbol, played on the exchange's clock | – (the service needs a replay file, below) |
+
+```json
+"priceSource": { "kind": "synthetic", "initialPrice": "187.50", "drift": 0.05, "volatility": 0.3,
+                 "tickIntervalMs": 1000 }
+```
+
+- **Defaults:** fields an instrument leaves out come from `price_sources.default` in the configuration, field by
+  field, then from the built-in defaults: kind `none`, drift 0, volatility 0.2, a step a second. A configuration that
+  sets `default: { kind: synthetic, volatility: 0.3 }` needs only an `initialPrice` per instrument.
+- **The synthetic walk** steps on a grid of `tickIntervalMs` of simulated time, starting when the source was set. Each
+  step multiplies the price by `exp((μ − σ²/2)Δt + σ√Δt·Z)`, with `drift` μ and `volatility` σ annualized (a year of
+  365.25 simulated days). Prices are rounded to the nearest tick and never fall below one tick.
+- **Reproducible:** the path depends only on the parameters, the seed and when the source was set, never on when it
+  is read. With deterministic IDs and a virtual clock, two runs give the same prices, across restarts and resets.
+  `seed` defaults to one derived from `price_sources.seed` and the instrument ID.
+- **Runtime changes:** `PATCH /api/instruments/{id}` with a new `priceSource` restarts the source without a restart of
+  the service. A switch to `synthetic` with no `initialPrice` continues from the current reference price, which is
+  stored as its `initialPrice`.
+- **Clock jumps** catch the walk up step by step on the exchange thread: about 50 ms per instrument for 30 simulated
+  days of one-second steps. `tickIntervalMs` is at least 100.
+
+#### Finnhub live prices
+
+`finnhub` streams real trades for `referenceSymbol` (`AAPL`, `BINANCE:BTCUSDT`; the exchange `symbol` when unset)
+from Finnhub's trades websocket, and seeds or refreshes each symbol from its REST quote endpoint on connect and
+whenever it has been quiet for `price_sources.finnhub.refresh_after_ms` (a closed market streams no trades).
+- **The API key** comes from the `FINNHUB_API_KEY` environment variable, which both Compose files pass through from
+  the host (`FINNHUB_API_KEY=… docker compose up`); `price_sources.finnhub.api_key_file` reads it from a file instead.
+  Without one the feed does not run and `finnhub` sources are refused (a startup error for a declared instrument, a
+  `400` from the API). The key is never logged, returned or used in a metric label.
+- **Time:** a price takes effect at the exchange's current time, also on a virtual or accelerated clock, and keeps
+  Finnhub's own time as `sourceTimestamp`. Live prices are not reproducible; `source: "finnhub"` says so.
+- **Conflation:** each instrument takes in at most `max_updates_per_second` new prices a second, the latest winning.
+- **Stale:** with nothing from Finnhub for `stale_after_ms` (real time; the connection or REST down), the last price
+  stays, marked `stale: true` in the market data, and the liquidity provider applies its `stalePolicy`. The feed
+  reconnects with backoff and jitter, subscribes every symbol again, and the price is fresh with the next update. A
+  feed that is down never stops the exchange.
+- **Limits:** at most `max_symbols` distinct symbols (Finnhub's free tier: 50) and `rest_calls_per_minute` REST calls
+  (free tier: 60). A source past the symbol limit is refused like a missing key; a REST call past the rate limit is
+  skipped and counted. Finnhub's free tier is for personal, non-commercial use.
+- **A ready-made market** of 40 instruments (large US stocks and ETFs, three crypto pairs) is
+  [`config/finnhub-market.yaml`](config/finnhub-market.yaml), shipped in the image at
+  `/etc/exchange/finnhub-market.yaml`: `FINNHUB_API_KEY=… EXCHANGE_CONFIG=/etc/exchange/finnhub-market.yaml docker compose up`.
+- **Recording:** `price_sources.finnhub.record_to` appends every price the exchange takes in to a file in the replay
+  format (below), stamped with the exchange's time, so a live session can be replayed later.
+- **Changing `referenceSymbol`** of a `finnhub` instrument unsubscribes the old symbol and subscribes the new one.
+- **Metrics (source health):** `exchange_price_feed_connected`, `exchange_price_feed_reconnects_total`,
+  `exchange_price_feed_updates_total{via}` (`websocket`, `rest`), `exchange_price_feed_rest_calls_total{outcome}`.
+  Rate-limit hits are its `outcome="rate_limited"` (a call skipped at `rest_calls_per_minute`) and
+  `outcome="throttled"` (Finnhub answered 429). Per instrument, see [`GET /metrics`](#get-metrics).
+
+#### Replay
+
+`replay` plays a file of recorded prices (`price_sources.replay.file`) on the exchange's clock, for realistic price
+paths in load tests and demos without a live feed:
+
+```text
+timestamp,referenceSymbol,price,volume
+2029-11-05T14:30:00Z,AAPL,187.50,100
+2029-11-05T14:30:02.250Z,MSFT,410.00,10
+```
+
+CSV with that header (`.csv`), or JSON lines with the same fields (any other extension); timestamps are RFC 3339.
+- **Timing:** the file's first row lands when the instrument's source starts (at startup, the clock's start), every
+  later row that much later on the clock, so a virtual clock at speed 60 plays an hour of recording in a minute. The
+  price is that of the symbol's last row by then; before its first row the instrument has no reference price.
+  `sourceTimestamp` is when the row played, on the exchange's clock.
+- **Loop:** `price_sources.replay.loop: true` starts the file over `loop_gap_ms` (default 1000) after its last row.
+- **Reproducible:** the price is a function of the clock alone, so a replay gives the same prices, and with
+  deterministic IDs the same event log, every run.
+- **Symbols:** an instrument plays its `referenceSymbol`, else its `symbol`; a symbol the file lacks, or no file, is
+  refused like a missing Finnhub key.
+- **Recorded files stay local.** Recordings of live data are the vendor's data: keep them under `recordings/`, which is
+  gitignored, and never commit them.
+
+### Liquidity provider
+
+A built-in participant (`liquidity.participant_id`, default `LP`) quotes a ladder of limit orders around each
+instrument's reference price, so a demo whose orders all come from one participant always has a counterparty. It is
+off unless an instrument's `liquidity` (or `liquidity.default`) sets `mode: on`:
+
+```json
+"liquidity": { "mode": "on", "levels": 5, "spreadBps": 10, "levelStepTicks": 1, "levelQuantity": 100,
+               "levelQuantityGrowth": 1, "requoteThresholdTicks": 1, "refillDelayMs": 0, "skewBpsPerLot": 0,
+               "maxInventory": 10000, "stalePolicy": "pull", "staleWidenFactor": 2, "closedPolicy": "pull",
+               "closedWidenFactor": 2 }
+```
+
+- **Ladder:** `levels` limit orders a side. The best bid and ask are `spreadBps` from the mid, rounded away from it to
+  the tick (with R = 100.00, 10 bps and a 0.01 tick: 99.90 and 100.10); each deeper level is `levelStepTicks`
+  further out and holds `levelQuantity` lots, times `levelQuantityGrowth` per level. Its orders are ordinary limit
+  orders: a market order sweeps the ladder level by level and its remainder is cancelled (`MARKET_REMAINDER`) when
+  the ladder runs out; a crossing limit order fills at the ladder's prices; a limit order inside the spread rests.
+- **When it quotes:** after every order and cancellation, after an instrument change, and on every tick. It quotes
+  again when the reference price moved `requoteThresholdTicks` from its last quote, and refills `refillDelayMs` of
+  simulated time after a fill. The old ladder is cancelled and the new one placed in one commit, inside the exchange
+  thread, so no order sees half a ladder. With mode `off`, trading disabled or no reference price, it pulls its ladder.
+- **Inventory:** its net position, in lots, moves the mid `skewBpsPerLot` per lot against the position: a long
+  provider lowers both sides, so one-sided client buying pushes the price up. At `maxInventory` lots it stops quoting
+  the side that would add to the position.
+- **Stale reference price** (a live source gone quiet): `stalePolicy` `pull` (the default) cancels the ladder until
+  the price is fresh, `widen` quotes it with the spread times `staleWidenFactor`, `keep` leaves it as it was quoted.
+  The market data's `liquidity` says which applies: `kept`, `widened` or `pulled`.
+- **Closed market** (outside the instrument's trading session): `closedPolicy` and `closedWidenFactor` likewise,
+  `pull` by default. A closed market takes precedence over a stale price. Its orders are never refused as
+  `MARKET_CLOSED`, so `widen` quotes a wider ladder while clients cannot trade; at the open it quotes normally again.
+- **Events:** its order lifecycle (accepted, filled, cancelled) stays out of the event log and webhooks unless
+  `liquidity.emit_order_events` is true. Its trades are always published (`TradeExecuted` with it as buyer or seller),
+  and it settles and appears on clearing statements like any participant. Metrics count its quotes
+  (`exchange_liquidity_quotes_total`), ladders replaced (`exchange_liquidity_requotes_total`) and fills
+  (`exchange_liquidity_fills_total`) either way.
+- **After a restart or reset** it quotes afresh: its inventory comes from its trades, its old ladder is replaced
+  (decision D18). On a frozen clock what it does depends only on the commands, so reproducible runs stay byte-identical.
+
+### `GET /api/liquidity` and `GET /api/liquidity/{instrumentId}`
+
+What the liquidity provider is doing in each instrument (in instrument ID order), or in one (`404` for an unknown one):
+
+```json
+{ "instrumentId": "AAPL", "providerId": "LP", "state": "quoting", "inventory": -40,
+  "settings": { "mode": "on", "levels": 5, "spreadBps": 10.0, "...": "every field, resolved" },
+  "own": { "mode": "on", "spreadBps": 10.0 },
+  "quotedAround": { "priceTicks": 18750, "price": "187.50" },
+  "ladder": { "bids": [ { "orderId": "…", "priceTicks": 18731, "price": "187.31", "quantity": 100 } ],
+              "asks": [ { "orderId": "…", "priceTicks": 18769, "price": "187.69", "quantity": 100 } ] },
+  "priceSource": { "kind": "synthetic", "initialPrice": "187.50" },
+  "reference": { "price": "187.52", "priceTicks": 18752, "source": "synthetic", "sourceTimestamp": "…", "stale": false },
+  "session": "open" }
+```
+
+`settings` are the resolved settings (own, then `liquidity.default`, then built-in), `own` the instrument's own
+(`null` without any), `inventory` its net position in units, `state` as the market data's `liquidity`, `ladder` its
+resting orders best first, `reference` the reference price with its source and staleness.
+
+### `PATCH /api/liquidity/{instrumentId}`
+
+Changes the provider's settings for one instrument while the service runs, field by field, and optionally the
+instrument's price source:
+
+```json
+{ "spreadBps": 50, "refillDelayMs": null, "priceSource": { "kind": "synthetic", "volatility": 0.3 } }
+```
+
+- A settings field given replaces the instrument's own value; `null` clears it, so the default applies again; a field
+  left out stays. `PATCH /api/instruments` with `liquidity`, by contrast, replaces all of them.
+- `priceSource` replaces the price source as a whole (`null` falls back to `price_sources.default`); a switch to
+  `synthetic` without `initialPrice` continues from the current reference price, so switching a live instrument to a
+  synthetic one at the close carries the last price on.
+- The provider re-quotes at once, and the change is stored and published as `InstrumentUpdated`. A declared
+  instrument gets its configuration back at the next start, as for every declared field.
+- `200` with the new status; `400` for an empty body, an unknown field or an invalid value (nothing changes); `404`
+  for an unknown instrument.
+
+### `GET /api/marketdata` and `GET /api/marketdata/{instrumentId}`
+
+```json
+{ "instrumentId": "AAPL", "mdSequence": 41,
+  "reference": { "price": "187.52", "priceTicks": 18752, "source": "synthetic",
+                 "sourceTimestamp": "2030-01-07T09:01:30Z", "stale": false },
+  "bestBid": { "priceTicks": 18733, "price": "187.33", "quantity": 100 },
+  "bestAsk": { "priceTicks": 18771, "price": "187.71", "quantity": 100 },
+  "lastTrade": { "priceTicks": 18771, "price": "187.71", "quantity": 25, "executedAt": "2030-01-07T09:01:12Z" },
+  "sessionVolume": 1250, "liquidity": "quoting", "session": "open" }
+```
+
+Each instrument's market data, in instrument ID order; `404` for an unknown instrument.
+- `reference` is `null` for a `none` source. `sourceTimestamp` is when the price was produced, on the exchange's
+  clock: when a fixed source was set, or the synthetic step's grid time. `stale` is for live sources (always `false`
+  for `fixed` and `synthetic`).
+- `bestBid` and `bestAsk` (`null` for an empty side) carry the quantity resting at the best price. `lastTrade` has no
+  participants; `null` before the first trade.
+- `sessionVolume` is the quantity traded on the current business date, which ends at `clearing.cutoff`.
+- `liquidity` is what the liquidity provider did when it last quoted: `off` (no provider, mode `off`, or trading
+  disabled), `no-reference`, `quoting`, or in a closed market or under a stale price `kept`, `widened` or `pulled`.
+- `session` is `open` or `closed` (see Trading sessions and time in force); always `open` without a session.
+- `mdSequence` is that of the last stream message about the instrument (below), so the snapshot and the stream line
+  up.
+
+The last trade and the session volume survive a restart; `mdSequence` starts again from 0 with the service.
+
+### `GET /api/marketdata/stream?instruments=`
+
+Server-sent events for the listed instruments (comma-separated; all when left out; `400` for an unknown one):
+
+```text
+event: quote
+id: 42
+data: {"instrumentId":"AAPL","mdSequence":42,"bestBid":{"priceTicks":18733,"price":"187.33","quantity":75},"bestAsk":{...}}
+
+event: trade
+id: 43
+data: {"instrumentId":"AAPL","mdSequence":43,"priceTicks":18733,"price":"187.33","quantity":25,"executedAt":"..."}
+
+event: reference
+id: 44
+data: {"instrumentId":"AAPL","mdSequence":44,"reference":{"price":"187.40",...,"stale":false}}
+```
+
+- **`quote`** when the best bid or ask (price or quantity) changes, **`trade`** for each print (anonymous), and
+  **`reference`** when the reference price changes, goes stale or goes away. Each carries the instrument's
+  `mdSequence`, which counts its messages from 1 and is the event's `id:`.
+- Messages are published once a whole command is done: an order, with the matching and the liquidity provider's
+  re-quote it caused; a cancellation; an instrument change; a clock tick. A trade's prints come before the quote
+  they leave behind. Intermediate states never reach the feed.
+- **To start:** open the stream, then read the snapshot, and skip messages at or below the snapshot's `mdSequence`.
+- **Conflation** (`market_data.conflation_interval_ms`, off by default): at most one message per instrument and
+  kind per interval, the latest. `quote` and `reference` carry their whole state, so nothing is lost but
+  intermediate values; prints left out remain in `GET /api/trades`.
+- **Slow subscribers** never slow the exchange. More than half of `market_data.stream_buffer` behind, a subscriber's
+  backlog collapses to the latest message per instrument and kind; a whole buffer behind, its stream is closed.
+  Reconnect and start again from the snapshot. Metrics: see [`GET /metrics`](#get-metrics), market data.
+- Market data is not in the event log and not delivered over webhooks.
+
+```bash
+curl -N 'localhost:8080/api/marketdata/stream?instruments=AAPL'
+```
+
 ### `GET /api/trades?instrumentId=&participantId=&orderId=&limit=`
 
 Executions in the order they were created. `participantId` matches either buyer or seller, and `orderId` either
 order. `limit` is 1–1000 (default 100). `Trade`: `executionId`, `instrumentId`, `buyOrderId`, `sellOrderId`,
-`buyerId`, `sellerId`, `priceTicks`, `price`, `quantity`, `currency`, `executedAt`.
+`buyerId`, `sellerId`, `priceTicks`, `price`, `quantity`, `currency`, `executedAt`, `tradeDate`,
+`intendedSettlementDate` (see Trade dates below). The same `Trade` is in `executions` of an order's result.
 
 ### `GET /health`
 
@@ -234,9 +512,27 @@ Event types and payloads (`schemaVersion` 1):
 |---|---|---|
 | `OrderAccepted` | order | order as accepted (status `OPEN`, nothing filled) |
 | `OrderRejected` | order | order with `rejectReason` |
-| `TradeExecuted` | execution | `executionId`, `instrumentId`, `instrument` {`id`, `symbol`, `mic`, `isin`, `cusip`, `currency`}, `buyOrderId`, `sellOrderId`, `buyerId`, `sellerId`, `buyerSettlement`, `sellerSettlement` (each party's settlement details at execution time, or `null`), `priceTicks`, `price`, `quantity`, `currency`, `currencyScale`, `tickSizeMinor`, `executedAt` |
-| `OrderPartiallyFilled` / `OrderFilled` | order | order after the fill; for a resting order also `executionId` |
-| `OrderCancelled` | order | order with `cancelReason`: `REQUESTED` or `MARKET_REMAINDER` |
+| `TradeExecuted` | execution | `executionId`, `instrumentId`, `instrument` {`id`, `symbol`, `mic`, `isin`, `cusip`, `currency`}, `buyOrderId`, `sellOrderId`, `buyerId`, `sellerId`, `buyerSettlement`, `sellerSettlement` (each party's settlement details at execution time, or `null`), `priceTicks`, `price`, `quantity`, `currency`, `currencyScale`, `tickSizeMinor`, `executedAt`, `tradeDate`, `intendedSettlementDate` |
+| `OrderPartiallyFilled` / `OrderFilled` | order | order after the fill, with the execution's `tradeDate` and `intendedSettlementDate`; for a resting order also `executionId` |
+| `OrderCancelled` | order | order with `cancelReason`: `REQUESTED`, `MARKET_REMAINDER` or `IOC_REMAINDER` |
+| `OrderExpired` | order | a `DAY` order at its session's close, with status `EXPIRED` and its remainder; `occurredAt` is the close |
+
+**Trade dates.** Every execution carries the business day it belongs to, `tradeDate` (FIX tag 75), and the day it is
+meant to settle, `intendedSettlementDate` (tag 64), so a consumer never needs its own calendar to book or reconcile a
+trade:
+- **`tradeDate`** is the execution's date on the business-day calendar: `clearing.cutoff` in `clearing.time_zone`,
+  on weekdays, whether or not clearing runs. A trade at or after the cutoff, or on a weekend, belongs to the next
+  business day; the same calendar closes business days (`BusinessDayClosed`). With a 17:30 Copenhagen cutoff, a trade
+  at 17:29 on Tuesday is Tuesday's, one at 17:30 is Wednesday's, and one on Friday evening is Monday's.
+- **`intendedSettlementDate`** is `tradeDate` plus the instrument's market cycle (`settlement.settlement_days`, or
+  `market_settlement_days` for its MIC) in business days, in every settlement mode: in `external` mode it is the date
+  the exchange expects.
+- **One answer:** an execution's dates are set when it is committed and stored with it. `TradeExecuted`, the fill
+  events, `GET /api/trades`, the order result, `SettlementPending` and later settlement events, and the clearing
+  statement line all carry the same two dates (until a `SettlementDelayed` moves the settlement date of later
+  settlement events). A later change to the cutoff or a cycle dates new trades only. Executions stored before
+  executions carried dates are dated once, at the next startup, on the then-current calendar.
+- Both are domain time, so on a virtual clock they follow it, like `executedAt`.
 
 Settlement lifecycle events come from the optional settlement simulator (`source: "settlement-simulator"`). Their
 aggregate and correlation ID is the `executionId`, and their `occurredAt` is the scheduled instant: the trade time at
@@ -257,11 +553,16 @@ intake, otherwise 00:00 UTC of the relevant date. Every one carries:
 | `SettlementCompleted` | `settledAt` | `SETTLED` |
 | `SettlementFailed` | `reason`: `SIMULATED_FAILURE` | `FAILED` |
 | `SettlementCancelled` | `reason`: `SIMULATED_CANCELLATION` | `CANCELLED` |
-| `SettlementOutcomeReported` | `source: "external"`: `reportId`, `status`, `reference`, `reason`, `details`, `receivedAt` (not a lifecycle step of the simulator) | – |
+| `SettlementOutcomeReported` | `source: "external"`: `reportId`, `buyerId`, `sellerId`, `status`, `reference`, `reason`, `details`, `receivedAt` (not a lifecycle step of the simulator) | – |
 | `SettlementCorrected` | `reason`: `SIMULATED_CORRECTION`, `previousSettlementAmount`, `previousAmountMinor` (the amount moves by one tick per unit) | `CORRECTED` |
 
 `ClearingStatementIssued` (`source: "clearinghouse"`, aggregate ID the statement ID, correlation ID the participant)
 carries the whole statement, as `GET /api/clearing/statements/{id}` returns it.
+
+`InstrumentListed` and `InstrumentUpdated` (`source: "exchange"`, aggregate ID the instrument ID, no correlation ID)
+carry the whole instrument after the change, as `GET /api/instruments` shows it, with `instrumentId` for `id`.
+`InstrumentUpdated` adds `changes`, the fields whose value changed (`enabled`, `referenceSymbol`). Every listing is an
+event, declared instruments included, so a consumer learns the instruments from the log alone.
 
 Order payloads carry `orderId`, `clientOrderId`, `instrumentId`, `participantId`, `side`, `type`, `priceTicks`, `price`,
 `quantity`, `remainingQuantity`, `filledQuantity`, `status` and `sequence`. Within one command, events come in this
@@ -277,6 +578,16 @@ declared in configuration also show their `name`, with `source: "config"`. The U
 types must be ones listed above. `secret` is optional (16–256 characters). When it is given, deliveries are signed. It
 is never returned; responses show `signed: true` instead. A subscription receives events committed after it was registered; replay earlier events with
 `/api/events`.
+
+**Participant filter:** `"participants": ["A", "B"]` (1 to 100 participant IDs; shown in responses when set) narrows
+a subscription to those participants, so two independent demo stacks can share one exchange:
+- order events (`OrderAccepted`, `OrderRejected`, fills, `OrderCancelled`) only for orders of a listed participant;
+- `TradeExecuted`, settlement events (`SettlementOutcomeReported` included) and `ClearingStatementIssued` when either
+  side, or the statement's participant, is listed;
+- events that involve no participant, such as `InstrumentListed`, always.
+
+Redelivery applies the same filter. `PATCH /api/webhooks/{id}` with `"participants": null` removes it. The payment
+gateway has no participants and refuses the field.
 
 Delivery is a `POST` of the event envelope with headers `X-Event-Id`, `X-Event-Type`, `X-Event-Sequence`,
 `X-Subscription-Id` and `X-Delivery-Attempt`.
@@ -411,6 +722,23 @@ Prometheus text format, with these series:
   `exchange_events_total{event_type}`.
 - **Webhooks:** `webhook_delivery_attempts_total{outcome}`, `webhook_delivery_duration_seconds`, and the outbox
   backlog `webhook_outbox_deliveries{status}`, read from SQLite at scrape time.
+- **Reference prices, per instrument** (label `instrument`): `exchange_reference_updates_total` (each new price
+  published; a change in staleness alone is not one), `exchange_reference_stale` (1 while stale) and
+  `exchange_reference_age_seconds` (simulated time since its `sourceTimestamp`, as of the last publication, which
+  every tick makes).
+- **Market data, per instrument:** `exchange_market_data_messages_total{instrument,kind}` (published),
+  `exchange_market_data_sent_total{instrument,kind}` (handed to subscribers, summed over them),
+  `exchange_market_data_conflated_total{instrument,kind}` (skipped by a subscriber for a newer message of the same
+  instrument and kind, by conflation or catch-up), `exchange_market_data_subscribers{instrument}` (open streams) and
+  `exchange_market_data_streams_closed_total{instrument}` (closed for falling a whole buffer behind). For the last
+  two, a stream without an instrument filter counts under `instrument="all"`, and a stream for several instruments
+  under each of them. `exchange_market_data_catch_ups_total` counts backlogs collapsed.
+- **Liquidity provider:** `exchange_liquidity_quotes_total`, `exchange_liquidity_requotes_total{instrument}`,
+  `exchange_liquidity_fills_total{instrument}`.
+- **Live price feed (source health):** `exchange_price_feed_connected`, `exchange_price_feed_reconnects_total`,
+  `exchange_price_feed_updates_total{via}` and `exchange_price_feed_rest_calls_total{outcome}`, whose
+  `rate_limited` and `throttled` outcomes are the rate-limit hits.
+- **Settlement:** `settlement_open_instructions`.
 
 ## Settlement
 
@@ -482,6 +810,35 @@ Everything known about one execution's settlement, side by side:
 
 Simulated instructions in trade order, optionally of one status. `limit` is 1–1000, default 100.
 
+## Business days
+
+At `clearing.cutoff`, local time in `clearing.time_zone`, every weekday, the exchange closes the business day with
+**`BusinessDayClosed`** (`source: "exchange"`, aggregate ID the business date, `occurredAt` the cutoff):
+`businessDate`, `cutoffAt`, `nextBusinessDate` and `timeZone`. It is the authoritative end-of-day signal for a
+consumer's end-of-day work (statements, valuation, closing books):
+- **Always:** whether or not clearing is enabled, and also on a day without trades. Weekends are skipped.
+- **Before the day's statements:** at the cutoff the day closes first, then that day's `ClearingStatementIssued`.
+- **Every day, in order:** a clock move past several cutoffs closes each day in turn, in time order with the
+  settlement events around it. A running clock closes days on its own (the background tick, every
+  `settlement.tick_interval_ms`). Cutoffs passed while the service was down are closed at startup, once.
+- **From now on:** a new database, or a reset, starts with the current business day; no earlier day is closed.
+
+Right after it, in the same commit, one **`ClosingPriceIssued`** per instrument, in instrument ID order (aggregate
+ID the instrument, correlation ID the business date, `occurredAt` the cutoff): `instrumentId`, `businessDate`,
+`closingPrice` (decimal) and `closingPriceTicks`, `currency`, `basis` and `volume`.
+
+```json
+{ "instrumentId": "AAPL", "businessDate": "2030-01-07", "closingPrice": "188.40", "closingPriceTicks": 18840,
+  "currency": "USD", "basis": "LAST_TRADE", "volume": 1250 }
+```
+
+- **`LAST_TRADE`:** the instrument traded in the business day's window (from the previous cutoff to this one); the
+  price of its last trade then, and `volume` the quantity traded.
+- **`REFERENCE`:** it did not trade; its reference price at the cutoff, and `volume` 0. An instrument with neither a
+  trade that day nor a price source has no closing price.
+- **Reproducible:** the reference price is taken as of the cutoff, however late the cutoff is handled, so two seeded
+  runs give byte-identical closing prices. Use them for end-of-day valuation, statements and closing books.
+
 ## Clearing
 
 With `clearing.enabled: true`, a clearinghouse issues end-of-day statements on the exchange clock. It plays an outside
@@ -498,7 +855,7 @@ the guide's [Back office](docs/back-office.md) chapter.
 - **Which trades:** a trade's business date is the first business day whose cutoff is after it. Trades after the
   cutoff, or on a weekend, are on the next business day's statement, and that date is also their trade date: T+N
   counts from it, in the statement and in the settlement simulator, so nothing settles before the statement that
-  clears it (T+0 aside). Without clearing, the trade date is the UTC date of execution.
+  clears it (T+0 aside). The trade date is the same without clearing (see Trade dates).
 - **What:** one statement per participant that traded since the previous cutoff, ID `CS:<businessDate>:<participant>`:
   `statementId`, `businessDate`, `participantId`, `timeZone`, `tradesFrom` and `cutoffAt` (the window of execution
   times, start included), `issuedAt`, then
@@ -559,6 +916,30 @@ Event sequences are assigned by the single writer, and event IDs follow from the
 happens in the trade's own transaction, so where `SettlementPending` lands in the log depends on the commands alone,
 not on a background tick.
 
+## The clock API
+
+`GET /api/clock` is always mounted: `{ "mode": "virtual"|"system", "running", "speed", "now" }`, for a consumer that
+follows the exchange's simulated time. With `clock.operator_control: true` (decision D17), operators can also change
+it without enabling test control, which would expose reset and fault injection:
+
+| Method | Path | Body | Effect |
+|---|---|---|---|
+| POST | `/api/clock/speed` | `{ "speed": 1440 }` | Change the speed from the current reading on; out of range is `400 invalid_clock_speed` |
+| POST | `/api/clock/freeze` / `/api/clock/resume` | – | Stop the clock, or let it run at its speed |
+
+Setting and advancing the clock stay under `/test`. With the system clock every change is `409 clock_not_virtual`.
+
+**`ClockChanged`** (`source: "exchange"`, aggregate ID `clock`) is published for every change that alters the clock,
+from either API: `change` (`advance`, `set`, `freeze`, `resume`, `speed`), `mode`, `running`, `speed`, `now` (the
+reading at the change) and `effectiveAt` (the real time of it). A follower computes simulated time as
+`now + (real time − effectiveAt) × speed` while `running`, and `now` while frozen, without polling. Details:
+- **No-ops publish nothing:** freezing a frozen clock, resuming a running one, the speed it already has.
+- **`effectiveAt` is `null` while frozen**, when the follower does not need it, so real time stays out of the
+  reproducible log of a run on a frozen clock.
+- **What became due on the way comes first:** a clock move first issues everything due by the new time (settlement
+  transitions, statements), then `ClockChanged`, so the log stays in time order.
+- **A reset publishes nothing:** read `GET /api/clock` after one.
+
 ## Test control
 
 With `test_control.enabled: true`, routes under `/test` control simulated time, show webhook deliveries and attempts,
@@ -599,7 +980,8 @@ The `/test/clock` routes change the clock only with `clock.mode: virtual`; with 
   settlement dates and clearing cutoffs.
 - **It never moves backwards.** Its state is stored, so a restart resumes simulated time where it was: at the stored
   reading or the latest event the exchange or the simulator stamped, whichever is later. Running or frozen is kept;
-  the speed is the configured one again (a speed changed through `/test/clock/speed` lasts until a restart or reset).
+  the speed is the configured one again (a speed changed through `/api/clock/speed` or `/test/clock/speed` lasts until
+  a restart or reset).
 - **Speed:** a running virtual clock moves `clock.speed` simulated seconds per real second. Everything on domain time
   follows: order and event timestamps, T+N business days and weekends. With `speed: 1440`, `running: true` and the
   T+1 default, a trade made at 09:00 settles at the next midnight, about 37 real seconds later, with no clock calls.
@@ -652,13 +1034,14 @@ steps:
 | `advance_clock: { days, hours, minutes, seconds }` / `set_clock: { to }` | Move the virtual clock |
 | `report_settlement: { execution, expect?, ...body }` | `POST /api/settlements/{executionId}/outcomes` |
 | `set_instrument: { instrument, enabled, expect? }` | `PATCH /api/instruments/{id}` |
+| `set_liquidity: { instrument, <settings>…, priceSource?, expect? }` | `PATCH /api/liquidity/{id}`: drain, widen, switch off or move to another price source mid-scenario |
 | `register: { instruments, participants, webhooks }` | Registers more, as in the setup (e.g. after a reset) |
 | `reset: {}` | `POST /test/reset`; order and webhook references are forgotten too |
 | `redeliver: { url, after, expect? }` | Redelivers the webhook's events after `after` |
 | `retry_dead_letters: { url?, expect? }` | Retries the webhook's dead letters, or all |
 | `set_faults: { url, faults }` | Set the fault policy of the webhook registered for `url`; `faults: null` clears it |
 | `market: { ...random market }` | A seeded random market; see below |
-| `expect: { order \| book \| settlement: ref, matches }` | `GET` the one resource; it must contain `matches` |
+| `expect: { order \| book \| liquidity \| settlement: ref, matches }` | `GET` the one resource (`liquidity`: `GET /api/liquidity/{instrument}`); it must contain `matches` |
 | `expect: { trades \| events \| deliveries \| attempts: filter, count? \| all? }` | The items containing `filter`: exactly `count`, at least one, or with `all: true` every item (and at least one) |
 
 - **References:** `as: name` names an order. Later steps use `name` for its order ID and `name#i` for the ID of the

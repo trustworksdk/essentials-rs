@@ -506,6 +506,7 @@ async fn declared_subscriptions_take_only_a_pause_through_the_api() {
             ordered: false,
             enabled: true,
             paused: false,
+            participants: None,
         }];
     })
     .await;

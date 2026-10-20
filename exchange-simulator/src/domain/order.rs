@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
 
 use super::{InstrumentId, ParticipantId};
@@ -59,13 +59,19 @@ pub(crate) use wire_enum;
 wire_enum!(Side, "side" { Buy => "BUY", Sell => "SELL" });
 wire_enum!(OrderType, "order type" { Limit => "LIMIT", Market => "MARKET" });
 wire_enum!(
+    /// How long an order stays on the book (SR-17): until the session closes, until cancelled, or not at all.
+    TimeInForce, "time in force" { Day => "DAY", Gtc => "GTC", Ioc => "IOC" }
+);
+wire_enum!(
     /// `Cancelled` keeps the unfilled `remaining_quantity` it had when cancelled, so filled = quantity - remaining.
+    /// `Expired` is a `DAY` order still open when its session closed (SR-17), likewise keeping its remainder.
     OrderStatus, "order status" {
         Open => "OPEN",
         PartiallyFilled => "PARTIALLY_FILLED",
         Filled => "FILLED",
         Cancelled => "CANCELLED",
         Rejected => "REJECTED",
+        Expired => "EXPIRED",
     }
 );
 
@@ -102,6 +108,7 @@ pub struct Order {
     pub remaining_quantity: u64,
     pub sequence: u64,
     pub status: OrderStatus,
+    pub time_in_force: TimeInForce,
 }
 
 impl Order {
@@ -122,6 +129,16 @@ pub struct Execution {
     pub price_ticks: i64,
     pub quantity: u64,
     pub executed_at: DateTime<Utc>,
+    /// The business day the trade belongs to (FIX `TradeDate`), and the day it is meant to settle (`SettlDate`).
+    pub trade_date: NaiveDate,
+    pub intended_settlement_date: NaiveDate,
+}
+
+/// The dates an execution carries (SR-29), the same for every fill of one command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TradeDates {
+    pub trade_date: NaiveDate,
+    pub intended_settlement_date: NaiveDate,
 }
 
 #[cfg(test)]

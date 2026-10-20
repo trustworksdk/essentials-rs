@@ -162,7 +162,7 @@ async fn detail(
     let Path(execution_id) = id?;
     let found = state
         .read(move |store| {
-            if !store.execution_exists(execution_id)? {
+            if store.execution_parties(execution_id)?.is_none() {
                 return Ok(None);
             }
             let key = execution_id.to_string();

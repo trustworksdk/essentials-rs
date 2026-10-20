@@ -26,7 +26,19 @@ pub const ORDER_REJECTED: &str = "OrderRejected";
 pub const ORDER_PARTIALLY_FILLED: &str = "OrderPartiallyFilled";
 pub const ORDER_FILLED: &str = "OrderFilled";
 pub const ORDER_CANCELLED: &str = "OrderCancelled";
+/// A `DAY` order still open when its session closed (SR-17).
+pub const ORDER_EXPIRED: &str = "OrderExpired";
 pub const TRADE_EXECUTED: &str = "TradeExecuted";
+/// An instrument was listed, through the API or from configuration.
+pub const INSTRUMENT_LISTED: &str = "InstrumentListed";
+/// A business day ended at its cutoff (`source: "exchange"`), also on days without trades.
+pub const BUSINESS_DAY_CLOSED: &str = "BusinessDayClosed";
+/// An instrument's closing price for a business day, right after its `BusinessDayClosed` (SR-14).
+pub const CLOSING_PRICE_ISSUED: &str = "ClosingPriceIssued";
+/// The virtual clock changed: speed, freeze, resume, set or advance (`source: "exchange"`).
+pub use simulator_kit::clock::CLOCK_CHANGED;
+/// A listed instrument changed (trading enabled or disabled, reference symbol).
+pub const INSTRUMENT_UPDATED: &str = "InstrumentUpdated";
 
 pub const SETTLEMENT_PENDING: &str = "SettlementPending";
 pub const SETTLEMENT_COMPLETED: &str = "SettlementCompleted";
@@ -47,7 +59,13 @@ pub const EVENT_TYPES: &[&str] = &[
     ORDER_PARTIALLY_FILLED,
     ORDER_FILLED,
     ORDER_CANCELLED,
+    ORDER_EXPIRED,
     TRADE_EXECUTED,
+    INSTRUMENT_LISTED,
+    INSTRUMENT_UPDATED,
+    CLOCK_CHANGED,
+    BUSINESS_DAY_CLOSED,
+    CLOSING_PRICE_ISSUED,
     SETTLEMENT_PENDING,
     SETTLEMENT_COMPLETED,
     SETTLEMENT_FAILED,
@@ -59,17 +77,138 @@ pub const EVENT_TYPES: &[&str] = &[
     CLEARING_STATEMENT_ISSUED,
 ];
 
+/// `BusinessDayClosed` for `date` under `calendar`: the authoritative end of the business day. Its `occurredAt` is
+/// the cutoff; the aggregate ID is the business date.
+pub fn business_day_closed(
+    date: chrono::NaiveDate,
+    calendar: &simulator_kit::calendar::CutoffCalendar,
+) -> NewEvent {
+    let cutoff_at = calendar.cutoff_at(date);
+    NewEvent {
+        event_id: Uuid::nil(),
+        sequence: 0,
+        event_type: BUSINESS_DAY_CLOSED,
+        source: EXCHANGE_SOURCE,
+        aggregate_id: date.to_string(),
+        correlation_id: None,
+        occurred_at: cutoff_at,
+        payload: json!({
+            "businessDate": date,
+            "cutoffAt": cutoff_at,
+            "nextBusinessDate": simulator_kit::calendar::next_business_day(date),
+            "timeZone": calendar.time_zone.name(),
+        }),
+    }
+}
+
+/// Where a closing price comes from (SR-14).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClosingBasis {
+    /// The instrument's last trade of the business day.
+    LastTrade,
+    /// No trade that day: its reference price at the cutoff.
+    Reference,
+}
+
+/// `ClosingPriceIssued` for `instrument` on business date `date`, stamped at the cutoff. Aggregate: the instrument;
+/// correlation: the business date.
+pub fn closing_price(
+    instrument: &Instrument,
+    date: chrono::NaiveDate,
+    cutoff_at: DateTime<Utc>,
+    price_ticks: i64,
+    basis: ClosingBasis,
+    volume: u64,
+) -> NewEvent {
+    NewEvent {
+        event_id: Uuid::nil(),
+        sequence: 0,
+        event_type: CLOSING_PRICE_ISSUED,
+        source: EXCHANGE_SOURCE,
+        aggregate_id: instrument.id.0.clone(),
+        correlation_id: Some(date.to_string()),
+        occurred_at: cutoff_at,
+        payload: json!({
+            "instrumentId": instrument.id,
+            "businessDate": date,
+            "closingPrice": instrument.ticks_to_price(price_ticks),
+            "closingPriceTicks": price_ticks,
+            "currency": instrument.currency,
+            "basis": match basis {
+                ClosingBasis::LastTrade => "LAST_TRADE",
+                ClosingBasis::Reference => "REFERENCE",
+            },
+            "volume": volume,
+        }),
+    }
+}
+
+/// The participants an event involves, for webhook participant filters: the `participantId` of order events and
+/// clearing statements, the `buyerId` and `sellerId` of trades and settlement events. Instrument events involve none.
+pub fn parties(_event_type: &str, payload: &Value) -> Vec<String> {
+    ["participantId", "buyerId", "sellerId"]
+        .iter()
+        .filter_map(|field| payload.get(field).and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Why an order was cancelled, carried in `OrderCancelled` payloads.
 pub const CANCEL_MARKET_REMAINDER: &str = "MARKET_REMAINDER";
+pub const CANCEL_IOC_REMAINDER: &str = "IOC_REMAINDER";
 pub const CANCEL_REQUESTED: &str = "REQUESTED";
 
 pub use simulator_kit::events::{EventEnvelope, NewEvent};
 
-/// Whether a command was a new order or a cancellation, which decides how a `CANCELLED` result is explained.
+/// Whether a command was a new order, a cancellation or an expiry, which decides the events an update gives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Submit,
     Cancel,
+    /// A `DAY` order expiring at its session's close.
+    Expire,
+}
+
+/// `InstrumentListed` (no `changes`) or `InstrumentUpdated` with the wire names of the fields that changed. The payload
+/// is the whole instrument after the change, as `GET /api/instruments` shows it. Unstamped, like [`for_update`]'s.
+pub fn instrument_event(
+    instrument: &Instrument,
+    changes: Option<&[&'static str]>,
+    now: DateTime<Utc>,
+) -> NewEvent {
+    let mut payload = json!({
+        "instrumentId": instrument.id,
+        "symbol": instrument.symbol,
+        "mic": instrument.mic,
+        "isin": instrument.isin,
+        "cusip": instrument.cusip,
+        "currency": instrument.currency,
+        "currencyScale": instrument.currency_scale,
+        "tickSizeMinor": instrument.tick_size_minor,
+        "tickSize": instrument.ticks_to_price(1),
+        "lotSize": instrument.lot_size,
+        "enabled": instrument.enabled,
+        "referenceSymbol": instrument.reference_symbol,
+        "priceSource": instrument.price_source,
+        "liquidity": instrument.liquidity,
+    });
+    if let Some(changes) = changes {
+        payload["changes"] = json!(changes);
+    }
+    NewEvent {
+        event_id: Uuid::nil(),
+        sequence: 0,
+        event_type: if changes.is_some() {
+            INSTRUMENT_UPDATED
+        } else {
+            INSTRUMENT_LISTED
+        },
+        source: EXCHANGE_SOURCE,
+        aggregate_id: instrument.id.0.clone(),
+        correlation_id: None,
+        occurred_at: now,
+        payload,
+    }
 }
 
 /// The events a committed update produces, in this order:
@@ -113,6 +252,14 @@ pub fn for_update(
         );
         return events;
     }
+    if command == Command::Expire {
+        push(
+            ORDER_EXPIRED,
+            order.id.to_string(),
+            order_payload(order, instrument, None, None),
+        );
+        return events;
+    }
     if let Some(reason) = update.rejection {
         let mut payload = order_payload(order, instrument, None, None);
         payload["rejectReason"] = json!(reason.code());
@@ -134,27 +281,38 @@ pub fn for_update(
             execution.id.to_string(),
             trade_payload(execution, instrument, settlement),
         );
-        push(
-            fill_event(maker),
-            maker.id.to_string(),
-            order_payload(maker, instrument, None, Some(execution.id)),
-        );
+        let mut payload = order_payload(maker, instrument, None, Some(execution.id));
+        add_dates(&mut payload, execution);
+        push(fill_event(maker), maker.id.to_string(), payload);
     }
     if order.filled_quantity() > 0 {
-        push(
-            fill_event(order),
-            order.id.to_string(),
-            order_payload(order, instrument, None, None),
-        );
+        let mut payload = order_payload(order, instrument, None, None);
+        // Every execution of one command has the same dates.
+        if let Some(execution) = update.executions.first() {
+            add_dates(&mut payload, execution);
+        }
+        push(fill_event(order), order.id.to_string(), payload);
     }
-    if order.status == OrderStatus::Cancelled && order.order_type == OrderType::Market {
+    // A market or IOC order's remainder is cancelled as part of the submission.
+    if order.status == OrderStatus::Cancelled {
+        let reason = if order.order_type == OrderType::Market {
+            CANCEL_MARKET_REMAINDER
+        } else {
+            CANCEL_IOC_REMAINDER
+        };
         push(
             ORDER_CANCELLED,
             order.id.to_string(),
-            order_payload(order, instrument, Some(CANCEL_MARKET_REMAINDER), None),
+            order_payload(order, instrument, Some(reason), None),
         );
     }
     events
+}
+
+/// The execution's trade and intended settlement dates (SR-29), on a fill event.
+fn add_dates(payload: &mut Value, execution: &Execution) {
+    payload["tradeDate"] = json!(execution.trade_date);
+    payload["intendedSettlementDate"] = json!(execution.intended_settlement_date);
 }
 
 fn fill_event(order: &Order) -> &'static str {
@@ -185,6 +343,7 @@ fn order_payload(
         "filledQuantity": order.filled_quantity(),
         "status": order.status,
         "sequence": order.sequence,
+        "timeInForce": order.time_in_force,
     });
     if let Some(reason) = cancel_reason {
         payload["cancelReason"] = json!(reason);
@@ -226,5 +385,7 @@ fn trade_payload(
         "currencyScale": instrument.currency_scale,
         "tickSizeMinor": instrument.tick_size_minor,
         "executedAt": execution.executed_at,
+        "tradeDate": execution.trade_date,
+        "intendedSettlementDate": execution.intended_settlement_date,
     })
 }

@@ -8,7 +8,7 @@ use simulator_kit::calendar::CutoffCalendar;
 use simulator_kit::ids::IdScheme;
 use simulator_kit::persistence::PersistenceMode;
 
-pub use simulator_kit::clock::{ClockConfig, ClockMode};
+pub use simulator_kit::clock::{ClockConfig, ClockMode, FollowConfig};
 pub use simulator_kit::webhooks::{SubscriptionConfig, WebhooksConfig};
 
 use crate::money::{Currencies, parse_amount};
@@ -139,7 +139,10 @@ impl Config {
     pub fn load() -> Result<Self, config::ConfigError> {
         let mut builder = config::Config::builder()
             .add_source(config::File::from_str(DEFAULTS, config::FileFormat::Yaml));
-        if let Ok(path) = std::env::var(CONFIG_FILE_ENV) {
+        // Empty counts as unset, as Compose passes an unset variable.
+        if let Ok(path) = std::env::var(CONFIG_FILE_ENV)
+            && !path.is_empty()
+        {
             builder = builder.add_source(config::File::with_name(&path));
         }
         builder
@@ -229,6 +232,31 @@ mod tests {
     }
 
     #[test]
+    fn the_with_your_app_example_configuration_is_valid() {
+        let config: Config = config::Config::builder()
+            .add_source(config::File::from_str(DEFAULTS, config::FileFormat::Yaml))
+            .add_source(config::File::from_str(
+                include_str!("../../exchange-simulator/examples/with-your-app/gateway.yaml"),
+                config::FileFormat::Yaml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(config.clock.mode, ClockMode::Follow);
+        assert_eq!(
+            config.clock.follow.as_ref().map(|f| f.url.as_str()),
+            Some("http://exchange:8080")
+        );
+        assert!(config.payment_policy().is_ok());
+        assert!(config.statement_policy().unwrap().is_some());
+        assert_eq!(
+            config.webhooks.subscriptions[0].url,
+            "http://app:9000/hooks/gateway"
+        );
+    }
+
+    #[test]
     fn the_back_office_example_configuration_is_valid() {
         let config: Config = config::Config::builder()
             .add_source(config::File::from_str(DEFAULTS, config::FileFormat::Yaml))
@@ -240,10 +268,15 @@ mod tests {
             .unwrap()
             .try_deserialize()
             .unwrap();
-        assert_eq!(config.clock.mode, ClockMode::Virtual);
+        assert_eq!(config.clock.mode, ClockMode::Follow);
+        assert_eq!(
+            config.clock.follow.as_ref().map(|f| f.url.as_str()),
+            Some("http://exchange:8080")
+        );
         assert!(config.payment_policy().is_ok());
         let statements = config.statement_policy().unwrap().unwrap();
         assert_eq!(statements.opening_balances["DKK"], 100_000_000);
+        assert_eq!(statements.opening_balances["USD"], 100_000_000);
         // Event types only: the secret file exists in the container.
         let declared = &config.webhooks.subscriptions[0];
         assert!(

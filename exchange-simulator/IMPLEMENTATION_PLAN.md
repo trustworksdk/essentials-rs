@@ -1560,7 +1560,682 @@ Done on 2026-10-17: 5.1 (T+1, per-market cycles), 5.2 (accelerated clock), 5.3 (
 (`simulator-kit`), 5.4b (payment gateway) and 5.5 (back-office acceptance and guide). Decisions D8–D16 are recorded
 below. Still on hold from Milestone 4: 4.6d (the containerized benchmark), until the user asks for it.
 
+## Milestone 6 — a live market for the trading demo (draft, 2026-10-18)
+
+**Context:** the trading demo is expanding. Its requirements on the simulators are in
+[`SIMULATOR_REQUIREMENTS.md`](SIMULATOR_REQUIREMENTS.md) (SR-1 to SR-28). Decisions cited there as D3, D8, D10, D18 and
+D20 are the **demo's** decisions, not this plan's; this plan writes them demo-D3, demo-D8 and so on.
+
+**Principle:** the demo never pushes prices into the exchange. The exchange produces a reference price per instrument,
+quotes around it with a built-in liquidity provider, and publishes market data that the demo consumes, as a broker
+consumes an exchange feed. Every new behaviour is off by default (price source `none`, no liquidity, no sessions), so
+existing tests, scenarios and deployments are unchanged.
+
+**Goal:**
+- a market with prices and depth before any client connects (fixed, synthetic, replayed or live Finnhub prices);
+- a counterparty for the demo's orders, since all of them come from one participant (demo-D8);
+- a live market-data feed, and durable end-of-day facts (closing prices, business day closed) in the event log;
+- the exchange's clock observable and controllable without test control, and followed by the payment gateway.
+
+Every step that adds a route or an event also updates `openapi.yaml`; the contract tests (`tests/openapi.rs`) enforce
+it.
+
+| # | Step | Demo phase | Size | Delivers |
+|---|---|---|---|---|
+| 6.1 | Instruments in configuration, instrument events | 0 | M | **SR-5, SR-28.** `instruments:` in the config file, reconciled at startup by id the way webhook subscriptions are (4.6a), and restored by `POST /test/reset`. New instrument fields `referenceSymbol`, `priceSource` and `liquidity` (the last two are stored here and used from 6.2 and 6.7), accepted by the API as well. `InstrumentListed` (all of `Instrument`) for every listing, declared ones included, and `InstrumentUpdated` for every change, `enabled` included. |
+| 6.2 | Price sources: `none`, `fixed`, `synthetic` | 0 | M | **SR-1, SR-3.** A reference price per instrument from a pluggable source, with a global default and per-instrument overrides. `synthetic` is a seeded geometric Brownian motion on simulated time (initial price, drift, volatility, tick interval), rounded to the tick size and never at or below zero, built on `simulator-kit::rng`. Changing `priceSource` through `PATCH /api/instruments/{id}` takes effect without a restart. The reference price is readable from a first cut of `GET /api/marketdata[/{id}]` (reference price, source kind, `sourceTimestamp`), which 6.8 completes. Reference ticks are not events. |
+| 6.3 | Participant filter on webhook subscriptions | 0 | S | **SR-19.** An optional `participants` list on a subscription, in config and through the API. Order lifecycle events go out only for those participants' orders; trade, settlement and clearing events when either side is listed. Events without a participant (instrument, clock, end-of-day) always go out. |
+| 6.4 | Operator clock API, `ClockChanged` | 1 | M | **SR-24, SR-25, D17.** `GET /api/clock` (`mode`, `running`, `speed`, `now`), always mounted. Speed, freeze and resume under `/api/clock`, behind `clock.operator_control` and independent of `test_control.enabled`; `set`, `advance` and `reset` stay under `/test`. A `ClockChanged` event (`mode`, `running`, `speed`, `now`, `effectiveAt` in real time) for every speed change, freeze, resume and set, from either API. Built in `simulator-kit`, so the gateway gets it too. |
+| 6.5 | `BusinessDayClosed` | 1 | S | **SR-26.** At the clearing cutoff of every business day, `businessDate`, `cutoffAt` and `nextBusinessDate`, also on days without trades and whether or not `clearing.enabled` is on. Ordered before that day's `ClearingStatementIssued` (and `ClosingPriceIssued`, 6.11). Days skipped by a clock jump each get their event, in order. |
+| 6.6 | Payment gateway for the demo | 2 | M | **SR-21, SR-22, SR-27.** USD is already accepted; the example and Compose configs gain a USD opening balance. Forced outcomes under test control (`completed`, `failed` with a reason, `returned` after a delay) for one payment, through `POST /test/payments/{id}/outcome` (D20). `clock.mode: follow`: the gateway reads the exchange's `GET /api/clock` at startup and follows its `ClockChanged` events. SR-23 (memory mode) is already done: the gateway has `durable`, `fast` and `memory` since 5.4b. |
+| 6.7 | Liquidity provider | 3 | L | **SR-6, SR-7, SR-8, SR-10, D18.** A participant created by the simulator (`LP` by default), quoting a ladder around the reference price per instrument: `levels`, `spread_bps`, `level_step_ticks`, `level_quantity` (optionally growing with depth), `requote_threshold_ticks`. Prices rounded away from the reference price. Re-quoting happens atomically inside the exchange thread. Refill after `refill_delay` (simulated time); inventory skew by `skew_bps_per_lot`; at `max_inventory` the side that would increase it is not quoted. It never trades with itself. `liquidity.emit_order_events` (default off) keeps its order lifecycle out of the event log and webhooks; its trades, settlement and clearing are always emitted. Metrics for quotes, re-quotes and fills. |
+| 6.8 | Market-data snapshot and stream | 3 | L | **SR-12, SR-13.** The full snapshot: reference price and staleness, best bid and ask with quantity, last trade, session volume, a per-instrument `mdSequence`. Server-sent events at `GET /api/marketdata/stream?instruments=`: `quote`, `trade` (anonymous prints) and `reference`, each with `mdSequence`, conflated per instrument and kind to `conflation_interval_ms`. The exchange thread publishes into a bounded, conflating channel and never waits on a consumer; a consumer that falls behind is conflated harder, then closed. Not in the event log, not on webhooks. |
+| 6.9 | Finnhub source, stale policy | 3 | L | **SR-2, SR-9, D19.** The trades websocket per `referenceSymbol`, seeded and refreshed from the REST quote endpoint. The key from a secret file or environment variable, never logged, returned or used in a metric label. Reconnect with backoff and jitter, re-subscribe after reconnect; a source that is down never stops the exchange. Ticks applied at the virtual clock's time with the provider's `sourceTimestamp`, conflated to `max_updates_per_second`. Prices older than `stale_after` are marked stale; the provider keeps, widens or pulls its ladder per instrument (SR-9). Symbol and call limits are checked at startup where possible, else logged and counted. Tests run against a local mock websocket and REST server, never the real network. |
+| 6.9a | Trade and settlement dates on executions | 3 | M | **SR-29** (added to the requirements 2026-10-19, planned before 6.10 at the user's request). `tradeDate` and `intendedSettlementDate` on `TradeExecuted`, the fill events, the order result and `GET /api/trades`, from the business-day calendar whether or not clearing runs and the market cycle in every settlement mode; identical on every event and response that carries them, the settlement events and clearing lines included. |
+| 6.10 | Trading sessions, time in force | 3 | M | **SR-16, SR-17.** Opening and closing times per MIC in local time on business days (`none`, always open, stays the default). Outside a session new orders are rejected with `MARKET_CLOSED`, and the provider applies its closed-market policy. `timeInForce`: `DAY` (default when sessions are on), `GTC`, `IOC`. `DAY` orders open at the close get `OrderExpired`; an `IOC` remainder is cancelled with `IOC_REMAINDER`. |
+| 6.11 | `ClosingPriceIssued` | 4 | S | **SR-14.** At the cutoff, after `BusinessDayClosed`, one event per traded instrument: `instrumentId`, `businessDate`, `closingPrice` (last trade, else the reference price), `basis` (`LAST_TRADE` or `REFERENCE`) and the day's volume. Reproducible: two seeded synthetic runs give a byte-identical event log, closing prices included (the SR-3 acceptance). |
+| 6.12 | Liquidity runtime control | 5 | M | **SR-11.** `GET /api/liquidity[/{instrumentId}]` (settings, inventory, current ladder, source, staleness) and `PATCH /api/liquidity/{instrumentId}` for any setting, the price source and `mode` (`on`/`off`) included. A scenario step for it, so scenarios can drain liquidity, widen spreads, or switch an instrument from `finnhub` to `synthetic` at the close. |
+| 6.13 | Replay source and recorder | 6 | M | **SR-4.** Replays `(timestamp, referenceSymbol, price, volume)` rows (CSV or JSON lines) on the virtual clock, offset to the clock's start, optionally looping. In `finnhub` mode an optional recorder appends every applied tick in the replay format. Recordings stay local and are gitignored; vendor data is never committed. |
+| 6.14 | Market-data metrics, load profile with the provider | 6 | M | **SR-15, SR-20.** Per-instrument reference updates, staleness, subscribers, messages sent and conflated, streams closed for back-pressure; source health (connected, reconnects, rate-limit hits). A bench run with the provider on and a replayed source, reporting order-ack latency with and without the provider at the same client order rate. |
+
+**Not planned:** SR-18 (FX reference rates) is marked LATER and waits for the demo's FX phase.
+
+**Order within the milestone:** by demo phase, as in the table: 6.1–6.3, then 6.4–6.5, then 6.6, then 6.7–6.10
+(6.7 and 6.8 before 6.9, so the provider and the feed are tested on synthetic prices before a live source is added),
+then 6.11, 6.12, 6.13–6.14.
+
+### Milestone 6 progress
+
+**6.1 — instruments in configuration, instrument events ✅ done (2026-10-18)**
+- **Delivered:**
+  - `instruments:` in the config file: the fields of `POST /api/instruments` in snake_case, IDs unique.
+    `Exchange::reconcile_instruments` runs at recovery and after a reset, after the declared webhook subscriptions,
+    so a declared subscription receives the listings.
+  - `referenceSymbol` on instruments: optional, 1 to 64 printable ASCII characters without spaces (`BINANCE:BTCUSDT`
+    fits). Migration 013 adds the column. Accepted by `POST /api/instruments`, the config and
+    `PATCH /api/instruments/{id}`.
+  - The PATCH body now takes `enabled`, `referenceSymbol`, or both; absent fields stay, `null` clears the reference
+    symbol, an empty body is a `400`. `Exchange::update_instrument` takes an `InstrumentChange`.
+  - `InstrumentListed` and `InstrumentUpdated` (`source: exchange`, aggregate ID the instrument ID, no correlation ID).
+    Each is committed in one transaction with the instrument row and its webhook deliveries. The payload is the whole
+    instrument after the change; `InstrumentUpdated` adds `changes`, the wire names of the fields that changed.
+  - `openapi.yaml`, the README and `docs/configuration.md` (a new Instruments section) are updated.
+  - New suite `tests/instruments.rs` (6 tests), domain unit tests for the reference symbol and `InstrumentChange`.
+- **Decisions:**
+  - **Configuration wins at each start**, as for declared subscriptions (4.6a). A declared instrument can still be
+    changed through the API (unlike a declared subscription, which is read-only there), since scenarios and SR-11
+    need runtime changes. The next start restores the configured values, with an `InstrumentUpdated`.
+  - **Fields other than `enabled` and `reference_symbol` never change once listed.** A declared value that differs
+    from the listed instrument stops startup with an error naming the field. Changing a tick or lot size under
+    resting orders would corrupt them.
+  - **An instrument removed from the configuration stays listed.** Orders and trades refer to it; disabling it
+    silently would be a surprise. Delisting can come later if the demo needs it.
+  - **A change that alters nothing publishes nothing.** `PATCH {"enabled": true}` on an enabled instrument answers
+    `200` with no event, so the log holds only facts.
+- **Deviation:** the plan's 6.1 row also stored `priceSource` and `liquidity`. They are left to 6.2 and 6.7, which
+  give them real types; an opaque placeholder could not be described by the strict OpenAPI schemas.
+- **Consequence for existing tests:** every test that registers an instrument now has an `InstrumentListed` at
+  sequence 1. Five tests that counted events or delivery sequences were adjusted (`recovery.rs` ×2, `webhooks.rs`,
+  `scenarios.rs`, `openapi.rs`, the last now exercises real changes so `InstrumentUpdated` occurs).
+- **Mutation checks**, each made a test fail: configuration not winning over an API change; immutable fields not
+  checked; reset not relisting declared instruments; a no-op change publishing; instruments reconciled before
+  webhook subscriptions; a payload field renamed; the reference symbol not read back from storage.
+
+**6.2 — price sources `none`, `fixed`, `synthetic` ✅ done (2026-10-18)**
+- **Delivered:**
+  - `src/pricing`: `PriceSourceSpec` (the configured source, every field optional) and `PriceSources`, the running
+    sources the exchange owns. `priceSource` on instruments: API (`POST`, `PATCH`, responses), configuration and the
+    instrument events, and `changes` can name `priceSource`. `price_sources.seed` and `price_sources.default` in the
+    configuration.
+  - `synthetic`: a seeded geometric Brownian motion, stepped on a grid of `tickIntervalMs` (at least 100) from the
+    instant the source was set. Prices are rounded to the nearest tick, never below one; the walk itself is not
+    rounded.
+  - Migration 014 stores the instrument's own source (JSON) and when it started (`price_source_since`). Recovery
+    restarts each source with its stored start, and recomputes the walk from it.
+  - `GET /api/marketdata` and `GET /api/marketdata/{instrumentId}`: the reference price, its source kind and
+    `sourceTimestamp`, through the exchange thread (a read request).
+  - A declared instrument whose listing or update fails now stops startup with an error naming it
+    (`ExchangeError::DeclaredInstrument`).
+  - `openapi.yaml`, the README (a Price sources section and the market-data routes), `docs/configuration.md` and
+    `config/default.yaml`.
+  - Tests: `tests/price_sources.rs` (6), unit tests in `src/pricing` (8) and a YAML config test.
+- **Decisions:**
+  - **The walk is independent of when it is read.** It is stepped one interval at a time, catching up on every read,
+    so a `GET` (or none) never changes the path. Aggregating a gap into one draw would be faster but would make the
+    path depend on the reads. Measured cost: 30 simulated days of one-second steps, 2.6 million steps, takes about
+    50 ms per instrument in a release build.
+  - **`drift` and `volatility` are annualized**, over a year of 365.25 simulated days, the usual GBM convention.
+  - **Defaults merge field by field.** `price_sources.default` can set the kind and walk parameters once; each
+    instrument then needs only its `initial_price`. Fields a kind does not use are ignored, so switching kinds
+    needs no clean-up.
+  - **A switch to `synthetic` with no initial price continues from the current reference price**, which is stored as
+    the source's `initialPrice`, so the walk reproduces after a restart. With no current price either, it is a `400`.
+  - **Seeds derive from `price_sources.seed` and the instrument ID** (FNV-1a), so adding an instrument changes no
+    other instrument's path.
+  - **Reference ticks are not events**, as planned. They are not in the log, so the event log of a reproducible run
+    is unchanged until closing prices (6.11).
+  - `Instrument` loses `Eq` (the spec holds `f64`s); nothing relied on it.
+- **Deviation:** none from the 6.2 row.
+- **Note:** a changed `price_sources.default` applies at the next start, and the walks that rely on it are recomputed
+  from their start with the new parameters, so their prices jump. Documented in the configuration guide.
+- **Mutation checks**, each made a test fail: catching up in one aggregated draw (a path that depends on reads); the
+  source's start not used at recovery; a switch to `synthetic` not filling the initial price; the default ignored;
+  no one-tick floor; a seed that ignores the instrument; `priceSource` missing from the event payload.
+
+**6.3 — participant filter on webhook subscriptions ✅ done (2026-10-18)**
+- **Delivered:**
+  - `participants` on subscriptions (1 to 100 IDs, sorted, without duplicates): `POST` and `PATCH /api/webhooks`
+    (`null` removes it), declared subscriptions (`participants:` under `webhooks.subscriptions`), and responses
+    when set. Built in `simulator-kit`, so both services share the code and the documented schema
+    (`ParticipantFilter`).
+  - The kit learns an event's participants from a function the service passes to `WebhookHub::load` (`Parties`).
+    The fan-out (`write_events`), the delivery wake-up and redelivery all apply the filter. A subscription receives
+    an event when it has no filter, when the event involves no participant, or when a listed participant is among
+    the event's.
+  - The exchange's function reads the payload's `participantId`, `buyerId` and `sellerId`. That covers order events,
+    trades, settlement events and clearing statements. `SettlementOutcomeReported` gains `buyerId` and `sellerId`, so
+    an outcome report reaches the stacks of the execution's two sides.
+  - The payment gateway passes no function and refuses a filter with a `400`; payments have no participants.
+  - Storage: the `participants` column on `webhook_subscriptions`, as `simulator_kit::outbox::PARTICIPANT_FILTER`.
+    The gateway runs it as its migration 3; the exchange as migration 015, a file with the same statement, which the
+    shared-schema test keeps equal.
+  - Both `openapi.yaml` documents (the shared webhook part stays identical), the README, the configuration guide
+    (a two-stack recipe), `config/default.yaml` and the gateway README.
+  - Tests: `tests/participant_filter.rs` (3) and a gateway test.
+- **Decisions:**
+  - **Order events follow the order's own participant only.** A filter for A receives A's `OrderAccepted` and
+    fills, and the `TradeExecuted` with B, but not B's order events, as SR-19 states.
+  - **Events that involve no participant always pass** (instrument events now; the clock and end-of-day events of
+    6.4 and 6.5 later), so each stack still learns the market's shared facts.
+  - **The filter is read from the stored payload at redelivery**, so no participant column is needed on `events`.
+    The function is pure, so fan-out and redelivery always agree.
+  - **A declared subscription's filter is owned by the configuration**, like its other fields (`409` through the
+    API).
+- **Deviation:** none from the 6.3 row. The `SettlementOutcomeReported` payload change is additive.
+- **Mutation checks**, each made a test fail: events involving no participant filtered out; the filter ignored;
+  redelivery ignoring the filter; trades' sides not read; the outcome report without `buyerId`; the gateway
+  accepting a filter; a declared filter not reconciled; `PATCH` ignoring `participants`.
+
+**6.4 — operator clock API, `ClockChanged` ✅ done (2026-10-19)**
+- **Delivered:**
+  - The clock moved into `simulator-kit`: `ClockState`, `ClockChange` with `apply`, `VirtualClock::anchor`,
+    `changed_event`, and `api::clock` with a `ClockBackend` trait. `router` mounts `GET /api/clock` always, plus
+    `POST /api/clock/speed`, `/freeze` and `/resume` with `clock.operator_control` (D17). `test_router` mounts
+    `/test/clock*` as before. Both services implement the trait and lost their copies of the clock handlers.
+  - `ClockChanged` (aggregate ID `clock`, the service's own `source`): `change`, `mode`, `running`, `speed`, `now`
+    (the reading at the change) and `effectiveAt` (the real time of it). Both come from the clock's anchor, the exact
+    pair every change records, so a follower's `now + (real time − effectiveAt) × speed` has no skew, even at
+    1,000,000×. Committed in one transaction with the stored reading. Both services emit it; it is in both
+    services' event types, and in the back-office example's gateway subscription.
+  - Both `openapi.yaml` documents: the `/api/clock` routes, `ClockChangedPayload` (shared, identical) and a
+    `ClockChangedEvent` per service. The README has a new "The clock API" section; the configuration guide's demo
+    recipe now uses the operator routes; both default configs have `operator_control: false`.
+  - Tests: `tests/operator_clock.rs` (4); both contract tests exercise the operator routes.
+- **Decisions:**
+  - **What became due on the way comes first.** A clock move runs everything due by the new time, then commits
+    `ClockChanged`. The log stays in time order, which several existing tests check. The first version committed
+    the event first and broke them.
+  - **`effectiveAt` is `null` while the clock is frozen.** A follower then reads `now` and needs no real time, and
+    real time stays out of the byte-identical log of a reproducible run on a frozen clock (D6). The first version
+    always carried it and broke the reproducibility tests.
+  - **Changes that alter nothing publish nothing:** freezing a frozen clock, resuming a running one, the same speed.
+  - **A reset publishes nothing.** It empties the log; a follower reads `GET /api/clock` after one.
+  - **A speed set at runtime still lasts until a restart**, as before; the configuration's speed then applies.
+- **Deviation:** none from the 6.4 row.
+- **Mutation checks**, each made a test fail: no-op changes publishing; real time while frozen; `effectiveAt` off by
+  a minute (the follower test); the operator routes mounted without the switch; `ClockChanged` committed before what
+  became due (the time-order test); the gateway publishing nothing.
+- **Known limit:** on a running, very fast clock, an item that falls due between the change and the run of due work
+  can be stamped a little after `ClockChanged`'s `now`. A frozen clock, the reproducible setup, is exact.
+
+**6.5 — `BusinessDayClosed` ✅ done (2026-10-19)**
+- **Delivered:**
+  - `BusinessDayClosed` (`source: exchange`, aggregate ID the business date, `occurredAt` the cutoff): `businessDate`,
+    `cutoffAt`, `nextBusinessDate` and `timeZone`. Emitted at the cutoff of every weekday, whether or not clearing
+    is enabled and whether or not anything traded.
+  - The business-day calendar is `clearing.cutoff` in `clearing.time_zone` (`Config::business_calendar`), the same
+    one clearing uses. Closing keeps its own cursor, in a new table (migration 016), since it runs without clearing
+    too. A new database or a reset starts at the current business day, as clearing does.
+  - `Exchange::tick` takes the earliest of the next close and the next clearing instant. At the same cutoff the day
+    closes first, then its statements are issued, each after the settlement transitions due by then. A clock move
+    past several cutoffs closes each day in turn. Cutoffs passed while the service was down close at startup, once.
+  - The background domain ticker now always runs (it ran only with settlement simulation or clearing), so a running
+    clock closes days with no request.
+  - `openapi.yaml` (`BusinessDayClosedEvent`), the README (a Business days section), the configuration guide and the
+    back-office guide (start end-of-day work on `BusinessDayClosed`).
+  - Tests: `tests/business_days.rs` (6); `tests/clock.rs` now expects the two closes its clock move passes.
+- **Decisions:**
+  - **One calendar.** Business days and clearing share `clearing.cutoff` and `clearing.time_zone`. The settings keep
+    their names; the configuration guide says they define the business days too. A separate `business_day` section
+    would allow a calendar that disagrees with clearing, which SR-26's ordering rules out.
+  - **`ExchangeOptions::business_days` is optional** (default `None`), so engine-level tests that build an
+    `Exchange` directly are unchanged; the service always sets it.
+  - **The gateway gets no business-day event.** SR-26 asks it of the exchange, and the gateway's statements have
+    their own cutoff.
+- **Deviation:** none from the 6.5 row.
+- **Mutation checks**, each made a test fail: statements before the close; the cursor not stored; the first day
+  skipped; no background ticker without clearing; a reset keeping the cursor. The last one first survived: the reset
+  test's clock happened to restart where the stale cursor was right. A new test resets after closing days, so the
+  clock goes back past them, and it fails.
+
+**6.6 — payment gateway for the demo ✅ done (2026-10-19)**
+- **Delivered:**
+  - **SR-21:** the back-office example's gateway has a USD opening balance next to DKK; USD was already accepted.
+  - **SR-22, D20:** `POST /test/payments/{id}/outcome` with `COMPLETED`, `FAILED` (with `reason`) or `RETURNED` (with
+    `returnAfterSeconds`), and an optional `delaySeconds`. The outcome is stored with the payment (gateway migration
+    4, `forced_outcome`) and replaces its seeded draws in `PaymentPolicy::transition`, so it holds across a restart.
+    A pending payment takes any outcome; a completed one not yet returned takes only `RETURNED`; a final one is
+    `409 payment_settled`.
+  - **SR-27:** `clock.mode: follow` with `clock.follow.url` and `poll_interval_ms` (default 250), in the kit's
+    `ClockConfig`. A background task reads the exchange's `GET /api/clock`, corrects the reading by half the round
+    trip, and `Gateway::follow` takes its speed, running state and reading. A change of speed or running state, or
+    a jump of over a simulated minute, publishes `ClockChanged` with `change: follow`; `follow` joins the shared
+    `ClockChangedPayload` enum in both documents. The gateway's own clock routes answer `409 clock_follows`. The
+    exchange refuses `follow` mode at startup.
+  - The back-office example follows: the gateway's clock follows the exchange's, so the walkthrough and the e2e
+    test resume only the exchange's clock. The example README, the back-office guide, the gateway README (forced
+    outcomes, following) and its default configuration are updated.
+  - Tests: gateway `tests/forced_outcomes.rs` (4) and `tests/follow.rs` (4, against a stand-in clock server), a
+    unit test of forced transitions, the gateway contract test for the new route, and an exchange test refusing
+    `follow`.
+  - SR-23 (memory mode) was already done.
+- **Decisions:**
+  - **Follow by polling `GET /api/clock`, not by consuming `ClockChanged`.** The exchange's initial running state
+    from configuration is never an event, so the clock endpoint is needed anyway, and polling needs no inbound
+    endpoint or signature check on the gateway. The cost is a lag of up to one poll interval: at 1440×, 250 ms is
+    six simulated minutes. The example polls every 100 ms.
+  - **Never backwards.** When the followed clock is behind, because it slowed or froze between reads or was reset,
+    the gateway holds its reading and logs once. Moving back would break the gateway's own time order. Resetting
+    both services together is documented.
+  - **Small corrections publish nothing**, so a running follower does not write an event per poll.
+  - **The forced outcome is test-only state.** It is not in the payment view or events, which stay as the bank would
+    show them.
+- **Deviation:** the 6.6 row said the gateway would "follow its `ClockChanged` events"; it reads `GET /api/clock`
+  only, for the reason above.
+- **Mutation checks**, each made a test fail: a forced failure ignored; a forced completion still returned; the
+  forced outcome not stored (the restart test); a following clock accepting changes; a follower moving backwards.
+  Two first attempts were malformed (one did not compile, one could not move the clock back) and were redone.
+
+**6.7 — liquidity provider ✅ done (2026-10-19)**
+- **Delivered:**
+  - `src/liquidity`: `LiquiditySpec` (every field optional, merged field by field with `liquidity.default`, then
+    built-in defaults with `mode: off`) and `LiquiditySettings::ladder`, a pure function from reference price,
+    inventory and settings to the ladder. Spread from the skewed mid, rounded away from it (with a millionth-of-a-tick
+    tolerance, see below); levels stepping out; quantities in whole lots growing per level; the side that would grow
+    the position dropped at `max_inventory`.
+  - `liquidity` on instruments: API, configuration, events, storage (migration 017), `changes`. `liquidity:` in the
+    configuration: `participant_id` (default `LP`), `emit_order_events` (default `false`), `default`.
+  - In the exchange (`Provider`): the provider's orders are ordinary limit orders, so matching, storage, settlement and
+    clearing apply unchanged; it is registered as a participant the first time it quotes. `maintain_liquidity` runs
+    after every client order and cancellation, after instrument changes and on every tick. `requote` decides from the
+    reference move against `requote_threshold_ticks`, a refill due after `refill_delay_ms` of simulated time, or a
+    reason to pull (mode off, disabled, no reference). It replaces the ladder by cancelling the old orders and placing
+    the new ones in one commit group: its own, or the caller's when one is open. A ladder identical to the resting one
+    is left alone.
+  - `commit_and_apply` drops the provider's order events before stamping when `emit_order_events` is off, and
+    accounts its inventory from every execution it is party to. Metrics: `exchange_liquidity_quotes_total`,
+    `_requotes_total`, `_fills_total`.
+  - `openapi.yaml` (`Liquidity` schema), the README (Liquidity provider), the configuration guide, `config/default.yaml`.
+  - Tests: `tests/liquidity.rs` (11), unit tests in `src/liquidity` (5), a YAML config test.
+- **Decisions:**
+  - **Re-quoting runs on commands, not on a timer alone.** After every order or cancellation the touched instrument
+    is maintained; the tick handles time (reference moves, refill delays). On a frozen clock the provider's actions
+    depend only on the commands, so a run reproduces byte for byte (tested), which a timer-driven re-quote would
+    break.
+  - **The provider's orders live in the orders table** even when their events are not published. Executions
+    reference both orders, and recovery needs the book. D18 holds: its state is not stored, the inventory is
+    recomputed from its trades (`Store::net_positions`) and the first quote after a restart replaces whatever ladder
+    survived.
+  - **Registered lazily**, at its first quote, so an exchange without liquidity has no extra participant.
+  - **Floating-point tolerance.** `10000 × 1.003` is `10029.999999999998` in floating point. Without a tolerance a
+    short provider's bid came out one tick low; the test for SR-8 caught it.
+- **Deviation:** SR-9 (the stale and closed-market policy) is part of 6.9, as planned. Here the ladder is pulled only
+  for mode off, disabled trading or a missing reference price.
+- **Mutation checks**, each made a test fail: the provider's order events published; the inventory sign flipped; the
+  re-quote threshold ignored; the refill delay ignored; a disabled instrument still quoted; the inventory not
+  recovered; no maintenance after a client order; no inventory limit. Two first survived and exposed gaps in the
+  tests. Every test had the provider selling, so a new test has clients selling to it. The "disabled" case also
+  cleared the settings, so the ladder was pulled for `mode: off`; it now disables only, and asserts that no
+  provider order is refused one by one.
+
+**6.8 — market-data snapshot and stream ✅ done (2026-10-19)**
+- **Delivered:**
+  - `src/market_data`: per instrument `State` (what was last published, the last trade, the session volume, prints
+    not yet published) and `State::publish`, which diffs the current top of book and reference price against what
+    was last published and returns the messages: prints first, then `quote`, then `reference`, each with the next
+    `mdSequence`. Each message is serialized once and shared by every subscriber (`Arc<Message>`).
+  - In the exchange: `publish_market_data` after every order and cancellation (after the provider's re-quote), after
+    instrument listings and changes, and on every tick; prints recorded in `commit_and_apply`. `Exchange::market_data`
+    builds the snapshot, publishing pending changes first so its `mdSequence` lines up with the stream. At startup
+    `load_market_data` rebuilds each instrument's last trade and its volume on the current business date from the
+    executions table (`Store::trade_summary`).
+  - `GET /api/marketdata[/{id}]` returns the full snapshot (reference with `stale`, `bestBid`/`bestAsk` with
+    quantity, `lastTrade`, `sessionVolume`, `mdSequence`). `GET /api/marketdata/stream?instruments=` serves server-sent
+    events (`event:` kind, `id:` `mdSequence`, `data:` JSON) from a tokio broadcast channel, filtered and conflated
+    per subscriber; `400` for an unknown instrument or query field.
+  - `market_data:` in the configuration: `conflation_interval_ms` (default 0, off) and `stream_buffer` (default 1024).
+    Metrics: `exchange_market_data_messages_total{kind}`, `_catch_ups_total`, `_streams_closed_total`.
+  - `Reference` gains `stale`, always `false` until a live source can be stale (6.9).
+  - `openapi.yaml` (the stream operation; `MarketData` completed; `MarketDataQuote`, `MarketDataTrade`,
+    `MarketDataReference` for the event bodies), the README, the configuration guide, `config/default.yaml`.
+  - Tests: `tests/market_data.rs` (8), one in `tests/recovery.rs` (a failed group commit). `tests/openapi.rs`
+    exercises the stream and validates every event's `data` against its kind's schema; `tests/price_sources.rs`
+    asserts the full snapshot.
+- **Decisions:**
+  - **Published at command boundaries, as a diff against what was last published.** Not from individual book
+    updates, so a half-replaced ladder or a partly matched order never reaches the feed, and a command that leaves
+    the top of book unchanged sends no `quote`. On a frozen clock the feed depends only on the commands.
+  - **Nothing is published before it is durable.** Inside a commit group (the dispatcher's normal path) the touched
+    instruments are noted and published after `commit_group`. A failed commit reloads the books and rebuilds the last
+    trade and volume from storage, so the group's trades never reach the feed or the snapshot. A subscriber sees the
+    group's net change: its prints, then one quote.
+  - **`mdSequence` is per instrument and in memory.** The feed is not durable, so it starts again from 0 with the
+    service; a subscriber resynchronises from the snapshot. The last trade and session volume do survive, rebuilt
+    from executions.
+  - **The session is the business date** of the business-day calendar (`clearing.cutoff`, 6.5), so `sessionVolume`
+    resets at the same cutoff that issues `BusinessDayClosed`.
+  - **Slow subscribers:** the plan row's "conflated harder, then closed" is a two-stage rule. More than half of
+    `stream_buffer` behind, the backlog collapses at once to the latest message per instrument and kind; a whole
+    buffer behind (the broadcast channel's lag), the stream is closed. The exchange thread's `send` never waits.
+  - **Trades conflate too** (latest print per interval). The plan said "conflated per instrument and kind"; prints
+    left out stay in `/api/trades` and the event log.
+  - **Message bodies are built with `serde_json::json!`** in `src/market_data` rather than `Serialize` structs in
+    `api::model`, because the same body is shared by the snapshot and the stream and serialized once per message.
+    `MarketDataView` in `api::model` is gone.
+  - Conflation defaults to off, so tests and scenarios see every message; a browser client sets 100–500 ms.
+- **Mutation checks**, each made a test fail: the quote republished unchanged; prints never published; no publish
+  after a cancellation; the session volume never reset; market data not rebuilt at startup; the instrument filter
+  ignored; no catch-up; a lagging subscriber not closed; conflation ignored; no publish on the tick; the snapshot not
+  publishing pending changes first; publishing inside an open group; a rolled-back trade kept as the last trade.
+  Three first survived and exposed gaps:
+  - The cancellation test ran with background ticks, which publish every instrument every 250 ms and covered for
+    the missing publish. It now runs without ticks.
+  - No test read the snapshot while a change was still unpublished. A new one moves a synthetic walk with no tick
+    running.
+  - Reviewing the group path showed the feed published before `commit_group`, so a failed commit's trades would
+    have been streamed. Fixed as above, with a test and two more mutations.
+
+**6.9 — Finnhub source, stale policy ✅ done (2026-10-19)**
+- **Delivered:**
+  - `src/pricing/finnhub`: the feed task. It connects to the trades websocket (`{ws_url}/?token=`), subscribes and
+    unsubscribes as the wanted symbols change, seeds every newly subscribed symbol from the REST quote endpoint
+    (`X-Finnhub-Token` header), and refreshes any symbol quiet for `refresh_after_ms`. A batch of trades gives each
+    symbol its latest trade. It reconnects with exponential backoff, each wait a random 50–100 % of the
+    step, resetting after a connection that lasted, and subscribes everything again. REST calls are limited per
+    sliding minute; HTTP 429, an unknown symbol (`c: 0`) and other failures are logged and counted, never fatal.
+    `ApiKey` has a redacted `Debug` and scrubs the key from every logged error.
+  - `PriceSourceKind::Finnhub`. The symbol is `referenceSymbol`, else `symbol`. `LiveFeed` is shared with the
+    exchange: the latest price per symbol behind a mutex, plus the wanted set, which `PriceSources` keeps equal to
+    the running live sources' symbols. The exchange adopts a new price at most `max_updates_per_second` times per
+    instrument (the latest wins), rounds it to the tick, and marks the reference stale when nothing has arrived for
+    `stale_after_ms` of real time. `sourceTimestamp` is the provider's.
+  - SR-9: liquidity settings `stalePolicy` (`keep`, `widen`, `pull`; default `pull`) and `staleWidenFactor` (1–100,
+    default 2). A change in staleness is a reason to re-quote. The snapshot's new `liquidity` field (`off`,
+    `no-reference`, `quoting`, `kept`, `widened`, `pulled`) shows what the provider did when it last quoted.
+  - Changing `referenceSymbol` restarts a live source (only a live one; a synthetic walk keeps its path).
+  - `price_sources.finnhub` in the configuration; the feed runs only with a key (`api_key_file`, else
+    `FINNHUB_API_KEY`). Metrics:
+    `exchange_price_feed_connected`, `_reconnects_total`, `_updates_total{via}`, `_rest_calls_total{outcome}`.
+  - New dependency `tokio-tungstenite` 0.30.0 (2026-07-11), with `rustls-tls-webpki-roots`. The service's normal
+    dependencies enable only rustls's aws-lc backend, so `wss://` needs no explicit crypto provider.
+  - `openapi.yaml`, the README (Finnhub live prices, stale policy), the configuration guide, `config/default.yaml`.
+  - Tests: `tests/finnhub.rs` (8) against a local websocket and REST mock that checks the key as Finnhub does
+    (D19), unit tests in `src/pricing/finnhub` (2). `tests/openapi.rs` now sends every liquidity field.
+- **Decisions:**
+  - **Free-tier limits** checked on 2026-10-19 against Finnhub's pricing page (D19): 60 REST calls a minute and 50
+    websocket symbols, plus a 30 calls/second cap on all plans. They are the defaults for `rest_calls_per_minute`
+    and `max_symbols`. The free tier is for personal, non-commercial use; the README and configuration guide say so.
+  - **Staleness measures the source, not the market.** It is real time since anything arrived, websocket or REST.
+    In a closed market the REST refresh keeps a price fresh while its `sourceTimestamp` stays at the last trade, so
+    `stale_after_ms` must be longer than `refresh_after_ms` (checked at startup).
+  - **Detectable limits are refused.** Exceeding `max_symbols`, or a `finnhub` source without a key, is a startup
+    error for a declared instrument and a `400` from the API. Two instruments may share a symbol. The REST rate is
+    only known at run time: skipped, logged, counted.
+  - **The exchange never waits on the feed.** It reads the shared latest price on its own schedule, as for synthetic
+    prices, so conflation and staleness are decided on the exchange thread.
+  - **The key arrives as `FINNHUB_API_KEY`** (user decision, 2026-10-19): both `compose.yaml` and
+    `examples/compose/compose.yaml` pass it through from the host's environment, empty when unset, which reads as
+    no key. `api_key_file` stays as the alternative and wins when set. The environment lookup is a parameter of
+    `FinnhubConfig::live_with`, so a unit test covers it without touching the process environment.
+  - **`stalePolicy` defaults to `pull`**, the conservative choice: no quotes around a price nobody can vouch for.
+  - **`liquidity` in the market data is recorded when the provider quotes**, not computed when the snapshot is read.
+    Computing it showed `quoting` before the ladder was in the book; the tests caught that.
+- **Changes outside the step:**
+  - `openapi.yaml` declared the liquidity `mode` as `enum: [on, off]`, which YAML reads as booleans, so a client
+    validating against the document would refuse `"mode": "on"`. Quoted, and the contract test now sends liquidity.
+  - The dispatcher test `queue_wait_and_acknowledgement_latency_are_measured_from_enqueueing` asserted
+    `ack >= wait + duration`. It failed twice in this step's runs: the caller records the acknowledgement once the
+    reply wakes it, while the exchange thread records the duration after sending it. It now asserts `ack >= wait`.
+- **Mutation checks**, each made a test fail: conflation ignored; never stale; no REST seed for a new subscription;
+  no refresh of quiet symbols; no REST rate limit; REST without the key header; unwanted symbols recorded; the key
+  not redacted; the symbol limit unchecked; `stale_after_ms` not checked against `refresh_after_ms`; a new
+  `referenceSymbol` not restarting the source; `widen` ignored; `pull` ignored; a change in staleness not causing a
+  re-quote; the provider's state not recorded at its quote; the liquidity `mode` enum unquoted again. Four first
+  survived and exposed gaps:
+  - The mock accepted any token. It now checks the key as Finnhub does (401, or a refused handshake).
+  - The quiet-symbol check fires at once on connect and seeded every symbol, so the explicit seed was never tested.
+    It matters for a symbol added later; the `referenceSymbol` test now runs with a 15 s check interval.
+  - No test changed the REST quote under a silent websocket (a closed market). One does now.
+  - With ticks running, the next tick recorded the provider's state anyway. A test without ticks reads the snapshot
+    right after the first quote.
+- **Not done here:** manual acceptance of SR-2 against the real Finnhub needs a key from the user (D19).
+
+**6.9a — trade and settlement dates on executions ✅ done (2026-10-19)**
+- **Delivered:**
+  - `Execution` carries `trade_date` and `intended_settlement_date`. `settlement::TradeDating` (the business-day
+    calendar and the settlement cycles) dates a command once; `MatchContext::dates` hands the result to the book,
+    which stamps every fill. Stored with the execution (migration 018).
+  - `tradeDate` and `intendedSettlementDate` on `TradeExecuted`, on both fill events (the maker's carries its
+    `executionId`; the taker's the dates its executions share), on `Trade` (`GET /api/trades` and the order result).
+  - The settlement simulator and the clearinghouse take the dates from the `TradeExecuted` payload
+    (`TradeFacts::dates`) instead of computing their own. Only trades from before this step, whose events lack the
+    dates, are still dated the old way.
+  - At startup, executions without dates (stored before migration 018) are dated on the current calendar.
+  - `openapi.yaml` (`TradeDate`, `IntendedSettlementDate`, required on `Trade`, `TradeExecuted` and the fill events),
+    the README (Trade dates), the back-office guide.
+  - Tests: `tests/trade_dates.rs` (4): SR-29's three acceptance cases, the two dates equal on `TradeExecuted`, both
+    fill events, `GET /api/trades`, the order result, `SettlementPending` and both clearing statement lines; without
+    clearing, in external and simulated mode, with a T+2 market; a changed cycle dating new trades only; the startup
+    backfill. `tests/events.rs` asserts the
+    payloads.
+- **Decisions:**
+  - **Stored, not computed on read.** A trade's dates must not move when the cutoff or a cycle is changed later; the
+    settlement instructions already store theirs. A configuration change dates new trades only.
+  - **Without clearing, settlement now dates by the business-day calendar too.** Before, the simulator used the UTC
+    date of execution when clearing was off. SR-29 says the business-day rule does not depend on `clearing.enabled`,
+    so a trade after the cutoff now belongs to the next business day in every configuration.
+  - **The taker's fill event carries the dates** although it names no `executionId`: all executions of one command
+    share them, being dated at one instant on one instrument.
+  - **`schemaVersion` stays 1:** additive fields, as for `referenceSymbol` and `liquidity` before.
+- **Note:** the requirement text reached this branch inside commit 3427344 (ports and with-your-app), committed by
+  mistake with that work; its content is unchanged.
+- **Mutation checks**, each made a test fail: the book ignoring the context's dates; dating ignoring the calendar;
+  dating ignoring the market cycle; the service giving no calendar; the settlement simulator ignoring the execution's
+  dates; fill events without dates; the taker's fill without dates; the settlement date stored as the trade date; no
+  backfill at startup; the clearinghouse ignoring the execution's dates. Two first survived and exposed gaps. Settlement
+  ignoring the dates was hidden by clearing, whose calendar gave the old path the same answer; a test now runs the
+  simulator without clearing. Clearing ignoring the dates gives the same answer under one configuration;
+  `a_changed_cycle_dates_new_trades_only` moves a market from T+1 to T+2 between a trade and its statement.
+
+**6.10 — trading sessions, time in force ✅ done (2026-10-20)**
+- **Delivered:**
+  - `sessions:` in the configuration: per MIC, `open` and `close` local time in a `time_zone`, on weekdays
+    (`simulator_kit::calendar::DailySession`, daylight saving followed). `src/sessions::TradingSessions` answers
+    whether a market is open and when a `DAY` order accepted at a given instant expires.
+  - Outside the session a client order is recorded as `REJECTED` with `MARKET_CLOSED` (`MatchContext::market_closed`,
+    like `INSTRUMENT_DISABLED`); cancellations keep working; the liquidity provider's own orders are exempt.
+  - `timeInForce` (`DAY`, `GTC`, `IOC`) on orders: request, `Order`, order event payloads, stored (migration 019).
+    Left out, `DAY` on a market with a session and `GTC` otherwise; a market order is always `IOC` (`DAY` or `GTC` on
+    one is a `400`). An `IOC` remainder is cancelled with `IOC_REMAINDER`.
+  - `DAY` expiry: a schedule of resting `DAY` orders by expiry instant, run by the tick in time order with
+    settlement, business-day closes (before them) and clearing. Each expiry is its own commit, status `EXPIRED`
+    (remainder kept), `OrderExpired` stamped at the close. Rebuilt from the stored orders at recovery and after a
+    failed group commit; an entry whose order is gone by then is dropped.
+  - SR-9's closed-market half: liquidity settings `closedPolicy` and `closedWidenFactor` (default `pull`, 2), taking
+    precedence over the stale policy; opening and closing are reasons to re-quote. The snapshot gains `session`.
+  - The shared migration runner accepts `-- foreign_keys: off` migrations (SQLite's table-rebuild procedure),
+    checked with `PRAGMA foreign_key_check` before commit. Migration 019 uses it to widen the orders table's status
+    CHECK.
+  - `openapi.yaml` (`TimeInForce`, `OrderExpired`, the new reasons and status, `session`, the closed policy), the
+    README (Trading sessions and time in force), the configuration guide, `config/default.yaml`.
+  - Tests: `tests/sessions.rs` (5), the contract test (a `DAY` order expiring at the cutoff, `IOC`, a refused market
+    `GTC`), unit tests for `DailySession`, `TradingSessions`, the runner (3) and the 019 upgrade.
+- **Decisions:**
+  - **A market without a session is always open**, and an instrument without a MIC too: existing setups are
+    unchanged, and `GTC` stays their default.
+  - **`DAY` on a market without a session ends with the business day** (`clearing.cutoff`), so `DAY` means "this
+    trading day" everywhere instead of being refused or silently `GTC`.
+  - **Market orders are always `IOC`**; they never rested, and a `DAY` or `GTC` market order is refused rather than
+    reinterpreted.
+  - **`EXPIRED` is its own status**, as FIX `OrdStatus=C`, not a cancellation, which needed the table rebuild and so
+    the runner change.
+  - **The provider is not a client**: its orders bypass `MARKET_CLOSED`, so `widen` and `keep` work outside the
+    session. A closed market takes precedence over a stale price.
+  - **No session events**: the snapshot's `session` shows the state, and `OrderExpired` and the provider's re-quote
+    mark the close. Holidays, half days and auctions are not modelled.
+- **Mutation checks**, each made a test fail (all 16 on the first run): the market never closed; the provider not
+  exempt; an `IOC` order resting; an `IOC` remainder reported as `MARKET_REMAINDER`; `DAY` not the default with a
+  session; a market order taking any time in force; no expiry scheduled on submission; expiries not rebuilt at
+  recovery; an expiry stamped when the clock move ran instead of at the close; expiries after the business day
+  closes; the closed policy ignored; a close not causing a re-quote; sessions on weekends; `close_after` not strictly
+  after; `DAY` never ending without a session; the snapshot always `open`.
+
+**6.11 — `ClosingPriceIssued` ✅ done (2026-10-20)**
+- **Delivered:**
+  - At each business day's cutoff, in the same commit as `BusinessDayClosed` and right after it, one
+    `ClosingPriceIssued` per instrument in ID order: `instrumentId`, `businessDate`, `closingPrice`,
+    `closingPriceTicks`, `currency`, `basis` (`LAST_TRADE` or `REFERENCE`), `volume`. Aggregate the instrument,
+    correlation the business date, `occurredAt` the cutoff. Exactly once with the business-day cursor.
+  - `Store::day_trading`: per instrument, the last trade and the volume in the day's window.
+  - `PriceSources::reference_at`: a reference price as of a past instant without moving the source; a synthetic walk
+    already beyond it is replayed from its start in a copy.
+  - `openapi.yaml` (the event and its schema), the README (Business days), the back-office guide.
+  - Tests: `tests/closing_prices.rs` (2): both bases, the day's window (a trade after the cutoff counts the next
+    day), order after `BusinessDayClosed`, exactly once across a restart; two seeded runs over three days with
+    synthetic prices and the liquidity provider giving a byte-identical event log (SR-3's acceptance, closing prices
+    included). A unit test for `reference_at`.
+- **Decisions:**
+  - **One per instrument that traded or has a reference price**, not only per traded instrument: the plan row says
+    "per traded instrument" but also gives the reference price as the fallback, which only an untraded instrument
+    needs. A portfolio can then be valued on a quiet day. An instrument with neither gets none, rather than carrying
+    an old trade forward under a basis the requirement does not name.
+  - **The reference price is read as of the cutoff.** A synthetic walk only steps forward, so a read on a running
+    clock between the cutoff and the tick that handles it would otherwise move the closing price.
+- **Mutation checks**, each made a test fail (all 6 on the first run): no closing prices; closing prices before
+  `BusinessDayClosed`; trades ignored (always the reference); the window starting at the beginning of time; the first
+  trade instead of the last; the reference read from the current walk. The last is caught by the unit test only: the
+  race it guards against (a read on a running clock between the cutoff and its tick) cannot be staged reliably in an
+  integration test, since a frozen clock's moves tick in the same command.
+
+**6.12 — liquidity runtime control ✅ done (2026-10-20)**
+- **Delivered:**
+  - `GET /api/liquidity[/{instrumentId}]` (`src/api/liquidity.rs`): per instrument the provider's participant, its
+    resolved settings and the instrument's own, its state, inventory, the reference it quoted around, its ladder (best
+    first), the price source, the reference price with source and staleness, and the session.
+  - `PATCH /api/liquidity/{instrumentId}`: settings field by field (`LiquiditySpec::patched`; `null` clears a field)
+    and optionally `priceSource`. Merged on the exchange thread (`Exchange::patch_liquidity`), then applied through
+    `update_instrument`, so it is stored, published as `InstrumentUpdated`, and re-quoted at once.
+  - Scenario step `set_liquidity` and expectation target `liquidity`; `scenarios/liquidity-control.yaml` drains the
+    ladder with a market order larger than it, refills it, widens the spread, switches the provider off and on, and
+    moves the instrument from a fixed to a synthetic price.
+  - `openapi.yaml` (`LiquidityStatus`, `LiquidityPatch`), the README, the scenario step table.
+  - Tests: `tests/liquidity_control.rs` (4), the contract test (all three operations), the scenario through
+    `tests/scenarios.rs`.
+- **Decisions:**
+  - **Field-by-field merge on its own endpoint**, unlike `PATCH /api/instruments`, which replaces `liquidity` as a
+    whole: a scenario "widens the spread" without restating every other setting.
+  - **Merged on the exchange thread**, so concurrent patches never lose each other's fields.
+  - **A declared instrument gets its configuration back at the next start**, as every declared field does (6.1);
+    runtime control is for the running service.
+- **Fixed on the way:** a settings change alone did not re-quote the ladder. `requote` only re-quoted on a reference
+  move, a refill, or a change in staleness or session, so a new `spreadBps` waited for the price to move. The
+  provider now remembers the settings it quoted with, and a change re-quotes at once. The 6.7 tests did not see it:
+  their settings changes also pulled the ladder.
+- **Mutation checks**, each made a test fail: a settings change not re-quoting; a patch replacing instead of merging;
+  an empty patch accepted; the price source ignored; the inventory shown as 0; bids worst first; no reference shown;
+  the own settings shown as the resolved ones. (One first did not compile and was rewritten.)
+
+**6.13 — replay source and recorder ✅ done (2026-10-20)**
+- **Delivered:**
+  - `src/pricing/replay`: `Replay` loads a file of `(timestamp, referenceSymbol, price, volume)` rows, CSV (`.csv`,
+    header required) or JSON lines, with errors naming the line; `price_at(symbol, elapsed)` is the symbol's last row
+    by then, `None` before its first, looping with a gap when asked. `Recorder` appends rows on its own thread.
+  - Price source kind `replay`: the instrument plays its `referenceSymbol` (else `symbol`) from when its source
+    starts; `sourceTimestamp` is when the row played. Refused without a file or without rows for the symbol.
+  - `price_sources.replay` (`file`, `loop`, `loop_gap_ms`) and `price_sources.finnhub.record_to`: every adopted live
+    price (after conflation, only on the exchange's own reads, never on `reference_at` copies) is recorded with the
+    exchange's time and the trade's volume (now kept on `LivePrice`).
+  - `recordings/` and `*.recording.{csv,jsonl}` are gitignored.
+  - `openapi.yaml` (the kind), the README (Replay, Recording), the configuration guide, `config/default.yaml`.
+  - Tests: `tests/replay.rs` (5): the clock anchor and a symbol before its first row, looping, SR-4's acceptance (at
+    speed 60 the prices seen follow the recorded path; replaying a session with the provider and client orders twice
+    gives a byte-identical event log, closing prices included), and the refusals. `tests/finnhub.rs` records a
+    session from the mock and replays its path. Unit tests in `src/pricing/replay` (4).
+- **Decisions:**
+  - **Anchored where the source starts**, which is the clock's start for instruments listed at startup (SR-4's
+    wording); a switch to `replay` mid-run then starts at the file's first row instead of somewhere inside it.
+  - **`sourceTimestamp` is when the row played** on the exchange's clock, not the recorded time: a looping replay
+    would otherwise go back in time.
+  - **The recorder stamps the exchange's time** of adoption, so a recording replays the path the exchange actually
+    used, conflation included.
+  - **One file for all replayed instruments**, chosen by symbol, as recordings hold every symbol of a session.
+- **Mutation checks**, each made a test fail (all 7 on the first run): the replay ignoring the clock; no loop; nothing
+  recorded; any symbol accepted; `sourceTimestamp` fixed at the start; a row playing just after its time; no CSV
+  header check.
+
+**6.14 — market-data metrics, load profile with the provider ✅ done (2026-10-20)**
+- **Delivered:**
+  - **SR-15, per instrument** (label `instrument`): `exchange_reference_updates_total` (each new reference price
+    published), `exchange_reference_stale` (1 while stale) and `exchange_reference_age_seconds` (simulated time
+    since `sourceTimestamp`, as of the last publication); `exchange_market_data_messages_total` gains `instrument`;
+    new `exchange_market_data_subscribers`, `exchange_market_data_sent_total{instrument,kind}` and
+    `exchange_market_data_conflated_total{instrument,kind}`; `exchange_market_data_streams_closed_total` gains
+    `instrument`. Every series now has a `# HELP` line, the provider's and the feed's included.
+  - **Source health** was already there from 6.9 (`exchange_price_feed_connected`, `…_reconnects_total`,
+    `…_updates_total{via}`, `…_rest_calls_total{outcome}`); rate-limit hits are the `rate_limited` (own limit) and
+    `throttled` (HTTP 429) outcomes, now documented as such.
+  - **SR-20:** `bench provider` runs the open loop at each `--rates` rate twice on the same workload: without, then
+    with the provider quoting ACME around a generated, seeded replay file (a row every 100 ms, looping). The provider
+    rows add its reference moves, re-quotes, orders placed and fills. Results in `bench/README.md` (two runs at
+    1,000/2,000/4,000 orders/s, VM disk): about 40–50 µs more exchange-thread time per order; invisible in the ack up
+    to 2,000/s; at 4,000/s client p50 +0.3–0.6 ms and p99 +2.5–5 ms, no refusals.
+  - The README's `GET /metrics` list (now complete), alerts in `docs/operations.md`, `docs/benchmarking.md`.
+  - Tests: `tests/market_data.rs` (3 new): subscribers per instrument and under each instrument of a multi-instrument
+    stream, released on close; published, sent and conflated counts; a stream closed for falling behind; reference
+    updates (a fixed price is one update), staleness and age. `tests/finnhub.rs`: the stale gauge goes to 1 and back,
+    and updates count prices, not staleness changes.
+- **Decisions:**
+  - **Streams are labelled by the instruments they asked for**, `all` without a filter, and a multi-instrument
+    stream counts under each, so a per-instrument dashboard sees every stream that carries the instrument. Summing
+    over labels therefore overcounts streams; the README says so.
+  - **"Reference updates" are new prices**, not every `reference` message: a change in staleness is visible on the
+    stale gauge instead.
+  - **Conflation is counted where it happens, in the subscriber,** so a subscriber that reads nothing has skipped
+    nothing yet; its backlog is in the channel, and is either collapsed (counted) or closes the stream (counted).
+  - **The bench stresses re-quoting** (re-quote on every tick of movement, refill at once) rather than modelling a
+    quiet market, so the figure is an upper bound for these settings. Re-quotes come mostly from refills after fills
+    (about 0.2 per client order), not from reference moves.
+- **Mutation checks**, each made a test fail (all 9): every publication counted as an update; staleness never set;
+  age always 0; a subscriber never released; subscribers always under `all`; conflated messages not counted as sent;
+  every conflation counted, replacement or not; closed streams not labelled per instrument; published messages
+  without the instrument label. (One mutation's pattern first missed after formatting and was rerun.)
+
+### Milestone 6 status
+
+All steps of the milestone are done (6.1–6.14 with 6.9a, 2026-10-18 to 2026-10-20). Not planned: SR-18 (FX, LATER).
+Still on hold from Milestone 4: 4.6d (the containerized benchmark).
+
+**SR-2 manual acceptance against the real Finnhub ✅ done (2026-10-20, D19).** `config/finnhub-market.yaml` (40
+symbols), the key from `api_key_file` (outside the repository), the provider on with `stale_policy: pull`, at 07:30
+New York time (US market closed, crypto trading). Within a minute: connected, all 40 instruments priced and none
+stale, the provider quoting every one; the crypto pairs and pre-market MSFT followed the websocket (457 websocket
+updates, BTCUSD 63 reference moves in a minute), the other stocks were seeded over REST with the previous close (77
+REST calls, all `ok`, within 60 a minute). A client market order on BTCUSD filled against the provider. The key
+appeared in no answer (`/api/marketdata`, `/api/instruments`, `/api/liquidity`, `/metrics`, `/health`) and not in the
+log. Reconnects and staleness were not staged against the real service; the mock tests cover them.
+
 ## Beyond the milestones
+
+**Running with an app in another project ✅ done (2026-10-19, requested by the user)**
+- **User decision:** the other project uses images built on the same machine, referred to by tag.
+- `scripts/build-images.sh` (workspace root) builds `exchange-simulator:<TAG>` and `payment-gateway:<TAG>` (default
+  `dev`), both or one, from the workspace root.
+- `examples/with-your-app`: both services from local images (`pull_policy: never`) next to a stand-in app (the
+  sample receiver), with configs: a virtual clock in real time with operator control, three synthetic instruments
+  quoted by the liquidity provider, simulated settlement and clearing, the gateway following the exchange's clock,
+  both delivering signed webhooks to `app`. `EXCHANGE_PORT`, `GATEWAY_PORT`, `APP_PORT`, `EXCHANGE_IMAGE`,
+  `GATEWAY_IMAGE` override.
+- `docs/running-with-your-app.md`: build, try, move into your project (or keep a separate project on a shared
+  network), secrets, clocks, ports. Linked from the guide index, getting started and the gateway README.
+- **Checks:** both example configs parse in unit tests (one per crate); the e2e test
+  `the_with_your_app_example_runs_from_local_images` brings it up healthy, trades against the provider, sees signed
+  deliveries from both services, and freezes the clocks together. The script was run for real.
+- **Found on the way:** the build script's image summary filtered on leading spaces that `docker image ls` strips;
+  fixed with reference filters. A follower clock freezes up to one poll interval ahead of the exchange, since it
+  never runs backwards (by design since 5.4b); the guide says so, and the test allows it.
+
+**Configurable ports in containers ✅ done (2026-10-19, requested by the user)**
+- `compose.yaml` maps `${EXCHANGE_PORT:-8080}:8080`, like the example Compose files (which already took
+  `EXCHANGE_PORT` and `GATEWAY_PORT`).
+- Both images' health checks read the port from `EXCHANGE__SERVER__BIND` / `GATEWAY__SERVER__BIND` (falling back to
+  8080 / 8081), so overriding the bind inside the container no longer leaves the container unhealthy. Checked under
+  the image's `dash` for an unset, an IPv4 and an IPv6 bind, and on the rebuilt image with the bind moved to 9090.
+- The payment gateway's `GATEWAY_CONFIG` now treats empty as unset, as `EXCHANGE_CONFIG` does.
+
+**Finnhub market file ✅ done (2026-10-19, requested by the user)**
+- **Delivered:** `config/finnhub-market.yaml`, a configuration file for `EXCHANGE_CONFIG`: 40 instruments on
+  `price_sources.default.kind: finnhub`. 37 are large US stocks and ETFs (19 on XNAS, 17 on XNYS, SPY on ARCX); 3
+  are Binance crypto pairs (`BINANCE:BTCUSDT`, `ETHUSDT`, `SOLUSDT` as `reference_symbol`, listed in USD) that trade
+  around the clock. 40 symbols stay within the free tier's 50. The liquidity provider is left off, with a commented
+  block to turn it on. The image ships the file at `/etc/exchange/finnhub-market.yaml`, and `compose.yaml` passes
+  `EXCHANGE_CONFIG` through.
+- **Change:** an empty `EXCHANGE_CONFIG` now counts as unset (Compose passes an unset variable as empty); before,
+  the service tried to open a file named `""`.
+- **Checks:** a unit test loads the file over the defaults (40 instruments, each valid under the strict identifier
+  policy, no symbol twice, within `max_symbols`); `tests/finnhub.rs` starts the service with it against the mock and
+  sees every symbol subscribed. The image itself was not rebuilt.
+- **Choices:** no ISINs (optional, and a wrong one would pass the check digit unnoticed); Walmart left out because
+  its listing moved between exchanges recently; BRK.B left out over its dotted symbol.
 
 **OpenAPI specifications ✅ done (2026-10-17, requested by the user)**
 - **Delivered:** `exchange-simulator/openapi.yaml` and `payment-gateway/openapi.yaml`, OpenAPI 3.1, written by hand,
@@ -1594,6 +2269,7 @@ below. Still on hold from Milestone 4: 4.6d (the containerized benchmark), until
    containerized benchmark) is on hold until the user asks for it.
 6. Milestone 5: 5.1 and 5.2 when the front-office demo needs short settlement cycles; 5.3–5.5 with the demo's
    back-office features.
+7. Milestone 6, in the trading demo's phase order (6.1–6.14).
 
 ## Decisions
 
@@ -1634,7 +2310,7 @@ Settled on 2026-10-17 (Milestone 5, second round):
 - **D9 — how demo accounts map to exchange participants:** the simulator stays agnostic. Statements (5.3) are per
   participant, and the demo may map one participant per client account now and a firm clearing member later. The
   demo's domain must not assume a participant ID is an account ID.
-- **D11 — controlling clock speed at runtime:** through the test-control API only (`/test/clock`). A showcase
+- **D11 — controlling clock speed at runtime:** superseded by D17 (2026-10-18). Was: through the test-control API only (`/test/clock`). A showcase
   deployment sets `clock.speed` in its configuration instead of exposing a control switch.
 - **D12 — per-market settlement cycles:** a table per MIC in configuration (`settlement.market_settlement_days`), no
   instrument field. Cycles are set per market in reality, and instrument payloads stay unchanged.
@@ -1658,3 +2334,19 @@ Settled on 2026-10-17 (5.4b, the payment gateway):
   services through Compose.
 - **D16 — statement breaks:** opt-in and seeded, in the clearing style: a movement left out, an amount off by one minor
   unit, a movement that never happened, a statement issued late; listed under `/test`.
+
+Settled on 2026-10-18 (Milestone 6, accepted as proposed):
+- **D17 — clock control outside test control (supersedes D11):** SR-24 asks a showcase deployment to change speed
+  without exposing reset and fault injection, which D11 cannot give. `GET /api/clock` is always mounted;
+  speed, freeze and resume are also under `/api/clock`, behind a separate `clock.operator_control` switch (default
+  off); `set`, `advance` and `reset` stay test-only. The `/test/clock` routes stay as they are.
+- **D18 — the provider's orders and recovery:** with `emit_order_events` off, the provider's orders are not in the
+  event log, so a restart cannot restore its ladder. After recovery or reset the provider re-quotes from the
+  current reference price, with its inventory recomputed from its trades. Re-quoting is a pure function of the
+  reference price, inventory and settings, so seeded runs stay reproducible (D6).
+- **D19 — Finnhub access:** automated tests use a local mock of the websocket and REST endpoints only. Manual
+  acceptance of SR-2 needs a key from the user, and the free-tier limits must be checked against Finnhub's current
+  terms before the defaults are set.
+- **D20 — forcing a payment outcome:** `POST /test/payments/{id}/outcome` rather than a test-only header on
+  `POST /api/payments`, so the payment API and its OpenAPI description carry nothing test-only, and a test can force
+  the outcome of a payment it did not create.

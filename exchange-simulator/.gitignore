@@ -1,2 +1,6 @@
 # Local runs keep the SQLite database here (config/default.yaml).
 /data/
+# Recorded live prices (price_sources.finnhub.record_to): vendor data, never committed (SR-4).
+/recordings/
+*.recording.csv
+*.recording.jsonl

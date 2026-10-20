@@ -11,12 +11,19 @@ use crate::events::{EventEnvelope, NewEvent};
 use crate::ids::IdScheme;
 use crate::persistence::sql::{from_sql, json_column, parsed, timestamp, to_sql};
 use crate::webhooks::{
-    DeliveryJob, DeliveryOutcome, DeliveryResult, FaultPolicy, Subscription, SubscriptionSource,
+    DeliveryJob, DeliveryOutcome, DeliveryResult, FaultPolicy, Parties, Subscription,
+    SubscriptionSource,
 };
 
-/// The shared tables as they stand, for a simulator's first migration: `events`, `webhook_subscriptions`,
-/// `webhook_deliveries`, `webhook_attempts` and `virtual_clock`.
+/// The shared tables as they stood when the kit was extracted, for a simulator's first migration: `events`,
+/// `webhook_subscriptions`, `webhook_deliveries`, `webhook_attempts` and `virtual_clock`. Later shared changes are
+/// migrations of their own, run after it: [`PARTICIPANT_FILTER`].
 pub const SCHEMA: &str = include_str!("schema.sql");
+
+/// A migration both services run after [`SCHEMA`]'s tables exist: the subscription's participant filter (JSON array
+/// of participant IDs; NULL receives every event of its types).
+pub const PARTICIPANT_FILTER: &str = "ALTER TABLE webhook_subscriptions ADD COLUMN participants TEXT \
+     CHECK (participants IS NULL OR (json_valid(participants) AND json_type(participants) = 'array'));";
 
 /// A recorded webhook attempt with its delivery's subscription and event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +83,8 @@ pub struct Outbox<'a> {
     pub ids: IdScheme,
     pub due: DateTime<Utc>,
     pub schema_version: u32,
+    /// The participants an event involves, for subscriptions' participant filters (see [`crate::webhooks::WebhookHub::parties`]).
+    pub parties: Option<Parties>,
 }
 
 /// Appends stamped events to the canonical log at their assigned sequences, and queues one pending delivery per event
@@ -112,10 +121,13 @@ pub fn write_events(
             event.payload.to_string(),
             timestamp(event.occurred_at),
         ])?;
+        let parties = outbox
+            .parties
+            .map_or_else(Vec::new, |f| f(event.event_type, &event.payload));
         for subscription in outbox
             .subscriptions
             .iter()
-            .filter(|s| s.wants(event.event_type))
+            .filter(|s| s.wants(event.event_type, &parties))
         {
             insert_delivery.execute(params![
                 outbox
@@ -177,8 +189,8 @@ pub fn insert_subscription(conn: &Connection, subscription: &Subscription) -> ru
     conn
         .prepare_cached(
             "INSERT INTO webhook_subscriptions (id, url, enabled, event_types, created_at, secret, ordered, name, source,
-                                                paused, previous_secret, previous_secret_until, deleted)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                                paused, previous_secret, previous_secret_until, deleted, participants)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )?
         .execute(params![
             subscription.id.to_string(),
@@ -194,6 +206,7 @@ pub fn insert_subscription(conn: &Connection, subscription: &Subscription) -> ru
             subscription.previous_secret.as_ref().map(|(secret, _)| secret),
             subscription.previous_secret.as_ref().map(|(_, until)| timestamp(*until)),
             subscription.deleted,
+            participants_json(subscription),
         ])
         .map(drop)
 }
@@ -201,6 +214,13 @@ pub fn insert_subscription(conn: &Connection, subscription: &Subscription) -> ru
 /// Stores a subscription's url, event types, secrets, ordering, and enabled, paused and deleted flags; false when
 /// there is no such subscription. Its pending deliveries keep their place and go to the new URL; while it is disabled or paused
 /// they wait.
+fn participants_json(subscription: &Subscription) -> Option<String> {
+    subscription
+        .participants
+        .as_ref()
+        .map(|p| serde_json::to_string(p).expect("strings serialize"))
+}
+
 pub fn update_subscription(
     conn: &Connection,
     subscription: &Subscription,
@@ -210,7 +230,7 @@ pub fn update_subscription(
         .prepare_cached(
             "UPDATE webhook_subscriptions SET url = ?2, enabled = ?3, event_types = ?4, secret = ?5, ordered = ?6,
                                              paused = ?7, previous_secret = ?8, previous_secret_until = ?9,
-                                             deleted = ?10
+                                             deleted = ?10, participants = ?11
              WHERE id = ?1",
         )?
         .execute(params![
@@ -224,6 +244,7 @@ pub fn update_subscription(
             subscription.previous_secret.as_ref().map(|(secret, _)| secret),
             subscription.previous_secret.as_ref().map(|(_, until)| timestamp(*until)),
             subscription.deleted,
+            participants_json(subscription),
         ])
         .map(|n| n == 1)
 }
@@ -232,7 +253,7 @@ pub fn subscriptions(conn: &Connection) -> rusqlite::Result<Vec<Subscription>> {
     conn
         .prepare_cached(
             "SELECT id, url, enabled, event_types, created_at, secret, ordered, fault_policy, name, source, paused,
-                    previous_secret, previous_secret_until, deleted
+                    previous_secret, previous_secret_until, deleted, participants
              FROM webhook_subscriptions ORDER BY created_at, id",
         )?
         .query_map([], |row| {
@@ -259,6 +280,7 @@ pub fn subscriptions(conn: &Connection) -> rusqlite::Result<Vec<Subscription>> {
                     None => None,
                 },
                 deleted: row.get(13)?,
+                participants: json_column(row, 14)?,
             })
         })?
         .collect()
@@ -587,26 +609,46 @@ pub fn deliveries(
         .collect()
 }
 
-/// Queues the subscription's events after sequence `after` (of the types it wants) for delivery again, due at
-/// `now`: existing deliveries start over (pending, no attempts, never held), and events from before the
-/// subscription existed get a delivery. Returns how many were queued.
+/// Queues the subscription's events after sequence `after` (of the types it wants, and through its participant
+/// filter) for delivery again, due at `now`: existing deliveries start over (pending, no attempts, never held), and
+/// events from before the subscription existed get a delivery. Returns how many were queued.
 pub fn redeliver(
     conn: &mut Connection,
     subscription: &Subscription,
     after: u64,
     now: DateTime<Utc>,
     ids: &IdScheme,
+    parties: Option<Parties>,
 ) -> rusqlite::Result<usize> {
     let event_types = serde_json::to_string(&subscription.event_types).expect("strings serialize");
     let tx = conn.transaction()?;
     let queued = {
         let sequences = tx
             .prepare_cached(
-                "SELECT sequence FROM events
+                "SELECT sequence, event_type, payload FROM events
                  WHERE sequence > ?1 AND event_type IN (SELECT value FROM json_each(?2))
                  ORDER BY sequence",
             )?
-            .query_map(params![to_sql(after), event_types], |row| from_sql(row, 0))?
+            .query_map(params![to_sql(after), event_types], |row| {
+                Ok((
+                    from_sql(row, 0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .filter_map(|row| match row {
+                Err(error) => Some(Err(error)),
+                Ok((sequence, event_type, payload)) => {
+                    let involved = match (parties, &subscription.participants) {
+                        (Some(parties), Some(_)) => {
+                            let payload = serde_json::from_str(&payload).unwrap_or_default();
+                            subscription.involves(&parties(&event_type, &payload))
+                        }
+                        _ => true,
+                    };
+                    involved.then_some(Ok(sequence))
+                }
+            })
             .collect::<rusqlite::Result<Vec<u64>>>()?;
         let mut upsert = tx.prepare_cached(
             "INSERT INTO webhook_deliveries (id, subscription_id, event_sequence, status, attempts, next_attempt_at)
@@ -706,9 +748,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_schema_creates_the_shared_tables() {
+    fn the_schema_and_later_migrations_create_the_shared_tables() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(PARTICIPANT_FILTER).unwrap();
         let schema = shared_schema(&conn).unwrap();
         assert_eq!(schema.len(), 10, "{schema:#?}");
         assert!(schema.iter().all(|s| !s.contains("--")));

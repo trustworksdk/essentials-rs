@@ -101,6 +101,14 @@ impl VirtualClock {
         self.state.lock().expect("clock lock").running
     }
 
+    /// The reading at the clock's last change and the real time of that change: the exact pair a follower
+    /// extrapolates from. Every change (set, advance, freeze, resume, speed) re-anchors the clock.
+    pub fn anchor(&self) -> (DateTime<Utc>, DateTime<Utc>) {
+        let state = self.state.lock().expect("clock lock");
+        let since = chrono::Duration::from_std(state.anchor.elapsed()).unwrap_or_default();
+        (state.at_anchor, (Utc::now() - since).trunc_subsecs(6))
+    }
+
     /// Simulated seconds per real second while running.
     pub fn speed(&self) -> f64 {
         self.state.lock().expect("clock lock").speed
@@ -198,6 +206,95 @@ impl Clock for VirtualClock {
     }
 }
 
+/// How a simulator tells time, as the clock API shows it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClockState {
+    pub virtual_clock: bool,
+    pub running: bool,
+    /// Simulated seconds per real second while running; 1 for the system clock.
+    pub speed: f64,
+    pub now: DateTime<Utc>,
+}
+
+/// A change to the virtual clock.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ClockChange {
+    Advance(chrono::Duration),
+    Set(DateTime<Utc>),
+    Freeze,
+    Resume,
+    Speed(f64),
+}
+
+impl ClockChange {
+    /// Its name in `ClockChanged`: `advance`, `set`, `freeze`, `resume` or `speed`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Advance(_) => "advance",
+            Self::Set(_) => "set",
+            Self::Freeze => "freeze",
+            Self::Resume => "resume",
+            Self::Speed(_) => "speed",
+        }
+    }
+
+    /// Applies the change to `clock`. Returns whether it changed anything a follower must know: the reading jumped,
+    /// or the clock froze, resumed or changed speed. Freezing a frozen clock, resuming a running one, or setting the
+    /// speed it already has changes nothing.
+    pub fn apply(&self, clock: &VirtualClock) -> Result<bool, ClockError> {
+        let (running, speed) = (clock.is_running(), clock.speed());
+        match *self {
+            Self::Advance(by) => clock.advance(by)?,
+            Self::Set(to) => {
+                let before = clock.now();
+                clock.set(to)?;
+                return Ok(to != before);
+            }
+            Self::Freeze => clock.freeze(),
+            Self::Resume => clock.resume(),
+            Self::Speed(to) => clock.set_speed(to)?,
+        }
+        Ok(matches!(self, Self::Advance(_))
+            || clock.is_running() != running
+            || clock.speed() != speed)
+    }
+}
+
+/// The event every clock change publishes, so a consumer can follow simulated time without polling.
+pub const CLOCK_CHANGED: &str = "ClockChanged";
+
+/// `ClockChanged` for `change` (a [`ClockChange::name`], or `follow` for a follower's correction), just applied to
+/// `clock`: its state after the change, with `now` the reading at the
+/// change and `effectiveAt` the real time of it ([`VirtualClock::anchor`]). A follower computes simulated time as
+/// `now + (real time − effectiveAt) × speed` while `running`. A frozen clock reads `now` whenever it is asked, so
+/// its `effectiveAt` is `null`: real time stays out of the event log of a reproducible run, whose clock is frozen
+/// (decision D6). The aggregate ID is `clock`; `source` is the simulator's own.
+pub fn changed_event(
+    change: &'static str,
+    clock: &VirtualClock,
+    source: &'static str,
+) -> crate::events::NewEvent {
+    let (now, effective_at) = clock.anchor();
+    let running = clock.is_running();
+    crate::events::NewEvent {
+        event_id: uuid::Uuid::nil(),
+        sequence: 0,
+        event_type: CLOCK_CHANGED,
+        source,
+        aggregate_id: "clock".into(),
+        correlation_id: None,
+        occurred_at: now,
+        payload: serde_json::json!({
+            "change": change,
+            "mode": "virtual",
+            "running": running,
+            "speed": clock.speed(),
+            "now": now,
+            "effectiveAt": running.then_some(effective_at),
+        }),
+    }
+}
+
 /// The clock settings (`clock:` in a simulator's configuration).
 #[derive(Clone, Debug, Deserialize)]
 pub struct ClockConfig {
@@ -211,6 +308,28 @@ pub struct ClockConfig {
     /// Virtual clock only: simulated seconds per real second while it runs (1440 makes a day pass in a minute).
     #[serde(default = "real_time")]
     pub speed: f64,
+    /// Mounts speed, freeze and resume under `/api/clock` (decision D17): runtime control for a showcase deployment
+    /// without test control's reset and fault injection. `GET /api/clock` is always mounted.
+    #[serde(default)]
+    pub operator_control: bool,
+    /// `follow` mode only: whose clock to follow.
+    #[serde(default)]
+    pub follow: Option<FollowConfig>,
+}
+
+/// Following another simulator's clock (`clock.mode: follow`): its `GET /api/clock`, polled.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FollowConfig {
+    /// The other simulator's base URL, e.g. `http://exchange:8080`.
+    pub url: String,
+    /// How often to read its clock. The follower lags a change by at most this much real time.
+    #[serde(default = "follow_poll_interval")]
+    pub poll_interval_ms: u64,
+}
+
+fn follow_poll_interval() -> u64 {
+    250
 }
 
 fn real_time() -> f64 {
@@ -222,6 +341,8 @@ fn real_time() -> f64 {
 pub enum ClockMode {
     System,
     Virtual,
+    /// A virtual clock that follows another simulator's (`clock.follow`); only the payment gateway supports it.
+    Follow,
 }
 
 #[cfg(test)]

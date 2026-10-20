@@ -15,7 +15,9 @@ cargo test -p payment-gateway -j 2
 ```
 
 Settings come from `config/default.yaml`, then a YAML file named by `GATEWAY_CONFIG`, then `GATEWAY__*` environment
-variables (`__` between levels, e.g. `GATEWAY__SERVER__BIND=0.0.0.0:8081`).
+variables (`__` between levels, e.g. `GATEWAY__SERVER__BIND=0.0.0.0:8081`). In the image, `GATEWAY__SERVER__BIND`
+sets the port inside the container and its health check follows it; in the back-office example Compose file,
+`GATEWAY_PORT` sets the port on the host.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -28,9 +30,10 @@ variables (`__` between levels, e.g. `GATEWAY__SERVER__BIND=0.0.0.0:8081`).
 | `statement.opening_balances` | `{}` | Balance before the first booking per currency, e.g. `{ DKK: "250000.00" }` |
 | `statement.breaks.*` | all 0 | Seeded reconciliation breaks (see Statements) |
 | `statement.tick_interval_ms` | `250` | How often due transitions and statements are looked for |
-| `webhooks.*` | as in the exchange simulator | Delivery timing and declared subscriptions |
+| `webhooks.*` | as in the exchange simulator | Delivery timing and declared subscriptions; a `participants` filter is refused, since payments have no participants |
 | `ids.mode` / `ids.seed` | `random` / `0` | `deterministic` makes every ID reproducible |
-| `clock.mode`, `start`, `running`, `speed` | `system` | As in the exchange simulator; `speed: 1440` makes a day pass in a minute |
+| `clock.mode`, `start`, `running`, `speed`, `operator_control` | `system` | As in the exchange simulator; `speed: 1440` makes a day pass in a minute. `GET /api/clock` is always mounted, the operator routes and `ClockChanged` too (see the exchange's README, The clock API). `follow` follows the exchange's clock (below) |
+| `clock.follow.url`, `poll_interval_ms` | – / `250` | `follow` mode: the exchange's base URL, and how often its clock is read |
 | `test_control.enabled` | `false` | Mounts `/test`; never in a real deployment |
 | `database.mode`, `path` | `durable`, `data/payment-gateway.db` | `durable`, `fast` or `memory`, as in the exchange simulator |
 
@@ -145,9 +148,37 @@ With `test_control.enabled: true`: `GET /test/clock`, `POST /test/clock/advance`
 routes (`/test/deliveries`, `/test/attempts`, `/test/dead-letters/retry`, `/test/webhooks/{id}/redeliver`,
 `/test/webhooks/{id}/faults`).
 
+**Forcing a payment's outcome** (decision D20): `POST /test/payments/{id}/outcome` with
+`{ "outcome": "COMPLETED" | "FAILED" | "RETURNED", "reason", "returnAfterSeconds", "delaySeconds" }`. The outcome
+replaces the payment's seeded draws and is stored with it, so a test takes the same path every time:
+- `COMPLETED`: completes, and is never returned.
+- `FAILED`: fails with `reason` (default `REFUSED_BY_BANK`).
+- `RETURNED`: completes, and is returned `returnAfterSeconds` later (default a day).
+
+A pending payment takes any outcome, at its scheduled time or `delaySeconds` from now (0 is at once); a completed
+one not yet returned takes only `RETURNED`, due `returnAfterSeconds` from now. A failed or returned payment is
+`409 payment_settled`. Whatever is due at once happens before the answer.
+
+## Following the exchange's clock
+
+`clock.mode: follow` with `clock.follow.url` (the exchange's base URL) makes the gateway's clock follow the
+exchange's: every `clock.follow.poll_interval_ms` (default 250) it reads `GET /api/clock` and takes its reading,
+speed and running state, correcting the reading by half the request's round trip. Then both services agree on the
+date, with no clocks to resume together by hand.
+- **Changes go to the exchange.** The gateway's own clock routes answer `409 clock_follows`.
+- **Lag:** a change reaches the gateway within one poll interval. At 1440x, 250 ms is six simulated minutes.
+- **Never backwards:** when the exchange's clock is behind (it slowed or froze between two reads, or was reset), the
+  gateway holds its reading and logs a warning until the exchange catches up. Reset both services together.
+- **Unreachable exchange:** the clock runs on at its last speed; a warning is logged once, and following resumes
+  when the exchange answers.
+- **Events:** a change of speed or running state, or a jump, publishes `ClockChanged` with `change: follow`.
+
 ## Running it with the exchange
 
-`payment-gateway/Dockerfile` builds the image from the workspace root (`docker build -f payment-gateway/Dockerfile .`).
+`payment-gateway/Dockerfile` builds the image from the workspace root (`docker build -f payment-gateway/Dockerfile .`,
+or `scripts/build-images.sh gateway`). To run both services next to an app in another project, see
+[Running with your app](../exchange-simulator/docs/running-with-your-app.md) and
+[`examples/with-your-app`](../exchange-simulator/examples/with-your-app).
 [`exchange-simulator/examples/back-office`](../exchange-simulator/examples/back-office) runs it with the exchange
 simulator on an accelerated clock, and the
 [back-office chapter](../exchange-simulator/docs/back-office.md) of the exchange simulator's guide describes how a

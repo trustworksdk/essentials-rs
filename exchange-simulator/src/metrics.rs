@@ -36,6 +36,42 @@ pub const EXECUTIONS: &str = "exchange_executions_total";
 pub const TRADED_QUANTITY: &str = "exchange_traded_quantity_total";
 /// Canonical events written. Label: `event_type`.
 pub const EVENTS: &str = "exchange_events_total";
+/// Orders the liquidity provider placed (each level of each ladder), whether or not its order events are published.
+pub const LIQUIDITY_QUOTES: &str = "exchange_liquidity_quotes_total";
+/// Ladders the liquidity provider replaced (or pulled). Label: `instrument`.
+pub const LIQUIDITY_REQUOTES: &str = "exchange_liquidity_requotes_total";
+/// Executions with the liquidity provider on one side. Label: `instrument`.
+pub const LIQUIDITY_FILLS: &str = "exchange_liquidity_fills_total";
+/// Reference price changes the exchange published (a new price, not a change in staleness). Label: `instrument`.
+pub const REFERENCE_UPDATES: &str = "exchange_reference_updates_total";
+/// 1 while an instrument's reference price is stale, else 0. Label: `instrument`.
+pub const REFERENCE_STALE: &str = "exchange_reference_stale";
+/// Simulated seconds since the reference price's `sourceTimestamp`, as of the last publication (every tick at
+/// least). Label: `instrument`.
+pub const REFERENCE_AGE: &str = "exchange_reference_age_seconds";
+/// Market-data messages published. Labels: `instrument`, `kind`.
+pub const MARKET_DATA_MESSAGES: &str = "exchange_market_data_messages_total";
+/// Open market-data streams. Label: `instrument`, or `all` for a stream without an instrument filter; a stream for
+/// several instruments counts under each.
+pub const MARKET_DATA_SUBSCRIBERS: &str = "exchange_market_data_subscribers";
+/// Market-data messages handed to subscribers, summed over subscribers. Labels: `instrument`, `kind`.
+pub const MARKET_DATA_SENT: &str = "exchange_market_data_sent_total";
+/// Market-data messages a subscriber skipped because a newer one of the same instrument and kind replaced them
+/// (conflation or catch-up). Labels: `instrument`, `kind`.
+pub const MARKET_DATA_CONFLATED: &str = "exchange_market_data_conflated_total";
+/// Times a market-data subscriber more than half a buffer behind had its backlog collapsed.
+pub const MARKET_DATA_CATCH_UPS: &str = "exchange_market_data_catch_ups_total";
+/// Market-data streams closed because their subscriber fell behind the buffer. Label: `instrument`, as
+/// [`MARKET_DATA_SUBSCRIBERS`].
+pub const MARKET_DATA_STREAMS_CLOSED: &str = "exchange_market_data_streams_closed_total";
+/// 1 while the live price feed's websocket is connected, else 0.
+pub const PRICE_FEED_CONNECTED: &str = "exchange_price_feed_connected";
+/// Times the live price feed's connection ended and was retried.
+pub const PRICE_FEED_RECONNECTS: &str = "exchange_price_feed_reconnects_total";
+/// Prices received from the live feed. Label: `via` (`websocket` or `rest`).
+pub const PRICE_FEED_UPDATES: &str = "exchange_price_feed_updates_total";
+/// REST quote calls. Label: `outcome` (`ok`, `no_quote`, `throttled`, `rate_limited`, `error`).
+pub const PRICE_FEED_REST_CALLS: &str = "exchange_price_feed_rest_calls_total";
 /// Settlement instructions with a transition still to come.
 pub const SETTLEMENT_OPEN: &str = "settlement_open_instructions";
 
@@ -127,6 +163,53 @@ fn describe() {
     describe_gauge!(
         PERSISTENCE_MODE,
         "1 for the persistence mode the service runs in (durable, fast, memory)"
+    );
+    describe_counter!(LIQUIDITY_QUOTES, "Orders the liquidity provider placed");
+    describe_counter!(
+        LIQUIDITY_REQUOTES,
+        "Ladders the liquidity provider replaced or pulled"
+    );
+    describe_counter!(
+        LIQUIDITY_FILLS,
+        "Executions with the liquidity provider on one side"
+    );
+    describe_counter!(REFERENCE_UPDATES, "Reference price changes published");
+    describe_gauge!(REFERENCE_STALE, "1 while the reference price is stale");
+    describe_gauge!(
+        REFERENCE_AGE,
+        Unit::Seconds,
+        "Simulated time since the reference price's source timestamp"
+    );
+    describe_counter!(MARKET_DATA_MESSAGES, "Market-data messages published");
+    describe_gauge!(MARKET_DATA_SUBSCRIBERS, "Open market-data streams");
+    describe_counter!(
+        MARKET_DATA_SENT,
+        "Market-data messages handed to subscribers"
+    );
+    describe_counter!(
+        MARKET_DATA_CONFLATED,
+        "Market-data messages skipped for a newer one of the same instrument and kind"
+    );
+    describe_counter!(
+        MARKET_DATA_CATCH_UPS,
+        "Subscriber backlogs collapsed for falling half a buffer behind"
+    );
+    describe_counter!(
+        MARKET_DATA_STREAMS_CLOSED,
+        "Market-data streams closed for falling a whole buffer behind"
+    );
+    describe_gauge!(
+        PRICE_FEED_CONNECTED,
+        "1 while the live price feed is connected"
+    );
+    describe_counter!(
+        PRICE_FEED_RECONNECTS,
+        "Live price feed connections that ended and were retried"
+    );
+    describe_counter!(PRICE_FEED_UPDATES, "Prices received from the live feed");
+    describe_counter!(
+        PRICE_FEED_REST_CALLS,
+        "Live price feed REST quote calls by outcome"
     );
     describe_gauge!(
         SETTLEMENT_OPEN,

@@ -151,14 +151,20 @@ impl SettlementSimulator {
 
     fn intake(&self, trade: &TradeFacts) -> Transition {
         let policy = &self.policy;
-        // With clearing, a trade after the cutoff or on a weekend is dated the next business day, as on its statement.
-        let trade_date = policy
-            .clearing
-            .map_or(trade.executed_at.date_naive(), |calendar| {
-                calendar.business_date(trade.executed_at)
-            });
+        // The trade's own dates (SR-29), as every other event about it carries them. A trade from before executions
+        // carried dates is dated as it was then: on the clearing calendar when clearing runs, else by UTC date.
         let settlement_days = policy.settlement_days_for(trade.mic.as_deref());
-        let isd = add_business_days(trade_date, settlement_days);
+        let (trade_date, isd) = match trade.dates {
+            Some(dates) => (dates.trade_date, dates.intended_settlement_date),
+            None => {
+                let trade_date = policy
+                    .clearing
+                    .map_or(trade.executed_at.date_naive(), |calendar| {
+                        calendar.business_date(trade.executed_at)
+                    });
+                (trade_date, add_business_days(trade_date, settlement_days))
+            }
+        };
         let amount = i128::from(trade.price_ticks)
             * i128::from(trade.tick_size_minor)
             * i128::from(trade.quantity);

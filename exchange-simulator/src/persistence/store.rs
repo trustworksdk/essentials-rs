@@ -53,7 +53,35 @@ pub struct OrderRecord {
 }
 
 const ORDER_COLUMNS: &str = "id, client_order_id, instrument_id, participant_id, side, order_type, limit_price_ticks, \
-                             quantity, remaining_quantity, sequence, status, created_at, updated_at";
+                             quantity, remaining_quantity, sequence, status, created_at, updated_at, time_in_force";
+
+/// An instrument's last trade and recent volume ([`Store::trade_summary`]).
+#[derive(Debug)]
+pub struct TradeSummary {
+    pub instrument_id: InstrumentId,
+    pub last_price_ticks: i64,
+    pub last_quantity: u64,
+    pub last_executed_at: DateTime<Utc>,
+    /// Quantity traded since the time asked for.
+    pub volume_since: u64,
+}
+
+/// An instrument's trading in one business day ([`Store::day_trading`]).
+#[derive(Debug)]
+pub struct DayTrading {
+    pub instrument_id: InstrumentId,
+    pub last_price_ticks: i64,
+    pub volume: u64,
+}
+
+/// An execution stored before executions carried dates ([`Store::executions_without_dates`]).
+#[derive(Debug)]
+pub struct UndatedExecution {
+    pub id: Uuid,
+    pub executed_at: DateTime<Utc>,
+    /// The instrument's market, which picks the settlement cycle.
+    pub mic: Option<String>,
+}
 
 impl Store {
     pub fn new(conn: Connection) -> Self {
@@ -120,41 +148,67 @@ impl Store {
     }
 
     pub fn insert_instrument(&self, instrument: &Instrument) -> rusqlite::Result<()> {
-        self.conn
-            .prepare_cached(
-                "INSERT INTO instruments (id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor,
-                                          lot_size, enabled)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        insert_instrument(&self.conn, instrument)
+    }
+
+    /// Lists a new instrument (`insert`) or stores a listed one's changeable fields, together with its event, in one
+    /// transaction. `price_source_since` is stored when the price source (re)started.
+    pub fn commit_instrument(
+        &mut self,
+        instrument: &Instrument,
+        insert: bool,
+        price_source_since: Option<DateTime<Utc>>,
+        event: &NewEvent,
+        outbox: Outbox<'_>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        if insert {
+            insert_instrument(&tx, instrument)?;
+        } else {
+            tx.prepare_cached(
+                "UPDATE instruments SET enabled = ?2, reference_symbol = ?3, price_source = ?4, liquidity = ?5
+                 WHERE id = ?1",
             )?
             .execute(params![
                 instrument.id.0,
-                instrument.symbol,
-                instrument.mic,
-                instrument.isin,
-                instrument.cusip,
-                instrument.currency,
-                instrument.currency_scale,
-                to_sql(instrument.tick_size_minor),
-                to_sql(instrument.lot_size),
                 instrument.enabled,
-            ])
-            .map(drop)
+                instrument.reference_symbol,
+                price_source_json(instrument),
+                liquidity_json(instrument),
+            ])?;
+        }
+        if let Some(since) = price_source_since {
+            set_price_source_since(&tx, &instrument.id, since)?;
+        }
+        write_events(&tx, std::slice::from_ref(event), &outbox)?;
+        tx.commit()
     }
 
-    pub fn set_instrument_enabled(
+    /// When each instrument's price source started; instruments listed before 6.2 have none.
+    pub fn price_source_since(
+        &self,
+    ) -> rusqlite::Result<std::collections::HashMap<InstrumentId, DateTime<Utc>>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT id, price_source_since FROM instruments WHERE price_source_since IS NOT NULL",
+        )?;
+        let rows =
+            statement.query_map([], |row| Ok((InstrumentId(row.get(0)?), parsed(row, 1)?)))?;
+        rows.collect()
+    }
+
+    pub fn save_price_source_since(
         &self,
         id: &InstrumentId,
-        enabled: bool,
-    ) -> rusqlite::Result<usize> {
-        self.conn
-            .prepare_cached("UPDATE instruments SET enabled = ?2 WHERE id = ?1")?
-            .execute(params![id.0, enabled])
+        since: DateTime<Utc>,
+    ) -> rusqlite::Result<()> {
+        set_price_source_since(&self.conn, id, since)
     }
 
     pub fn instruments(&self, filter: &InstrumentFilter) -> rusqlite::Result<Vec<Instrument>> {
         self.conn
             .prepare_cached(
-                "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size, enabled
+                "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size, enabled,
+                        reference_symbol, price_source, liquidity
                  FROM instruments
                  WHERE (?1 IS NULL OR symbol = ?1) AND (?2 IS NULL OR mic = ?2)
                    AND (?3 IS NULL OR isin = ?3) AND (?4 IS NULL OR cusip = ?4)
@@ -167,7 +221,8 @@ impl Store {
     pub fn instrument(&self, id: &InstrumentId) -> rusqlite::Result<Option<Instrument>> {
         self.conn
             .prepare_cached(
-                "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size, enabled
+                "SELECT id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size, enabled,
+                        reference_symbol, price_source, liquidity
                  FROM instruments WHERE id = ?1",
             )?
             .query_row([&id.0], instrument_row)
@@ -178,7 +233,7 @@ impl Store {
         self.conn
             .prepare_cached(
                 "SELECT id, instrument_id, buy_order_id, sell_order_id, buyer_id, seller_id, price_ticks, quantity,
-                        executed_at
+                        executed_at, trade_date, intended_settlement_date
                  FROM executions
                  WHERE (?1 IS NULL OR instrument_id = ?1)
                    AND (?2 IS NULL OR buyer_id = ?2 OR seller_id = ?2)
@@ -204,10 +259,51 @@ impl Store {
                         price_ticks: row.get(6)?,
                         quantity: from_sql(row, 7)?,
                         executed_at: parsed(row, 8)?,
+                        trade_date: parsed(row, 9)?,
+                        intended_settlement_date: parsed(row, 10)?,
                     })
                 },
             )?
             .collect()
+    }
+
+    /// Executions stored before they carried dates (migration 018).
+    pub fn executions_without_dates(&self) -> rusqlite::Result<Vec<UndatedExecution>> {
+        self.conn
+            .prepare_cached(
+                "SELECT e.id, e.executed_at, i.mic FROM executions e JOIN instruments i ON i.id = e.instrument_id
+                 WHERE e.trade_date IS NULL OR e.intended_settlement_date IS NULL
+                 ORDER BY e.rowid",
+            )?
+            .query_map([], |row| {
+                Ok(UndatedExecution {
+                    id: parsed(row, 0)?,
+                    executed_at: parsed(row, 1)?,
+                    mic: row.get(2)?,
+                })
+            })?
+            .collect()
+    }
+
+    /// Dates the executions [`Self::executions_without_dates`] found, in one transaction.
+    pub fn set_execution_dates(
+        &mut self,
+        dates: &[(Uuid, crate::domain::TradeDates)],
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut update = tx.prepare_cached(
+                "UPDATE executions SET trade_date = ?2, intended_settlement_date = ?3 WHERE id = ?1",
+            )?;
+            for (id, d) in dates {
+                update.execute(params![
+                    id.to_string(),
+                    d.trade_date.to_string(),
+                    d.intended_settlement_date.to_string()
+                ])?;
+            }
+        }
+        tx.commit()
     }
 
     pub fn insert_participant(&self, participant: &Participant) -> rusqlite::Result<()> {
@@ -247,6 +343,17 @@ impl Store {
                 "SELECT {ORDER_COLUMNS} FROM orders WHERE status IN ('OPEN', 'PARTIALLY_FILLED') ORDER BY sequence"
             ))?
             .query_map([], |row| order_record(row).map(|record| record.order))?
+            .collect()
+    }
+
+    /// Active `DAY` orders, with when they were accepted, so their expiry can be scheduled again after a restart.
+    pub fn active_day_orders(&self) -> rusqlite::Result<Vec<OrderRecord>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {ORDER_COLUMNS} FROM orders
+                 WHERE status IN ('OPEN', 'PARTIALLY_FILLED') AND time_in_force = 'DAY' ORDER BY sequence"
+            ))?
+            .query_map([], order_record)?
             .collect()
     }
 
@@ -297,7 +404,8 @@ impl Store {
         let tx = self.conn.savepoint()?;
         {
             let mut upsert = tx.prepare_cached(&format!(
-                "INSERT INTO orders ({ORDER_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+                "INSERT INTO orders ({ORDER_COLUMNS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13)
                  ON CONFLICT (id) DO UPDATE SET remaining_quantity = excluded.remaining_quantity,
                                                 status = excluded.status,
                                                 updated_at = excluded.updated_at"
@@ -317,12 +425,13 @@ impl Store {
                     to_sql(order.sequence),
                     order.status.as_str(),
                     now,
+                    order.time_in_force.as_str(),
                 ])?;
             }
             let mut insert_execution = tx.prepare_cached(
                 "INSERT INTO executions (id, instrument_id, buy_order_id, sell_order_id, buyer_id, seller_id,
-                                         price_ticks, quantity, executed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                         price_ticks, quantity, executed_at, trade_date, intended_settlement_date)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             for execution in &update.executions {
                 insert_execution.execute(params![
@@ -335,6 +444,8 @@ impl Store {
                     execution.price_ticks,
                     to_sql(execution.quantity),
                     timestamp(execution.executed_at),
+                    execution.trade_date.to_string(),
+                    execution.intended_settlement_date.to_string(),
                 ])?;
             }
             write_events(&tx, new_events, &outbox)?;
@@ -420,6 +531,20 @@ impl Store {
 
     pub fn save_virtual_clock(&self, now: DateTime<Utc>, running: bool) -> rusqlite::Result<()> {
         outbox::save_virtual_clock(&self.conn, now, running)
+    }
+
+    /// Stores the virtual clock's reading with its `ClockChanged`, in one transaction.
+    pub fn commit_clock(
+        &mut self,
+        now: DateTime<Utc>,
+        running: bool,
+        event: &NewEvent,
+        outbox: Outbox<'_>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        outbox::save_virtual_clock(&tx, now, running)?;
+        write_events(&tx, std::slice::from_ref(event), &outbox)?;
+        tx.commit()
     }
 
     /// Settlement instructions with a transition still to come, for resuming the simulator.
@@ -524,6 +649,36 @@ impl Store {
             .optional()
     }
 
+    /// The last business date closed with `BusinessDayClosed`, once one was.
+    pub fn business_day_cursor(&self) -> rusqlite::Result<Option<chrono::NaiveDate>> {
+        self.conn
+            .query_row(
+                "SELECT business_date FROM business_day_cursor WHERE id = 1",
+                [],
+                |row| parsed(row, 0),
+            )
+            .optional()
+    }
+
+    pub fn save_business_day_cursor(&self, date: chrono::NaiveDate) -> rusqlite::Result<()> {
+        save_business_day_cursor(&self.conn, date)
+    }
+
+    /// Closes a business day: its `BusinessDayClosed` and the moved cursor, in one transaction.
+    /// Closes a business day: its cursor and its events (`BusinessDayClosed`, then the closing prices), in one
+    /// transaction.
+    pub fn commit_business_day(
+        &mut self,
+        date: chrono::NaiveDate,
+        events: &[NewEvent],
+        outbox: Outbox<'_>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        save_business_day_cursor(&tx, date)?;
+        write_events(&tx, events, &outbox)?;
+        tx.commit()
+    }
+
     pub fn save_clearing_cursor(
         &self,
         date: chrono::NaiveDate,
@@ -616,10 +771,78 @@ impl Store {
         )
     }
 
-    pub fn execution_exists(&self, id: Uuid) -> rusqlite::Result<bool> {
+    /// Per instrument that traded in `[from, until)`: the price of its last trade then, and the quantity traded, in
+    /// instrument ID order (closing prices, SR-14).
+    pub fn day_trading(
+        &self,
+        from: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> rusqlite::Result<Vec<DayTrading>> {
         self.conn
-            .prepare_cached("SELECT 1 FROM executions WHERE id = ?1")?
-            .exists([id.to_string()])
+            .prepare_cached(
+                "SELECT e.instrument_id, e.price_ticks, d.volume
+                 FROM (SELECT instrument_id, MAX(rowid) AS last, SUM(quantity) AS volume FROM executions
+                       WHERE executed_at >= ?1 AND executed_at < ?2 GROUP BY instrument_id) d
+                 JOIN executions e ON e.rowid = d.last
+                 ORDER BY e.instrument_id",
+            )?
+            .query_map([timestamp(from), timestamp(until)], |row| {
+                Ok(DayTrading {
+                    instrument_id: InstrumentId(row.get(0)?),
+                    last_price_ticks: row.get(1)?,
+                    volume: from_sql(row, 2)?,
+                })
+            })?
+            .collect()
+    }
+
+    /// Per instrument that traded: its last trade and the quantity traded since `since`, in instrument ID order.
+    pub fn trade_summary(&self, since: DateTime<Utc>) -> rusqlite::Result<Vec<TradeSummary>> {
+        self.conn
+            .prepare_cached(
+                "SELECT e.instrument_id, e.price_ticks, e.quantity, e.executed_at,
+                        (SELECT COALESCE(SUM(v.quantity), 0) FROM executions v
+                         WHERE v.instrument_id = e.instrument_id AND v.executed_at >= ?1)
+                 FROM executions e
+                 WHERE e.rowid = (SELECT MAX(l.rowid) FROM executions l WHERE l.instrument_id = e.instrument_id)
+                 ORDER BY e.instrument_id",
+            )?
+            .query_map([timestamp(since)], |row| {
+                Ok(TradeSummary {
+                    instrument_id: InstrumentId(row.get(0)?),
+                    last_price_ticks: row.get(1)?,
+                    last_quantity: from_sql(row, 2)?,
+                    last_executed_at: parsed(row, 3)?,
+                    volume_since: from_sql(row, 4)?,
+                })
+            })?
+            .collect()
+    }
+
+    /// A participant's net traded quantity per instrument (bought minus sold), for instruments it traded.
+    pub fn net_positions(
+        &self,
+        participant: &ParticipantId,
+    ) -> rusqlite::Result<Vec<(InstrumentId, i64)>> {
+        self.conn
+            .prepare_cached(
+                "SELECT instrument_id,
+                        SUM(CASE WHEN buyer_id = ?1 THEN quantity ELSE -quantity END)
+                 FROM executions WHERE buyer_id = ?1 OR seller_id = ?1
+                 GROUP BY instrument_id ORDER BY instrument_id",
+            )?
+            .query_map([&participant.0], |row| {
+                Ok((InstrumentId(row.get(0)?), row.get(1)?))
+            })?
+            .collect()
+    }
+
+    /// The buyer and seller of an execution; `None` when there is no such execution.
+    pub fn execution_parties(&self, id: Uuid) -> rusqlite::Result<Option<(String, String)>> {
+        self.conn
+            .prepare_cached("SELECT buyer_id, seller_id FROM executions WHERE id = ?1")?
+            .query_row([id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
     }
 
     pub fn report_by_reference(
@@ -713,7 +936,14 @@ impl Store {
         now: DateTime<Utc>,
         ids: &IdScheme,
     ) -> rusqlite::Result<usize> {
-        outbox::redeliver(&mut self.conn, subscription, after, now, ids)
+        outbox::redeliver(
+            &mut self.conn,
+            subscription,
+            after,
+            now,
+            ids,
+            Some(events::parties),
+        )
     }
 
     /// Gives dead-lettered deliveries a fresh attempt budget, due at `now`: all of them, one subscription's, or the
@@ -869,6 +1099,15 @@ fn instruction_row(row: &Row<'_>) -> rusqlite::Result<Instruction> {
     })
 }
 
+fn save_business_day_cursor(conn: &Connection, date: chrono::NaiveDate) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO business_day_cursor (id, business_date) VALUES (1, ?1)
+         ON CONFLICT (id) DO UPDATE SET business_date = excluded.business_date",
+        [date.to_string()],
+    )
+    .map(drop)
+}
+
 fn save_clearing_cursor(
     conn: &Connection,
     date: chrono::NaiveDate,
@@ -912,7 +1151,72 @@ fn instrument_row(row: &Row<'_>) -> rusqlite::Result<Instrument> {
         tick_size_minor: from_sql(row, 7)?,
         lot_size: from_sql(row, 8)?,
         enabled: row.get(9)?,
+        reference_symbol: row.get(10)?,
+        price_source: row
+            .get::<_, Option<String>>(11)?
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(11, Type::Text, Box::new(e))
+                })
+            })
+            .transpose()?,
+        liquidity: row
+            .get::<_, Option<String>>(12)?
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(12, Type::Text, Box::new(e))
+                })
+            })
+            .transpose()?,
     })
+}
+
+fn liquidity_json(instrument: &Instrument) -> Option<String> {
+    instrument
+        .liquidity
+        .as_ref()
+        .map(|spec| serde_json::to_string(spec).expect("liquidity settings serialize"))
+}
+
+fn price_source_json(instrument: &Instrument) -> Option<String> {
+    instrument
+        .price_source
+        .as_ref()
+        .map(|spec| serde_json::to_string(spec).expect("a price source serializes"))
+}
+
+fn set_price_source_since(
+    conn: &Connection,
+    id: &InstrumentId,
+    since: DateTime<Utc>,
+) -> rusqlite::Result<()> {
+    conn.prepare_cached("UPDATE instruments SET price_source_since = ?2 WHERE id = ?1")?
+        .execute(params![id.0, timestamp(since)])
+        .map(drop)
+}
+
+fn insert_instrument(conn: &Connection, instrument: &Instrument) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO instruments (id, symbol, mic, isin, cusip, currency, currency_scale, tick_size_minor, lot_size,
+                                  enabled, reference_symbol, price_source, liquidity)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+    )?
+    .execute(params![
+        instrument.id.0,
+        instrument.symbol,
+        instrument.mic,
+        instrument.isin,
+        instrument.cusip,
+        instrument.currency,
+        instrument.currency_scale,
+        to_sql(instrument.tick_size_minor),
+        to_sql(instrument.lot_size),
+        instrument.enabled,
+        instrument.reference_symbol,
+        price_source_json(instrument),
+        liquidity_json(instrument),
+    ])
+    .map(drop)
 }
 
 fn order_record(row: &Row<'_>) -> rusqlite::Result<OrderRecord> {
@@ -929,6 +1233,7 @@ fn order_record(row: &Row<'_>) -> rusqlite::Result<OrderRecord> {
             remaining_quantity: from_sql(row, 8)?,
             sequence: from_sql(row, 9)?,
             status: parsed(row, 10)?,
+            time_in_force: parsed(row, 13)?,
         },
         created_at: parsed(row, 11)?,
         updated_at: parsed(row, 12)?,

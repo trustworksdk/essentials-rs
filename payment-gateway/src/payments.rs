@@ -24,7 +24,7 @@ pub const PAYMENT_FAILED: &str = "PaymentFailed";
 pub const PAYMENT_RETURNED: &str = "PaymentReturned";
 
 /// The longest a payment may take to complete or fail: a week.
-const MAX_DELAY_SECONDS: u64 = 7 * 24 * 3600;
+pub const MAX_DELAY_SECONDS: u64 = 7 * 24 * 3600;
 
 macro_rules! wire_enum {
     ($(#[$doc:meta])* $name:ident { $($variant:ident => $text:literal),* $(,)? }) => {
@@ -106,6 +106,22 @@ pub struct Payment {
     pub failed_at: Option<DateTime<Utc>>,
     pub returned_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    /// An outcome a test forced; it replaces the seeded draws.
+    pub forced: Option<ForcedOutcome>,
+}
+
+/// An outcome a test forced on a payment (`POST /test/payments/{id}/outcome`, decision D20). It is stored with the
+/// payment and replaces the seeded draws when the outcome is due, so a test takes the same path every time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ForcedOutcome {
+    /// Completes, and is never returned.
+    Completed,
+    /// Fails with `reason`.
+    Failed { reason: String },
+    /// Completes, and is returned `return_after_seconds` later.
+    #[serde(rename_all = "camelCase")]
+    Returned { return_after_seconds: u64 },
 }
 
 /// A movement on the firm's account at the bank, booked when a payment completes or is returned.
@@ -206,15 +222,22 @@ impl PaymentPolicy {
         match current.status {
             PaymentStatus::Pending => {
                 let o = self.outcome(current.payment_type);
-                if draw(self.seed, seq, 0, FAIL) < o.fail_probability {
-                    let reasons = match current.payment_type {
-                        PaymentType::Deposit => DEPOSIT_FAILURES,
-                        PaymentType::Withdrawal => WITHDRAWAL_FAILURES,
-                    };
-                    let pick =
-                        (draw(self.seed, seq, 0, FAIL_REASON) * reasons.len() as f64) as usize;
+                let fails = match &current.forced {
+                    Some(ForcedOutcome::Failed { reason }) => Some(reason.clone()),
+                    Some(_) => None,
+                    None => (draw(self.seed, seq, 0, FAIL) < o.fail_probability).then(|| {
+                        let reasons = match current.payment_type {
+                            PaymentType::Deposit => DEPOSIT_FAILURES,
+                            PaymentType::Withdrawal => WITHDRAWAL_FAILURES,
+                        };
+                        let pick =
+                            (draw(self.seed, seq, 0, FAIL_REASON) * reasons.len() as f64) as usize;
+                        reasons[pick.min(reasons.len() - 1)].to_string()
+                    }),
+                };
+                if let Some(reason) = fails {
                     next.status = PaymentStatus::Failed;
-                    next.reason = Some(reasons[pick.min(reasons.len() - 1)].to_string());
+                    next.reason = Some(reason);
                     next.failed_at = Some(at);
                     next.due_at = None;
                     let event = payment_event(PAYMENT_FAILED, &next, at);
@@ -226,16 +249,23 @@ impl PaymentPolicy {
                 }
                 next.status = PaymentStatus::Completed;
                 next.completed_at = Some(at);
-                next.due_at =
-                    (draw(self.seed, seq, 0, RETURN) < self.return_probability).then(|| {
-                        let days = 1
-                            + ((draw(self.seed, seq, 0, RETURN_DAYS)
-                                * f64::from(self.max_return_days))
-                                as u32)
-                                .min(self.max_return_days - 1);
-                        let date = add_business_days(at.date_naive(), days);
-                        date.and_time(at.time()).and_utc()
-                    });
+                next.due_at = match &current.forced {
+                    Some(ForcedOutcome::Returned {
+                        return_after_seconds,
+                    }) => Some(at + chrono::Duration::seconds(*return_after_seconds as i64)),
+                    Some(_) => None,
+                    None => {
+                        (draw(self.seed, seq, 0, RETURN) < self.return_probability).then(|| {
+                            let days = 1
+                                + ((draw(self.seed, seq, 0, RETURN_DAYS)
+                                    * f64::from(self.max_return_days))
+                                    as u32)
+                                    .min(self.max_return_days - 1);
+                            let date = add_business_days(at.date_naive(), days);
+                            date.and_time(at.time()).and_utc()
+                        })
+                    }
+                };
                 let (kind, sign) = match current.payment_type {
                     PaymentType::Deposit => (BookingKind::Deposit, 1),
                     PaymentType::Withdrawal => (BookingKind::Withdrawal, -1),
@@ -366,12 +396,59 @@ mod tests {
             failed_at: None,
             returned_at: None,
             updated_at: at,
+            forced: None,
         }
     }
 
     fn due(policy: &PaymentPolicy, mut p: Payment) -> Payment {
         p.due_at = Some(policy.outcome_due(&p));
         p
+    }
+
+    #[test]
+    fn a_forced_outcome_replaces_the_seeded_draws() {
+        // Every seeded draw would fail the payment, or return it; the forced outcome wins either way.
+        let policy = policy(|p| {
+            p.deposit.fail_probability = 1.0;
+            p.return_probability = 1.0;
+        });
+        let forced = |outcome| {
+            let mut p = due(&policy, payment(1, PaymentType::Deposit));
+            p.forced = Some(outcome);
+            policy.transition(&p)
+        };
+        let completed = forced(ForcedOutcome::Completed);
+        assert_eq!(
+            (completed.payment.status, completed.payment.due_at),
+            (PaymentStatus::Completed, None),
+            "completed, never returned"
+        );
+        let failed = forced(ForcedOutcome::Failed {
+            reason: "TEST_REASON".into(),
+        });
+        assert_eq!(
+            (failed.payment.status, failed.payment.reason.as_deref()),
+            (PaymentStatus::Failed, Some("TEST_REASON"))
+        );
+        let returned = forced(ForcedOutcome::Returned {
+            return_after_seconds: 90,
+        });
+        assert_eq!(returned.payment.status, PaymentStatus::Completed);
+        assert_eq!(
+            returned.payment.due_at,
+            Some(returned.payment.completed_at.unwrap() + chrono::Duration::seconds(90))
+        );
+        assert_eq!(
+            policy.transition(&returned.payment).payment.status,
+            PaymentStatus::Returned
+        );
+        assert_eq!(
+            serde_json::to_value(ForcedOutcome::Returned {
+                return_after_seconds: 90
+            })
+            .unwrap(),
+            serde_json::json!({ "outcome": "RETURNED", "returnAfterSeconds": 90 })
+        );
     }
 
     #[test]

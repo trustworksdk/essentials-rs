@@ -6,10 +6,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::{
-    Execution, Instrument, InstrumentId, Order, OrderStatus, OrderType, Participant, ParticipantId,
-    Side,
+    Execution, Instrument, InstrumentChange, InstrumentId, Order, OrderStatus, OrderType,
+    Participant, ParticipantId, Side,
 };
 use crate::engine::{BookSnapshot, Level, RejectReason, SubmitOrder};
+use crate::liquidity::LiquiditySpec;
+use crate::pricing::PriceSourceSpec;
 
 fn one() -> u64 {
     1
@@ -19,11 +21,39 @@ fn yes() -> bool {
     true
 }
 
-/// `PATCH /api/instruments/{id}`: the fields that may change after registration.
+/// `PATCH /api/instruments/{id}`: the fields that may change after registration. Absent fields stay as they are;
+/// `"referenceSymbol": null` clears the reference symbol.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InstrumentPatch {
-    pub enabled: bool,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default, deserialize_with = "present")]
+    pub reference_symbol: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    pub price_source: Option<Option<PriceSourceSpec>>,
+    #[serde(default, deserialize_with = "present")]
+    pub liquidity: Option<Option<LiquiditySpec>>,
+}
+
+impl From<InstrumentPatch> for InstrumentChange {
+    fn from(p: InstrumentPatch) -> Self {
+        Self {
+            enabled: p.enabled,
+            reference_symbol: p.reference_symbol,
+            price_source: p.price_source,
+            liquidity: p.liquidity,
+        }
+    }
+}
+
+/// Tells a field given as `null` (`Some(None)`) from an absent one (`None`, through `#[serde(default)]`).
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,6 +73,9 @@ pub struct InstrumentRequest {
     /// Default true.
     #[serde(default = "yes")]
     pub enabled: bool,
+    pub reference_symbol: Option<String>,
+    pub price_source: Option<PriceSourceSpec>,
+    pub liquidity: Option<LiquiditySpec>,
 }
 
 impl From<InstrumentRequest> for Instrument {
@@ -58,6 +91,9 @@ impl From<InstrumentRequest> for Instrument {
             tick_size_minor: r.tick_size_minor,
             lot_size: r.lot_size,
             enabled: r.enabled,
+            reference_symbol: r.reference_symbol,
+            price_source: r.price_source,
+            liquidity: r.liquidity,
         }
     }
 }
@@ -77,6 +113,9 @@ pub struct InstrumentView {
     pub tick_size: String,
     pub lot_size: u64,
     pub enabled: bool,
+    pub reference_symbol: Option<String>,
+    pub price_source: Option<PriceSourceSpec>,
+    pub liquidity: Option<LiquiditySpec>,
 }
 
 impl From<&Instrument> for InstrumentView {
@@ -93,6 +132,9 @@ impl From<&Instrument> for InstrumentView {
             tick_size: i.ticks_to_price(1),
             lot_size: i.lot_size,
             enabled: i.enabled,
+            reference_symbol: i.reference_symbol.clone(),
+            price_source: i.price_source.clone(),
+            liquidity: i.liquidity.clone(),
         }
     }
 }
@@ -148,6 +190,7 @@ pub struct OrderRequest {
     /// Limit price in ticks; required for `LIMIT`, absent for `MARKET`.
     pub price_ticks: Option<i64>,
     pub quantity: u64,
+    pub time_in_force: Option<crate::domain::TimeInForce>,
 }
 
 impl From<OrderRequest> for SubmitOrder {
@@ -160,6 +203,7 @@ impl From<OrderRequest> for SubmitOrder {
             order_type: r.order_type,
             limit_price_ticks: r.price_ticks,
             quantity: r.quantity,
+            time_in_force: r.time_in_force,
         }
     }
 }
@@ -181,6 +225,7 @@ pub struct OrderView {
     pub filled_quantity: u64,
     pub status: OrderStatus,
     pub sequence: u64,
+    pub time_in_force: crate::domain::TimeInForce,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reject_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,6 +252,7 @@ impl OrderView {
             filled_quantity: order.filled_quantity(),
             status: order.status,
             sequence: order.sequence,
+            time_in_force: order.time_in_force,
             reject_reason: None,
             created_at: None,
             updated_at: None,
@@ -258,6 +304,9 @@ pub struct TradeView {
     pub quantity: u64,
     pub currency: String,
     pub executed_at: DateTime<Utc>,
+    /// The business day the trade belongs to, and the day it is meant to settle (SR-29).
+    pub trade_date: chrono::NaiveDate,
+    pub intended_settlement_date: chrono::NaiveDate,
 }
 
 impl TradeView {
@@ -274,6 +323,8 @@ impl TradeView {
             quantity: e.quantity,
             currency: instrument.currency.clone(),
             executed_at: e.executed_at,
+            trade_date: e.trade_date,
+            intended_settlement_date: e.intended_settlement_date,
         }
     }
 }

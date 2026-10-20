@@ -39,8 +39,12 @@ impl From<ExchangeError> for ApiError {
             E::InvalidClientOrderId
             | E::InvalidParticipant(_)
             | E::InvalidWebhook(_)
-            | E::Instrument(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
-            E::Book(BookError::Invalid(_)) => (StatusCode::BAD_REQUEST, "invalid_order"),
+            | E::Instrument(_)
+            | E::PriceSource(_)
+            | E::Liquidity(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
+            E::Book(BookError::Invalid(_)) | E::InvalidTimeInForce(_) => {
+                (StatusCode::BAD_REQUEST, "invalid_order")
+            }
             E::ClockNotVirtual => (StatusCode::CONFLICT, "clock_not_virtual"),
             E::ExternalOutcomesDisabled => (StatusCode::CONFLICT, "external_outcomes_disabled"),
             E::UnknownExecution(_) => (StatusCode::NOT_FOUND, "not_found"),
@@ -48,7 +52,13 @@ impl From<ExchangeError> for ApiError {
             E::ReportConflict { .. } => (StatusCode::CONFLICT, "report_conflict"),
             E::Clock(ClockError::Speed(_)) => (StatusCode::BAD_REQUEST, "invalid_clock_speed"),
             E::Clock(_) => (StatusCode::CONFLICT, "clock_backwards"),
-            E::Book(_) | E::Storage(_) | E::GroupCommit(_) | E::Settlement(_) | E::Clearing(_) => {
+            E::Book(_)
+            | E::Storage(_)
+            | E::GroupCommit(_)
+            | E::Settlement(_)
+            | E::Clearing(_)
+            | E::DeclaredInstrumentConflict { .. }
+            | E::DeclaredInstrument { .. } => {
                 return Self::internal(error);
             }
         };

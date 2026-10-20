@@ -22,6 +22,9 @@ fn acme() -> Instrument {
         tick_size_minor: 1,
         lot_size: 1,
         enabled: true,
+        reference_symbol: None,
+        price_source: None,
+        liquidity: None,
     }
 }
 
@@ -66,14 +69,12 @@ impl Harness {
             remaining_quantity: quantity,
             sequence: self.sequence,
             status: OrderStatus::Open,
+            time_in_force: exchange_simulator::domain::TimeInForce::Gtc,
         }
     }
 
     fn submit(&mut self, order: Order) -> exchange_simulator::engine::BookUpdate {
-        let mut ctx = MatchContext {
-            now: self.now,
-            ids: self.ids,
-        };
+        let mut ctx = MatchContext::utc(self.now, self.ids);
         self.book.submit(order, &mut ctx).expect("valid order")
     }
 
@@ -448,7 +449,7 @@ fn malformed_orders_are_refused_before_matching() {
         let mut order = h.order("A", Side::Buy, Some(10000), 100);
         mutate(&mut order);
         h.book
-            .plan_submit(order, &mut MatchContext { now, ids })
+            .plan_submit(order, &mut MatchContext::utc(now, ids))
             .unwrap_err()
     };
     assert_eq!(
@@ -489,10 +490,7 @@ fn malformed_orders_are_refused_before_matching() {
 fn sequence_must_increase_and_ids_must_be_unique() {
     let mut h = Harness::new();
     let resting = h.limit("A", Side::Buy, 10000, 10);
-    let mut ctx = MatchContext {
-        now: h.now,
-        ids: IdScheme::Deterministic { seed: 1 },
-    };
+    let mut ctx = MatchContext::utc(h.now, IdScheme::Deterministic { seed: 1 });
 
     let mut replay = resting.order.clone();
     replay.status = OrderStatus::Open;
@@ -513,10 +511,7 @@ fn planning_leaves_the_book_untouched_until_applied() {
     let mut h = Harness::new();
     let sell = h.limit("A", Side::Sell, 10000, 100);
     let buy = h.order("B", Side::Buy, Some(10000), 60);
-    let mut ctx = MatchContext {
-        now: h.now,
-        ids: h.ids,
-    };
+    let mut ctx = MatchContext::utc(h.now, h.ids);
 
     let update = h.book.plan_submit(buy, &mut ctx).unwrap();
     assert_eq!(update.executions.len(), 1);
@@ -580,10 +575,7 @@ fn restored_book_keeps_price_time_priority() {
     }
     assert_eq!(restored.last_sequence(), h.book.last_sequence());
 
-    let mut ctx = MatchContext {
-        now: h.now,
-        ids: IdScheme::Deterministic { seed: 1 },
-    };
+    let mut ctx = MatchContext::utc(h.now, IdScheme::Deterministic { seed: 1 });
     let mut next = h.order("F", Side::Buy, Some(10000), 150);
     next.sequence = restored.last_sequence() + 1;
     let update = restored.submit(next.clone(), &mut ctx).unwrap();

@@ -222,12 +222,15 @@ impl ClearingPolicy {
         side: &str,
         trade: &TradeFacts,
     ) -> StatementTrade {
-        // The statement's business date is the trade date, as the settlement simulator dates it too.
-        let trade_date = date;
-        let settles = add_business_days(
-            trade_date,
-            self.cycles.settlement_days_for(trade.mic.as_deref()),
-        );
+        // The trade's own dates (SR-29). They agree with the statement's business date, since both come from the
+        // business-day calendar; a trade from before executions carried dates takes the statement's.
+        let (trade_date, settles) = match trade.dates {
+            Some(dates) => (dates.trade_date, dates.intended_settlement_date),
+            None => (
+                date,
+                add_business_days(date, self.cycles.settlement_days_for(trade.mic.as_deref())),
+            ),
+        };
         let mut line = StatementTrade {
             execution_id: trade.execution_id,
             trade_sequence: trade.sequence,
@@ -496,6 +499,7 @@ mod tests {
             currency_scale: 2,
             tick_size_minor: 1,
             executed_at: at("2030-01-07T10:00:00Z"),
+            dates: None,
         }
     }
 

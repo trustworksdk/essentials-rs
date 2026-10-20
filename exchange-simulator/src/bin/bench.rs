@@ -26,7 +26,7 @@ use exchange_simulator::market::{
 use exchange_simulator::persistence::{self, Store};
 use exchange_simulator::webhooks::NewSubscription;
 
-const USAGE: &str = "usage: bench [all|matching|durable|http|checkpoint|open-loop] [--quick] [--seed N] \
+const USAGE: &str = "usage: bench [all|matching|durable|http|checkpoint|open-loop|provider] [--quick] [--seed N] \
                      [--matching-orders N] [--durable-orders N] [--http-orders N] [--concurrency N] [--rates R,R,..] \
                      [--seconds S] [--queue-capacity N] [--max-in-flight N] [--group-commit N] [--group-wait-us N] \
                      [--checkpoint background|inline] [--persistence durable|fast|memory] [--dir DIR] [--out FILE]
@@ -37,6 +37,9 @@ open-loop (not part of all): for each target rate in --rates (orders/s, default 
        on a fixed schedule for --seconds (default 10; 3 with --quick) whatever the responses, and measures each
        latency from the order's scheduled send time. --queue-capacity is the service's command queue bound (default
        10000), --max-in-flight the client's limit on open requests (default 16384).
+provider (not part of all): the open loop at each rate in --rates twice, without and then with the liquidity
+       provider quoting ACME around a replayed price (a generated walk, a row every 100 ms, looping), so the cost of
+       re-quoting shows in the order-ack latency at the same client order rate.
 --group-commit: most orders per commit in the service, and the group size of the grouped durable row (default 256;
        1 commits each order on its own). --group-wait-us: how long the service waits for more orders (default 0).
 --checkpoint: where WAL checkpoints run for the durable and service rows (default background, as in the service;
@@ -86,9 +89,8 @@ impl Options {
             let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
             let number = |text: String| text.parse::<usize>().map_err(|e| format!("{text}: {e}"));
             match arg.as_str() {
-                "all" | "matching" | "durable" | "http" | "checkpoint" | "open-loop" => {
-                    options.mode = arg
-                }
+                "all" | "matching" | "durable" | "http" | "checkpoint" | "open-loop"
+                | "provider" => options.mode = arg,
                 "--quick" => {
                     options.matching_orders = 200_000;
                     options.durable_orders = 10_000;
@@ -173,6 +175,9 @@ fn acme() -> Instrument {
         tick_size_minor: 1,
         lot_size: 1,
         enabled: true,
+        reference_symbol: None,
+        price_source: None,
+        liquidity: None,
     }
 }
 
@@ -305,6 +310,7 @@ fn bench_matching(options: &Options, report: &mut Report) {
             remaining_quantity: c.quantity,
             sequence: i as u64 + 1,
             status: OrderStatus::Open,
+            time_in_force: exchange_simulator::domain::TimeInForce::Gtc,
         })
         .collect();
     let mut book = OrderBook::new(acme());
@@ -313,7 +319,7 @@ fn bench_matching(options: &Options, report: &mut Report) {
     let started = Instant::now();
     for order in orders {
         let update = book
-            .submit(order, &mut MatchContext { now, ids })
+            .submit(order, &mut MatchContext::utc(now, ids))
             .expect("valid order");
         executions += update.executions.len();
     }
@@ -601,6 +607,38 @@ fn bench_checkpoint(options: &Options, report: &mut Report) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The liquidity provider of the `provider` mode: five levels a side, 10 bps from the reference price, one tick
+/// apart, 100 lots each, re-quoted on every move of a tick and refilled at once.
+fn provider_liquidity() -> serde_json::Value {
+    serde_json::json!({ "mode": "on", "levels": 5, "spreadBps": 10.0, "levelStepTicks": 1, "levelQuantity": 100,
+                        "requoteThresholdTicks": 1, "refillDelayMs": 0 })
+}
+
+/// Rows between replayed prices in the `provider` mode, and the service's tick interval, which reads them.
+const REPLAY_STEP_MS: i64 = 100;
+
+/// A replay file for the `provider` mode: ACME on a seeded walk around 100.00 (the workload's mid), a row every
+/// [`REPLAY_STEP_MS`] for ten minutes, each a move of -2..=2 ticks, kept within ±20 ticks of the mid.
+fn write_replay(dir: &std::path::Path, seed: u64) -> std::path::PathBuf {
+    let path = dir.join("acme.replay.csv");
+    let mut rng = fastrand::Rng::with_seed(seed);
+    let start: chrono::DateTime<Utc> = "2026-01-05T14:30:00Z".parse().unwrap();
+    let mut ticks: i64 = 10_000;
+    let mut text = String::from("timestamp,referenceSymbol,price,volume\n");
+    for i in 0..(600_000 / REPLAY_STEP_MS) {
+        ticks = (ticks + rng.i64(-2..=2)).clamp(9_980, 10_020);
+        let at = start + chrono::Duration::milliseconds(i * REPLAY_STEP_MS);
+        text.push_str(&format!(
+            "{},ACME,{}.{:02},100\n",
+            at.to_rfc3339(),
+            ticks / 100,
+            ticks % 100
+        ));
+    }
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
 /// The service started in-process on a TCP port, with ACME and the participants registered over HTTP.
 struct Service {
     app: App,
@@ -612,9 +650,10 @@ struct Service {
 }
 
 impl Service {
-    async fn start(options: &Options, pool: usize) -> Self {
+    /// With `provider`, ACME plays a generated replay file and the liquidity provider quotes it.
+    async fn start(options: &Options, pool: usize, provider: bool) -> Self {
         let dir = temp_dir(&options.dir, "http");
-        let config = Config {
+        let mut config = Config {
             server: ServerConfig {
                 bind: "127.0.0.1:0".into(),
             },
@@ -624,6 +663,11 @@ impl Service {
                 group_commit: options.group_commit,
             },
             events: EventsConfig::default(),
+            instruments: Vec::new(),
+            price_sources: Default::default(),
+            liquidity: Default::default(),
+            market_data: Default::default(),
+            sessions: Default::default(),
             webhooks: WebhooksConfig {
                 subscriptions: Vec::new(),
                 secret_grace_seconds: 3600,
@@ -648,6 +692,8 @@ impl Service {
                 start: None,
                 running: false,
                 speed: 1.0,
+                operator_control: false,
+                follow: None,
             },
             ids: IdsConfig::default(),
             settlement: SettlementConfig::default(),
@@ -658,6 +704,19 @@ impl Service {
                 format: LogFormat::Pretty,
             },
         };
+        let mut acme = serde_json::json!({ "id": "ACME", "symbol": "ACME", "mic": "XCSE", "currency": "DKK", "currencyScale": 2 });
+        if provider {
+            config.price_sources.replay.file = Some(
+                write_replay(&dir, options.seed)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            config.price_sources.replay.looping = true;
+            config.price_sources.replay.loop_gap_ms = REPLAY_STEP_MS as u64;
+            config.settlement.tick_interval_ms = REPLAY_STEP_MS as u64;
+            acme["priceSource"] = serde_json::json!({ "kind": "replay" });
+            acme["liquidity"] = provider_liquidity();
+        }
         let app = App::start(&config).unwrap();
         let database = app.database_location().to_string();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -675,7 +734,7 @@ impl Service {
             database,
             dir,
         };
-        service.post("/api/instruments", serde_json::json!({ "id": "ACME", "symbol": "ACME", "mic": "XCSE", "currency": "DKK", "currencyScale": 2 })).await;
+        service.post("/api/instruments", acme).await;
         for id in participant_ids() {
             service
                 .post(
@@ -824,6 +883,22 @@ fn breakdown(before: &Scrape, after: &Scrape) -> String {
     )
 }
 
+/// What the liquidity provider did between two scrapes: re-quotes, orders placed, fills, and reference moves.
+fn provider_activity(before: &Scrape, after: &Scrape) -> String {
+    use exchange_simulator::metrics::{
+        LIQUIDITY_FILLS, LIQUIDITY_QUOTES, LIQUIDITY_REQUOTES, REFERENCE_UPDATES,
+    };
+    let delta = |series: String| after.value(&series) - before.value(&series);
+    let acme = r#"{instrument="ACME"}"#;
+    format!(
+        "provider: {:.0} reference moves, {:.0} re-quotes placing {:.0} orders, {:.0} fills",
+        delta(format!("{REFERENCE_UPDATES}{acme}")),
+        delta(format!("{LIQUIDITY_REQUOTES}{acme}")),
+        delta(LIQUIDITY_QUOTES.to_string()),
+        delta(format!("{LIQUIDITY_FILLS}{acme}")),
+    )
+}
+
 fn order_bodies(seed: u64, n: usize) -> Arc<Vec<serde_json::Value>> {
     Arc::new(
         workload(seed, n)
@@ -839,7 +914,7 @@ fn order_bodies(seed: u64, n: usize) -> Arc<Vec<serde_json::Value>> {
 /// The full service over real TCP: `concurrency` HTTP clients submitting the workload; optionally a webhook consumer
 /// subscribed to `TradeExecuted`, with the time until every delivery is done.
 async fn bench_http(options: &Options, report: &mut Report, with_webhook: bool) {
-    let service = Service::start(options, options.concurrency).await;
+    let service = Service::start(options, options.concurrency, false).await;
     let delivered = Arc::new(AtomicUsize::new(0));
     if with_webhook {
         let counter = delivered.clone();
@@ -949,8 +1024,11 @@ enum Outcome {
 /// orders were answered. Latency runs from the due time, not the actual send, so a stalled server or a lagging
 /// generator shows up in the latency instead of quietly lowering the offered load (no coordinated omission).
 /// `--max-in-flight` bounds the open requests; at that bound the generator waits, and the wait counts as latency.
-async fn bench_open_loop(options: &Options, report: &mut Report, rate: f64) {
-    let service = Service::start(options, options.max_in_flight).await;
+///
+/// With `provider`, the liquidity provider quotes ACME around a replayed price (see [`Service::start`]), and the notes
+/// add what it did during the run.
+async fn bench_open_loop(options: &Options, report: &mut Report, rate: f64, provider: bool) {
+    let service = Service::start(options, options.max_in_flight, provider).await;
     let n = ((rate * options.seconds).round() as usize).max(1);
     let bodies = order_bodies(options.seed, n);
     let url = format!("{}/api/orders", service.base);
@@ -996,7 +1074,7 @@ async fn bench_open_loop(options: &Options, report: &mut Report, rate: f64) {
     } else {
         accepted.summary()
     };
-    let notes = format!(
+    let mut notes = format!(
         "target {rate:.0}/s for {:.0} s: {n} sent, {ok} accepted, {overloaded} × 503, {failed} other failures; \
          generator lag p99 {} max {}; {}",
         options.seconds,
@@ -1004,13 +1082,15 @@ async fn bench_open_loop(options: &Options, report: &mut Report, rate: f64) {
         micros(lags.percentile(1.0)),
         breakdown(&before, &after),
     );
-    report.row(
-        &format!("HTTP open loop, target {rate:.0} orders/s"),
-        ok,
-        elapsed,
-        &latency,
-        &notes,
-    );
+    let scenario = if provider {
+        notes.push_str(&format!("; {}", provider_activity(&before, &after)));
+        format!("HTTP open loop, target {rate:.0} orders/s, provider on (replayed price)")
+    } else if options.mode == "provider" {
+        format!("HTTP open loop, target {rate:.0} orders/s, provider off")
+    } else {
+        format!("HTTP open loop, target {rate:.0} orders/s")
+    };
+    report.row(&scenario, ok, elapsed, &latency, &notes);
     service.stop().await;
 }
 
@@ -1170,7 +1250,13 @@ async fn main() {
     }
     if options.mode == "open-loop" {
         for rate in options.rates.clone() {
-            bench_open_loop(&options, &mut report, rate).await;
+            bench_open_loop(&options, &mut report, rate, false).await;
+        }
+    }
+    if options.mode == "provider" {
+        for rate in options.rates.clone() {
+            bench_open_loop(&options, &mut report, rate, false).await;
+            bench_open_loop(&options, &mut report, rate, true).await;
         }
     }
     let text = format!(

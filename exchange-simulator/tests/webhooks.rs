@@ -320,6 +320,11 @@ async fn events_can_be_replayed_by_sequence() {
     let (status, all) = app.get("/api/events").await;
     assert_eq!(status, StatusCode::OK);
     let all = all.as_array().unwrap().clone();
+    assert_eq!(
+        all[0]["eventType"], "InstrumentListed",
+        "seeding listed ACME"
+    );
+    let all = all[1..].to_vec();
     let types: Vec<_> = all
         .iter()
         .map(|e| e["eventType"].as_str().unwrap())
@@ -365,8 +370,8 @@ async fn events_can_be_replayed_by_sequence() {
 
     app.restart().await;
     assert_eq!(
-        app.get("/api/events").await.1.as_array().unwrap(),
-        &all,
+        app.get("/api/events").await.1.as_array().unwrap()[1..],
+        all,
         "replay is stable across restarts"
     );
     app.stop().await;

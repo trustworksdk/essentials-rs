@@ -63,8 +63,12 @@ ids:
   seed: 0
 clock:
   # "system": domain time is real time. "virtual": controllable (start, running, speed), as in the exchange simulator.
+  # "follow": a virtual clock that follows another simulator's GET /api/clock (its reading, speed and running state),
+  # e.g. follow: { url: "http://exchange:8080", poll_interval_ms: 250 }. It refuses clock changes of its own.
   mode: "system"
   speed: 1
+  # Mounts POST /api/clock/speed, /freeze and /resume without test control. GET /api/clock is always mounted.
+  operator_control: false
 test_control:
   # Mounts /test/... Never enable outside test deployments.
   enabled: false

@@ -118,6 +118,8 @@ pub enum Step {
     ReportSettlement(ReportStep),
     /// `PATCH /api/instruments/{instrument}`.
     SetInstrument(SetInstrument),
+    /// `PATCH /api/liquidity/{instrument}`: the liquidity provider's settings, field by field, or the price source.
+    SetLiquidity(SetLiquidity),
     /// Registers more instruments, participants and webhooks, as in the setup (e.g. after a reset).
     Register(Register),
     /// `POST /test/reset`: clears all state, as on a new database. Order and webhook references are forgotten too.
@@ -236,6 +238,16 @@ pub struct SetInstrument {
     pub expect: Option<ResponseCheck>,
 }
 
+/// `set_liquidity: { instrument: ACME, spreadBps: 50, mode: off, priceSource: { kind: synthetic } }`: every field
+/// besides `instrument` and `expect` goes into the request body.
+#[derive(Clone, Debug, Deserialize)]
+pub struct SetLiquidity {
+    pub instrument: String,
+    pub expect: Option<ResponseCheck>,
+    #[serde(flatten)]
+    pub body: Map<String, Value>,
+}
+
 /// A check of the current state. Exactly one target: an `order`, a `book`, a `settlement`, or a filter over `trades`,
 /// `events`, webhook `deliveries` or webhook `attempts` (what was actually sent). For single targets `matches` must be
 /// contained in the target's JSON; for lists the filter selects the matching items and `count` checks how many
@@ -248,6 +260,8 @@ pub struct SetInstrument {
 pub struct Expectation {
     pub order: Option<String>,
     pub book: Option<String>,
+    /// An instrument: `GET /api/liquidity/{instrument}`.
+    pub liquidity: Option<String>,
     pub settlement: Option<String>,
     pub trades: Option<Value>,
     pub events: Option<Value>,
@@ -275,6 +289,7 @@ impl Scenario {
                 let targets = [
                     expectation.order.is_some(),
                     expectation.book.is_some(),
+                    expectation.liquidity.is_some(),
                     expectation.settlement.is_some(),
                     expectation.trades.is_some(),
                     expectation.events.is_some(),
@@ -283,8 +298,8 @@ impl Scenario {
                 ];
                 if targets.iter().filter(|t| **t).count() != 1 {
                     return Err(format!(
-                        "step {}: expect needs exactly one of order, book, settlement, trades, events, deliveries, \
-                         attempts",
+                        "step {}: expect needs exactly one of order, book, liquidity, settlement, trades, events, \
+                         deliveries, attempts",
                         i + 1
                     ));
                 }

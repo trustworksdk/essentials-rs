@@ -36,10 +36,78 @@ webhooks:
   #     ordered: true                           # default false
   #     enabled: true                           # default true; false turns it off (no deliveries recorded)
   #     paused: false                           # default false; true records deliveries but holds them
+  #     participants: [A, B]                    # optional: only these participants' events, plus events of none
   subscriptions: []
   # When the configuration changes a declared subscription's secret, deliveries are signed with both the new and the
   # previous secret for this long, so the consumer can switch without rejecting any.
   secret_grace_seconds: 3600
+# Instruments listed at startup, and again after POST /test/reset, with an InstrumentListed event each: the fields of
+# POST /api/instruments in snake_case. A listed one whose enabled or reference_symbol differs is updated
+# (InstrumentUpdated), so the configuration wins over API changes at each start. Its other fields cannot change once
+# listed: a difference stops startup. Instruments removed from this list stay listed. For example:
+#   - id: AAPL
+#     symbol: AAPL
+#     mic: XNAS
+#     currency: USD
+#     currency_scale: 2
+#     tick_size_minor: 1      # default 1
+#     lot_size: 1             # default 1
+#     enabled: true           # default true
+#     reference_symbol: AAPL  # optional: the symbol a price source quotes it under
+#     price_source: { kind: synthetic, initial_price: "187.50" }   # optional; fields left out come from below
+instruments: []
+# Reference prices. Each instrument's price_source is "none" (no reference price, the default), "fixed" (price) or
+# "synthetic" (a seeded geometric Brownian motion: initial_price, drift and volatility annualized, tick_interval_ms
+# of simulated time per step, seed). Fields an instrument leaves out come from `default`, field by field.
+price_sources:
+  seed: 0                     # base of each instrument's derived synthetic seed
+  default: { kind: none }
+  # Live prices for kind finnhub. The feed runs only with an API key: the FINNHUB_API_KEY environment variable
+  # (passed through by the compose files), or api_key_file, which wins when set.
+  # The limits are Finnhub's free tier (checked 2026-10-19); the free tier is for personal, non-commercial use.
+  finnhub:
+    api_key_file: null
+    ws_url: "wss://ws.finnhub.io"
+    rest_url: "https://finnhub.io/api/v1"
+    stale_after_ms: 120000      # real time without an update before a price is stale; longer than refresh_after_ms
+    refresh_after_ms: 60000     # real time without an update before a symbol is refreshed over REST
+    max_updates_per_second: 4   # reference price updates taken in per instrument; the latest wins
+    max_symbols: 50
+    rest_calls_per_minute: 60
+    request_timeout_ms: 10000
+    reconnect_initial_ms: 1000  # backoff, doubled per failure up to reconnect_max_ms, with jitter
+    reconnect_max_ms: 60000
+    # Append every adopted price to this file in the replay format, to replay the session later. Keep recordings
+    # under recordings/ (gitignored): vendor data must not be committed.
+    record_to: null
+  # Recorded prices for kind replay: CSV (timestamp,referenceSymbol,price,volume) or JSON lines, played on the clock
+  # from when each instrument's source starts.
+  replay:
+    file: null
+    loop: false
+    loop_gap_ms: 1000
+# The built-in liquidity provider: a participant that quotes a ladder of limit orders around each instrument's
+# reference price. Off unless an instrument's liquidity (or the default here) sets mode: on. Fields: levels,
+# spread_bps, level_step_ticks, level_quantity (lots), level_quantity_growth, requote_threshold_ticks, refill_delay_ms
+# (simulated), skew_bps_per_lot, max_inventory (lots), stale_policy (keep, widen or pull; default pull),
+# stale_widen_factor, closed_policy (the same, outside the market's session), closed_widen_factor.
+liquidity:
+  participant_id: "LP"
+  # Publish its order lifecycle (accepted, filled, cancelled); its trades are published either way.
+  emit_order_events: false
+  default: { mode: off }
+# Trading sessions by MIC: open and close local time on weekdays. Outside a session client orders are rejected
+# (MARKET_CLOSED), DAY orders expire at the close, and the liquidity provider applies its closed_policy. A market not
+# listed is always open. For example:
+#   sessions:
+#     XNAS: { open: "09:30", close: "16:00", time_zone: America/New_York }
+sessions: {}
+market_data:
+  # Per subscriber, instrument and kind (quote, trade, reference), at most one stream message this often, the latest;
+  # 0 sends every message. The snapshot is never conflated.
+  conflation_interval_ms: 0
+  # Messages a stream subscriber may fall behind. Half as far behind, its backlog is collapsed; this far, it is closed.
+  stream_buffer: 1024
 ids:
   # "random": UUIDv7, different every run. "deterministic": every ID (orders, executions, events, deliveries,
   # subscriptions, reports) is derived from `seed` and the order of commands, so the same commands give the same IDs
@@ -92,6 +160,9 @@ clock:
   # Virtual clock only: simulated seconds per real second while it runs. 1440 makes a day pass in a minute, for
   # demos that settle T+1 trades within a minute or two. The system clock accepts only 1.
   speed: 1
+  # Mounts POST /api/clock/speed, /freeze and /resume, for changing a showcase's clock without test control.
+  # GET /api/clock is always mounted.
+  operator_control: false
 test_control:
   # Mounts /test/... (virtual clock controls). Never enable outside test deployments.
   enabled: false

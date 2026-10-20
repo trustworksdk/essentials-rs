@@ -29,19 +29,25 @@ by `eventId`, and use ordered subscriptions where order matters (the example dec
 Both services run on their own domain clock, which in a demo runs fast (`clock.speed: 1440` is a day per minute).
 Take every date and time from the events: `executedAt`, `tradeDate`, `intendedSettlementDate`, `occurredAt`,
 `completedAt`, `businessDate`. Never use your own clock to decide what day a trade or payment belongs to, or whether
-a statement is due.
+a statement is due. The end of a business day is `BusinessDayClosed` from the exchange: start end-of-day work on it,
+before the day's clearing statements arrive. It is published on days without trades too. Right after it come the
+day's `ClosingPriceIssued` events, one per instrument: value positions at their `closingPrice`.
 
-The two services keep separate clocks. The example starts both frozen at the same instant and resumes them together
-(`POST /test/clock/resume` on each), which keeps them within a fraction of a simulated minute of each other. A
-restart of one service continues its clock from where it was, so they may drift apart by the restart's duration.
+The gateway's clock follows the exchange's (`clock.mode: follow`): it reads the exchange's `GET /api/clock` every
+`clock.follow.poll_interval_ms` and takes its speed, running state and reading, so both services agree on the date.
+Start, freeze or speed up the exchange's clock only; the gateway's clock API refuses changes (`409 clock_follows`).
+A follower lags a change by at most one poll interval, and never moves back: if the exchange slows or freezes, the
+gateway holds until the exchange catches up, and a reset of the exchange needs a reset of the gateway too.
 
 ## Trading and settlement
 
-- **`TradeExecuted`** carries both parties, quantity, price (`priceTicks` and `price`), currency and `executedAt`.
-  A buy commits cash and adds a position; a sell the reverse. Until settlement these are pending.
+- **`TradeExecuted`** carries both parties, quantity, price (`priceTicks` and `price`), currency, `executedAt`, and
+  the trade's `tradeDate` and `intendedSettlementDate`. Book the trade into the day `tradeDate` names; the fill
+  events and the order result carry the same dates. A buy commits cash and adds a position; a sell the reverse.
+  Until settlement these are pending.
 - **The settlement cycle is T+1 by default**, per market where it differs (`settlement.market_settlement_days`).
-  With clearing enabled, a trade after the cutoff or on a weekend is dated the next business day, so it settles a
-  business day after that.
+  A trade after the cutoff or on a weekend has the next business day as its `tradeDate`, so it settles a business
+  day after that. The exchange decides this; never derive the dates from `executedAt` yourself.
 - **`SettlementPending`** comes in the same transaction as the trade, with the `intendedSettlementDate`.
   `SettlementCompleted` arrives at 00:00 UTC on that date; `SettlementFailed`, `SettlementDelayed` (with a new date)
   and the others follow their probabilities (all 0 in the example).

@@ -337,7 +337,7 @@ async fn the_clock_reset_and_health_behave_as_in_the_exchange() {
     let (_, health) = app.get("/health").await;
     assert_eq!(
         health,
-        json!({ "status": "ok", "schemaVersion": 2, "persistence": "durable" })
+        json!({ "status": "ok", "schemaVersion": 4, "persistence": "durable" })
     );
     let (_, clock) = app.get("/test/clock").await;
     assert_eq!(
@@ -443,12 +443,36 @@ async fn a_return_due_before_a_slow_payment_completes_comes_first_in_the_log() {
                 format!(
                     "{} {}",
                     e["eventType"].as_str().unwrap(),
-                    e["payload"]["idempotencyKey"].as_str().unwrap()
+                    e["payload"]["idempotencyKey"].as_str().unwrap_or("-")
                 ),
             )
         })
         .collect();
     assert!(log.is_sorted_by_key(|(at, _)| at.clone()), "{log:#?}");
-    assert_eq!(log.len(), 6, "{log:#?}");
+    assert_eq!(log.len(), 7, "{log:#?}");
+    assert_eq!(
+        log.last().unwrap().1,
+        "ClockChanged -",
+        "the clock move comes after what became due on the way"
+    );
+    app.stop().await;
+}
+
+#[tokio::test]
+async fn webhook_participant_filters_are_refused() {
+    let mut app = TestApp::start().await;
+    let (status, body) = app
+        .post(
+            "/api/webhooks",
+            json!({ "url": "http://127.0.0.1:9/hook", "eventTypes": ["PaymentCompleted"], "participants": ["A"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["message"],
+        json!(
+            "invalid webhook subscription: participants: this service has no participants to filter by"
+        )
+    );
     app.stop().await;
 }

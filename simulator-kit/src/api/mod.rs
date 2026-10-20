@@ -1,5 +1,6 @@
-//! HTTP pieces the simulators share: the error response, and the webhook maintenance and test-control routes.
+//! HTTP pieces the simulators share: the error response, the clock routes, and the webhook maintenance and test-control routes.
 
+pub mod clock;
 pub mod webhooks;
 
 use axum::Json;

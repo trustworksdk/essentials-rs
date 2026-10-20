@@ -75,6 +75,9 @@ fn trade(exchange: &mut Exchange) {
             tick_size_minor: 1,
             lot_size: 1,
             enabled: true,
+            reference_symbol: None,
+            price_source: None,
+            liquidity: None,
         })
         .unwrap();
     for id in ["A", "B"] {
@@ -101,6 +104,7 @@ fn trade(exchange: &mut Exchange) {
                 order_type: OrderType::Limit,
                 limit_price_ticks: Some(10_000),
                 quantity: 10,
+                time_in_force: None,
             })
             .unwrap();
         exchange.store().request_checkpoint_if_due();

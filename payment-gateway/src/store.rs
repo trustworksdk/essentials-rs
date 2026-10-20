@@ -16,11 +16,13 @@ use crate::statement::{BookedMovement, Draft, StoredStatement};
 pub const MIGRATIONS: &[&str] = &[
     simulator_kit::outbox::SCHEMA,
     include_str!("../migrations/002_payments.sql"),
+    simulator_kit::outbox::PARTICIPANT_FILTER,
+    include_str!("../migrations/004_forced_outcomes.sql"),
 ];
 
 const PAYMENT_COLUMNS: &str = "id, sequence, idempotency_key, type, account_id, iban, holder_name, amount_minor, \
     currency, currency_scale, reference, status, reason, created_at, due_at, completed_at, failed_at, returned_at, \
-    updated_at";
+    updated_at, forced_outcome";
 
 /// A text column holding one of the wire enums (type, status, kind).
 fn wire<T: std::str::FromStr<Err = String>>(row: &Row<'_>, index: usize) -> rusqlite::Result<T> {
@@ -58,16 +60,24 @@ fn payment_row(row: &Row<'_>) -> rusqlite::Result<Payment> {
         failed_at: optional_time(row, 16)?,
         returned_at: optional_time(row, 17)?,
         updated_at: parsed(row, 18)?,
+        forced: row
+            .get::<_, Option<String>>(19)?
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(19, Type::Text, Box::new(e))
+                })
+            })
+            .transpose()?,
     })
 }
 
 fn upsert_payment(conn: &Connection, p: &Payment) -> rusqlite::Result<()> {
     conn.prepare_cached(&format!(
         "INSERT INTO payments ({PAYMENT_COLUMNS})
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
          ON CONFLICT (id) DO UPDATE SET status = excluded.status, reason = excluded.reason, due_at = excluded.due_at,
            completed_at = excluded.completed_at, failed_at = excluded.failed_at, returned_at = excluded.returned_at,
-           updated_at = excluded.updated_at"
+           updated_at = excluded.updated_at, forced_outcome = excluded.forced_outcome"
     ))?
     .execute(params![
         p.id.to_string(),
@@ -89,8 +99,25 @@ fn upsert_payment(conn: &Connection, p: &Payment) -> rusqlite::Result<()> {
         p.failed_at.map(timestamp),
         p.returned_at.map(timestamp),
         timestamp(p.updated_at),
+        p.forced
+            .as_ref()
+            .map(|f| serde_json::to_string(f).expect("an outcome serializes")),
     ])
     .map(drop)
+}
+
+/// Stores the virtual clock's reading with its `ClockChanged` (and outbox rows), atomically.
+pub fn commit_clock(
+    conn: &mut Connection,
+    now: DateTime<Utc>,
+    running: bool,
+    event: &NewEvent,
+    outbox: Outbox<'_>,
+) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    simulator_kit::outbox::save_virtual_clock(&tx, now, running)?;
+    simulator_kit::outbox::write_events(&tx, std::slice::from_ref(event), &outbox)?;
+    tx.commit()
 }
 
 /// Writes payments' new states, the bookings they make and their events (with outbox rows), atomically.

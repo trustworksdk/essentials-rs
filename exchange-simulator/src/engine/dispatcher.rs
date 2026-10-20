@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{
     BookUpdate, ClockChange, ClockState, Exchange, ExchangeError, Level, SubmitOrder, SubmitOutcome,
 };
-use crate::domain::{Instrument, InstrumentId, Participant, Side};
+use crate::domain::{Instrument, InstrumentChange, InstrumentId, Participant, Side};
 use crate::settlement::{ExternalReport, NewReport};
 use crate::webhooks::{
     DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription, WebhookChange,
@@ -55,7 +55,7 @@ fn backend_error(error: DispatchError) -> simulator_kit::webhooks::BackendError 
 }
 
 /// Point-in-time view of one instrument's book.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BookSnapshot {
     pub instrument: Instrument,
     pub bids: Vec<Level>,
@@ -81,7 +81,20 @@ enum Request {
     Redeliver(Uuid, u64, Reply<usize>),
     RetryDeadLetters(Option<Uuid>, Vec<Uuid>, Reply<usize>),
     Reset(Reply<()>),
-    SetInstrumentEnabled(InstrumentId, bool, Reply<Instrument>),
+    UpdateInstrument(InstrumentId, InstrumentChange, Reply<Instrument>),
+    MarketData(
+        Option<InstrumentId>,
+        oneshot::Sender<Vec<crate::market_data::Snapshot>>,
+    ),
+    Liquidity(
+        Option<InstrumentId>,
+        oneshot::Sender<Vec<super::LiquidityStatus>>,
+    ),
+    PatchLiquidity(
+        InstrumentId,
+        super::LiquidityPatch,
+        Reply<super::LiquidityStatus>,
+    ),
     ClockState(oneshot::Sender<ClockState>),
     Tick(Reply<usize>),
     ReportSettlement(NewReport, Reply<(ExternalReport, bool)>),
@@ -107,7 +120,10 @@ impl Request {
             Self::Redeliver(..) => "redeliver",
             Self::RetryDeadLetters(..) => "retry_dead_letters",
             Self::Reset(..) => "reset",
-            Self::SetInstrumentEnabled(..) => "set_instrument_enabled",
+            Self::UpdateInstrument(..) => "update_instrument",
+            Self::MarketData(..) => "market_data",
+            Self::Liquidity(..) => "liquidity",
+            Self::PatchLiquidity(..) => "patch_liquidity",
             Self::ClockState(..) => "clock_state",
             Self::Tick(..) => "tick",
             Self::ReportSettlement(..) => "report_settlement",
@@ -233,12 +249,39 @@ impl Dispatcher {
         self.call(|reply| Request::ChangeClock(change, reply)).await
     }
 
-    pub async fn set_instrument_enabled(
+    /// Every listed instrument's market data now (or only `id`'s), in ID order.
+    pub async fn market_data(
+        &self,
+        id: Option<InstrumentId>,
+    ) -> Result<Vec<crate::market_data::Snapshot>, DispatchError> {
+        self.ask(|reply| Request::MarketData(id, reply)).await
+    }
+
+    /// The liquidity provider's status in every listed instrument (or only `id`'s), in ID order.
+    pub async fn liquidity(
+        &self,
+        id: Option<InstrumentId>,
+    ) -> Result<Vec<super::LiquidityStatus>, DispatchError> {
+        self.ask(|reply| Request::Liquidity(id, reply)).await
+    }
+
+    /// Changes one instrument's liquidity (see [`Exchange::patch_liquidity`]).
+    pub async fn patch_liquidity(
         &self,
         id: InstrumentId,
-        enabled: bool,
+        patch: super::LiquidityPatch,
+    ) -> Result<super::LiquidityStatus, DispatchError> {
+        self.call(|reply| Request::PatchLiquidity(id, patch, reply))
+            .await
+    }
+
+    /// Changes a listed instrument (see [`Exchange::update_instrument`]).
+    pub async fn update_instrument(
+        &self,
+        id: InstrumentId,
+        change: InstrumentChange,
     ) -> Result<Instrument, DispatchError> {
-        self.call(|reply| Request::SetInstrumentEnabled(id, enabled, reply))
+        self.call(|reply| Request::UpdateInstrument(id, change, reply))
             .await
     }
 
@@ -525,8 +568,19 @@ fn handle(exchange: &mut Exchange, request: Request) -> &'static str {
             "ok"
         }
         Request::ChangeClock(change, reply) => answer(reply, exchange.change_clock(change)),
-        Request::SetInstrumentEnabled(id, enabled, reply) => {
-            answer(reply, exchange.set_instrument_enabled(&id, enabled))
+        Request::UpdateInstrument(id, change, reply) => {
+            answer(reply, exchange.update_instrument(&id, &change))
+        }
+        Request::Liquidity(id, reply) => {
+            let _ = reply.send(exchange.liquidity(id.as_ref()));
+            "ok"
+        }
+        Request::PatchLiquidity(id, patch, reply) => {
+            answer(reply, exchange.patch_liquidity(&id, &patch))
+        }
+        Request::MarketData(id, reply) => {
+            let _ = reply.send(exchange.market_data(id.as_ref()));
+            "ok"
         }
         Request::RegisterWebhook(request, reply) => {
             answer(reply, exchange.register_webhook(request))
@@ -701,7 +755,8 @@ mod tests {
         let delta = |i: usize| (after[i].0 - before[i].0, after[i].1 - before[i].1);
         let (wait, waits) = delta(0);
         let (ack, acks) = delta(1);
-        let (duration, _) = delta(2);
+        let (_, durations) = delta(2);
+        assert_eq!(durations, 1.0, "one execution");
         assert_eq!(
             (waits, acks),
             (1.0, 1.0),
@@ -711,9 +766,11 @@ mod tests {
             wait >= 0.1,
             "queue wait {wait} s covers the 100 ms in the queue"
         );
+        // Not `ack >= wait + duration`: the caller records the acknowledgement as soon as the reply wakes it, while
+        // the exchange thread records the execution's duration after sending that reply, so they overlap.
         assert!(
-            ack >= wait + duration,
-            "acknowledgement {ack} s covers the wait {wait} s and the execution {duration} s"
+            ack >= wait,
+            "acknowledgement {ack} s covers the wait {wait} s in the queue"
         );
     }
 
@@ -767,6 +824,9 @@ mod tests {
                 tick_size_minor: 1,
                 lot_size: 1,
                 enabled: true,
+                reference_symbol: None,
+                price_source: None,
+                liquidity: None,
             }
         }
 
@@ -824,6 +884,7 @@ mod tests {
                 order_type: OrderType::Limit,
                 limit_price_ticks: Some(10_000 + (i * 7 % 11) as i64 - 5),
                 quantity,
+                time_in_force: None,
             }
         }
 

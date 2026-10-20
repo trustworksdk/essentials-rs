@@ -12,6 +12,7 @@ use exchange_simulator::domain::{
 use exchange_simulator::engine::{
     BookUpdate, Exchange, ExchangeError, ExchangeOptions, SubmitOrder, SubmitOutcome,
 };
+use exchange_simulator::market_data::Message;
 use exchange_simulator::persistence::{self, InstrumentFilter, Store};
 use exchange_simulator::webhooks::NewSubscription;
 use uuid::Uuid;
@@ -59,6 +60,9 @@ fn acme() -> Instrument {
         tick_size_minor: 1,
         lot_size: 1,
         enabled: true,
+        reference_symbol: None,
+        price_source: None,
+        liquidity: None,
     }
 }
 
@@ -93,6 +97,7 @@ fn order(participant: &str, side: Side, price: Option<i64>, quantity: u64) -> Su
         },
         limit_price_ticks: price,
         quantity,
+        time_in_force: None,
     }
 }
 
@@ -664,8 +669,8 @@ fn events_and_webhook_deliveries_commit_or_roll_back_with_the_trade() {
     assert_eq!(count(&exchange, "SELECT COUNT(*) FROM orders"), 1);
     assert_eq!(
         count(&exchange, "SELECT COUNT(*) FROM events"),
-        1,
-        "only the first order's OrderAccepted"
+        2,
+        "InstrumentListed and only the first order's OrderAccepted"
     );
     assert_eq!(
         count(&exchange, "SELECT COUNT(*) FROM webhook_deliveries"),
@@ -683,6 +688,7 @@ fn events_and_webhook_deliveries_commit_or_roll_back_with_the_trade() {
     assert_eq!(
         types,
         [
+            "InstrumentListed",
             "OrderAccepted",
             "OrderAccepted",
             "TradeExecuted",
@@ -844,10 +850,10 @@ fn an_ordered_subscription_has_one_delivery_in_flight_in_sequence_order() {
     let first = store.claim_deliveries(at(0), at(10), 100).unwrap();
     assert_eq!(
         of(&first, unordered.id),
-        [1, 2, 3],
-        "unordered: everything due at once"
+        [2, 3, 4],
+        "unordered: everything due at once (sequence 1 is InstrumentListed)"
     );
-    assert_eq!(of(&first, ordered.id), [1], "ordered: only the oldest");
+    assert_eq!(of(&first, ordered.id), [2], "ordered: only the oldest");
     assert!(
         store
             .claim_deliveries(at(1), at(10), 100)
@@ -874,7 +880,7 @@ fn an_ordered_subscription_has_one_delivery_in_flight_in_sequence_order() {
     );
 
     let again = store.claim_deliveries(at(20), at(30), 100).unwrap();
-    assert_eq!(of(&again, ordered.id), [1], "the head is retried first");
+    assert_eq!(of(&again, ordered.id), [2], "the head is retried first");
     record(
         &mut store,
         again
@@ -889,7 +895,7 @@ fn an_ordered_subscription_has_one_delivery_in_flight_in_sequence_order() {
     let next = store.claim_deliveries(at(21), at(30), 100).unwrap();
     assert_eq!(
         of(&next, ordered.id),
-        [2],
+        [3],
         "after a dead letter, delivery continues with the next event"
     );
     record(
@@ -905,7 +911,7 @@ fn an_ordered_subscription_has_one_delivery_in_flight_in_sequence_order() {
             &store.claim_deliveries(at(22), at(30), 100).unwrap(),
             ordered.id
         ),
-        [3]
+        [4]
     );
 }
 
@@ -1272,6 +1278,71 @@ fn a_failed_group_commit_changes_neither_memory_nor_storage() {
         0,
         "event sequences have no gaps"
     );
+}
+
+#[test]
+fn market_data_is_published_only_once_its_group_is_durable() {
+    let db = TempDb::new();
+    let conn = persistence::open(db.path(), Duration::from_secs(5)).unwrap();
+    let (sender, _) = tokio::sync::broadcast::channel(64);
+    let mut feed = sender.subscribe();
+    let mut exchange = Exchange::recover(
+        Store::new(conn),
+        ExchangeOptions {
+            market_data: Some(sender),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    exchange.register_instrument(acme()).unwrap();
+    for id in ["A", "B", "C"] {
+        exchange.register_participant(participant(id)).unwrap();
+    }
+    processed(exchange.submit(order("A", Side::Sell, Some(10000), 100)));
+    fn kinds(
+        feed: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<Message>>,
+    ) -> Vec<&'static str> {
+        std::iter::from_fn(|| feed.try_recv().ok())
+            .map(|m| m.kind)
+            .collect()
+    }
+    assert_eq!(kinds(&mut feed), ["quote", "reference", "quote"]);
+    exchange
+        .store()
+        .connection()
+        .execute_batch(FAIL_COMMIT_ON_QUANTITY_7)
+        .unwrap();
+
+    exchange.begin_group().unwrap();
+    processed(exchange.submit(order("B", Side::Buy, Some(10000), 60)));
+    assert!(kinds(&mut feed).is_empty(), "nothing before the commit");
+    processed(exchange.submit(order("C", Side::Sell, Some(10100), 7)));
+    exchange.commit_group().unwrap_err();
+    assert!(
+        kinds(&mut feed).is_empty(),
+        "the failed group's trade and quotes never reach the feed"
+    );
+    let snapshot = &exchange.market_data(None)[0];
+    assert_eq!((snapshot.last_trade, snapshot.session_volume), (None, 0));
+    assert_eq!(snapshot.best_ask.unwrap().quantity, 100);
+
+    exchange
+        .store()
+        .connection()
+        .execute_batch("DROP TRIGGER fail_commit")
+        .unwrap();
+    exchange.begin_group().unwrap();
+    processed(exchange.submit(order("B", Side::Buy, Some(10000), 60)));
+    processed(exchange.submit(order("C", Side::Sell, Some(10100), 7)));
+    exchange.commit_group().unwrap();
+    assert_eq!(
+        kinds(&mut feed),
+        ["trade", "quote"],
+        "once durable, the net change: the print, then the quote both orders left"
+    );
+    let snapshot = &exchange.market_data(None)[0];
+    assert_eq!(snapshot.session_volume, 60);
+    assert_eq!(snapshot.best_ask.unwrap().quantity, 40);
 }
 
 #[test]

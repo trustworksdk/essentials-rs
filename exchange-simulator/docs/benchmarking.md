@@ -13,6 +13,10 @@ cargo run --release -p exchange-simulator --bin bench -- --help
 
 - **`open-loop`** sends orders on a fixed schedule and measures latency from each order's scheduled time, so a
   stalled service shows up as latency.
+- **`provider`** runs the open loop at each rate twice, without and with the liquidity provider quoting a replayed
+  price, so the cost of re-quoting shows in the order-ack latency at the same client rate (SR-20). Measured: about
+  40–50 µs of exchange-thread time per order; invisible in the ack up to 2,000 orders/s, about +0.3–0.6 ms p50 and
+  +2.5–5 ms p99 at 4,000/s.
 - **Each report** records the environment: CPUs, memory, the container's cgroup limits, and the measured fsync cost
   of the database directory.
 - **Each row** splits the service's time into queue wait, exchange-thread time, commit, and the size of commit

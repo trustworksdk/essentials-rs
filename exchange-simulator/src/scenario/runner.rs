@@ -120,6 +120,8 @@ fn sandbox_config(scenario: &Scenario, base: &Config, dir: &std::path::Path) -> 
         start: Some(scenario.start),
         running: false,
         speed: 1.0,
+        operator_control: false,
+        follow: None,
     };
     config.ids = IdsConfig {
         mode: IdMode::Deterministic,
@@ -374,6 +376,18 @@ impl Runner {
                     .await;
                 (description, check_response(response, set.expect.as_ref()))
             }
+            Step::SetLiquidity(set) => {
+                let description = format!(
+                    "set_liquidity {} {}",
+                    set.instrument,
+                    Value::Object(set.body.clone())
+                );
+                let uri = format!("/api/liquidity/{}", set.instrument);
+                let response = self
+                    .call(Method::PATCH, &uri, Some(Value::Object(set.body.clone())))
+                    .await;
+                (description, check_response(response, set.expect.as_ref()))
+            }
             Step::Market(market) => self.market(market).await,
             Step::Register(register) => {
                 let description = format!(
@@ -608,6 +622,13 @@ impl Runner {
                 .await;
             return (description, failures);
         }
+        if let Some(instrument) = &e.liquidity {
+            let description = format!("expect liquidity {instrument}");
+            let failures = self
+                .check_single(&format!("/api/liquidity/{instrument}"), e.matches.as_ref())
+                .await;
+            return (description, failures);
+        }
         if let Some(execution) = &e.settlement {
             let description = format!("expect settlement {execution}");
             return match self.execution_id(execution) {
@@ -793,6 +814,7 @@ mod tests {
             ordered: false,
             enabled: true,
             paused: false,
+            participants: None,
         }];
         let scenario: Scenario =
             serde_saphyr::from_str("name: s\nseed: 1\nstart: 2030-01-07T09:00:00Z\nsteps: []\n")

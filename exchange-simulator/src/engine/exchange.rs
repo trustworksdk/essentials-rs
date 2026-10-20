@@ -9,13 +9,15 @@ use super::{BookError, BookUpdate, Clock, IdScheme, MatchContext, OrderBook};
 use crate::clearing::{ClearingPolicy, StoredStatement, next_business_day, previous_business_day};
 use crate::clock::{ClockError, SystemClock, VirtualClock};
 use crate::domain::{
-    IdentifierPolicy, Instrument, InstrumentError, InstrumentId, Order, OrderStatus, OrderType,
-    Participant, ParticipantId, Side,
+    IdentifierPolicy, Instrument, InstrumentChange, InstrumentError, InstrumentId, Order,
+    OrderStatus, OrderType, Participant, ParticipantId, Side, TimeInForce,
 };
 use crate::events::NewEvent;
 use crate::events::{self, Command};
 use crate::ids::ExchangeIds;
+use crate::liquidity::{LiquiditySettings, StalePolicy};
 use crate::persistence::{Outbox, SettlementWrite, Store};
+use crate::pricing::{PriceSourceError, PriceSources, Reference};
 use crate::settlement::{
     ExternalReport, NewReport, SettlementPolicy, SettlementSimulator, TradeFacts,
 };
@@ -23,6 +25,7 @@ use crate::webhooks::{
     DeclaredSubscription, DeliveryJob, DeliveryResult, FaultPolicy, NewSubscription, Subscription,
     WebhookChange, WebhookError, WebhookHub,
 };
+pub use simulator_kit::clock::{ClockChange, ClockState};
 
 /// The settlement simulator's name in `consumer_offsets`.
 pub const SETTLEMENT_CONSUMER: &str = "settlement-simulator";
@@ -40,6 +43,8 @@ pub struct SubmitOrder {
     pub order_type: OrderType,
     pub limit_price_ticks: Option<i64>,
     pub quantity: u64,
+    /// `None` takes the default: `IOC` for a market order, `DAY` on a market with a session, else `GTC` (SR-17).
+    pub time_in_force: Option<TimeInForce>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +69,23 @@ pub enum ExchangeError {
     DuplicateInstrument(InstrumentId),
     #[error("symbol {symbol} is already listed on {mic}")]
     DuplicateListing { mic: String, symbol: String },
+    #[error(
+        "instruments {id}: {field} differs from the listed instrument; only enabled, reference_symbol, \
+         price_source and liquidity can change"
+    )]
+    DeclaredInstrumentConflict {
+        id: InstrumentId,
+        field: &'static str,
+    },
+    #[error("instruments {id}: {error}")]
+    DeclaredInstrument {
+        id: InstrumentId,
+        error: Box<ExchangeError>,
+    },
+    #[error(transparent)]
+    PriceSource(#[from] PriceSourceError),
+    #[error(transparent)]
+    Liquidity(#[from] crate::liquidity::LiquidityError),
     #[error("participant {0} already exists")]
     DuplicateParticipant(ParticipantId),
     #[error(
@@ -75,6 +97,8 @@ pub enum ExchangeError {
     },
     #[error("client order ID must be 1 to 64 characters")]
     InvalidClientOrderId,
+    #[error("a market order is always IOC; timeInForce {0} is not allowed")]
+    InvalidTimeInForce(TimeInForce),
     #[error("invalid participant: {0}")]
     InvalidParticipant(String),
     #[error("invalid webhook subscription: {0}")]
@@ -158,6 +182,34 @@ pub struct ExchangeOptions {
     pub webhooks: Vec<DeclaredSubscription>,
     /// How long a declared subscription's previous secret stays valid after the configuration changes it.
     pub webhook_secret_grace: chrono::Duration,
+    /// Instruments declared in configuration, listed or updated at recovery and after a reset, in this order. IDs
+    /// must be unique (see [`crate::config::InstrumentConfig`]).
+    pub instruments: Vec<Instrument>,
+    /// What an instrument's own price source leaves out, and the base of derived synthetic seeds.
+    pub price_sources: PriceSources,
+    /// Closes every business day at this calendar's cutoff with `BusinessDayClosed`, whether or not clearing runs.
+    /// `None` closes no days.
+    pub business_days: Option<simulator_kit::calendar::CutoffCalendar>,
+    /// Runs the built-in liquidity provider (plan item 6.7); `None` quotes nothing.
+    pub liquidity: Option<LiquidityPolicy>,
+    /// Where market-data messages go (plan item 6.8); `None` publishes nothing, the snapshot still works.
+    pub market_data: Option<crate::market_data::Sender>,
+    /// How executions are dated (SR-29). The default dates by UTC date and settles T+1.
+    pub trade_dating: crate::settlement::TradeDating,
+    /// Trading sessions by market (plan item 6.10). The default has none: every market is always open.
+    pub sessions: crate::sessions::TradingSessions,
+}
+
+/// How the liquidity provider runs (`liquidity:` in the configuration).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiquidityPolicy {
+    /// The participant it trades as, registered the first time it quotes.
+    pub participant: ParticipantId,
+    /// Publish its order lifecycle (accepted, filled, cancelled) in the event log and over webhooks. Its trades are
+    /// published either way: they are real clients' counterparties.
+    pub emit_order_events: bool,
+    /// What an instrument's own settings leave out.
+    pub default: crate::liquidity::LiquiditySpec,
 }
 
 impl Default for ExchangeOptions {
@@ -174,28 +226,16 @@ impl Default for ExchangeOptions {
             clearing: None,
             webhooks: Vec::new(),
             webhook_secret_grace: chrono::Duration::hours(1),
+            instruments: Vec::new(),
+            price_sources: PriceSources::new(Default::default(), 0)
+                .expect("the empty default is valid"),
+            business_days: None,
+            liquidity: None,
+            market_data: None,
+            trade_dating: Default::default(),
+            sessions: Default::default(),
         }
     }
-}
-
-/// How the exchange tells time, for the test-control API.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ClockState {
-    pub virtual_clock: bool,
-    pub running: bool,
-    /// Simulated seconds per real second while running; 1 for the system clock.
-    pub speed: f64,
-    pub now: DateTime<Utc>,
-}
-
-/// A change to the virtual clock.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ClockChange {
-    Advance(chrono::Duration),
-    Set(DateTime<Utc>),
-    Freeze,
-    Resume,
-    Speed(f64),
 }
 
 /// The persistence coordinator: owns the order books and the single SQLite writer, and serializes every command.
@@ -234,6 +274,99 @@ pub struct Exchange {
     epoch: u64,
     /// The open commit group: what its commands wrote, reported once the group is durable.
     group: Option<Vec<Committed>>,
+    /// Instruments declared in configuration.
+    declared_instruments: Vec<Instrument>,
+    /// Every listed instrument's running price source.
+    prices: PriceSources,
+    /// The business-day calendar and the last date closed.
+    days: Option<BusinessDays>,
+    /// The liquidity provider and its state per instrument.
+    provider: Option<Provider>,
+    /// Market data per instrument, and where to publish it.
+    market_data: crate::market_data::States,
+    market_data_sender: Option<crate::market_data::Sender>,
+    /// Instruments to publish once the open commit group is durable.
+    market_data_due: std::collections::BTreeSet<InstrumentId>,
+    trade_dating: crate::settlement::TradeDating,
+    sessions: crate::sessions::TradingSessions,
+    /// Resting `DAY` orders by when they expire: (expiry, sequence, instrument, order). An entry whose order is no
+    /// longer active when it comes due is dropped.
+    expiries: std::collections::BTreeSet<(DateTime<Utc>, u64, InstrumentId, Uuid)>,
+}
+
+/// The liquidity provider in one instrument, as `GET /api/liquidity` shows it (SR-11).
+#[derive(Clone, Debug)]
+pub struct LiquidityStatus {
+    pub instrument: Instrument,
+    /// The participant it quotes as; `None` when the service runs no provider.
+    pub provider: Option<ParticipantId>,
+    /// Its settings, resolved (own, then `liquidity.default`, then built-in).
+    pub settings: Option<LiquiditySettings>,
+    /// What it did when it last quoted (see `Exchange::liquidity_state`).
+    pub state: &'static str,
+    /// Its net position in units (positive long).
+    pub inventory: i64,
+    /// The reference price its current ladder was quoted around.
+    pub quoted_at: Option<i64>,
+    /// Its resting orders, bids best first, then asks best first.
+    pub ladder: Vec<Order>,
+    pub reference: Option<Reference>,
+    pub session_open: bool,
+}
+
+/// A change to one instrument's liquidity (`PATCH /api/liquidity/{id}`): settings by wire name (`null` clears one),
+/// and optionally a new price source.
+#[derive(Clone, Debug, Default)]
+pub struct LiquidityPatch {
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    pub price_source: Option<Option<crate::pricing::PriceSourceSpec>>,
+}
+
+/// The liquidity provider: its policy, and per instrument what it last quoted around and holds.
+struct Provider {
+    policy: LiquidityPolicy,
+    quoting: HashMap<InstrumentId, Quoting>,
+}
+
+/// The provider's state in one instrument. Not stored: after a restart or reset it is rebuilt from the trades, and
+/// the ladder is quoted afresh (decision D18).
+#[derive(Clone, Debug, Default)]
+struct Quoting {
+    /// Net position in units: positive long.
+    inventory: i64,
+    /// The reference price the current ladder was quoted around; `None` before the first quote or once pulled.
+    quoted_at: Option<i64>,
+    /// When it last traded, until the ladder is refilled.
+    filled_at: Option<DateTime<Utc>>,
+    /// Whether the reference price was stale, and the market closed, when the current ladder was quoted (or pulled).
+    quoted_stale: bool,
+    quoted_closed: bool,
+    /// The settings the current ladder was quoted with: a change re-quotes it at once.
+    quoted_settings: Option<LiquiditySettings>,
+    /// What it is doing, as the market data shows it (see [`Exchange::liquidity_state`]); `None` reads `off`.
+    state: Option<&'static str>,
+}
+
+/// Business days and the last one closed with `BusinessDayClosed`.
+struct BusinessDays {
+    calendar: simulator_kit::calendar::CutoffCalendar,
+    cursor: chrono::NaiveDate,
+}
+
+impl BusinessDays {
+    /// When the next business day closes.
+    fn due(&self) -> DateTime<Utc> {
+        self.calendar.cutoff_at(next_business_day(self.cursor))
+    }
+
+    /// The cursor for days starting at `now`: the business day before the one now belongs to, so the first day closed
+    /// is the current one and no past day is.
+    fn first_cursor(
+        calendar: &simulator_kit::calendar::CutoffCalendar,
+        now: DateTime<Utc>,
+    ) -> chrono::NaiveDate {
+        previous_business_day(calendar.business_date(now))
+    }
 }
 
 /// The clearinghouse: its policy, the last business date whose cutoff was handled, and late statements waiting to be
@@ -305,6 +438,7 @@ impl Exchange {
             options.webhooks,
             options.webhook_secret_grace,
             events::EVENT_TYPES,
+            Some(events::parties),
         )?;
         let released = store.release_claims(wall_now())?;
         let settlement = match options.settlement {
@@ -370,8 +504,25 @@ impl Exchange {
             clock_start,
             epoch: 0,
             group: None,
+            declared_instruments: options.instruments,
+            prices: options.price_sources,
+            days: None,
+            provider: options.liquidity.map(|policy| Provider {
+                policy,
+                quoting: HashMap::new(),
+            }),
+            market_data: HashMap::new(),
+            market_data_sender: options.market_data,
+            market_data_due: Default::default(),
+            trade_dating: options.trade_dating,
+            sessions: options.sessions,
+            expiries: Default::default(),
         };
+        exchange.start_price_sources()?;
         exchange.reconcile_webhooks()?;
+        exchange.schedule_expiries()?;
+        exchange.start_liquidity()?;
+        exchange.reconcile_instruments()?;
         if let Some(policy) = options.clearing {
             policy.breaks.validate().map_err(ExchangeError::Clearing)?;
             let (cursor, after) = match exchange.store.clearing_cursor()? {
@@ -391,6 +542,19 @@ impl Exchange {
             });
             exchange.sort_pending();
         }
+        if let Some(calendar) = options.business_days {
+            let cursor = match exchange.store.business_day_cursor()? {
+                Some(cursor) => cursor,
+                None => {
+                    let cursor = BusinessDays::first_cursor(&calendar, exchange.now());
+                    exchange.store.save_business_day_cursor(cursor)?;
+                    cursor
+                }
+            };
+            exchange.days = Some(BusinessDays { calendar, cursor });
+        }
+        exchange.date_old_executions()?;
+        exchange.load_market_data()?;
         // Trades committed while the simulator was off (or before it existed) are taken in now, before any command,
         // so intake order does not depend on when a background tick happens to run. Cutoffs passed while the service
         // was down are issued too.
@@ -398,6 +562,7 @@ impl Exchange {
         Ok(exchange)
     }
 
+    /// Lists an instrument and publishes `InstrumentListed`.
     pub fn register_instrument(&mut self, instrument: Instrument) -> Result<(), ExchangeError> {
         instrument.validate(self.identifier_policy)?;
         if self.books.contains_key(&instrument.id) {
@@ -414,9 +579,11 @@ impl Exchange {
                 symbol: instrument.symbol,
             });
         }
-        self.store.insert_instrument(&instrument)?;
-        self.books
-            .insert(instrument.id.clone(), OrderBook::new(instrument));
+        let mut instrument = instrument;
+        let id = instrument.id.clone();
+        self.commit_instrument(&mut instrument, None)?;
+        self.maintain_liquidity(Some(&id))?;
+        self.publish_market_data(Some(&id));
         Ok(())
     }
 
@@ -426,13 +593,630 @@ impl Exchange {
         id: &InstrumentId,
         enabled: bool,
     ) -> Result<Instrument, ExchangeError> {
+        self.update_instrument(
+            id,
+            &InstrumentChange {
+                enabled: Some(enabled),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Changes a listed instrument and returns it. A change that alters a value publishes `InstrumentUpdated` with the
+    /// fields it changed; one that alters nothing publishes nothing.
+    pub fn update_instrument(
+        &mut self,
+        id: &InstrumentId,
+        change: &InstrumentChange,
+    ) -> Result<Instrument, ExchangeError> {
+        let mut instrument = self
+            .books
+            .get(id)
+            .ok_or_else(|| ExchangeError::UnknownInstrument(id.clone()))?
+            .instrument()
+            .clone();
+        let changes = change.apply(&mut instrument);
+        if changes.is_empty() {
+            return Ok(instrument);
+        }
+        instrument.validate(self.identifier_policy)?;
+        self.commit_instrument(&mut instrument, Some(&changes))?;
+        // A new price source, liquidity setting or trading status changes what the provider quotes.
+        self.maintain_liquidity(Some(id))?;
+        self.publish_market_data(Some(id));
+        Ok(instrument)
+    }
+
+    /// Writes a new (`changes: None`) or changed instrument with its event, then applies it to memory. A new price
+    /// source is prepared first (see [`PriceSources::prepare`]), so the instrument stored and published is the one
+    /// whose source then starts, with its grid at now.
+    fn commit_instrument(
+        &mut self,
+        instrument: &mut Instrument,
+        changes: Option<&[&'static str]>,
+    ) -> Result<(), ExchangeError> {
+        if let Some(liquidity) = &instrument.liquidity {
+            liquidity.validate()?;
+        }
+        let now = self.now();
+        // A live source streams its reference symbol, so a new one restarts it too.
+        let restarts = changes.is_none_or(|c| {
+            c.contains(&"priceSource")
+                || (c.contains(&"referenceSymbol") && self.prices.is_live(instrument))
+        });
+        if restarts {
+            let current = self.prices.reference(&instrument.id, now);
+            self.prices.prepare(instrument, current)?;
+        }
+        let mut event = events::instrument_event(instrument, changes, now);
+        let next = NewEvent::stamp(
+            std::slice::from_mut(&mut event),
+            self.next_event_sequence,
+            self.ids,
+        );
+        let outbox = Outbox {
+            subscriptions: self.webhooks.subscriptions(),
+            simulation_id: self.simulation_id.as_deref(),
+            ids: self.ids,
+            due: wall_now(),
+            schema_version: events::SCHEMA_VERSION,
+            parties: self.webhooks.parties(),
+        };
+        self.store.commit_instrument(
+            instrument,
+            changes.is_none(),
+            restarts.then_some(now),
+            &event,
+            outbox,
+        )?;
+        self.next_event_sequence = next;
+        ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type).increment(1);
+        if restarts {
+            self.prices.start(instrument, now)?;
+        }
+        match self.books.get_mut(&instrument.id) {
+            Some(book) => book.set_instrument(instrument.clone()),
+            None => {
+                self.books
+                    .insert(instrument.id.clone(), OrderBook::new(instrument.clone()));
+            }
+        }
+        self.wake_delivery(std::slice::from_ref(&event));
+        Ok(())
+    }
+
+    /// Brings the instruments declared in configuration into the registry. Runs at recovery and after a reset, after
+    /// the declared webhook subscriptions, so they receive the events. A missing instrument is listed; a listed one
+    /// whose `enabled`, `reference_symbol` or `price_source` differs is updated, so configuration wins over API
+    /// changes, as for subscriptions. Any other difference fails: those fields never change once listed. Instruments
+    /// no longer declared stay listed, since orders and trades refer to them.
+    fn reconcile_instruments(&mut self) -> Result<(), ExchangeError> {
+        for declared in self.declared_instruments.clone() {
+            let id = declared.id.clone();
+            let wrap = |error| match error {
+                error @ ExchangeError::Storage(_) => error,
+                error => ExchangeError::DeclaredInstrument {
+                    id: id.clone(),
+                    error: Box::new(error),
+                },
+            };
+            let Some(book) = self.books.get(&declared.id) else {
+                tracing::info!(id = %declared.id.0, "instrument listed from configuration");
+                self.register_instrument(declared).map_err(wrap)?;
+                continue;
+            };
+            let listed = book.instrument();
+            let fixed = [
+                ("symbol", listed.symbol == declared.symbol),
+                ("mic", listed.mic == declared.mic),
+                ("isin", listed.isin == declared.isin),
+                ("cusip", listed.cusip == declared.cusip),
+                ("currency", listed.currency == declared.currency),
+                (
+                    "currency_scale",
+                    listed.currency_scale == declared.currency_scale,
+                ),
+                (
+                    "tick_size_minor",
+                    listed.tick_size_minor == declared.tick_size_minor,
+                ),
+                ("lot_size", listed.lot_size == declared.lot_size),
+            ];
+            if let Some((field, _)) = fixed.iter().find(|(_, same)| !same) {
+                return Err(ExchangeError::DeclaredInstrumentConflict {
+                    id: declared.id,
+                    field,
+                });
+            }
+            let change = InstrumentChange {
+                enabled: Some(declared.enabled),
+                reference_symbol: Some(declared.reference_symbol.clone()),
+                price_source: Some(declared.price_source.clone()),
+                liquidity: Some(declared.liquidity.clone()),
+            };
+            self.update_instrument(&declared.id, &change)
+                .map_err(wrap)?;
+        }
+        Ok(())
+    }
+
+    /// Starts every listed instrument's price source at recovery, each with its grid where it was. An instrument with
+    /// no stored start (listed before price sources existed) starts now, and that is stored.
+    fn start_price_sources(&mut self) -> Result<(), ExchangeError> {
+        let mut since = self.store.price_source_since()?;
+        let now = self.now();
+        let mut instruments: Vec<Instrument> = self
+            .books
+            .values()
+            .map(|b| b.instrument().clone())
+            .collect();
+        instruments.sort_by(|a, b| a.id.cmp(&b.id));
+        for instrument in instruments {
+            let at = match since.remove(&instrument.id) {
+                Some(at) => at,
+                None => {
+                    self.store.save_price_source_since(&instrument.id, now)?;
+                    now
+                }
+            };
+            self.prices.start(&instrument, at).map_err(|error| {
+                ExchangeError::DeclaredInstrument {
+                    id: instrument.id.clone(),
+                    error: Box::new(error.into()),
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Sets the liquidity provider up, at recovery and after a reset: its inventory per instrument from its trades,
+    /// and no ladder yet, so each is quoted afresh (decision D18). Its resting orders, if any survived a restart, are
+    /// replaced at the first quote.
+    fn start_liquidity(&mut self) -> Result<(), ExchangeError> {
+        let Some(provider) = &mut self.provider else {
+            return Ok(());
+        };
+        provider.quoting = self
+            .store
+            .net_positions(&provider.policy.participant)?
+            .into_iter()
+            .map(|(id, inventory)| {
+                (
+                    id,
+                    Quoting {
+                        inventory,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        Ok(())
+    }
+
+    /// Lets the liquidity provider quote what is due, in one instrument or all (in ID order): the first ladder, a
+    /// new one when the reference price moved `requote_threshold_ticks` from the last quote, a refill once
+    /// `refill_delay_ms` passed since a fill, or no ladder when the instrument is off, disabled or without a reference
+    /// price. Runs after every order and cancellation, after instrument changes, and on every tick, so on a frozen
+    /// clock what it does depends only on the commands.
+    fn maintain_liquidity(&mut self, only: Option<&InstrumentId>) -> Result<(), ExchangeError> {
+        if self.provider.is_none() {
+            return Ok(());
+        }
+        let mut ids: Vec<InstrumentId> = match only {
+            Some(id) => vec![id.clone()],
+            None => self.books.keys().cloned().collect(),
+        };
+        ids.sort();
+        let now = self.now();
+        for id in ids {
+            self.requote(&id, now)?;
+        }
+        Ok(())
+    }
+
+    /// Quotes one instrument if due (see [`Exchange::maintain_liquidity`]). The old ladder is cancelled and the new
+    /// one placed as one commit group, inside the caller's group if one is open, so no order ever sees half a ladder.
+    fn requote(&mut self, id: &InstrumentId, now: DateTime<Utc>) -> Result<(), ExchangeError> {
+        let Some(book) = self.books.get(id) else {
+            return Ok(());
+        };
+        let instrument = book.instrument().clone();
+        let mut settings = self
+            .liquidity_settings(&instrument)
+            .expect("checked by the caller");
+        let provider = self.provider.as_ref().expect("checked by the caller");
+        let lp = provider.policy.participant.clone();
+        let state = provider.quoting.get(id).cloned().unwrap_or_default();
+        let mut resting: Vec<Order> = book
+            .orders()
+            .filter(|o| o.participant_id == lp)
+            .cloned()
+            .collect();
+        resting.sort_by_key(|o| o.sequence);
+        let reference = match (settings.mode, instrument.enabled) {
+            (crate::liquidity::LiquidityMode::On, true) => self.prices.reference(id, now),
+            _ => None,
+        };
+        let closed = !self.sessions.is_open(instrument.mic.as_deref(), now);
+        let shown = Self::liquidity_state(&settings, &instrument, reference.as_ref(), closed);
+        let configured = settings.clone();
+        // SR-9: in a closed market, or under a stale price, the ladder is quoted as it is (keep), with a wider spread
+        // (widen), or not at all (pull). A closed market's policy takes precedence.
+        let stale = reference.is_some_and(|r| r.stale);
+        let degraded = if closed {
+            Some((settings.closed_policy, settings.closed_widen_factor))
+        } else if stale {
+            Some((settings.stale_policy, settings.stale_widen_factor))
+        } else {
+            None
+        };
+        if let Some((StalePolicy::Widen, factor)) = degraded {
+            settings.spread_bps *= factor;
+        }
+        let reference = reference
+            .filter(|_| !matches!(degraded, Some((StalePolicy::Pull, _))))
+            .map(|r| r.ticks);
+        let lot = instrument.lot_size;
+        let wanted =
+            reference.map(|r| settings.ladder(r, state.inventory / lot.max(1) as i64, lot));
+        let due = match (reference, state.quoted_at) {
+            (None, _) => !resting.is_empty(),
+            (Some(_), None) => true,
+            (Some(r), Some(quoted)) => {
+                (r - quoted).abs() >= i64::from(settings.requote_threshold_ticks)
+                    || stale != state.quoted_stale
+                    || closed != state.quoted_closed
+                    || state.quoted_settings.as_ref() != Some(&configured)
+                    || state.filled_at.is_some_and(|at| {
+                        now >= at + chrono::Duration::milliseconds(settings.refill_delay_ms as i64)
+                    })
+            }
+        };
+        if !due {
+            self.quoting(id).state = Some(shown);
+            return Ok(());
+        }
+        let wanted = wanted.unwrap_or_default();
+        let unchanged = resting.len() == wanted.len()
+            && resting.iter().zip(&wanted).all(|(order, quote)| {
+                order.side == quote.side
+                    && order.limit_price_ticks == Some(quote.price_ticks)
+                    && order.remaining_quantity == quote.quantity
+            });
+        if !unchanged {
+            if !wanted.is_empty() && !self.participants.contains_key(&lp) {
+                self.register_participant(Participant {
+                    id: lp.clone(),
+                    name: "Liquidity provider".into(),
+                    settlement: None,
+                })?;
+            }
+            let own_group = self.group.is_none();
+            if own_group {
+                self.begin_group()?;
+            }
+            let replaced = self.replace_ladder(&instrument.id, &lp, &resting, &wanted);
+            if own_group {
+                // What was written is applied in memory too, so commit it even when a step failed.
+                self.commit_group()?;
+            }
+            replaced?;
+            ::metrics::counter!(crate::metrics::LIQUIDITY_REQUOTES, "instrument" => id.0.clone())
+                .increment(1);
+            ::metrics::counter!(crate::metrics::LIQUIDITY_QUOTES).increment(wanted.len() as u64);
+        }
+        let quoting = self.quoting(id);
+        quoting.quoted_at = reference;
+        quoting.filled_at = None;
+        quoting.quoted_stale = stale;
+        quoting.quoted_closed = closed;
+        quoting.quoted_settings = Some(configured);
+        quoting.state = Some(shown);
+        Ok(())
+    }
+
+    fn quoting(&mut self, id: &InstrumentId) -> &mut Quoting {
+        self.provider
+            .as_mut()
+            .expect("checked by the caller")
+            .quoting
+            .entry(id.clone())
+            .or_default()
+    }
+
+    /// The liquidity provider's status in every listed instrument (or only `id`'s), in ID order (SR-11).
+    pub fn liquidity(&mut self, id: Option<&InstrumentId>) -> Vec<LiquidityStatus> {
+        let now = self.now();
+        let mut ids: Vec<InstrumentId> = self
+            .books
+            .keys()
+            .filter(|i| id.is_none_or(|id| id == *i))
+            .cloned()
+            .collect();
+        ids.sort();
+        ids.into_iter()
+            .map(|id| {
+                let book = &self.books[&id];
+                let instrument = book.instrument().clone();
+                let provider = self.provider.as_ref().map(|p| p.policy.participant.clone());
+                let quoting = self
+                    .provider
+                    .as_ref()
+                    .and_then(|p| p.quoting.get(&id))
+                    .cloned()
+                    .unwrap_or_default();
+                let mut ladder: Vec<Order> = book
+                    .orders()
+                    .filter(|o| provider.as_ref() == Some(&o.participant_id))
+                    .cloned()
+                    .collect();
+                ladder.sort_by_key(|o| match o.side {
+                    Side::Buy => (0, -o.limit_price_ticks.unwrap_or(0)),
+                    Side::Sell => (1, o.limit_price_ticks.unwrap_or(0)),
+                });
+                LiquidityStatus {
+                    settings: self.liquidity_settings(&instrument),
+                    provider,
+                    state: quoting.state.unwrap_or("off"),
+                    inventory: quoting.inventory,
+                    quoted_at: quoting.quoted_at,
+                    ladder,
+                    reference: self.prices.reference(&id, now),
+                    session_open: self.sessions.is_open(instrument.mic.as_deref(), now),
+                    instrument,
+                }
+            })
+            .collect()
+    }
+
+    /// Changes one instrument's liquidity settings field by field, and its price source if given, durably (an
+    /// `InstrumentUpdated`), then returns the provider's status there. The merge runs here, on the exchange thread, so
+    /// concurrent patches never lose each other's fields.
+    pub fn patch_liquidity(
+        &mut self,
+        id: &InstrumentId,
+        patch: &LiquidityPatch,
+    ) -> Result<LiquidityStatus, ExchangeError> {
         let book = self
             .books
-            .get_mut(id)
+            .get(id)
             .ok_or_else(|| ExchangeError::UnknownInstrument(id.clone()))?;
-        self.store.set_instrument_enabled(id, enabled)?;
-        book.set_enabled(enabled);
-        Ok(book.instrument().clone())
+        let liquidity = if patch.fields.is_empty() {
+            None
+        } else {
+            let merged = book
+                .instrument()
+                .liquidity
+                .clone()
+                .unwrap_or_default()
+                .patched(&patch.fields)?;
+            Some((merged != Default::default()).then_some(merged))
+        };
+        let change = InstrumentChange {
+            enabled: None,
+            reference_symbol: None,
+            price_source: patch.price_source.clone(),
+            liquidity,
+        };
+        self.update_instrument(id, &change)?;
+        Ok(self
+            .liquidity(Some(id))
+            .pop()
+            .expect("the instrument is listed"))
+    }
+
+    /// The provider's settings for `instrument`, resolved; `None` when there is no provider.
+    fn liquidity_settings(&self, instrument: &Instrument) -> Option<LiquiditySettings> {
+        let provider = self.provider.as_ref()?;
+        Some(
+            instrument
+                .liquidity
+                .clone()
+                .unwrap_or_default()
+                .or(&provider.policy.default)
+                .resolve(),
+        )
+    }
+
+    /// What the provider does in an instrument, for the market data: `off` (mode off or trading disabled),
+    /// `no-reference`, `quoting`, or in a closed market or under a stale price that policy: `kept`, `widened` or
+    /// `pulled`. Recorded when it quotes, so the snapshot never shows a state whose ladder is not in the book yet.
+    fn liquidity_state(
+        settings: &LiquiditySettings,
+        instrument: &Instrument,
+        reference: Option<&Reference>,
+        closed: bool,
+    ) -> &'static str {
+        if settings.mode == crate::liquidity::LiquidityMode::Off || !instrument.enabled {
+            return "off";
+        }
+        let policy = match reference {
+            None => return "no-reference",
+            Some(_) if closed => settings.closed_policy,
+            Some(r) if r.stale => settings.stale_policy,
+            Some(_) => return "quoting",
+        };
+        match policy {
+            StalePolicy::Keep => "kept",
+            StalePolicy::Widen => "widened",
+            StalePolicy::Pull => "pulled",
+        }
+    }
+
+    /// Cancels the provider's resting orders and places `wanted`, bids then asks, best first.
+    fn replace_ladder(
+        &mut self,
+        instrument: &InstrumentId,
+        lp: &ParticipantId,
+        resting: &[Order],
+        wanted: &[crate::liquidity::Quote],
+    ) -> Result<(), ExchangeError> {
+        for order in resting {
+            self.cancel_order(order.id)?;
+        }
+        for quote in wanted {
+            self.submit_order(SubmitOrder {
+                client_order_id: None,
+                instrument_id: instrument.clone(),
+                participant_id: lp.clone(),
+                side: quote.side,
+                order_type: OrderType::Limit,
+                limit_price_ticks: Some(quote.price_ticks),
+                quantity: quote.quantity,
+                time_in_force: None,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Every listed instrument's market data now, in ID order (or only `id`'s). What changed since the last
+    /// publication is published first, so the snapshot's `mdSequence` is that of the last message about it.
+    pub fn market_data(&mut self, id: Option<&InstrumentId>) -> Vec<crate::market_data::Snapshot> {
+        self.publish_market_data(id);
+        let now = self.now();
+        let today = self.business_date(now);
+        let mut ids: Vec<InstrumentId> = self
+            .books
+            .keys()
+            .filter(|i| id.is_none_or(|id| id == *i))
+            .cloned()
+            .collect();
+        ids.sort();
+        ids.into_iter()
+            .map(|id| {
+                let reference = self.prices.reference(&id, now);
+                let (best_bid, best_ask) = self.top_of_book(&id);
+                let state = self.market_data.get(&id).cloned().unwrap_or_default();
+                let instrument = self.books[&id].instrument().clone();
+                let instrument_mic = instrument.mic.clone();
+                crate::market_data::Snapshot {
+                    liquidity: self
+                        .provider
+                        .as_ref()
+                        .and_then(|p| p.quoting.get(&id))
+                        .and_then(|q| q.state)
+                        .unwrap_or("off"),
+                    instrument,
+                    md_sequence: state.md_sequence,
+                    reference,
+                    best_bid,
+                    best_ask,
+                    last_trade: state.last_trade,
+                    session_volume: state.volume_on(today),
+                    session_open: self.sessions.is_open(instrument_mic.as_deref(), now),
+                }
+            })
+            .collect()
+    }
+
+    /// Publishes what changed in one instrument's market data, or every instrument's, since the last publication:
+    /// trade prints, then the quote, then the reference price. Inside a commit group, nothing is published until the
+    /// group is durable (see [`Self::commit_group`]).
+    fn publish_market_data(&mut self, only: Option<&InstrumentId>) {
+        let ids: Vec<InstrumentId> = match only {
+            Some(id) => vec![id.clone()],
+            None => self.books.keys().cloned().collect(),
+        };
+        if self.group.is_some() {
+            self.market_data_due.extend(ids);
+            return;
+        }
+        let now = self.now();
+        let mut ids = ids;
+        ids.sort();
+        for id in ids {
+            let Some(book) = self.books.get(&id) else {
+                continue;
+            };
+            let instrument = book.instrument().clone();
+            let quote = self.top_of_book(&id);
+            let reference = self.prices.reference(&id, now);
+            let state = self.market_data.entry(id).or_default();
+            let before = state.reference.flatten().map(|(ticks, ..)| ticks);
+            let messages = state.publish(&instrument, quote, reference);
+            record_reference(&instrument.id, before, reference, now);
+            for message in messages {
+                ::metrics::counter!(crate::metrics::MARKET_DATA_MESSAGES, "instrument" => message.instrument_id.0.clone(), "kind" => message.kind)
+                    .increment(1);
+                if let Some(sender) = &self.market_data_sender {
+                    // No subscribers is not an error; a full subscriber loses its place, never blocks this.
+                    let _ = sender.send(std::sync::Arc::new(message));
+                }
+            }
+        }
+    }
+
+    /// The best bid and ask of an instrument's book, with the quantity resting there.
+    fn top_of_book(
+        &self,
+        id: &InstrumentId,
+    ) -> (
+        Option<crate::market_data::Top>,
+        Option<crate::market_data::Top>,
+    ) {
+        let top = |side| {
+            self.books[id]
+                .depth(side)
+                .first()
+                .map(|level| crate::market_data::Top {
+                    price_ticks: level.price_ticks,
+                    quantity: level.quantity,
+                })
+        };
+        (top(Side::Buy), top(Side::Sell))
+    }
+
+    /// The business date an instant belongs to: on the business-day calendar when there is one, else its UTC date.
+    fn business_date(&self, at: DateTime<Utc>) -> chrono::NaiveDate {
+        self.days
+            .as_ref()
+            .map_or_else(|| at.date_naive(), |d| d.calendar.business_date(at))
+    }
+
+    /// Dates the executions stored before executions carried dates (migration 018), on the current calendar and
+    /// cycles, so every execution has both dates from here on.
+    fn date_old_executions(&mut self) -> Result<(), ExchangeError> {
+        let undated = self.store.executions_without_dates()?;
+        if undated.is_empty() {
+            return Ok(());
+        }
+        let dated: Vec<_> = undated
+            .into_iter()
+            .map(|e| {
+                (
+                    e.id,
+                    self.trade_dating.dates(e.executed_at, e.mic.as_deref()),
+                )
+            })
+            .collect();
+        tracing::info!(
+            executions = dated.len(),
+            "dating executions stored before they carried dates"
+        );
+        self.store.set_execution_dates(&dated)?;
+        Ok(())
+    }
+
+    /// Rebuilds the market data a restart lost: each instrument's last trade and its volume on the current business
+    /// date. The `mdSequence` starts again from 0.
+    fn load_market_data(&mut self) -> Result<(), ExchangeError> {
+        let now = self.now();
+        let today = self.business_date(now);
+        let since = match &self.days {
+            Some(days) => days.calendar.window(today).0,
+            None => today.and_hms_opt(0, 0, 0).expect("midnight").and_utc(),
+        };
+        for summary in self.store.trade_summary(since)? {
+            let state = self.market_data.entry(summary.instrument_id).or_default();
+            state.last_trade = Some(crate::market_data::Print {
+                price_ticks: summary.last_price_ticks,
+                quantity: summary.last_quantity,
+                executed_at: summary.last_executed_at,
+            });
+            state.volume_date = Some(today);
+            state.volume = summary.volume_since;
+        }
+        Ok(())
     }
 
     pub fn register_participant(&mut self, participant: Participant) -> Result<(), ExchangeError> {
@@ -465,7 +1249,16 @@ impl Exchange {
     /// Sequences, matches and commits an order. Malformed orders are refused without a sequence; orders the exchange
     /// rejects (self-trade) are sequenced and stored as `REJECTED`. A repeated client order ID returns the original
     /// order if the terms match and fails otherwise.
+    /// Matches an order, commits it, and then lets the liquidity provider react (refill, re-quote) to what it did.
     pub fn submit(&mut self, command: SubmitOrder) -> Result<SubmitOutcome, ExchangeError> {
+        let instrument_id = command.instrument_id.clone();
+        let outcome = self.submit_order(command)?;
+        self.maintain_liquidity(Some(&instrument_id))?;
+        self.publish_market_data(Some(&instrument_id));
+        Ok(outcome)
+    }
+
+    fn submit_order(&mut self, command: SubmitOrder) -> Result<SubmitOutcome, ExchangeError> {
         let book = self
             .books
             .get(&command.instrument_id)
@@ -493,6 +1286,24 @@ impl Exchange {
         }
 
         let now = self.now();
+        let mic = book.instrument().mic.clone();
+        let time_in_force = match (command.order_type, command.time_in_force) {
+            (OrderType::Market, None | Some(TimeInForce::Ioc)) => TimeInForce::Ioc,
+            (OrderType::Market, Some(other)) => {
+                return Err(ExchangeError::InvalidTimeInForce(other));
+            }
+            (OrderType::Limit, Some(given)) => given,
+            (OrderType::Limit, None) if self.sessions.session(mic.as_deref()).is_some() => {
+                TimeInForce::Day
+            }
+            (OrderType::Limit, None) => TimeInForce::Gtc,
+        };
+        // The liquidity provider is not a client: it follows its closed-market policy instead (SR-9).
+        let provider = self
+            .provider
+            .as_ref()
+            .is_some_and(|p| p.policy.participant == command.participant_id);
+        let market_closed = !provider && !self.sessions.is_open(mic.as_deref(), now);
         let order = Order {
             id: self.ids.order(self.last_sequence + 1),
             client_order_id: command.client_order_id,
@@ -505,11 +1316,71 @@ impl Exchange {
             remaining_quantity: command.quantity,
             sequence: self.last_sequence + 1,
             status: OrderStatus::Open,
+            time_in_force,
         };
         let started = std::time::Instant::now();
-        let update = book.plan_submit(order, &mut MatchContext { now, ids: self.ids })?;
+        let mut ctx = MatchContext {
+            now,
+            ids: self.ids,
+            dates: self.trade_dating.dates(now, mic.as_deref()),
+            market_closed,
+        };
+        let update = book.plan_submit(order, &mut ctx)?;
         ::metrics::histogram!(crate::metrics::MATCH_DURATION).record(started.elapsed());
-        self.commit_and_apply(Command::Submit, update, now)
+        let outcome = self.commit_and_apply(Command::Submit, update, now)?;
+        if let SubmitOutcome::Processed(update) = &outcome
+            && update.order.time_in_force == TimeInForce::Day
+            && update.order.status.is_active()
+        {
+            self.schedule_expiry(&update.order, mic.as_deref(), now);
+        }
+        Ok(outcome)
+    }
+
+    /// Schedules a resting `DAY` order's expiry (SR-17).
+    fn schedule_expiry(&mut self, order: &Order, mic: Option<&str>, accepted_at: DateTime<Utc>) {
+        if let Some(due) = self.sessions.day_expiry(mic, accepted_at) {
+            self.expiries
+                .insert((due, order.sequence, order.instrument_id.clone(), order.id));
+        }
+    }
+
+    /// Rebuilds the expiry schedule from the stored active `DAY` orders, at recovery and after a failed commit.
+    fn schedule_expiries(&mut self) -> Result<(), ExchangeError> {
+        self.expiries.clear();
+        for record in self.store.active_day_orders()? {
+            let mic = self
+                .books
+                .get(&record.order.instrument_id)
+                .and_then(|b| b.instrument().mic.clone());
+            self.schedule_expiry(&record.order, mic.as_deref(), record.created_at);
+        }
+        Ok(())
+    }
+
+    /// Expires the `DAY` orders due at `due` that are still active, each in its own commit with `OrderExpired` stamped
+    /// at `due`, the close. Returns the number of events.
+    fn expire_due(&mut self, due: DateTime<Utc>) -> Result<usize, ExchangeError> {
+        let mut events = 0;
+        while let Some(entry) = self.expiries.first().cloned() {
+            if entry.0 > due {
+                break;
+            }
+            self.expiries.remove(&entry);
+            let (_, _, instrument, order_id) = entry;
+            let Some(book) = self.books.get(&instrument) else {
+                continue;
+            };
+            if book.order(order_id).is_none() {
+                continue; // Filled or cancelled since.
+            }
+            let update = book.plan_expire(order_id)?;
+            self.commit_and_apply(Command::Expire, update, due)?;
+            events += 1;
+            self.maintain_liquidity(Some(&instrument))?;
+            self.publish_market_data(Some(&instrument));
+        }
+        Ok(events)
     }
 
     /// Opens a commit group: the following [`Exchange::submit`]s and [`Exchange::cancel`]s become durable together
@@ -535,6 +1406,8 @@ impl Exchange {
             if let Err(reload) = self.reload() {
                 panic!("cannot reload the exchange after a failed group commit: {reload}");
             }
+            // Nothing of the group was published; what is due now compares against the reloaded books.
+            self.publish_due_market_data();
             return Err(error.into());
         }
         ::metrics::histogram!(crate::metrics::COMMIT_DURATION).record(started.elapsed());
@@ -542,12 +1415,28 @@ impl Exchange {
             command.record();
         }
         self.signal_deliveries(committed.iter().any(|c| c.delivers));
+        self.publish_due_market_data();
         Ok(())
+    }
+
+    fn publish_due_market_data(&mut self) {
+        for id in std::mem::take(&mut self.market_data_due) {
+            self.publish_market_data(Some(&id));
+        }
     }
 
     /// Rebuilds what commands change in memory (books, sequences, the settlement simulator) from storage.
     fn reload(&mut self) -> Result<(), ExchangeError> {
         self.books = load_books(&self.store)?;
+        self.schedule_expiries()?;
+        // The group's trades are gone: forget their prints, and take the last trade and volume from storage again.
+        for state in self.market_data.values_mut() {
+            state.pending.clear();
+            state.last_trade = None;
+            state.volume_date = None;
+            state.volume = 0;
+        }
+        self.load_market_data()?;
         self.last_sequence = self.store.max_sequence()?;
         self.next_event_sequence = self.store.next_event_sequence()?;
         if let Some(simulator) = &mut self.settlement {
@@ -560,8 +1449,15 @@ impl Exchange {
         Ok(())
     }
 
-    /// Cancels the remaining quantity of an active order.
+    /// Cancels the remaining quantity of an active order, then lets the liquidity provider react.
     pub fn cancel(&mut self, order_id: Uuid) -> Result<BookUpdate, ExchangeError> {
+        let update = self.cancel_order(order_id)?;
+        self.maintain_liquidity(Some(&update.order.instrument_id))?;
+        self.publish_market_data(Some(&update.order.instrument_id));
+        Ok(update)
+    }
+
+    fn cancel_order(&mut self, order_id: Uuid) -> Result<BookUpdate, ExchangeError> {
         let Some(book) = self
             .books
             .values()
@@ -685,6 +1581,9 @@ impl Exchange {
     pub fn reset(&mut self) -> Result<(), ExchangeError> {
         self.store.reset()?;
         self.books.clear();
+        self.expiries.clear();
+        self.prices.clear();
+        self.market_data.clear();
         self.participants.clear();
         self.webhooks.clear();
         self.last_sequence = 0;
@@ -700,6 +1599,10 @@ impl Exchange {
                 .save_virtual_clock(clock.now(), clock.is_running())?;
         }
         let now = self.now();
+        if let Some(days) = &mut self.days {
+            days.cursor = BusinessDays::first_cursor(&days.calendar, now);
+            self.store.save_business_day_cursor(days.cursor)?;
+        }
         if let Some(clearing) = &mut self.clearing {
             clearing.cursor = Clearing::first_cursor(&clearing.policy, now);
             clearing.after = 0;
@@ -707,8 +1610,10 @@ impl Exchange {
             self.store.save_clearing_cursor(clearing.cursor, 0)?;
         }
         self.epoch += 1;
-        // Configuration-declared subscriptions come back, as on a new database.
+        // Configuration-declared subscriptions and instruments come back, as on a new database.
         self.reconcile_webhooks()?;
+        self.start_liquidity()?;
+        self.reconcile_instruments()?;
         tracing::info!(epoch = self.epoch, "exchange state reset");
         Ok(())
     }
@@ -740,21 +1645,108 @@ impl Exchange {
         Ok(retried)
     }
 
-    /// Everything due by now on domain time, in time order: settlement transitions, and clearing statements at each
-    /// cutoff (and late ones when due). Before each statement, the settlement transitions due by its instant run
-    /// first, so the event log stays in time order across a large clock move. Returns the number of events.
+    /// Everything due by now on domain time, in time order: settlement transitions, each business day's close, and
+    /// clearing statements at each cutoff (and late ones when due). Before each instant, the settlement transitions
+    /// due by it run first, so the event log stays in time order across a large clock move; at a cutoff the day closes
+    /// before its statements are issued. Returns the number of events.
     pub fn tick(&mut self) -> Result<usize, ExchangeError> {
         let mut total = 0;
         loop {
             let now = self.now();
-            match self.clearing.as_ref().map(Clearing::due) {
+            let close = self.days.as_ref().map(BusinessDays::due);
+            let clearing = self.clearing.as_ref().map(Clearing::due);
+            let expiry = self.expiries.first().map(|e| e.0);
+            match close.into_iter().chain(clearing).chain(expiry).min() {
                 Some(due) if due <= now => {
                     total += self.settlement_step(due)?;
-                    total += self.clearing_step(due)?;
+                    // DAY orders end with their trading day, before the business day closes.
+                    if expiry == Some(due) {
+                        total += self.expire_due(due)?;
+                    }
+                    if close == Some(due) {
+                        total += self.close_business_day()?;
+                    }
+                    if clearing == Some(due) {
+                        total += self.clearing_step(due)?;
+                    }
                 }
-                _ => return Ok(total + self.settlement_step(now)?),
+                _ => {
+                    total += self.settlement_step(now)?;
+                    // Time moved: reference prices with it, and refill delays ran out.
+                    self.maintain_liquidity(None)?;
+                    self.publish_market_data(None);
+                    return Ok(total);
+                }
             }
         }
+    }
+
+    /// Closes the next business day with `BusinessDayClosed`, committed with the moved cursor.
+    fn close_business_day(&mut self) -> Result<usize, ExchangeError> {
+        let days = self.days.as_ref().expect("business days run");
+        let date = next_business_day(days.cursor);
+        let calendar = days.calendar;
+        let mut new_events = vec![events::business_day_closed(date, &calendar)];
+        new_events.extend(self.closing_prices(date, &calendar)?);
+        let next = NewEvent::stamp(&mut new_events, self.next_event_sequence, self.ids);
+        let outbox = Outbox {
+            subscriptions: self.webhooks.subscriptions(),
+            simulation_id: self.simulation_id.as_deref(),
+            ids: self.ids,
+            due: wall_now(),
+            schema_version: events::SCHEMA_VERSION,
+            parties: self.webhooks.parties(),
+        };
+        self.store.commit_business_day(date, &new_events, outbox)?;
+        self.next_event_sequence = next;
+        for event in &new_events {
+            ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type)
+                .increment(1);
+        }
+        self.days.as_mut().expect("business days run").cursor = date;
+        self.wake_delivery(&new_events);
+        Ok(new_events.len())
+    }
+
+    /// `ClosingPriceIssued` for business date `date`, in instrument ID order (SR-14): every listed instrument that
+    /// traded in the day's window closes at its last trade then; one that did not, at its reference price at the
+    /// cutoff; one with neither has no closing price. The reference is read as of the cutoff without moving the
+    /// source, so the event is the same however late the cutoff is handled.
+    fn closing_prices(
+        &self,
+        date: chrono::NaiveDate,
+        calendar: &simulator_kit::calendar::CutoffCalendar,
+    ) -> Result<Vec<NewEvent>, ExchangeError> {
+        let (from, cutoff_at) = calendar.window(date);
+        let traded: HashMap<InstrumentId, crate::persistence::DayTrading> = self
+            .store
+            .day_trading(from, cutoff_at)?
+            .into_iter()
+            .map(|t| (t.instrument_id.clone(), t))
+            .collect();
+        let mut ids: Vec<&InstrumentId> = self.books.keys().collect();
+        ids.sort();
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| {
+                let instrument = self.books[id].instrument();
+                let (price, basis, volume) = match traded.get(id) {
+                    Some(day) => (
+                        day.last_price_ticks,
+                        events::ClosingBasis::LastTrade,
+                        day.volume,
+                    ),
+                    None => (
+                        self.prices.reference_at(id, cutoff_at)?.ticks,
+                        events::ClosingBasis::Reference,
+                        0,
+                    ),
+                };
+                Some(events::closing_price(
+                    instrument, date, cutoff_at, price, basis, volume,
+                ))
+            })
+            .collect())
     }
 
     /// One clearing step at `at`, the earliest instant something is due: the cutoff's statements (those not drafted
@@ -811,6 +1803,7 @@ impl Exchange {
             ids: self.ids,
             due: wall_now(),
             schema_version: events::SCHEMA_VERSION,
+            parties: self.webhooks.parties(),
         };
         let rows: Vec<&StoredStatement> = issue.iter().chain(&waiting).collect();
         self.store
@@ -873,6 +1866,7 @@ impl Exchange {
                 ids: self.ids,
                 due: wall_now(),
                 schema_version: events::SCHEMA_VERSION,
+                parties: self.webhooks.parties(),
             };
             let write = SettlementWrite {
                 instructions: plan.transitions.iter().map(|t| &t.instruction).collect(),
@@ -920,9 +1914,9 @@ impl Exchange {
                 "details must be a JSON object of at most {MAX_SETTLEMENT_BYTES} bytes"
             )));
         }
-        if !self.store.execution_exists(report.execution_id)? {
+        let Some((buyer_id, seller_id)) = self.store.execution_parties(report.execution_id)? else {
             return Err(ExchangeError::UnknownExecution(report.execution_id));
-        }
+        };
         if let Some(reference) = &report.reference
             && let Some(existing) = self
                 .store
@@ -960,6 +1954,8 @@ impl Exchange {
             payload: serde_json::json!({
                 "reportId": stored.id,
                 "executionId": stored.execution_id,
+                "buyerId": buyer_id,
+                "sellerId": seller_id,
                 "status": stored.status,
                 "reference": stored.reference,
                 "reason": stored.reason,
@@ -978,6 +1974,7 @@ impl Exchange {
             ids: self.ids,
             due: wall_now(),
             schema_version: events::SCHEMA_VERSION,
+            parties: self.webhooks.parties(),
         };
         self.store.commit_report(&stored, &event, outbox)?;
         self.next_event_sequence = next;
@@ -1008,19 +2005,35 @@ impl Exchange {
     pub fn change_clock(&mut self, change: ClockChange) -> Result<ClockState, ExchangeError> {
         let clock = self
             .virtual_clock
-            .as_ref()
+            .clone()
             .ok_or(ExchangeError::ClockNotVirtual)?;
-        match change {
-            ClockChange::Advance(by) => clock.advance(by)?,
-            ClockChange::Set(to) => clock.set(to)?,
-            ClockChange::Freeze => clock.freeze(),
-            ClockChange::Resume => clock.resume(),
-            ClockChange::Speed(speed) => clock.set_speed(speed)?,
-        }
-        self.store
-            .save_virtual_clock(clock.now(), clock.is_running())?;
-        // Whatever became due by the new time happens before the caller hears back.
+        let changed = change.apply(&clock)?;
+        // Whatever became due by the new time happens first, so the log stays in time order; then the new reading
+        // commits with its ClockChanged.
         self.tick()?;
+        if changed {
+            let mut event =
+                simulator_kit::clock::changed_event(change.name(), &clock, events::EXCHANGE_SOURCE);
+            let next = NewEvent::stamp(
+                std::slice::from_mut(&mut event),
+                self.next_event_sequence,
+                self.ids,
+            );
+            let outbox = Outbox {
+                subscriptions: self.webhooks.subscriptions(),
+                simulation_id: self.simulation_id.as_deref(),
+                ids: self.ids,
+                due: wall_now(),
+                schema_version: events::SCHEMA_VERSION,
+                parties: self.webhooks.parties(),
+            };
+            self.store
+                .commit_clock(clock.now(), clock.is_running(), &event, outbox)?;
+            self.next_event_sequence = next;
+            ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type)
+                .increment(1);
+            self.wake_delivery(std::slice::from_ref(&event));
+        }
         Ok(self.clock_state())
     }
 
@@ -1044,6 +2057,15 @@ impl Exchange {
         let participants = &self.participants;
         let lookup = |id: &ParticipantId| participants.get(id).cloned().flatten();
         let mut new_events = events::for_update(command, &update, instrument, &lookup, now);
+        if let Some(provider) = &self.provider
+            && !provider.policy.emit_order_events
+        {
+            // The provider's order lifecycle stays out of the log (SR-10); its trades stay in.
+            let lp = provider.policy.participant.0.as_str();
+            new_events.retain(|e| {
+                e.event_type == events::TRADE_EXECUTED || e.payload["participantId"] != lp
+            });
+        }
         let mut next = NewEvent::stamp(&mut new_events, self.next_event_sequence, self.ids);
         let settlement_plan = match &self.settlement {
             Some(simulator) if !update.executions.is_empty() => {
@@ -1072,6 +2094,7 @@ impl Exchange {
             ids: self.ids,
             due: wall_now(),
             schema_version: events::SCHEMA_VERSION,
+            parties: self.webhooks.parties(),
         };
         let settlement_write = settlement_plan.as_ref().map(|plan| SettlementWrite {
             instructions: plan.transitions.iter().map(|t| &t.instruction).collect(),
@@ -1088,6 +2111,38 @@ impl Exchange {
         book.apply(&update)
             .expect("nothing else touched the book between plan and apply");
         self.last_sequence = self.last_sequence.max(update.order.sequence);
+        for execution in &update.executions {
+            let date = self.business_date(execution.executed_at);
+            self.market_data
+                .entry(update.order.instrument_id.clone())
+                .or_default()
+                .trade(
+                    crate::market_data::Print {
+                        price_ticks: execution.price_ticks,
+                        quantity: execution.quantity,
+                        executed_at: execution.executed_at,
+                    },
+                    date,
+                );
+        }
+        if let Some(provider) = &mut self.provider {
+            let lp = &provider.policy.participant;
+            for execution in &update.executions {
+                let signed = match (&execution.buyer_id, &execution.seller_id) {
+                    (buyer, _) if buyer == lp => execution.quantity as i64,
+                    (_, seller) if seller == lp => -(execution.quantity as i64),
+                    _ => continue,
+                };
+                let quoting = provider
+                    .quoting
+                    .entry(update.order.instrument_id.clone())
+                    .or_default();
+                quoting.inventory += signed;
+                quoting.filled_at = Some(now);
+                ::metrics::counter!(crate::metrics::LIQUIDITY_FILLS, "instrument" => update.order.instrument_id.0.clone())
+                    .increment(1);
+            }
+        }
         if let (Some(plan), Some(simulator)) = (&settlement_plan, self.settlement.as_mut()) {
             simulator.apply(plan);
             ::metrics::gauge!(crate::metrics::SETTLEMENT_OPEN).set(simulator.open() as f64);
@@ -1162,4 +2217,29 @@ fn same_terms(order: &Order, command: &SubmitOrder) -> bool {
         && order.order_type == command.order_type
         && order.limit_price_ticks == command.limit_price_ticks
         && order.quantity == command.quantity
+        && command
+            .time_in_force
+            .is_none_or(|t| t == order.time_in_force)
+}
+
+/// The reference-price metrics after one publication: an update when the published price moved from `before`, and
+/// the staleness and age of what is published now.
+fn record_reference(
+    id: &InstrumentId,
+    before: Option<i64>,
+    reference: Option<Reference>,
+    now: DateTime<Utc>,
+) {
+    use crate::metrics::{REFERENCE_AGE, REFERENCE_STALE, REFERENCE_UPDATES};
+    let Some(reference) = reference else {
+        ::metrics::gauge!(REFERENCE_STALE, "instrument" => id.0.clone()).set(0.0);
+        return;
+    };
+    if before != Some(reference.ticks) {
+        ::metrics::counter!(REFERENCE_UPDATES, "instrument" => id.0.clone()).increment(1);
+    }
+    ::metrics::gauge!(REFERENCE_STALE, "instrument" => id.0.clone())
+        .set(f64::from(u8::from(reference.stale)));
+    let age = (now - reference.source_timestamp).num_milliseconds().max(0) as f64 / 1000.0;
+    ::metrics::gauge!(REFERENCE_AGE, "instrument" => id.0.clone()).set(age);
 }

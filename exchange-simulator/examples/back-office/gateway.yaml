@@ -1,9 +1,12 @@
 # Mounted at /etc/gateway/gateway.yaml, layered over the built-in defaults (payment-gateway/config/default.yaml).
 clock:
-  mode: virtual
+  # The gateway follows the exchange's clock: same reading, speed and running state, read from its GET /api/clock
+  # every poll interval. Start, stop or speed up the exchange's clock; the gateway's refuses changes of its own.
+  mode: follow
   start: "2030-01-07T08:00:00Z"
-  running: false
-  speed: 1440
+  follow:
+    url: http://exchange:8080
+    poll_interval_ms: 100
 payments:
   # Every payment completes and none is returned, so the clean run reconciles exactly. Raise these to see failures
   # and returns.
@@ -13,13 +16,13 @@ payments:
 statement:
   cutoff: "17:30"
   time_zone: Europe/Copenhagen
-  opening_balances: { DKK: "1000000.00" }
+  opening_balances: { DKK: "1000000.00", USD: "1000000.00" }
 test_control:
   enabled: true
 webhooks:
   subscriptions:
     - name: payments
       url: http://receiver:9000/hooks/gateway
-      event_types: [PaymentPending, PaymentCompleted, PaymentFailed, PaymentReturned, BankStatementIssued]
+      event_types: [PaymentPending, PaymentCompleted, PaymentFailed, PaymentReturned, BankStatementIssued, ClockChanged]
       secret_file: /run/secrets/webhook_secret
       ordered: true

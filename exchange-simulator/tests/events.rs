@@ -21,6 +21,9 @@ fn acme() -> Instrument {
         tick_size_minor: 1,
         lot_size: 1,
         enabled: true,
+        reference_symbol: None,
+        price_source: None,
+        liquidity: None,
     }
 }
 
@@ -66,11 +69,12 @@ impl Harness {
             remaining_quantity: quantity,
             sequence: self.sequence,
             status: OrderStatus::Open,
+            time_in_force: exchange_simulator::domain::TimeInForce::Gtc,
         };
         let now = Utc.with_ymd_and_hms(2026, 10, 14, 12, 0, 0).unwrap();
         let update = self
             .book
-            .submit(order, &mut MatchContext { now, ids: self.ids })
+            .submit(order, &mut MatchContext::utc(now, self.ids))
             .unwrap();
         let settlement = |id: &ParticipantId| self.settlement.get(&id.0).cloned();
         let events = events::for_update(Command::Submit, &update, &acme(), &settlement, now);
@@ -146,8 +150,21 @@ fn acceptance_trade_produces_trade_and_fill_events() {
             "currencyScale": 2,
             "tickSizeMinor": 1,
             "executedAt": "2026-10-14T12:00:00Z",
+            "tradeDate": "2026-10-14",
+            "intendedSettlementDate": "2026-10-15",
         })
     );
+    for fill in [&events[2], &events[3]] {
+        assert_eq!(
+            (
+                &fill.payload["tradeDate"],
+                &fill.payload["intendedSettlementDate"]
+            ),
+            (&json!("2026-10-14"), &json!("2026-10-15")),
+            "{} carries its execution's dates",
+            fill.event_type
+        );
+    }
 
     let maker = &events[2];
     assert_eq!(maker.aggregate_id, sell.order.id.to_string());
