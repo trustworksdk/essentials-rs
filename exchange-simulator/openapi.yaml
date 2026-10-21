@@ -218,6 +218,27 @@ paths:
         "409": { $ref: "#/components/responses/Conflict" }
         "422": { $ref: "#/components/responses/Unprocessable" }
         "503": { $ref: "#/components/responses/Unavailable" }
+    delete:
+      tags: [orders]
+      operationId: cancelOrderByClientOrderId
+      summary: Cancel an open or partially filled order named by its client order ID
+      description: |
+        The order the participant submitted with this `clientOrderId`, cancelled exactly as
+        `DELETE /api/orders/{id}` cancels it: the same answers and the same `OrderCancelled`. A cancel queued right
+        after the order is resolved after it, so it does not need the exchange's order ID first.
+      parameters:
+        - { name: participantId, in: query, required: true, description: Client order IDs are unique per participant., schema: { type: string } }
+        - { name: clientOrderId, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 64 } }
+      responses:
+        "200":
+          description: Cancelled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrderResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /api/orders/{id}:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string, format: uuid } }

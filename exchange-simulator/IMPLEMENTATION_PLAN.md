@@ -1597,6 +1597,7 @@ it.
 | 6.12 | Liquidity runtime control | 5 | M | **SR-11.** `GET /api/liquidity[/{instrumentId}]` (settings, inventory, current ladder, source, staleness) and `PATCH /api/liquidity/{instrumentId}` for any setting, the price source and `mode` (`on`/`off`) included. A scenario step for it, so scenarios can drain liquidity, widen spreads, or switch an instrument from `finnhub` to `synthetic` at the close. |
 | 6.13 | Replay source and recorder | 6 | M | **SR-4.** Replays `(timestamp, referenceSymbol, price, volume)` rows (CSV or JSON lines) on the virtual clock, offset to the clock's start, optionally looping. In `finnhub` mode an optional recorder appends every applied tick in the replay format. Recordings stay local and are gitignored; vendor data is never committed. |
 | 6.14 | Market-data metrics, load profile with the provider | 6 | M | **SR-15, SR-20.** Per-instrument reference updates, staleness, subscribers, messages sent and conflated, streams closed for back-pressure; source health (connected, reconnects, rate-limit hits). A bench run with the provider on and a replayed source, reporting order-ack latency with and without the provider at the same client order rate. |
+| 6.15 | Cancel by client order id | 3 | S | **SR-30** (added to the requirements 2026-10-21, after the milestone was done). `DELETE /api/orders?participantId=…&clientOrderId=…`: the order is resolved inside the exchange thread (where submission's idempotency check resolves it), then cancelled exactly as `DELETE /api/orders/{id}` cancels it: the same `OrderResult`, the same `OrderCancelled`, `409 order_not_active` for a second cancel, `404` for an unknown `clientOrderId` within the participant. Both query parameters are required (`400` otherwise), since client order ids are unique per participant only. `openapi.yaml` gains the operation. |
 
 **Not planned:** SR-18 (FX reference rates) is marked LATER and waits for the demo's FX phase.
 
@@ -2180,9 +2181,38 @@ then 6.11, 6.12, 6.13–6.14.
   every conflation counted, replacement or not; closed streams not labelled per instrument; published messages
   without the instrument label. (One mutation's pattern first missed after formatting and was rerun.)
 
+**6.15 — cancel by client order id ✅ done (2026-10-21)**
+- **Delivered:**
+  - `DELETE /api/orders?participantId=…&clientOrderId=…` (SR-30). `CancelTarget` (`Order(id)` or `Client`) travels
+    to the exchange thread with the cancel; `Exchange::order_id_of` resolves a client order ID within its
+    participant with the lookup submission's idempotency check uses, then the cancel runs as a cancel by ID does. The
+    same `OrderResult`, the same `OrderCancelled`, `409 order_not_active` for a second cancel.
+  - `ExchangeError::UnknownClientOrderId`, answered `404 not_found` like an unknown order ID.
+  - `openapi.yaml` (`cancelOrderByClientOrderId`), the README.
+  - Tests: `tests/api.rs` `cancel_by_client_order_id` (SR-30's acceptance: cancelled by `C`, the same answer and
+    `OrderCancelled` as a cancel by ID, a second cancel answering as a second cancel by ID, unknown `404`, another
+    participant's order with the same client ID untouched, `400` without either parameter); a dispatcher test that
+    queues the order and its cancel by client ID in one commit group and finds them answered from that group;
+    `tests/openapi.rs` covers the operation's responses.
+- **Decisions:**
+  - **`participantId` is required** (settled with the user 2026-10-21): client order IDs are unique per participant
+    only, and the API has no authentication to say who is calling.
+  - **Resolved on the exchange thread, not by a read before dispatch.** A cancel queued right behind its order sees
+    it, even inside the same open commit group, which is the race SR-30 describes.
+  - **Cancels by client ID join commit groups** as cancels by ID do.
+  - **Not done:** the scenario `cancel` step still names orders by scenario reference only; SR-30 does not ask for
+    more.
+- **Gates:** fmt, clippy, doc, `cargo test -j 2` all green. `tests/market_data.rs` flaked once
+  (`subscribers_and_messages_sent_and_conflated_are_counted_per_instrument`, and once
+  `the_snapshot_publishes_what_moved_since_the_last_tick_first`); it flakes on `main` as well (1 run in 6), so it is
+  not this step's.
+- **Mutation checks**, each made a test fail (all 4): a client order ID never found; an unknown client order ID
+  answered `409`; cancels left out of commit groups; the lookup ignoring the participant.
+
 ### Milestone 6 status
 
 All steps of the milestone are done (6.1–6.14 with 6.9a, 2026-10-18 to 2026-10-20). Not planned: SR-18 (FX, LATER).
+SR-30 (cancel by client order id) was added on 2026-10-21 and done as step 6.15 the same day.
 Still on hold from Milestone 4: 4.6d (the containerized benchmark).
 
 **SR-2 manual acceptance against the real Finnhub ✅ done (2026-10-20, D19).** `config/finnhub-market.yaml` (40

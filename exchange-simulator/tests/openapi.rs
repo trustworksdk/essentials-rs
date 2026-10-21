@@ -568,6 +568,19 @@ async fn every_operation_and_event_matches_the_document() {
         None,
     )
     .await;
+    let by_client = "/api/orders?participantId=C&clientOrderId=c-1";
+    expect(a, s, 200, M::DELETE, by_client, None).await;
+    expect(a, s, 409, M::DELETE, by_client, None).await;
+    expect(
+        a,
+        s,
+        404,
+        M::DELETE,
+        "/api/orders?participantId=C&clientOrderId=nope",
+        None,
+    )
+    .await;
+    expect(a, s, 400, M::DELETE, "/api/orders?clientOrderId=c-1", None).await;
     expect(a, s, 200, M::GET, "/api/orderbooks/ACME", None).await;
     expect(a, s, 404, M::GET, "/api/orderbooks/NOPE", None).await;
     let trades = expect(

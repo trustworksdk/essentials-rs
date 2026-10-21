@@ -329,6 +329,15 @@ impl TradeView {
     }
 }
 
+/// Names an order by the participant's own ID (SR-30). Both are required: client order IDs are unique per participant
+/// only.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientOrderQuery {
+    pub participant_id: ParticipantId,
+    pub client_order_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TradeQuery {

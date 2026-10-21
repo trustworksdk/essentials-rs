@@ -240,6 +240,14 @@ The stored order, plus `createdAt` and `updatedAt`.
 Cancels the remaining quantity of an `OPEN` or `PARTIALLY_FILLED` order, also outside its session. Returns `200`
 with the same body as `POST /api/orders`; `409 order_not_active` if the order is already done (expired included).
 
+### `DELETE /api/orders?participantId=…&clientOrderId=…`
+
+The same cancel, naming the order by the `clientOrderId` it was submitted with, as FIX `OrderCancelRequest` names it
+by `OrigClOrdID`. Both parameters are required (`400` otherwise), since client order IDs are unique per participant
+only. The answers and the `OrderCancelled` event are those of a cancel by ID; an unknown `clientOrderId` within the
+participant answers `404`. The order is looked up on the exchange thread, after every request queued before the
+cancel, so a cancel sent right after its order needs no exchange order ID.
+
 ### `GET /api/orderbooks/{instrumentId}`
 
 ```json
