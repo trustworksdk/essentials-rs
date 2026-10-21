@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Exchange simulator API
-  version: 0.1.0
+  version: 0.2.0
   summary: A stock exchange simulator with price-time matching, settlement and clearing simulation, and signed webhooks.
   description: |
     Commands are answered after they are committed to SQLite. Field names are camelCase, enums use their upper-case
@@ -1242,7 +1242,7 @@ components:
       additionalProperties: false
       required: [error, message]
       properties:
-        error: { type: string, description: A stable code, e.g. `not_found`. }
+        error: { type: string, description: "A stable code, e.g. `not_found`." }
         message: { type: string }
     Health:
       type: object
@@ -1465,7 +1465,7 @@ components:
         drift: { type: number, description: Annualized drift μ (a year of 365.25 simulated days). }
         volatility: { type: number, minimum: 0, description: Annualized volatility σ. }
         tickIntervalMs: { type: integer, minimum: 100, maximum: 86400000, description: Simulated milliseconds per step. }
-        seed: { type: integer, minimum: 0, description: Left out, derived from `price_sources.seed` and the instrument ID. }
+        seed: { type: integer, minimum: 0, description: "Left out, derived from `price_sources.seed` and the instrument ID." }
     MarketData:
       type: object
       additionalProperties: false
@@ -1571,8 +1571,13 @@ components:
         id: { type: string }
         name: { type: string }
         settlement:
-          type: [object, "null"]
+          oneOf: [{ $ref: "#/components/schemas/SettlementDetails" }, { type: "null" }]
           description: Free-form settlement details (at most 4 KiB), copied into `TradeExecuted`.
+    SettlementDetails:
+      type: object
+      description: >-
+        A participant's free-form settlement details, as registered. Written as a named schema so that client
+        generators read "this object or null" as a nullable map.
     OrderRequest:
       type: object
       additionalProperties: false
@@ -1583,7 +1588,7 @@ components:
         participantId: { type: string }
         side: { $ref: "#/components/schemas/Side" }
         type: { $ref: "#/components/schemas/OrderType" }
-        priceTicks: { type: [integer, "null"], description: Required for `LIMIT`, absent for `MARKET`. }
+        priceTicks: { type: [integer, "null"], description: "Required for `LIMIT`, absent for `MARKET`." }
         quantity: { type: integer, minimum: 1 }
         timeInForce:
           $ref: "#/components/schemas/TimeInForce"
@@ -1969,8 +1974,10 @@ components:
         sellOrderId: { type: string, format: uuid }
         buyerId: { type: string }
         sellerId: { type: string }
-        buyerSettlement: { type: [object, "null"], description: The buyer's settlement details at execution time. }
-        sellerSettlement: { type: [object, "null"] }
+        buyerSettlement:
+          oneOf: [{ $ref: "#/components/schemas/SettlementDetails" }, { type: "null" }]
+          description: The buyer's settlement details at execution time.
+        sellerSettlement: { oneOf: [{ $ref: "#/components/schemas/SettlementDetails" }, { type: "null" }] }
         priceTicks: { type: integer }
         price: { $ref: "#/components/schemas/Amount" }
         quantity: { type: integer }
@@ -2187,7 +2194,7 @@ components:
           allOf: [{ $ref: "#/components/schemas/SettlementPayloadBase" }]
           required: [settlementDays]
           properties:
-            settlementDays: { type: integer, description: The cycle applied, T+N business days. }
+            settlementDays: { type: integer, description: "The cycle applied, T+N business days." }
           unevaluatedProperties: false
     SettlementCompletedEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
@@ -2283,8 +2290,8 @@ components:
           minItems: 1
           items: { type: string }
           description: Known event types of this service; duplicates are removed.
-        secret: { type: [string, "null"], minLength: 16, maxLength: 256, description: When set, every delivery is signed. Never returned. }
-        ordered: { type: boolean, default: false, description: One delivery at a time, in event sequence order. }
+        secret: { type: [string, "null"], minLength: 16, maxLength: 256, description: "When set, every delivery is signed. Never returned." }
+        ordered: { type: boolean, default: false, description: "One delivery at a time, in event sequence order." }
         participants: { $ref: "#/components/schemas/ParticipantFilter" }
     WebhookUpdate:
       type: object
@@ -2399,7 +2406,7 @@ components:
           type: array
           items: { type: string }
           description: e.g. `missing:payload.price`, `duplicate`, `delay:500ms`, `held:1000ms`.
-        body: { description: The body sent, only when a fault changed it. }
+        body: { description: "The body sent, only when a fault changed it." }
         httpStatus: { type: [integer, "null"] }
         error: { type: [string, "null"] }
         at: { $ref: "#/components/schemas/Timestamp" }

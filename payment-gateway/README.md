@@ -45,6 +45,11 @@ against the service: the documented routes are exactly the mounted ones, every o
 requests and responses validated, and every event type is emitted and validated. The webhook, clock and reset parts
 are identical to the exchange simulator's specification (checked in its suite).
 
+For generating clients, [`openapi-3.0.json`](openapi-3.0.json) is the same API as OpenAPI 3.0, derived from it and
+kept current by the tests. Both documents, with the exchange simulator's, are distributed under one version as the Maven
+artifact `dk.trustworks.simulators:simulator-api-specs`; see [`api-specs/`](../api-specs/README.md), which also shows
+how a Java project generates its clients.
+
 `GET /health` answers `{"status": "ok", "schemaVersion", "persistence"}`, or `503` with `{"status": "unavailable"}`
 when the database does not answer.
 
