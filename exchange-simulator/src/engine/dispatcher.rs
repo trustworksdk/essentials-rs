@@ -5,7 +5,8 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use super::{
-    BookUpdate, ClockChange, ClockState, Exchange, ExchangeError, Level, SubmitOrder, SubmitOutcome,
+    BookUpdate, CancelTarget, ClockChange, ClockState, Exchange, ExchangeError, Level, SubmitOrder,
+    SubmitOutcome,
 };
 use crate::domain::{Instrument, InstrumentChange, InstrumentId, Participant, Side};
 use crate::settlement::{ExternalReport, NewReport};
@@ -71,7 +72,7 @@ enum Request {
     RegisterInstrument(Instrument, Reply<Instrument>),
     RegisterParticipant(Participant, Reply<Participant>),
     Submit(SubmitOrder, Reply<(SubmitOutcome, Instrument)>),
-    Cancel(Uuid, Reply<(BookUpdate, Instrument)>),
+    Cancel(CancelTarget, Reply<(BookUpdate, Instrument)>),
     Snapshot(InstrumentId, oneshot::Sender<Option<BookSnapshot>>),
     RegisterWebhook(NewSubscription, Reply<Subscription>),
     SetWebhookFaults(Uuid, Option<FaultPolicy>, Reply<Subscription>),
@@ -215,7 +216,15 @@ impl Dispatcher {
     }
 
     pub async fn cancel(&self, order_id: Uuid) -> Result<(BookUpdate, Instrument), DispatchError> {
-        self.call(|reply| Request::Cancel(order_id, reply)).await
+        self.cancel_target(CancelTarget::Order(order_id)).await
+    }
+
+    /// Cancels the order `target` names, resolving a client order ID on the exchange thread (SR-30).
+    pub async fn cancel_target(
+        &self,
+        target: CancelTarget,
+    ) -> Result<(BookUpdate, Instrument), DispatchError> {
+        self.call(|reply| Request::Cancel(target, reply)).await
     }
 
     pub async fn snapshot(
@@ -497,7 +506,7 @@ fn run_group(
         let (command, started) = start(&queued, rx);
         let answer = match queued.request {
             Request::Submit(order, reply) => Held::Submit(reply, submit(exchange, order)),
-            Request::Cancel(order_id, reply) => Held::Cancel(reply, cancel(exchange, order_id)),
+            Request::Cancel(target, reply) => Held::Cancel(reply, cancel(exchange, target)),
             _ => unreachable!("only orders and cancellations join a group"),
         };
         ::metrics::histogram!(crate::metrics::COMMAND_DURATION, "command" => command)
@@ -558,7 +567,7 @@ fn handle(exchange: &mut Exchange, request: Request) -> &'static str {
             answer(reply, result)
         }
         Request::Submit(order, reply) => answer(reply, submit(exchange, order)),
-        Request::Cancel(order_id, reply) => answer(reply, cancel(exchange, order_id)),
+        Request::Cancel(target, reply) => answer(reply, cancel(exchange, target)),
         Request::Tick(reply) => answer(reply, exchange.tick()),
         Request::ReportSettlement(report, reply) => {
             answer(reply, exchange.report_settlement(report))
@@ -648,8 +657,9 @@ fn submit(
 
 fn cancel(
     exchange: &mut Exchange,
-    order_id: Uuid,
+    target: CancelTarget,
 ) -> Result<(BookUpdate, Instrument), ExchangeError> {
+    let order_id = exchange.order_id_of(target)?;
     exchange.cancel(order_id).map(|update| {
         let instrument = instrument_of(exchange, &update.order.instrument_id);
         (update, instrument)
@@ -781,7 +791,7 @@ mod tests {
         use chrono::TimeZone;
 
         use super::*;
-        use crate::domain::{OrderType, ParticipantId};
+        use crate::domain::{OrderStatus, OrderType, ParticipantId};
         use crate::engine::{ExchangeOptions, FixedClock, IdScheme};
         use crate::ids::ExchangeIds;
         use crate::persistence::Store;
@@ -1106,6 +1116,85 @@ mod tests {
             drop(dispatcher);
             thread.join().unwrap();
             assert_eq!(db.count("SELECT COUNT(*) FROM orders"), 1);
+        }
+
+        #[tokio::test]
+        async fn a_cancel_by_client_order_id_queued_behind_its_order_finds_it_in_the_same_group() {
+            let db = TempDb::new();
+            let (exchange, commits) = exchange(&db);
+            let (tx, rx) = mpsc::channel(1024);
+            let dispatcher = Dispatcher { tx };
+            let by_client = |participant: &str, client_order_id: &str| CancelTarget::Client {
+                participant_id: ParticipantId(participant.into()),
+                client_order_id: client_order_id.into(),
+            };
+            let d = dispatcher.clone();
+            let placed = queue(&dispatcher, async move {
+                d.submit(SubmitOrder {
+                    client_order_id: Some("c-1".into()),
+                    ..order(0, 10)
+                })
+                .await
+            })
+            .await;
+            let mut cancels = Vec::new();
+            for target in [
+                by_client("P0", "c-1"),
+                by_client("P0", "c-1"),
+                by_client("P1", "c-1"),
+                by_client("P0", "c-2"),
+            ] {
+                let d = dispatcher.clone();
+                cancels
+                    .push(queue(&dispatcher, async move { d.cancel_target(target).await }).await);
+            }
+            commits.store(0, Ordering::SeqCst);
+            let grouping = GroupCommit {
+                max_commands: 64,
+                max_wait: std::time::Duration::ZERO,
+            };
+            let thread = std::thread::spawn(move || run(exchange, rx, grouping));
+
+            let (outcome, _) = placed.await.unwrap().unwrap();
+            let SubmitOutcome::Processed(placed) = outcome else {
+                panic!("not a duplicate")
+            };
+            let mut answers = Vec::new();
+            for cancel in cancels {
+                answers.push(cancel.await.unwrap());
+            }
+            drop(dispatcher);
+            thread.join().unwrap();
+            let (cancelled, _) = answers.remove(0).unwrap();
+            assert_eq!(
+                (cancelled.order.id, cancelled.order.status),
+                (placed.order.id, OrderStatus::Cancelled),
+                "the cancel named the order queued before it"
+            );
+            assert!(
+                matches!(
+                    answers[0],
+                    Err(DispatchError::Exchange(ExchangeError::OrderNotActive { id, .. })) if id == placed.order.id
+                ),
+                "a second cancel answers as a second cancel by ID: {:?}",
+                answers[0]
+            );
+            for answer in &answers[1..] {
+                assert!(
+                    matches!(
+                        answer,
+                        Err(DispatchError::Exchange(
+                            ExchangeError::UnknownClientOrderId { .. }
+                        ))
+                    ),
+                    "client order IDs are looked up within the participant: {answer:?}"
+                );
+            }
+            assert_eq!(
+                commits.load(Ordering::SeqCst),
+                1,
+                "the order and its cancel were one group"
+            );
         }
     }
 }

@@ -47,6 +47,16 @@ pub struct SubmitOrder {
     pub time_in_force: Option<TimeInForce>,
 }
 
+/// The order a cancel names: the exchange's order ID, or the participant's own client order ID (SR-30).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CancelTarget {
+    Order(Uuid),
+    Client {
+        participant_id: ParticipantId,
+        client_order_id: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubmitOutcome {
     /// The order was sequenced, matched and committed.
@@ -63,6 +73,11 @@ pub enum ExchangeError {
     UnknownParticipant(ParticipantId),
     #[error("unknown order {0}")]
     UnknownOrder(Uuid),
+    #[error("participant {participant_id} has no order with client order ID {client_order_id}")]
+    UnknownClientOrderId {
+        participant_id: ParticipantId,
+        client_order_id: String,
+    },
     #[error("order {id} is {status} and cannot be cancelled")]
     OrderNotActive { id: Uuid, status: OrderStatus },
     #[error("instrument {0} already exists")]
@@ -1455,6 +1470,27 @@ impl Exchange {
         self.maintain_liquidity(Some(&update.order.instrument_id))?;
         self.publish_market_data(Some(&update.order.instrument_id));
         Ok(update)
+    }
+
+    /// The ID of the order `target` names. A client order ID is looked up within its participant, among the orders
+    /// stored so far, those of an open commit group included.
+    pub fn order_id_of(&self, target: CancelTarget) -> Result<Uuid, ExchangeError> {
+        match target {
+            CancelTarget::Order(order_id) => Ok(order_id),
+            CancelTarget::Client {
+                participant_id,
+                client_order_id,
+            } => match self
+                .store
+                .order_by_client_id(&participant_id, &client_order_id)?
+            {
+                Some(record) => Ok(record.order.id),
+                None => Err(ExchangeError::UnknownClientOrderId {
+                    participant_id,
+                    client_order_id,
+                }),
+            },
+        }
     }
 
     fn cancel_order(&mut self, order_id: Uuid) -> Result<BookUpdate, ExchangeError> {

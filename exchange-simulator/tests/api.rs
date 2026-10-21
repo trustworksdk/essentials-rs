@@ -252,6 +252,102 @@ async fn cancel_and_order_lookup_errors() {
     );
 }
 
+/// SR-30: a cancel addressed by the participant's own client order ID answers as a cancel by order ID does.
+#[tokio::test]
+async fn cancel_by_client_order_id() {
+    let app = TestApp::start().await;
+    app.seed().await;
+    let keyed = |participant: &str, client_order_id: &str| {
+        json!({ "clientOrderId": client_order_id, "instrumentId": "ACME", "participantId": participant,
+                "side": "BUY", "type": "LIMIT", "priceTicks": 9000, "quantity": 10 })
+    };
+    let (_, by_id) = app.post("/api/orders", keyed("A", "a-1")).await;
+    let by_id = by_id["order"]["orderId"].as_str().unwrap().to_string();
+    let (_, placed) = app.post("/api/orders", keyed("C", "c-1")).await;
+    let id = placed["order"]["orderId"].as_str().unwrap().to_string();
+    // The same client order ID in another participant is another order, untouched by C's cancel.
+    let (_, other) = app.post("/api/orders", keyed("D", "c-1")).await;
+    let other = other["order"]["orderId"].as_str().unwrap().to_string();
+
+    let (status, reference) = app.delete(&format!("/api/orders/{by_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, cancelled) = app
+        .delete("/api/orders?participantId=C&clientOrderId=c-1")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    assert_eq!(cancelled["order"]["orderId"], json!(id));
+    assert_eq!(cancelled["order"]["clientOrderId"], "c-1");
+    assert_eq!(
+        (
+            &cancelled["order"]["status"],
+            &cancelled["order"]["remainingQuantity"]
+        ),
+        (&json!("CANCELLED"), &json!(10))
+    );
+    let shape = |v: &Value| {
+        let mut keys: Vec<_> = v["order"].as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(
+        shape(&cancelled),
+        shape(&reference),
+        "the same answer as a cancel by ID"
+    );
+    assert_eq!(
+        app.get(&format!("/api/orders/{other}")).await.1["status"],
+        "OPEN"
+    );
+
+    let (_, events) = app.get("/api/events?eventType=OrderCancelled").await;
+    let events = events.as_array().unwrap();
+    assert_eq!(events.len(), 2, "{events:?}");
+    let (reference, event) = (&events[0]["payload"], &events[1]["payload"]);
+    assert_eq!(event["orderId"], json!(id));
+    assert_eq!(event["cancelReason"], reference["cancelReason"]);
+    let keys = |p: &Value| {
+        let mut keys: Vec<_> = p.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(keys(event), keys(reference), "the same OrderCancelled");
+
+    let (status, again) = app
+        .delete("/api/orders?participantId=C&clientOrderId=c-1")
+        .await;
+    let (status_by_id, again_by_id) = app.delete(&format!("/api/orders/{id}")).await;
+    assert_eq!(
+        (status, &again["error"]),
+        (status_by_id, &again_by_id["error"]),
+        "a second cancel answers as a second cancel by ID"
+    );
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, unknown) = app
+        .delete("/api/orders?participantId=C&clientOrderId=nope")
+        .await;
+    assert_eq!(
+        (status, &unknown["error"]),
+        (StatusCode::NOT_FOUND, &json!("not_found"))
+    );
+    assert_eq!(
+        app.delete("/api/orders?participantId=B&clientOrderId=c-1")
+            .await
+            .0,
+        StatusCode::NOT_FOUND,
+        "looked up within the participant"
+    );
+    assert_eq!(
+        app.delete("/api/orders?clientOrderId=c-1").await.0,
+        StatusCode::BAD_REQUEST,
+        "the participant is required"
+    );
+    assert_eq!(
+        app.delete("/api/orders?participantId=C").await.0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
 #[tokio::test]
 async fn instruments_and_participants_registration_and_lookup() {
     let app = TestApp::start().await;

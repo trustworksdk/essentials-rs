@@ -25,7 +25,7 @@ pub use error::ApiError;
 pub use model::*;
 
 use crate::domain::{Instrument, InstrumentChange, InstrumentId, Participant};
-use crate::engine::{DispatchError, Dispatcher, ExchangeError, SubmitOutcome};
+use crate::engine::{CancelTarget, DispatchError, Dispatcher, ExchangeError, SubmitOutcome};
 use crate::events::EventEnvelope;
 use crate::persistence::{ExecutionFilter, InstrumentFilter, PersistenceMode, Store};
 
@@ -101,7 +101,10 @@ pub fn router(state: AppState) -> Router {
             axum::routing::patch(update_instrument),
         )
         .route("/api/participants", post(register_participant))
-        .route("/api/orders", post(submit_order))
+        .route(
+            "/api/orders",
+            post(submit_order).delete(cancel_order_by_client_id),
+        )
         .route("/api/orders/{id}", get(get_order).delete(cancel_order))
         .route("/api/orderbooks/{instrument_id}", get(order_book))
         .route("/api/trades", get(list_trades))
@@ -362,6 +365,25 @@ async fn cancel_order(
 ) -> Result<Json<OrderResult>, ApiError> {
     let Path(id) = id?;
     let (update, instrument) = state.dispatcher.cancel(id).await?;
+    Ok(Json(OrderResult::new(
+        &update.order,
+        &update.executions,
+        update.rejection,
+        &instrument,
+    )))
+}
+
+/// Cancels an order named by its client order ID, with the same answers as a cancel by order ID.
+async fn cancel_order_by_client_id(
+    State(state): State<AppState>,
+    query: Result<Query<ClientOrderQuery>, QueryRejection>,
+) -> Result<Json<OrderResult>, ApiError> {
+    let Query(q) = query?;
+    let target = CancelTarget::Client {
+        participant_id: q.participant_id,
+        client_order_id: q.client_order_id,
+    };
+    let (update, instrument) = state.dispatcher.cancel_target(target).await?;
     Ok(Json(OrderResult::new(
         &update.order,
         &update.executions,
