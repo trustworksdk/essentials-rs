@@ -74,6 +74,23 @@ fn the_document_describes_exactly_the_mounted_routes() {
     );
 }
 
+#[test]
+fn the_document_carries_the_crate_version() {
+    assert_eq!(
+        spec().document()["info"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+/// The OpenAPI 3.0 rendition shipped for client generators (`api-specs/`) is the current document's.
+#[test]
+fn the_openapi_30_rendition_is_current() {
+    simulator_kit::openapi30::check_rendition(
+        payment_gateway::api::OPENAPI,
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("openapi-3.0.json"),
+    );
+}
+
 #[tokio::test]
 async fn every_operation_and_event_matches_the_document() {
     let spec = spec();

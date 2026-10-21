@@ -12,6 +12,8 @@ pub mod events;
 pub mod ids;
 pub mod matcher;
 pub mod metrics;
+#[cfg(feature = "contract")]
+pub mod openapi30;
 pub mod outbox;
 pub mod persistence;
 pub mod rng;

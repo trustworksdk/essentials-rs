@@ -26,6 +26,13 @@ impl Spec {
     pub fn from_yaml(text: &str) -> Self {
         let doc: Value = serde_saphyr::from_str(text).expect("the OpenAPI document is valid YAML");
         assert_eq!(doc["openapi"], "3.1.0", "an OpenAPI 3.1 document");
+        let mut cut = Vec::new();
+        cut_descriptions(&doc, "", &mut cut);
+        assert!(
+            cut.is_empty(),
+            "an unquoted comma in a flow mapping ended a description early and made the rest a key; quote the \
+             description: {cut:#?}"
+        );
         Self {
             doc,
             validators: Mutex::default(),
@@ -240,6 +247,26 @@ impl Spec {
     }
 }
 
+/// Collects keys with a null value and a space in them: what YAML makes of `{ description: A, b c. }`.
+fn cut_descriptions(value: &Value, path: &str, found: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            for (key, inner) in object {
+                if inner.is_null() && key.contains(' ') {
+                    found.push(format!("{path}: {key}"));
+                }
+                cut_descriptions(inner, &format!("{path}/{key}"), found);
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                cut_descriptions(item, &format!("{path}/{i}"), found);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `operations` with every path parameter written `{}`: parameter names do not reach the wire, so routes and the
 /// document may name them differently.
 pub fn without_parameter_names(operations: &BTreeSet<Operation>) -> BTreeSet<Operation> {
@@ -319,6 +346,15 @@ components:
         id: { type: string }
         at: { type: string, format: date-time }
 "##;
+
+    #[test]
+    #[should_panic(expected = "quote the description")]
+    fn a_description_cut_by_an_unquoted_comma_is_refused() {
+        Spec::from_yaml(&DOC.replace(
+            "        \"404\": { description: none }",
+            "        \"404\": { description: none, not even one. }",
+        ));
+    }
 
     #[test]
     fn responses_are_matched_to_templates_and_validated() {

@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  How a Java project consumes simulator-api-specs: unpack the documents from the artifact, generate a client per
+  service with openapi-generator from the 3.0 renditions (its 3.1 support is in beta and does not compile these
+  documents), compile. Copy the dependency and the two plugins into your own pom. See ../README.md.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>dk.trustworks.simulators.example</groupId>
+  <artifactId>simulator-clients-example</artifactId>
+  <version>0.0.0-SNAPSHOT</version>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <simulator-api-specs.version>0.2.0</simulator-api-specs.version>
+    <openapi-generator.version>7.14.0</openapi-generator.version>
+    <jackson.version>2.19.1</jackson.version>
+    <specs.dir>${project.build.directory}/simulator-api-specs</specs.dir>
+  </properties>
+
+  <dependencies>
+    <!-- What the generated `native` clients need at run time. -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.datatype</groupId>
+      <artifactId>jackson-datatype-jsr310</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.openapitools</groupId>
+      <artifactId>jackson-databind-nullable</artifactId>
+      <version>0.2.6</version>
+    </dependency>
+    <dependency>
+      <groupId>jakarta.annotation</groupId>
+      <artifactId>jakarta.annotation-api</artifactId>
+      <version>3.0.0</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.8.1</version>
+        <executions>
+          <execution>
+            <id>unpack-simulator-api-specs</id>
+            <phase>initialize</phase>
+            <goals>
+              <goal>unpack</goal>
+            </goals>
+            <configuration>
+              <artifactItems>
+                <artifactItem>
+                  <groupId>dk.trustworks.simulators</groupId>
+                  <artifactId>simulator-api-specs</artifactId>
+                  <version>${simulator-api-specs.version}</version>
+                  <includes>openapi/**</includes>
+                </artifactItem>
+              </artifactItems>
+              <outputDirectory>${specs.dir}</outputDirectory>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.openapitools</groupId>
+        <artifactId>openapi-generator-maven-plugin</artifactId>
+        <version>${openapi-generator.version}</version>
+        <configuration>
+          <generatorName>java</generatorName>
+          <library>native</library>
+          <generateApiTests>false</generateApiTests>
+          <generateModelTests>false</generateModelTests>
+          <generateApiDocumentation>false</generateApiDocumentation>
+          <generateModelDocumentation>false</generateModelDocumentation>
+          <configOptions>
+            <useJakartaEe>true</useJakartaEe>
+            <openApiNullable>true</openApiNullable>
+            <dateLibrary>java8</dateLibrary>
+          </configOptions>
+        </configuration>
+        <executions>
+          <execution>
+            <id>exchange-simulator</id>
+            <goals>
+              <goal>generate</goal>
+            </goals>
+            <configuration>
+              <inputSpec>${specs.dir}/openapi/exchange-simulator/openapi-3.0.json</inputSpec>
+              <output>${project.build.directory}/generated-sources/exchange-simulator</output>
+              <apiPackage>dk.trustworks.simulators.exchange.api</apiPackage>
+              <modelPackage>dk.trustworks.simulators.exchange.model</modelPackage>
+              <invokerPackage>dk.trustworks.simulators.exchange.client</invokerPackage>
+            </configuration>
+          </execution>
+          <execution>
+            <id>payment-gateway</id>
+            <goals>
+              <goal>generate</goal>
+            </goals>
+            <configuration>
+              <inputSpec>${specs.dir}/openapi/payment-gateway/openapi-3.0.json</inputSpec>
+              <output>${project.build.directory}/generated-sources/payment-gateway</output>
+              <apiPackage>dk.trustworks.simulators.payments.api</apiPackage>
+              <modelPackage>dk.trustworks.simulators.payments.model</modelPackage>
+              <invokerPackage>dk.trustworks.simulators.payments.client</invokerPackage>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

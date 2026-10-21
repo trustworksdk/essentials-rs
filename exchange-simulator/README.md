@@ -127,6 +127,11 @@ The OpenAPI 3.1 specification is [`openapi.yaml`](openapi.yaml), also served at 
 every endpoint, the `/test` routes under the `test-control` tag, and every event type in its `webhooks` section;
 `tests/openapi.rs` checks it against the service (see Testing).
 
+For generating clients, [`openapi-3.0.json`](openapi-3.0.json) is the same API as OpenAPI 3.0, derived from it and
+kept current by the tests. Both documents, with the payment gateway's, are distributed under one version as the Maven
+artifact `dk.trustworks.simulators:simulator-api-specs`; see [`api-specs/`](../api-specs/README.md), which also shows
+how a Java project generates its clients.
+
 All bodies are JSON with camelCase fields. Errors look like `{"error": "<code>", "message": "..."}`:
 
 | Status | `error` | When |

@@ -164,6 +164,32 @@ fn the_document_describes_exactly_the_mounted_routes() {
     );
 }
 
+/// One version for the simulators' APIs: both crates, both documents and the `simulator-api-specs` artifact
+/// (`api-specs/pom.xml`). The gateway's suite checks its crate against its document.
+#[test]
+fn the_simulators_share_one_version() {
+    let version = env!("CARGO_PKG_VERSION");
+    assert_eq!(spec().document()["info"]["version"], version);
+    let gateway = Spec::from_yaml(include_str!("../../payment-gateway/openapi.yaml"));
+    assert_eq!(gateway.document()["info"]["version"], version);
+    let pom = include_str!("../../api-specs/pom.xml");
+    let artifact = pom
+        .split_once("<artifactId>simulator-api-specs</artifactId>")
+        .and_then(|(_, rest)| rest.split_once("<version>"))
+        .and_then(|(_, rest)| rest.split_once("</version>"))
+        .map(|(version, _)| version.trim());
+    assert_eq!(artifact, Some(version), "the version in api-specs/pom.xml");
+}
+
+/// The OpenAPI 3.0 rendition shipped for client generators (`api-specs/`) is the current document's.
+#[test]
+fn the_openapi_30_rendition_is_current() {
+    simulator_kit::openapi30::check_rendition(
+        exchange_simulator::api::OPENAPI,
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("openapi-3.0.json"),
+    );
+}
+
 #[test]
 fn the_parts_shared_with_the_payment_gateway_are_identical() {
     let gateway = Spec::from_yaml(include_str!("../../payment-gateway/openapi.yaml"));

@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The simulators' OpenAPI specifications as one Maven artifact, for Java projects that generate clients from them.
+  Not a Cargo member: Rust never builds this. The version is the simulators' version (both crates' `version` and both
+  documents' `info.version`); exchange-simulator/tests/openapi.rs fails when they differ. See README.md.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>dk.trustworks.simulators</groupId>
+  <artifactId>simulator-api-specs</artifactId>
+  <version>0.2.0</version>
+  <packaging>jar</packaging>
+
+  <name>Simulator API specifications</name>
+  <description>
+    OpenAPI documents of the exchange simulator and the payment gateway simulator: the 3.1 originals and their 3.0
+    renditions for client generators.
+  </description>
+  <url>https://github.com/trustworksdk/essentials-rs</url>
+
+  <licenses>
+    <license>
+      <name>Apache-2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+    </license>
+  </licenses>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <distributionManagement>
+    <repository>
+      <id>github</id>
+      <name>GitHub Packages</name>
+      <url>https://maven.pkg.github.com/trustworksdk/essentials-rs</url>
+    </repository>
+  </distributionManagement>
+
+  <build>
+    <!-- The documents are taken from the crates as they are; nothing is copied into this folder. -->
+    <resources>
+      <resource>
+        <directory>../exchange-simulator</directory>
+        <includes>
+          <include>openapi.yaml</include>
+          <include>openapi-3.0.json</include>
+        </includes>
+        <targetPath>openapi/exchange-simulator</targetPath>
+      </resource>
+      <resource>
+        <directory>../payment-gateway</directory>
+        <includes>
+          <include>openapi.yaml</include>
+          <include>openapi-3.0.json</include>
+        </includes>
+        <targetPath>openapi/payment-gateway</targetPath>
+      </resource>
+    </resources>
+  </build>
+</project>

@@ -2289,6 +2289,44 @@ log. Reconnects and staleness were not staged against the real service; the mock
 - **Note:** the first build of the contract tests compiles `jsonschema`'s dependencies, which took about ten
   minutes in the devcontainer.
 
+**Distributing the API specifications ✅ done (2026-10-21, requested by the user)**
+- **Need:** a Java application consumes both simulators' APIs and should generate its clients from the specifications.
+  Other users may generate clients in other languages.
+- **User decisions:** a Maven artifact with the documents, the services still serving their own; one version for
+  both simulators' APIs.
+- **Delivered:**
+  - `api-specs/`: `simulator-api-specs` (`dk.trustworks.simulators`), a jar holding both 3.1 documents and their 3.0
+    renditions, taken from the crates as they are; `check.sh` (builds it, then generates and compiles both Java clients
+    in `example-consumer/`), `publish.sh` (contract tests, `check.sh`, `mvn deploy` to GitHub Packages with
+    `GITHUB_ACTOR`/`GITHUB_TOKEN` from the environment), and a README covering consumption, access and versioning.
+    Maven runs in a container capped at 1.5 GiB; only Docker is needed.
+  - `simulator_kit::openapi30`: the OpenAPI 3.0.3 rendition of a 3.1 document. Each crate commits it
+    (`openapi-3.0.json`), and its contract tests fail when it is stale (`UPDATE_OPENAPI_30=1` rewrites it).
+  - One version, 0.2.0: both crates, both documents' `info.version` and the pom. The exchange suite checks all four
+    against its crate version; the gateway suite checks its own.
+- **Found on the way:**
+  - **openapi-generator (7.14) cannot build Java clients from the 3.1 documents.** Its 3.1 support is in beta: nullable
+    `oneOf`s become wrapper classes over a `ModelNull` it never generates, and a required, nullable free-form object
+    becomes a map helper with no value type. Normalizer options and rewriting the documents pattern by pattern did not
+    get it to compile. From the 3.0 rendition it builds clean typed clients for both services, a model per webhook
+    event included, with no 3.1 warnings. Hence the rendition.
+  - **13 descriptions were cut short** (7 in the exchange's document, 6 in the gateway's): an unquoted comma in a flow
+    mapping, `{ description: A, b c. }`, ends the description and makes the rest a key with a null value. JSON Schema
+    ignores unknown keywords, so the contract tests passed. Quoted, and `Spec::from_yaml` now refuses such keys.
+  - The participant's free-form settlement details are now the named schema `SettlementDetails`, referenced as
+    "it or null" from `Participant` and `TradeExecuted`. The same API, written so generators read it.
+- **Checks:** the converter's unit tests, the guard's test, both contract suites, `check.sh` (both clients compile from
+  the built artifact), clippy and docs. **Mutation checks**, each made a test fail (all 4): the guard finding nothing;
+  a nullable `oneOf` branch left in place; the pom's version differing; a document changed without its rendition.
+- **Installed locally:** at the user's request, `M2_DIR=~/.m2 api-specs/check.sh` installed 0.2.0 into the
+  devcontainer's `~/.m2`. Maven now runs as the calling user; the first runs ran as root and left root-owned files
+  in the repository, now given back.
+- **Not done:** nothing is published to GitHub Packages; that needs a token with `write:packages`
+  (`api-specs/publish.sh`). No tag `simulators-v0.2.0` either.
+- **Builds in this container:** the first rebuild after the version bump, at `-j 2` with two crates and a reloading
+  rust-analyzer, filled the 8 GiB container. These checks then ran one crate at a time at `-j 1` under a memory
+  watchdog, peaking under 6 GiB.
+
 ## Suggested order
 
 1. Milestone 1 wrap-up: 1.1 now, then 1.2, then 1.3a–d.

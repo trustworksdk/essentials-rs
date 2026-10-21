@@ -14,3 +14,7 @@
 
 # OS
 .DS_Store
+
+# Maven output of the API specification artifact and its example consumer
+/api-specs/target/
+/api-specs/example-consumer/target/

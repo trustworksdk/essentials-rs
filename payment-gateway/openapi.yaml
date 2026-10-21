@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Payment gateway simulator API
-  version: 0.1.0
+  version: 0.2.0
   summary: Deposits and withdrawals with seeded outcomes, signed webhooks, and end-of-day bank statements.
   description: |
     The payment provider and bank for the trading demo. Amounts are decimal strings in major currency units on the
@@ -801,7 +801,7 @@ components:
         type: { $ref: "#/components/schemas/PaymentType" }
         accountId: { type: string, minLength: 1, maxLength: 64, description: The caller's own account; never interpreted. }
         bankAccount: { $ref: "#/components/schemas/BankAccount" }
-        amount: { $ref: "#/components/schemas/Amount", description: Positive, with at most the currency's decimals. }
+        amount: { $ref: "#/components/schemas/Amount", description: "Positive, with at most the currency's decimals." }
         currency: { type: string, description: An accepted currency (`payments.currencies`). }
         reference: { type: [string, "null"], maxLength: 140 }
     PaymentFields:
@@ -873,7 +873,7 @@ components:
         counterparty: { $ref: "#/components/schemas/BankAccount" }
         kind: { $ref: "#/components/schemas/BookingKind" }
         direction: { enum: [CREDIT, DEBIT] }
-        amountMinor: { type: integer, description: Positive credits, negative debits. }
+        amountMinor: { type: integer, description: "Positive credits, negative debits." }
         amount: { $ref: "#/components/schemas/Amount" }
         bookedAt: { $ref: "#/components/schemas/Timestamp" }
         valueDate: { $ref: "#/components/schemas/Date" }
@@ -964,7 +964,7 @@ components:
       additionalProperties: false
       required: [error, message]
       properties:
-        error: { type: string, description: A stable code, e.g. `not_found`. }
+        error: { type: string, description: "A stable code, e.g. `not_found`." }
         message: { type: string }
     Timestamp:
       type: string
@@ -1019,8 +1019,8 @@ components:
           minItems: 1
           items: { type: string }
           description: Known event types of this service; duplicates are removed.
-        secret: { type: [string, "null"], minLength: 16, maxLength: 256, description: When set, every delivery is signed. Never returned. }
-        ordered: { type: boolean, default: false, description: One delivery at a time, in event sequence order. }
+        secret: { type: [string, "null"], minLength: 16, maxLength: 256, description: "When set, every delivery is signed. Never returned." }
+        ordered: { type: boolean, default: false, description: "One delivery at a time, in event sequence order." }
         participants: { $ref: "#/components/schemas/ParticipantFilter" }
     WebhookUpdate:
       type: object
@@ -1135,7 +1135,7 @@ components:
           type: array
           items: { type: string }
           description: e.g. `missing:payload.price`, `duplicate`, `delay:500ms`, `held:1000ms`.
-        body: { description: The body sent, only when a fault changed it. }
+        body: { description: "The body sent, only when a fault changed it." }
         httpStatus: { type: [integer, "null"] }
         error: { type: [string, "null"] }
         at: { $ref: "#/components/schemas/Timestamp" }
