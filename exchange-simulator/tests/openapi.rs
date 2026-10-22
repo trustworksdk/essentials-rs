@@ -621,6 +621,46 @@ async fn every_operation_and_event_matches_the_document() {
     let execution = trades[0]["executionId"].as_str().unwrap().to_string();
     expect(a, s, 400, M::GET, "/api/trades?limit=0", None).await;
 
+    // Trade corrections and busts (SR-36), on the last trade: corrected, then busted.
+    let last = trades.as_array().unwrap().last().unwrap()["executionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let price = trades.as_array().unwrap().last().unwrap()["priceTicks"]
+        .as_i64()
+        .unwrap();
+    let correction = format!("/api/trades/{last}/correction");
+    let bust = format!("/api/trades/{last}/bust");
+    expect(
+        a,
+        s,
+        200,
+        M::POST,
+        &correction,
+        Some(json!({ "priceTicks": price + 1, "reason": "FAT_FINGER" })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        400,
+        M::POST,
+        &correction,
+        Some(json!({ "quantity": 1_000_000 })),
+    )
+    .await;
+    expect(a, s, 200, M::POST, &bust, Some(json!({}))).await;
+    expect(a, s, 409, M::POST, &bust, Some(json!({}))).await;
+    expect(
+        a,
+        s,
+        404,
+        M::POST,
+        "/api/trades/00000000-0000-0000-0000-000000000000/bust",
+        Some(json!({})),
+    )
+    .await;
+
     // Settlement, simulated and reported.
     expect(a, s, 200, M::GET, "/api/settlements?status=PENDING", None).await;
     expect(a, s, 400, M::GET, "/api/settlements?status=LOST", None).await;

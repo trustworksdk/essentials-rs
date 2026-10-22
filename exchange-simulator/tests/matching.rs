@@ -70,6 +70,7 @@ impl Harness {
             sequence: self.sequence,
             status: OrderStatus::Open,
             time_in_force: exchange_simulator::domain::TimeInForce::Gtc,
+            busted_quantity: 0,
         }
     }
 

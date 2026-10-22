@@ -70,6 +70,7 @@ impl Harness {
             sequence: self.sequence,
             status: OrderStatus::Open,
             time_in_force: exchange_simulator::domain::TimeInForce::Gtc,
+            busted_quantity: 0,
         };
         let now = Utc.with_ymd_and_hms(2026, 10, 14, 12, 0, 0).unwrap();
         let update = self

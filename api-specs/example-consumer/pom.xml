@@ -16,7 +16,7 @@
   <properties>
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <simulator-api-specs.version>0.4.0</simulator-api-specs.version>
+    <simulator-api-specs.version>0.5.0</simulator-api-specs.version>
     <openapi-generator.version>7.14.0</openapi-generator.version>
     <jackson.version>2.19.1</jackson.version>
     <specs.dir>${project.build.directory}/simulator-api-specs</specs.dir>

@@ -12,7 +12,8 @@ pub use book::{BookError, BookUpdate, InvalidOrder, Level, OrderBook, RejectReas
 pub use dispatcher::{BookSnapshot, DispatchError, Dispatcher, GroupCommit};
 pub use exchange::{
     CancelTarget, ClockChange, ClockState, Exchange, ExchangeError, ExchangeOptions,
-    LiquidityPatch, LiquidityPolicy, LiquidityStatus, SubmitOrder, SubmitOutcome,
+    LiquidityPatch, LiquidityPolicy, LiquidityStatus, SubmitOrder, SubmitOutcome, TradeAdjusted,
+    TradeAdjustmentPolicy, TradeChange,
 };
 
 pub use crate::ids::IdScheme;

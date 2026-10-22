@@ -497,7 +497,37 @@ curl -N 'localhost:8080/api/marketdata/stream?instruments=AAPL'
 Executions in the order they were created. `participantId` matches either buyer or seller, and `orderId` either
 order. `limit` is 1–1000 (default 100). `Trade`: `executionId`, `instrumentId`, `buyOrderId`, `sellOrderId`,
 `buyerId`, `sellerId`, `priceTicks`, `price`, `quantity`, `currency`, `executedAt`, `tradeDate`,
-`intendedSettlementDate` (see Trade dates below). The same `Trade` is in `executions` of an order's result.
+`intendedSettlementDate` (see Trade dates below), and `status`: `EXECUTED`, `CORRECTED` (with the corrected price and
+quantity) or `BUSTED`. The same `Trade` is in `executions` of an order's result.
+
+### `POST /api/trades/{executionId}/correction` and `POST /api/trades/{executionId}/bust`
+
+Trade corrections and busts (SR-36), as an exchange's operations desk makes them after the fact (FIX `ExecType` `G`
+Trade Correct and `H` Trade Cancel).
+- **Correction:** `{"priceTicks": 10050, "quantity": 4, "reason": "FAT_FINGER"}`. The price may move to any positive
+  tick; the quantity may only go down, to at least 1; at least one must change (`400` otherwise). `reason` defaults to
+  `OPERATOR_CORRECTION`.
+- **Bust:** `{"reason": "ERRONEOUS_TRADE"}` or no body; `reason` defaults to `OPERATOR_BUST`.
+- **The orders:** the quantity busted or corrected away is not reinstated. Both orders' `filledQuantity` drops and
+  their `bustedQuantity` grows by it (quantity = filled + remaining + busted), and nothing goes back on the book: a
+  resting order keeps its remainder and its place. A `FILLED` order whose fills are all busted becomes `CANCELLED`, a
+  `PARTIALLY_FILLED` one `OPEN`.
+- **Events:** `TradeCorrected` or `TradeBusted`, then the buy order's and the sell order's `OrderFillCorrected` or
+  `OrderFillBusted`, each with the order's new running totals and the execution's fields as on fill events
+  (`executionId`, `lastQuantity`, `lastPriceTicks`, `lastPrice`; the corrected ones, or the busted ones).
+- **Settlement follows** in the same commit: a correction recomputes the instruction's amount (`SettlementCorrected`,
+  reason `TRADE_CORRECTED`; a pending instruction stays pending, a settled one becomes `CORRECTED`), a bust cancels it
+  (`SettlementCancelled`, reason `TRADE_BUSTED`). An instruction already rejected, failed or cancelled is left alone.
+- **Clearing:** a statement drafted after the change shows the execution as it now stands (a busted one not at all);
+  one already issued is not reissued.
+- **Not adjusted:** the market data (last trade, session volume) and closing prices keep the original prints.
+- The answer is `{"trade": Trade, "orders": [buy Order, sell Order]}`. `404` for an unknown execution, `409
+  execution_busted` once it is busted.
+
+**Seeded corrections and busts** (`trades:` in the configuration, off by default): each execution is busted with
+`bust_probability`, else corrected by one tick with `correct_probability`, drawn from `trades.seed`, at a seeded
+instant between the trade and the cutoff `max_correction_days` business days after its trade date. They are stored
+with the trade, so a restart keeps them; their reasons are `SIMULATED_BUST` and `SIMULATED_CORRECTION`.
 
 ### `GET /health`
 
@@ -536,6 +566,9 @@ Event types and payloads (`schemaVersion` 1):
 | `TradeExecuted` | execution | `executionId`, `instrumentId`, `instrument` {`id`, `symbol`, `mic`, `isin`, `cusip`, `currency`}, `buyOrderId`, `sellOrderId`, `buyerId`, `sellerId`, `buyerSettlement`, `sellerSettlement` (each party's settlement details at execution time, or `null`), `priceTicks`, `price`, `quantity`, `currency`, `currencyScale`, `tickSizeMinor`, `executedAt`, `tradeDate`, `intendedSettlementDate` |
 | `OrderPartiallyFilled` / `OrderFilled` | order | order after the execution, with the execution it reports: `executionId` (FIX `ExecID`, as on `TradeExecuted`), `lastQuantity` (`LastQty`), `lastPriceTicks` and `lastPrice` (`LastPx`), `tradeDate` and `intendedSettlementDate`. One per execution for each side: an incoming order that trades against several resting orders gets one per execution, in execution order, with its running totals after that execution |
 | `OrderCancelled` | order | order with `cancelReason`: `REQUESTED`, `MARKET_REMAINDER` or `IOC_REMAINDER` |
+| `TradeCorrected` | execution | `executionId`, the orders and parties, `previousQuantity`, `quantity`, `previousPriceTicks`, `priceTicks`, `previousPrice`, `price`, `currency`, `reason`, `tradeDate`, `intendedSettlementDate` |
+| `TradeBusted` | execution | `executionId`, the orders and parties, the busted `quantity`, `priceTicks` and `price`, `currency`, `reason`, `tradeDate`, `intendedSettlementDate` |
+| `OrderFillCorrected` / `OrderFillBusted` | order | order after the change, with the execution's `executionId`, `lastQuantity`, `lastPriceTicks`, `lastPrice` (corrected, or busted) and `reason`; a correction also `previousLastQuantity`, `previousLastPriceTicks`, `previousLastPrice`. Correlation ID the execution |
 | `OrderExpired` | order | a `DAY` order at its session's close, with status `EXPIRED` and its remainder, and `businessDate`: the business day whose end expired it (the date `BusinessDayClosed` names for that cutoff, or on a market with a session the session's date); `occurredAt` is the close |
 
 **Trade dates.** Every execution carries the business day it belongs to, `tradeDate` (FIX tag 75), and the day it is
@@ -573,9 +606,9 @@ intake, otherwise 00:00 UTC of the relevant date. Every one carries:
 | `SettlementDelayed` | `previousIntendedSettlementDate`, `delayBusinessDays` | `DELAYED` (due on the new date) |
 | `SettlementCompleted` | `settledAt` | `SETTLED` |
 | `SettlementFailed` | `reason`: `SIMULATED_FAILURE` | `FAILED` |
-| `SettlementCancelled` | `reason`: `SIMULATED_CANCELLATION` | `CANCELLED` |
+| `SettlementCancelled` | `reason`: `SIMULATED_CANCELLATION`, or `TRADE_BUSTED` after a bust | `CANCELLED` |
 | `SettlementOutcomeReported` | `source: "external"`: `reportId`, `buyerId`, `sellerId`, `status`, `reference`, `reason`, `details`, `receivedAt` (not a lifecycle step of the simulator) | – |
-| `SettlementCorrected` | `reason`: `SIMULATED_CORRECTION`, `previousSettlementAmount`, `previousAmountMinor` (the amount moves by one tick per unit) | `CORRECTED` |
+| `SettlementCorrected` | `reason`: `SIMULATED_CORRECTION`, `previousSettlementAmount`, `previousAmountMinor` (the amount moves by one tick per unit); or `TRADE_CORRECTED` after a trade correction, with `previousQuantity` and `previousPriceTicks` | `CORRECTED` (after a trade correction, a pending instruction stays as it was) |
 
 `ClearingStatementIssued` (`source: "clearinghouse"`, aggregate ID the statement ID, correlation ID the participant)
 carries the whole statement, as `GET /api/clearing/statements/{id}` returns it.
@@ -586,7 +619,7 @@ carry the whole instrument after the change, as `GET /api/instruments` shows it,
 event, declared instruments included, so a consumer learns the instruments from the log alone.
 
 Order payloads carry `orderId`, `clientOrderId`, `instrumentId`, `participantId`, `side`, `type`, `priceTicks`, `price`,
-`quantity`, `remainingQuantity`, `filledQuantity`, `status` and `sequence`. Within one command, events come in this
+`quantity`, `remainingQuantity`, `filledQuantity`, `bustedQuantity`, `status` and `sequence`. Within one command, events come in this
 order: `OrderAccepted`, then for each execution `TradeExecuted` followed by the resting order's fill event and the
 incoming order's fill event for it, then `OrderCancelled` for a market or IOC remainder. A command's events all share
 `correlationId`, the incoming (or cancelled) order's ID.

@@ -139,6 +139,14 @@ settlement:
   max_delay_days: 3
   max_delays: 2
   correction_days: 1
+trades:
+  # Seeded trade corrections and busts (SR-36), off by default. Each execution is busted with bust_probability, else
+  # corrected by one tick with correct_probability, at a seeded instant before the cutoff max_correction_days business
+  # days after its trade date. Operators correct and bust through POST /api/trades/{executionId}/correction and /bust.
+  seed: 0
+  correct_probability: 0.0
+  bust_probability: 0.0
+  max_correction_days: 1
 clearing:
   # End-of-day clearing statements: at `cutoff` (local time in `time_zone`) on each business day, one
   # ClearingStatementIssued per participant that traded since the previous cutoff, with its trades and net obligations

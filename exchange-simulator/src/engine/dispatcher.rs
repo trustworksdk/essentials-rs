@@ -99,6 +99,12 @@ enum Request {
     ClockState(oneshot::Sender<ClockState>),
     Tick(Reply<usize>),
     ReportSettlement(NewReport, Reply<(ExternalReport, bool)>),
+    AdjustTrade(
+        Uuid,
+        super::TradeChange,
+        String,
+        Reply<super::TradeAdjusted>,
+    ),
     ChangeClock(ClockChange, Reply<ClockState>),
     ClaimDeliveries(u32, std::time::Duration, Reply<Vec<DeliveryJob>>),
     RecordDeliveries(Vec<DeliveryResult>, Reply<()>),
@@ -128,6 +134,7 @@ impl Request {
             Self::ClockState(..) => "clock_state",
             Self::Tick(..) => "tick",
             Self::ReportSettlement(..) => "report_settlement",
+            Self::AdjustTrade(..) => "adjust_trade",
             Self::ChangeClock(..) => "change_clock",
             Self::ClaimDeliveries(..) => "claim_deliveries",
             Self::RecordDeliveries(..) => "record_deliveries",
@@ -272,6 +279,17 @@ impl Dispatcher {
         id: Option<InstrumentId>,
     ) -> Result<Vec<super::LiquidityStatus>, DispatchError> {
         self.ask(|reply| Request::Liquidity(id, reply)).await
+    }
+
+    /// Corrects or busts an execution (see [`Exchange::adjust_trade`]).
+    pub async fn adjust_trade(
+        &self,
+        id: Uuid,
+        change: super::TradeChange,
+        reason: String,
+    ) -> Result<super::TradeAdjusted, DispatchError> {
+        self.call(|reply| Request::AdjustTrade(id, change, reason, reply))
+            .await
     }
 
     /// Changes one instrument's liquidity (see [`Exchange::patch_liquidity`]).
@@ -571,6 +589,9 @@ fn handle(exchange: &mut Exchange, request: Request) -> &'static str {
         Request::Tick(reply) => answer(reply, exchange.tick()),
         Request::ReportSettlement(report, reply) => {
             answer(reply, exchange.report_settlement(report))
+        }
+        Request::AdjustTrade(id, change, reason, reply) => {
+            answer(reply, exchange.adjust_trade(id, change, &reason))
         }
         Request::ClockState(reply) => {
             let _ = reply.send(exchange.clock_state());

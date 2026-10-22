@@ -112,6 +112,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/orders/{id}", get(get_order).delete(cancel_order))
         .route("/api/orderbooks/{instrument_id}", get(order_book))
         .route("/api/trades", get(list_trades))
+        .route("/api/trades/{execution_id}/correction", post(correct_trade))
+        .route("/api/trades/{execution_id}/bust", post(bust_trade))
         .route("/api/events", get(list_events))
         .route("/api/calendar", get(calendar))
         .with_state(state.clone())
@@ -408,6 +410,65 @@ async fn order_book(
     let snapshot = snapshot
         .ok_or_else(|| ApiError::not_found(format!("unknown instrument {instrument_id}")))?;
     Ok(Json(snapshot.into()))
+}
+
+/// Corrects an execution's price, lowers its quantity, or both (SR-36).
+async fn correct_trade(
+    State(state): State<AppState>,
+    path: Result<Path<Uuid>, PathRejection>,
+    body: Result<Json<TradeCorrectionRequest>, JsonRejection>,
+) -> Result<Json<TradeAdjustmentResult>, ApiError> {
+    let Path(id) = path?;
+    let Json(body) = body?;
+    let change = crate::engine::TradeChange::Correct {
+        price_ticks: body.price_ticks,
+        quantity: body.quantity,
+    };
+    adjust_trade(&state, id, change, body.reason, "OPERATOR_CORRECTION").await
+}
+
+/// Busts an execution (SR-36). The body, `{"reason": …}`, may be empty.
+async fn bust_trade(
+    State(state): State<AppState>,
+    path: Result<Path<Uuid>, PathRejection>,
+    body: axum::body::Bytes,
+) -> Result<Json<TradeAdjustmentResult>, ApiError> {
+    let Path(id) = path?;
+    let body: TradeBustRequest = if body.is_empty() {
+        TradeBustRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()))?
+    };
+    adjust_trade(
+        &state,
+        id,
+        crate::engine::TradeChange::Bust,
+        body.reason,
+        "OPERATOR_BUST",
+    )
+    .await
+}
+
+async fn adjust_trade(
+    state: &AppState,
+    id: Uuid,
+    change: crate::engine::TradeChange,
+    reason: Option<String>,
+    default_reason: &str,
+) -> Result<Json<TradeAdjustmentResult>, ApiError> {
+    let reason = reason.unwrap_or_else(|| default_reason.to_string());
+    if reason.trim().is_empty() || reason.len() > 64 {
+        return Err(ApiError::bad_request("reason must be 1 to 64 characters"));
+    }
+    let adjusted = state.dispatcher.adjust_trade(id, change, reason).await?;
+    Ok(Json(TradeAdjustmentResult {
+        trade: TradeView::new(&adjusted.execution, &adjusted.instrument),
+        orders: adjusted
+            .orders
+            .iter()
+            .map(|o| OrderView::new(o, &adjusted.instrument))
+            .collect(),
+    }))
 }
 
 async fn list_trades(

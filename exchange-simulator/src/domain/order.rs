@@ -109,13 +109,25 @@ pub struct Order {
     pub sequence: u64,
     pub status: OrderStatus,
     pub time_in_force: TimeInForce,
+    /// Quantity whose fills were busted or corrected away (SR-36). It is not reinstated: it is neither filled nor
+    /// remaining, as FIX's `CumQty` drops on a trade cancel while `LeavesQty` stays.
+    pub busted_quantity: u64,
 }
 
 impl Order {
     pub fn filled_quantity(&self) -> u64 {
-        self.quantity - self.remaining_quantity
+        self.quantity - self.remaining_quantity - self.busted_quantity
     }
 }
+
+wire_enum!(
+    /// Whether an execution stands as executed, was corrected, or was busted (SR-36).
+    ExecutionStatus, "execution status" {
+        Executed => "EXECUTED",
+        Corrected => "CORRECTED",
+        Busted => "BUSTED",
+    }
+);
 
 /// An immutable fill between one buy and one sell order. Its price is the resting (maker) order's limit price.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +144,7 @@ pub struct Execution {
     /// The business day the trade belongs to (FIX `TradeDate`), and the day it is meant to settle (`SettlDate`).
     pub trade_date: NaiveDate,
     pub intended_settlement_date: NaiveDate,
+    pub status: ExecutionStatus,
 }
 
 /// The dates an execution carries (SR-29), the same for every fill of one command.

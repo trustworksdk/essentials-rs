@@ -311,6 +311,7 @@ fn bench_matching(options: &Options, report: &mut Report) {
             sequence: i as u64 + 1,
             status: OrderStatus::Open,
             time_in_force: exchange_simulator::domain::TimeInForce::Gtc,
+            busted_quantity: 0,
         })
         .collect();
     let mut book = OrderBook::new(acme());
@@ -698,6 +699,7 @@ impl Service {
             ids: IdsConfig::default(),
             settlement: SettlementConfig::default(),
             clearing: Default::default(),
+            trades: Default::default(),
             test_control: TestControlConfig::default(),
             logging: LoggingConfig {
                 filter: "warn".into(),

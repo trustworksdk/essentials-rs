@@ -9,8 +9,8 @@ use super::{BookError, BookUpdate, Clock, IdScheme, MatchContext, OrderBook};
 use crate::clearing::{ClearingPolicy, StoredStatement};
 use crate::clock::{ClockError, SystemClock, VirtualClock};
 use crate::domain::{
-    IdentifierPolicy, Instrument, InstrumentChange, InstrumentError, InstrumentId, Order,
-    OrderStatus, OrderType, Participant, ParticipantId, Side, TimeInForce,
+    Execution, ExecutionStatus, IdentifierPolicy, Instrument, InstrumentChange, InstrumentError,
+    InstrumentId, Order, OrderStatus, OrderType, Participant, ParticipantId, Side, TimeInForce,
 };
 use crate::events::NewEvent;
 use crate::events::{self, Command};
@@ -80,6 +80,10 @@ pub enum ExchangeError {
     },
     #[error("order {id} is {status} and cannot be cancelled")]
     OrderNotActive { id: Uuid, status: OrderStatus },
+    #[error("execution {0} was busted and cannot change")]
+    ExecutionBusted(Uuid),
+    #[error("invalid trade correction: {0}")]
+    InvalidCorrection(String),
     #[error("instrument {0} already exists")]
     DuplicateInstrument(InstrumentId),
     #[error("symbol {symbol} is already listed on {mic}")]
@@ -213,6 +217,59 @@ pub struct ExchangeOptions {
     pub trade_dating: crate::settlement::TradeDating,
     /// Trading sessions by market (plan item 6.10). The default has none: every market is always open.
     pub sessions: crate::sessions::TradingSessions,
+    /// Seeded trade corrections and busts (SR-36); off by default.
+    pub trade_adjustments: TradeAdjustmentPolicy,
+}
+
+/// Seeded trade corrections and busts (`trades:`, SR-36): each execution is busted with `bust_probability`, else
+/// corrected by one tick with `correct_probability`, at a seeded instant before the cutoff of the business day
+/// `max_correction_days` after its trade date.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TradeAdjustmentPolicy {
+    pub seed: u64,
+    pub correct_probability: f64,
+    pub bust_probability: f64,
+    pub max_correction_days: u32,
+}
+
+impl TradeAdjustmentPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        let (correct, bust) = (self.correct_probability, self.bust_probability);
+        if !(0.0..=1.0).contains(&correct) || !(0.0..=1.0).contains(&bust) || correct + bust > 1.0 {
+            return Err(
+                "trades: correct_probability and bust_probability must be between 0 and 1, and sum to at most 1"
+                    .into(),
+            );
+        }
+        if self.max_correction_days > 30 {
+            return Err("trades.max_correction_days must be at most 30".into());
+        }
+        Ok(())
+    }
+
+    fn active(&self) -> bool {
+        self.correct_probability > 0.0 || self.bust_probability > 0.0
+    }
+}
+
+/// A trade correction or bust (SR-36).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TradeChange {
+    /// A new price and/or a lower quantity; at least one must change.
+    Correct {
+        price_ticks: Option<i64>,
+        quantity: Option<u64>,
+    },
+    Bust,
+}
+
+/// A committed correction or bust: the execution and both orders after it.
+#[derive(Clone, Debug)]
+pub struct TradeAdjusted {
+    pub execution: Execution,
+    pub orders: Vec<Order>,
+    pub instrument: Instrument,
 }
 
 /// How the liquidity provider runs (`liquidity:` in the configuration).
@@ -249,6 +306,7 @@ impl Default for ExchangeOptions {
             market_data: None,
             trade_dating: Default::default(),
             sessions: Default::default(),
+            trade_adjustments: Default::default(),
         }
     }
 }
@@ -308,6 +366,9 @@ pub struct Exchange {
     /// then). An entry whose order is no longer active when it comes due is dropped.
     expiries:
         std::collections::BTreeSet<(DateTime<Utc>, u64, InstrumentId, Uuid, chrono::NaiveDate)>,
+    trade_adjustments: TradeAdjustmentPolicy,
+    /// Seeded corrections and busts waiting for their time (SR-36), in due order.
+    scheduled: std::collections::BTreeSet<crate::persistence::ScheduledAdjustment>,
 }
 
 /// The liquidity provider in one instrument, as `GET /api/liquidity` shows it (SR-11).
@@ -539,10 +600,17 @@ impl Exchange {
             trade_dating: options.trade_dating,
             sessions: options.sessions,
             expiries: Default::default(),
+            trade_adjustments: options.trade_adjustments,
+            scheduled: Default::default(),
         };
         exchange.start_price_sources()?;
         exchange.reconcile_webhooks()?;
         exchange.schedule_expiries()?;
+        exchange.scheduled = exchange
+            .store
+            .scheduled_adjustments()?
+            .into_iter()
+            .collect();
         exchange.start_liquidity()?;
         exchange.reconcile_instruments()?;
         if let Some(policy) = options.clearing {
@@ -1339,6 +1407,7 @@ impl Exchange {
             sequence: self.last_sequence + 1,
             status: OrderStatus::Open,
             time_in_force,
+            busted_quantity: 0,
         };
         let started = std::time::Instant::now();
         let mut ctx = MatchContext {
@@ -1456,6 +1525,7 @@ impl Exchange {
     fn reload(&mut self) -> Result<(), ExchangeError> {
         self.books = load_books(&self.store)?;
         self.schedule_expiries()?;
+        self.scheduled = self.store.scheduled_adjustments()?.into_iter().collect();
         // The group's trades are gone: forget their prints, and take the last trade and volume from storage again.
         for state in self.market_data.values_mut() {
             state.pending.clear();
@@ -1630,6 +1700,7 @@ impl Exchange {
         self.store.reset()?;
         self.books.clear();
         self.expiries.clear();
+        self.scheduled.clear();
         self.prices.clear();
         self.market_data.clear();
         self.participants.clear();
@@ -1704,12 +1775,23 @@ impl Exchange {
             let close = self.days.as_ref().map(BusinessDays::due);
             let clearing = self.clearing.as_ref().map(Clearing::due);
             let expiry = self.expiries.first().map(|e| e.0);
-            match close.into_iter().chain(clearing).chain(expiry).min() {
+            let adjustment = self.scheduled.first().map(|a| a.due_at);
+            match close
+                .into_iter()
+                .chain(clearing)
+                .chain(expiry)
+                .chain(adjustment)
+                .min()
+            {
                 Some(due) if due <= now => {
                     total += self.settlement_step(due)?;
                     // DAY orders end with their trading day, before the business day closes.
                     if expiry == Some(due) {
                         total += self.expire_due(due)?;
+                    }
+                    // A seeded correction or bust before the cutoff shows on that day's statement.
+                    if adjustment == Some(due) {
+                        total += self.adjust_due(due)?;
                     }
                     if close == Some(due) {
                         total += self.close_business_day()?;
@@ -1824,7 +1906,22 @@ impl Exchange {
                 .map(TradeFacts::from_event)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(ExchangeError::Clearing)?;
-            for draft in clearing.policy.draft(date, &trades) {
+            let after = trades.last().map_or(clearing.after, |t| t.sequence);
+            // As the executions stand now (SR-36): corrected in place, busted ones left out.
+            let mut current = Vec::with_capacity(trades.len());
+            for mut trade in trades {
+                match self.store.execution(trade.execution_id)? {
+                    Some(execution) if execution.status == ExecutionStatus::Busted => {}
+                    Some(execution) => {
+                        trade.quantity = execution.quantity;
+                        trade.price_ticks = execution.price_ticks;
+                        current.push(trade);
+                    }
+                    None => current.push(trade),
+                }
+            }
+            let clearing = self.clearing.as_ref().expect("clearing runs");
+            for draft in clearing.policy.draft(date, &current) {
                 let stored = StoredStatement {
                     draft,
                     issued: false,
@@ -1836,7 +1933,6 @@ impl Exchange {
                     waiting.push(stored);
                 }
             }
-            let after = trades.last().map_or(clearing.after, |t| t.sequence);
             cursor = Some((date, after));
         }
         issue.sort_by(|a, b| issue_order(a).cmp(&issue_order(b)));
@@ -2153,8 +2249,16 @@ impl Exchange {
             consumer: SETTLEMENT_CONSUMER,
             cursor: plan.cursor,
         });
-        self.store
-            .commit(&update, &new_events, settlement_write, outbox, now)?;
+        let scheduled = self.schedule_adjustments(&update);
+        self.store.commit(
+            &update,
+            &new_events,
+            settlement_write,
+            &scheduled,
+            outbox,
+            now,
+        )?;
+        self.scheduled.extend(scheduled);
         self.next_event_sequence = next;
         let book = self
             .books
@@ -2215,6 +2319,272 @@ impl Exchange {
             }
         }
         Ok(SubmitOutcome::Processed(update))
+    }
+
+    /// Corrects or busts an execution now (SR-36), for an operator.
+    pub fn adjust_trade(
+        &mut self,
+        execution_id: Uuid,
+        change: TradeChange,
+        reason: &str,
+    ) -> Result<TradeAdjusted, ExchangeError> {
+        let now = self.now();
+        self.adjust_trade_at(execution_id, change, reason, now)
+    }
+
+    /// Corrects or busts an execution at `at`, in one commit: the execution changed in place or marked busted, both
+    /// orders' busted quantities and statuses (nothing goes back on the book), `TradeCorrected`/`TradeBusted` and
+    /// each order's `OrderFillCorrected`/`OrderFillBusted`, and the settlement instruction's answer. Clearing
+    /// statements drafted later see the execution's new state; issued ones are not reissued.
+    fn adjust_trade_at(
+        &mut self,
+        execution_id: Uuid,
+        change: TradeChange,
+        reason: &str,
+        at: DateTime<Utc>,
+    ) -> Result<TradeAdjusted, ExchangeError> {
+        let before = self
+            .store
+            .execution(execution_id)?
+            .ok_or(ExchangeError::UnknownExecution(execution_id))?;
+        if before.status == ExecutionStatus::Busted {
+            return Err(ExchangeError::ExecutionBusted(execution_id));
+        }
+        let mut after = before.clone();
+        match change {
+            TradeChange::Bust => after.status = ExecutionStatus::Busted,
+            TradeChange::Correct {
+                price_ticks,
+                quantity,
+            } => {
+                after.price_ticks = price_ticks.unwrap_or(before.price_ticks);
+                after.quantity = quantity.unwrap_or(before.quantity);
+                if after.price_ticks <= 0 {
+                    return Err(ExchangeError::InvalidCorrection(
+                        "priceTicks must be positive".into(),
+                    ));
+                }
+                if !(1..=before.quantity).contains(&after.quantity) {
+                    return Err(ExchangeError::InvalidCorrection(format!(
+                        "quantity must be between 1 and the executed {}",
+                        before.quantity
+                    )));
+                }
+                if after.price_ticks == before.price_ticks && after.quantity == before.quantity {
+                    return Err(ExchangeError::InvalidCorrection(
+                        "the correction changes neither price nor quantity".into(),
+                    ));
+                }
+                after.status = ExecutionStatus::Corrected;
+            }
+        }
+        let removed = match after.status {
+            ExecutionStatus::Busted => before.quantity,
+            _ => before.quantity - after.quantity,
+        };
+        let instrument = self
+            .books
+            .get(&before.instrument_id)
+            .ok_or_else(|| ExchangeError::UnknownInstrument(before.instrument_id.clone()))?
+            .instrument()
+            .clone();
+        let mut orders = Vec::with_capacity(2);
+        for order_id in [before.buy_order_id, before.sell_order_id] {
+            let mut order = match self.books[&before.instrument_id].order(order_id) {
+                Some(resting) => resting.clone(),
+                None => {
+                    self.store
+                        .order(order_id)?
+                        .ok_or(ExchangeError::UnknownOrder(order_id))?
+                        .order
+                }
+            };
+            order.busted_quantity += removed;
+            if order.filled_quantity() == 0 {
+                order.status = match order.status {
+                    OrderStatus::Filled => OrderStatus::Cancelled,
+                    OrderStatus::PartiallyFilled => OrderStatus::Open,
+                    other => other,
+                };
+            }
+            orders.push(order);
+        }
+        let mut new_events =
+            events::for_trade_adjustment(&before, &after, &orders, &instrument, reason, at);
+        if let Some(provider) = &self.provider
+            && !provider.policy.emit_order_events
+        {
+            let lp = provider.policy.participant.0.as_str();
+            new_events.retain(|e| {
+                e.event_type == events::TRADE_CORRECTED
+                    || e.event_type == events::TRADE_BUSTED
+                    || e.payload["participantId"] != lp
+            });
+        }
+        let mut next = NewEvent::stamp(&mut new_events, self.next_event_sequence, self.ids);
+        let settlement_plan = match &self.settlement {
+            Some(simulator) => match self.store.settlement(execution_id)? {
+                Some(stored) => {
+                    let corrected = (after.status != ExecutionStatus::Busted)
+                        .then_some((after.quantity, after.price_ticks));
+                    simulator.adjust(&stored, corrected, at)
+                }
+                None => None,
+            },
+            None => None,
+        };
+        let mut settlement_events: Vec<NewEvent> = settlement_plan
+            .iter()
+            .flat_map(|plan| plan.transitions.iter().map(|t| t.event.clone()))
+            .collect();
+        next = NewEvent::stamp(&mut settlement_events, next, self.ids);
+        new_events.extend(settlement_events);
+        let outbox = Outbox {
+            subscriptions: self.webhooks.subscriptions(),
+            simulation_id: self.simulation_id.as_deref(),
+            ids: self.ids,
+            due: wall_now(),
+            schema_version: events::SCHEMA_VERSION,
+            parties: self.webhooks.parties(),
+        };
+        let settlement_write = settlement_plan.as_ref().map(|plan| SettlementWrite {
+            instructions: plan.transitions.iter().map(|t| &t.instruction).collect(),
+            consumer: SETTLEMENT_CONSUMER,
+            cursor: plan.cursor,
+        });
+        self.store.commit_trade_adjustment(
+            &after,
+            &orders,
+            &new_events,
+            settlement_write,
+            outbox,
+            at,
+        )?;
+        self.next_event_sequence = next;
+        let book = self
+            .books
+            .get_mut(&before.instrument_id)
+            .expect("checked above");
+        for order in &orders {
+            book.amend(order);
+        }
+        if let (Some(plan), Some(simulator)) = (&settlement_plan, self.settlement.as_mut()) {
+            simulator.apply(plan);
+        }
+        if let Some(provider) = &mut self.provider {
+            let lp = &provider.policy.participant;
+            let signed = match (&before.buyer_id, &before.seller_id) {
+                (buyer, _) if buyer == lp => -(removed as i64),
+                (_, seller) if seller == lp => removed as i64,
+                _ => 0,
+            };
+            if signed != 0 {
+                provider
+                    .quoting
+                    .entry(before.instrument_id.clone())
+                    .or_default()
+                    .inventory += signed;
+            }
+        }
+        self.scheduled.retain(|a| a.execution_id != execution_id);
+        for event in &new_events {
+            ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type)
+                .increment(1);
+        }
+        self.wake_delivery(&new_events);
+        Ok(TradeAdjusted {
+            execution: after,
+            orders,
+            instrument,
+        })
+    }
+
+    /// Runs the seeded corrections and busts due by `due`, each in its own commit stamped at its due time. A
+    /// correction moves the price one tick, down unless that would leave no price; an execution busted in the
+    /// meantime is skipped.
+    fn adjust_due(&mut self, due: DateTime<Utc>) -> Result<usize, ExchangeError> {
+        let mut events = 0;
+        while let Some(scheduled) = self.scheduled.first().copied() {
+            if scheduled.due_at > due {
+                break;
+            }
+            self.scheduled.remove(&scheduled);
+            let Some(execution) = self.store.execution(scheduled.execution_id)? else {
+                continue;
+            };
+            if execution.status == ExecutionStatus::Busted {
+                self.store.drop_scheduled_adjustment(execution.id)?;
+                continue;
+            }
+            let (change, reason) = if scheduled.bust {
+                (TradeChange::Bust, "SIMULATED_BUST")
+            } else {
+                let down = execution.id.as_u128() % 2 == 0 && execution.price_ticks > 1;
+                let price_ticks = execution.price_ticks + if down { -1 } else { 1 };
+                (
+                    TradeChange::Correct {
+                        price_ticks: Some(price_ticks),
+                        quantity: None,
+                    },
+                    "SIMULATED_CORRECTION",
+                )
+            };
+            self.adjust_trade_at(execution.id, change, reason, scheduled.due_at)?;
+            events += 1;
+        }
+        Ok(events)
+    }
+
+    /// The seeded corrections and busts for an update's executions (SR-36): drawn per execution from the policy's
+    /// seed, the incoming order's sequence and the execution's place, due at a seeded instant between the trade and
+    /// the cutoff `max_correction_days` business days after its trade date.
+    fn schedule_adjustments(
+        &self,
+        update: &BookUpdate,
+    ) -> Vec<crate::persistence::ScheduledAdjustment> {
+        let policy = &self.trade_adjustments;
+        if !policy.active() {
+            return Vec::new();
+        }
+        const KIND: u64 = 41;
+        const WHEN: u64 = 42;
+        let sequence = update.order.sequence;
+        update
+            .executions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, execution)| {
+                let place = i as u32;
+                let u = simulator_kit::rng::draw(policy.seed, sequence, place, KIND);
+                let bust = u < policy.bust_probability;
+                if !bust && u >= policy.bust_probability + policy.correct_probability {
+                    return None;
+                }
+                let last = match &self.days {
+                    Some(days) => days.calendar.cutoff_at(
+                        days.calendar
+                            .days
+                            .add_business_days(execution.trade_date, policy.max_correction_days),
+                    ),
+                    None => {
+                        execution.executed_at
+                            + chrono::Duration::days(i64::from(policy.max_correction_days.max(1)))
+                    }
+                };
+                let span = (last - execution.executed_at)
+                    .num_microseconds()
+                    .unwrap_or(0)
+                    .max(1);
+                let offset = (simulator_kit::rng::draw(policy.seed, sequence, place, WHEN)
+                    * span as f64) as i64;
+                Some(crate::persistence::ScheduledAdjustment {
+                    due_at: execution.executed_at
+                        + chrono::Duration::microseconds(offset.clamp(1, span - 1).max(1)),
+                    execution_id: execution.id,
+                    bust,
+                })
+            })
+            .collect()
     }
 
     /// Wakes the delivery worker if any of `events` has a subscriber.

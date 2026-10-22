@@ -225,6 +225,7 @@ impl OrderBook {
                     executed_at: ctx.now,
                     trade_date: ctx.dates.trade_date,
                     intended_settlement_date: ctx.dates.intended_settlement_date,
+                    status: crate::domain::ExecutionStatus::Executed,
                 });
                 fills.push(maker);
             }
@@ -289,6 +290,15 @@ impl OrderBook {
         self.last_sequence = self.last_sequence.max(update.order.sequence);
         self.version += 1;
         Ok(())
+    }
+
+    /// Replaces a resting order's state after a trade correction or bust (SR-36): its busted quantity and status
+    /// change, never its remaining quantity or its place in the queue. Does nothing for an order not resting here.
+    pub fn amend(&mut self, order: &Order) {
+        if self.orders.contains_key(&order.id) {
+            self.reconcile(order);
+            self.version += 1;
+        }
     }
 
     /// Plans and applies in one step, for callers with nothing to persist in between.

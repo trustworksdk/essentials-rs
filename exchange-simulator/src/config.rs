@@ -43,6 +43,9 @@ pub struct Config {
     pub settlement: SettlementConfig,
     #[serde(default)]
     pub clearing: ClearingConfig,
+    /// Seeded trade corrections and busts (SR-36); off by default.
+    #[serde(default)]
+    pub trades: crate::engine::TradeAdjustmentPolicy,
     pub clock: ClockConfig,
     pub test_control: TestControlConfig,
     pub database: DatabaseConfig,
