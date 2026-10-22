@@ -529,6 +529,20 @@ Trade Correct and `H` Trade Cancel).
 instant between the trade and the cutoff `max_correction_days` business days after its trade date. They are stored
 with the trade, so a restart keeps them; their reasons are `SIMULATED_BUST` and `SIMULATED_CORRECTION`.
 
+### Fees
+
+Each side of an execution pays the exchange a fee (SR-37), configured under `fees:` (free by default):
+- **Rates:** `maker_bps` for the resting order's side, `taker_bps` for the incoming order's, in basis points of the
+  execution's value (price ticks × tick size × quantity), rounded half up, at least `minimum` (major units of the
+  instrument's currency, e.g. `"1.00"`) per execution and side.
+- **Per participant:** `participants: { B: { taker_bps: 0.5 } }` overrides rates field by field; `exempt: [LP]` pays
+  nothing (for example the liquidity provider).
+- **Where:** `buyerFee` and `sellerFee` (`amount`, `amountMinor`, `currency`) on `TradeExecuted` and every `Trade`;
+  `fee`, the order's own side's, in an order result's `executions`; `lastFee` on the fill events; and on the clearing
+  statement each trade line's `fee` and each obligation's `feesNet`, the sum of its lines' fees. Fees are owed apart
+  from the cash settled: `cashNet` and the settlement amount do not include them.
+- A correction reprices both fees (`TradeCorrected` carries the new ones); a busted execution pays none.
+
 ### `GET /health`
 
 `{"status": "ok", "schemaVersion": <n>, "persistence": "<mode>"}` (`schemaVersion` is the number of the last applied
@@ -563,8 +577,8 @@ Event types and payloads (`schemaVersion` 1):
 |---|---|---|
 | `OrderAccepted` | order | order as accepted (status `OPEN`, nothing filled) |
 | `OrderRejected` | order | order with `rejectReason` |
-| `TradeExecuted` | execution | `executionId`, `instrumentId`, `instrument` {`id`, `symbol`, `mic`, `isin`, `cusip`, `currency`}, `buyOrderId`, `sellOrderId`, `buyerId`, `sellerId`, `buyerSettlement`, `sellerSettlement` (each party's settlement details at execution time, or `null`), `priceTicks`, `price`, `quantity`, `currency`, `currencyScale`, `tickSizeMinor`, `executedAt`, `tradeDate`, `intendedSettlementDate` |
-| `OrderPartiallyFilled` / `OrderFilled` | order | order after the execution, with the execution it reports: `executionId` (FIX `ExecID`, as on `TradeExecuted`), `lastQuantity` (`LastQty`), `lastPriceTicks` and `lastPrice` (`LastPx`), `tradeDate` and `intendedSettlementDate`. One per execution for each side: an incoming order that trades against several resting orders gets one per execution, in execution order, with its running totals after that execution |
+| `TradeExecuted` | execution | `executionId`, `instrumentId`, `instrument` {`id`, `symbol`, `mic`, `isin`, `cusip`, `currency`}, `buyOrderId`, `sellOrderId`, `buyerId`, `sellerId`, `buyerSettlement`, `sellerSettlement` (each party's settlement details at execution time, or `null`), `priceTicks`, `price`, `quantity`, `currency`, `currencyScale`, `tickSizeMinor`, `executedAt`, `tradeDate`, `intendedSettlementDate`, `buyerFee` and `sellerFee` (see Fees) |
+| `OrderPartiallyFilled` / `OrderFilled` | order | order after the execution, with the execution it reports: `executionId` (FIX `ExecID`, as on `TradeExecuted`), `lastQuantity` (`LastQty`), `lastPriceTicks` and `lastPrice` (`LastPx`), `lastFee` (the order's side's fee, `Commission`), `tradeDate` and `intendedSettlementDate`. One per execution for each side: an incoming order that trades against several resting orders gets one per execution, in execution order, with its running totals after that execution |
 | `OrderCancelled` | order | order with `cancelReason`: `REQUESTED`, `MARKET_REMAINDER` or `IOC_REMAINDER` |
 | `TradeCorrected` | execution | `executionId`, the orders and parties, `previousQuantity`, `quantity`, `previousPriceTicks`, `priceTicks`, `previousPrice`, `price`, `currency`, `reason`, `tradeDate`, `intendedSettlementDate` |
 | `TradeBusted` | execution | `executionId`, the orders and parties, the busted `quantity`, `priceTicks` and `price`, `currency`, `reason`, `tradeDate`, `intendedSettlementDate` |

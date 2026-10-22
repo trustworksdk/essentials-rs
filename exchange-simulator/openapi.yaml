@@ -1798,7 +1798,7 @@ components:
       type: object
       additionalProperties: false
       required: [executionId, instrumentId, buyOrderId, sellOrderId, buyerId, sellerId, priceTicks, price, quantity,
-                 currency, executedAt, tradeDate, intendedSettlementDate, status]
+                 currency, executedAt, tradeDate, intendedSettlementDate, status, buyerFee, sellerFee]
       properties:
         executionId: { type: string, format: uuid }
         instrumentId: { type: string }
@@ -1816,6 +1816,22 @@ components:
         status:
           enum: [EXECUTED, CORRECTED, BUSTED]
           description: "SR-36: a corrected execution shows its corrected price and quantity."
+        buyerFee: { $ref: "#/components/schemas/Fee" }
+        sellerFee: { $ref: "#/components/schemas/Fee" }
+        fee:
+          allOf: [{ $ref: "#/components/schemas/Fee" }]
+          description: In an order's result only, the order's own side's fee.
+    Fee:
+      type: object
+      additionalProperties: false
+      required: [amount, amountMinor, currency]
+      description: >-
+        What one side pays the exchange for an execution (SR-37): the maker's or taker's rate of its value (`fees`),
+        at least the minimum, in the instrument's currency.
+      properties:
+        amount: { $ref: "#/components/schemas/Amount" }
+        amountMinor: { type: integer, minimum: 0 }
+        currency: { type: string }
     TradeAdjustment:
       type: object
       additionalProperties: false
@@ -1972,7 +1988,7 @@ components:
       type: object
       additionalProperties: false
       required: [executionId, tradeSequence, instrumentId, side, quantity, priceTicks, currency, currencyScale,
-                 amountMinor, amount, executedAt, tradeDate, intendedSettlementDate, obligationId]
+                 amountMinor, amount, executedAt, tradeDate, intendedSettlementDate, obligationId, feeMinor, fee]
       properties:
         executionId: { type: string, format: uuid }
         tradeSequence: { type: integer }
@@ -1988,11 +2004,13 @@ components:
         tradeDate: { $ref: "#/components/schemas/Date" }
         intendedSettlementDate: { $ref: "#/components/schemas/Date" }
         obligationId: { type: string }
+        feeMinor: { type: integer, description: "What the participant pays the exchange for this trade (SR-37)." }
+        fee: { $ref: "#/components/schemas/Amount" }
     Obligation:
       type: object
       additionalProperties: false
       required: [obligationId, instrumentId, intendedSettlementDate, currency, currencyScale, securitiesNet,
-                 cashNetMinor, cashNet, tradeCount]
+                 cashNetMinor, cashNet, tradeCount, feesNetMinor, feesNet]
       description: Positive receives, negative delivers.
       properties:
         obligationId: { type: string, description: "`<statementId>:<instrument>:<settlementDate>`" }
@@ -2004,6 +2022,10 @@ components:
         cashNetMinor: { type: integer }
         cashNet: { $ref: "#/components/schemas/Amount" }
         tradeCount: { type: integer }
+        feesNetMinor:
+          type: integer
+          description: The obligation's trades' fees (SR-37), owed to the exchange apart from the cash settled.
+        feesNet: { $ref: "#/components/schemas/Amount" }
     ClearingBreaks:
       type: object
       additionalProperties: false
@@ -2132,6 +2154,9 @@ components:
         lastQuantity: { type: integer, description: "On fill events, what this execution filled (FIX LastQty)." }
         lastPriceTicks: { type: integer, description: "On fill events, the execution's price in ticks (FIX LastPx)." }
         lastPrice: { type: string, description: "On fill events, the execution's price in major units (FIX LastPx)." }
+        lastFee:
+          allOf: [{ $ref: "#/components/schemas/Fee" }]
+          description: On fill events, the order's side's fee for the execution (SR-37, FIX Commission).
         previousLastQuantity: { type: integer, description: "On OrderFillCorrected, the execution's quantity before." }
         previousLastPriceTicks: { type: integer, description: "On OrderFillCorrected, the execution's price before." }
         previousLastPrice: { type: string, description: "On OrderFillCorrected, the execution's price before." }
@@ -2150,7 +2175,7 @@ components:
       additionalProperties: false
       required: [executionId, instrumentId, instrument, buyOrderId, sellOrderId, buyerId, sellerId, buyerSettlement,
                  sellerSettlement, priceTicks, price, quantity, currency, currencyScale, tickSizeMinor, executedAt,
-                 tradeDate, intendedSettlementDate]
+                 tradeDate, intendedSettlementDate, buyerFee, sellerFee]
       properties:
         executionId: { type: string, format: uuid }
         instrumentId: { type: string }
@@ -2183,6 +2208,8 @@ components:
         executedAt: { $ref: "#/components/schemas/Timestamp" }
         tradeDate: { $ref: "#/components/schemas/TradeDate" }
         intendedSettlementDate: { $ref: "#/components/schemas/IntendedSettlementDate" }
+        buyerFee: { $ref: "#/components/schemas/Fee" }
+        sellerFee: { $ref: "#/components/schemas/Fee" }
     InstrumentEventPayload:
       type: object
       required: [instrumentId, symbol, mic, isin, cusip, currency, currencyScale, tickSizeMinor, tickSize, lotSize,
@@ -2257,7 +2284,7 @@ components:
         source: { const: exchange }
         payload:
           allOf: [{ $ref: "#/components/schemas/OrderEventPayload" }]
-          required: [executionId, lastQuantity, lastPriceTicks, lastPrice, tradeDate, intendedSettlementDate]
+          required: [executionId, lastQuantity, lastPriceTicks, lastPrice, lastFee, tradeDate, intendedSettlementDate]
     OrderFilledEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
       properties:
@@ -2265,7 +2292,7 @@ components:
         source: { const: exchange }
         payload:
           allOf: [{ $ref: "#/components/schemas/OrderEventPayload" }]
-          required: [executionId, lastQuantity, lastPriceTicks, lastPrice, tradeDate, intendedSettlementDate]
+          required: [executionId, lastQuantity, lastPriceTicks, lastPrice, lastFee, tradeDate, intendedSettlementDate]
     OrderCancelledEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
       properties:
@@ -2295,7 +2322,7 @@ components:
           additionalProperties: false
           required: [executionId, instrumentId, buyOrderId, sellOrderId, buyerId, sellerId, currency, reason, tradeDate,
                      intendedSettlementDate, previousQuantity, quantity, previousPriceTicks, priceTicks, previousPrice,
-                     price]
+                     price, buyerFee, sellerFee]
           properties:
             executionId: { type: string, format: uuid }
             instrumentId: { type: string }
@@ -2313,6 +2340,8 @@ components:
             priceTicks: { type: integer }
             previousPrice: { $ref: "#/components/schemas/Amount" }
             price: { $ref: "#/components/schemas/Amount" }
+            buyerFee: { $ref: "#/components/schemas/Fee", description: The fee repriced on the correction. }
+            sellerFee: { $ref: "#/components/schemas/Fee" }
     TradeBustedEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
       description: Aggregate and correlation ID the execution.
@@ -2346,7 +2375,7 @@ components:
         source: { const: exchange }
         payload:
           allOf: [{ $ref: "#/components/schemas/OrderEventPayload" }]
-          required: [executionId, lastQuantity, lastPriceTicks, lastPrice, previousLastQuantity, previousLastPriceTicks,
+          required: [executionId, lastQuantity, lastPriceTicks, lastPrice, lastFee, previousLastQuantity, previousLastPriceTicks,
                      previousLastPrice, reason, tradeDate, intendedSettlementDate]
     OrderFillBustedEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
@@ -2356,7 +2385,7 @@ components:
         source: { const: exchange }
         payload:
           allOf: [{ $ref: "#/components/schemas/OrderEventPayload" }]
-          required: [executionId, lastQuantity, lastPriceTicks, lastPrice, reason, tradeDate, intendedSettlementDate]
+          required: [executionId, lastQuantity, lastPriceTicks, lastPrice, lastFee, reason, tradeDate, intendedSettlementDate]
     ClockChangedPayload:
       type: object
       additionalProperties: false

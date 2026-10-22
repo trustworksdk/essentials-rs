@@ -139,6 +139,10 @@ impl App {
                     config.trades.validate().map_err(anyhow::Error::msg)?;
                     config.trades.clone()
                 },
+                fees: {
+                    config.fees.validate().map_err(anyhow::Error::msg)?;
+                    config.fees.clone()
+                },
                 trade_dating: crate::settlement::TradeDating {
                     calendar: Some(config.business_calendar().map_err(anyhow::Error::msg)?),
                     cycles: config.settlement_policy(),

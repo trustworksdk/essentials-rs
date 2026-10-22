@@ -145,6 +145,9 @@ pub struct Execution {
     pub trade_date: NaiveDate,
     pub intended_settlement_date: NaiveDate,
     pub status: ExecutionStatus,
+    /// What each side pays the exchange for this execution (SR-37), in minor units of the instrument's currency.
+    pub buyer_fee_minor: i64,
+    pub seller_fee_minor: i64,
 }
 
 /// The dates an execution carries (SR-29), the same for every fill of one command.

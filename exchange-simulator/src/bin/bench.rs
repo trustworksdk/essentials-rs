@@ -700,6 +700,7 @@ impl Service {
             settlement: SettlementConfig::default(),
             clearing: Default::default(),
             trades: Default::default(),
+            fees: Default::default(),
             test_control: TestControlConfig::default(),
             logging: LoggingConfig {
                 filter: "warn".into(),

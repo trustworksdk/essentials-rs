@@ -763,6 +763,13 @@
             "format": "uuid",
             "type": "string"
           },
+          "fee": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "feeMinor": {
+            "description": "What the participant pays the exchange for this trade (SR-37).",
+            "type": "integer"
+          },
           "instrumentId": {
             "type": "string"
           },
@@ -802,7 +809,9 @@
           "executedAt",
           "tradeDate",
           "intendedSettlementDate",
-          "obligationId"
+          "obligationId",
+          "feeMinor",
+          "fee"
         ],
         "type": "object"
       },
@@ -1245,6 +1254,28 @@
             "type": "integer"
           }
         },
+        "type": "object"
+      },
+      "Fee": {
+        "additionalProperties": false,
+        "description": "What one side pays the exchange for an execution (SR-37): the maker's or taker's rate of its value (`fees`), at least the minimum, in the instrument's currency.",
+        "properties": {
+          "amount": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "amountMinor": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "currency": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "amount",
+          "amountMinor",
+          "currency"
+        ],
         "type": "object"
       },
       "FieldFault": {
@@ -2338,6 +2369,13 @@
           "currencyScale": {
             "type": "integer"
           },
+          "feesNet": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "feesNetMinor": {
+            "description": "The obligation's trades' fees (SR-37), owed to the exchange apart from the cash settled.",
+            "type": "integer"
+          },
           "instrumentId": {
             "type": "string"
           },
@@ -2364,7 +2402,9 @@
           "securitiesNet",
           "cashNetMinor",
           "cashNet",
-          "tradeCount"
+          "tradeCount",
+          "feesNetMinor",
+          "feesNet"
         ],
         "type": "object"
       },
@@ -2562,6 +2602,14 @@
           "intendedSettlementDate": {
             "$ref": "#/components/schemas/IntendedSettlementDate"
           },
+          "lastFee": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Fee"
+              }
+            ],
+            "description": "On fill events, the order's side's fee for the execution (SR-37, FIX Commission)."
+          },
           "lastPrice": {
             "description": "On fill events, the execution's price in major units (FIX LastPx).",
             "type": "string"
@@ -2718,6 +2766,7 @@
               "lastQuantity",
               "lastPriceTicks",
               "lastPrice",
+              "lastFee",
               "reason",
               "tradeDate",
               "intendedSettlementDate"
@@ -2756,6 +2805,7 @@
               "lastQuantity",
               "lastPriceTicks",
               "lastPrice",
+              "lastFee",
               "previousLastQuantity",
               "previousLastPriceTicks",
               "previousLastPrice",
@@ -2796,6 +2846,7 @@
               "lastQuantity",
               "lastPriceTicks",
               "lastPrice",
+              "lastFee",
               "tradeDate",
               "intendedSettlementDate"
             ]
@@ -2832,6 +2883,7 @@
               "lastQuantity",
               "lastPriceTicks",
               "lastPrice",
+              "lastFee",
               "tradeDate",
               "intendedSettlementDate"
             ]
@@ -3992,6 +4044,9 @@
             "format": "uuid",
             "type": "string"
           },
+          "buyerFee": {
+            "$ref": "#/components/schemas/Fee"
+          },
           "buyerId": {
             "type": "string"
           },
@@ -4004,6 +4059,14 @@
           "executionId": {
             "format": "uuid",
             "type": "string"
+          },
+          "fee": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Fee"
+              }
+            ],
+            "description": "In an order's result only, the order's own side's fee."
           },
           "instrumentId": {
             "type": "string"
@@ -4023,6 +4086,9 @@
           "sellOrderId": {
             "format": "uuid",
             "type": "string"
+          },
+          "sellerFee": {
+            "$ref": "#/components/schemas/Fee"
           },
           "sellerId": {
             "type": "string"
@@ -4054,7 +4120,9 @@
           "executedAt",
           "tradeDate",
           "intendedSettlementDate",
-          "status"
+          "status",
+          "buyerFee",
+          "sellerFee"
         ],
         "type": "object"
       },
@@ -4186,6 +4254,14 @@
                 "format": "uuid",
                 "type": "string"
               },
+              "buyerFee": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/Fee"
+                  }
+                ],
+                "description": "The fee repriced on the correction."
+              },
               "buyerId": {
                 "type": "string"
               },
@@ -4228,6 +4304,9 @@
                 "format": "uuid",
                 "type": "string"
               },
+              "sellerFee": {
+                "$ref": "#/components/schemas/Fee"
+              },
               "sellerId": {
                 "type": "string"
               },
@@ -4251,7 +4330,9 @@
               "previousPriceTicks",
               "priceTicks",
               "previousPrice",
-              "price"
+              "price",
+              "buyerFee",
+              "sellerFee"
             ],
             "type": "object"
           },
@@ -4298,6 +4379,9 @@
           "buyOrderId": {
             "format": "uuid",
             "type": "string"
+          },
+          "buyerFee": {
+            "$ref": "#/components/schemas/Fee"
           },
           "buyerId": {
             "type": "string"
@@ -4379,6 +4463,9 @@
             "format": "uuid",
             "type": "string"
           },
+          "sellerFee": {
+            "$ref": "#/components/schemas/Fee"
+          },
           "sellerId": {
             "type": "string"
           },
@@ -4415,7 +4502,9 @@
           "tickSizeMinor",
           "executedAt",
           "tradeDate",
-          "intendedSettlementDate"
+          "intendedSettlementDate",
+          "buyerFee",
+          "sellerFee"
         ],
         "type": "object"
       },

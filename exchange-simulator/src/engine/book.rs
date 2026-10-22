@@ -226,6 +226,8 @@ impl OrderBook {
                     trade_date: ctx.dates.trade_date,
                     intended_settlement_date: ctx.dates.intended_settlement_date,
                     status: crate::domain::ExecutionStatus::Executed,
+                    buyer_fee_minor: 0,
+                    seller_fee_minor: 0,
                 });
                 fills.push(maker);
             }

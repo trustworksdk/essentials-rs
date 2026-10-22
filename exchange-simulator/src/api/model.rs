@@ -286,7 +286,15 @@ impl OrderResult {
             order: view,
             executions: executions
                 .iter()
-                .map(|e| TradeView::new(e, instrument))
+                .map(|e| {
+                    let mut view = TradeView::new(e, instrument);
+                    // The order's own side's fee (SR-37).
+                    view.fee = Some(match order.side {
+                        crate::domain::Side::Buy => view.buyer_fee.clone(),
+                        crate::domain::Side::Sell => view.seller_fee.clone(),
+                    });
+                    view
+                })
                 .collect(),
             duplicate: false,
         }
@@ -312,6 +320,12 @@ pub struct TradeView {
     pub intended_settlement_date: chrono::NaiveDate,
     /// `EXECUTED`, `CORRECTED` (price and quantity are the corrected ones) or `BUSTED` (SR-36).
     pub status: crate::domain::ExecutionStatus,
+    /// What each side pays the exchange (SR-37).
+    pub buyer_fee: serde_json::Value,
+    pub seller_fee: serde_json::Value,
+    /// In an order's result only: the order's own side's fee.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee: Option<serde_json::Value>,
 }
 
 impl TradeView {
@@ -331,6 +345,9 @@ impl TradeView {
             trade_date: e.trade_date,
             intended_settlement_date: e.intended_settlement_date,
             status: e.status,
+            buyer_fee: crate::events::fee(e.buyer_fee_minor, instrument),
+            seller_fee: crate::events::fee(e.seller_fee_minor, instrument),
+            fee: None,
         }
     }
 }

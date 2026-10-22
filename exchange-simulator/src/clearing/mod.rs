@@ -121,6 +121,11 @@ pub struct StatementTrade {
     pub trade_date: NaiveDate,
     pub intended_settlement_date: NaiveDate,
     pub obligation_id: String,
+    /// What the participant pays the exchange for this trade (SR-37), apart from the cash it settles.
+    #[serde(default)]
+    pub fee_minor: i64,
+    #[serde(default)]
+    pub fee: String,
     #[serde(skip)]
     tick_size_minor: u64,
 }
@@ -139,6 +144,11 @@ pub struct Obligation {
     pub cash_net_minor: i64,
     pub cash_net: String,
     pub trade_count: u32,
+    /// The obligation's trades' fees (SR-37): what the participant owes the exchange, separate from `cashNet`.
+    #[serde(default)]
+    pub fees_net_minor: i64,
+    #[serde(default)]
+    pub fees_net: String,
 }
 
 /// A clearing statement, as delivered in `ClearingStatementIssued` and served by the API.
@@ -249,8 +259,15 @@ impl ClearingPolicy {
                 &trade.instrument_id,
                 settles,
             ),
+            fee_minor: if side == "BUY" {
+                trade.buyer_fee_minor
+            } else {
+                trade.seller_fee_minor
+            },
+            fee: String::new(),
             tick_size_minor: trade.tick_size_minor,
         };
+        line.fee = format_amount(line.fee_minor, line.currency_scale);
         line.reprice();
         line
     }
@@ -381,6 +398,8 @@ fn net(trades: &[StatementTrade]) -> Vec<Obligation> {
                 cash_net_minor: 0,
                 cash_net: String::new(),
                 trade_count: 0,
+                fees_net_minor: 0,
+                fees_net: String::new(),
             });
         let sign = if t.side == "BUY" { 1 } else { -1 };
         o.securities_net = o
@@ -388,11 +407,13 @@ fn net(trades: &[StatementTrade]) -> Vec<Obligation> {
             .saturating_add(sign * i64::try_from(t.quantity).unwrap_or(i64::MAX));
         o.cash_net_minor = o.cash_net_minor.saturating_sub(sign * t.amount_minor);
         o.trade_count += 1;
+        o.fees_net_minor = o.fees_net_minor.saturating_add(t.fee_minor);
     }
     obligations
         .into_values()
         .map(|mut o| {
             o.cash_net = format_amount(o.cash_net_minor, o.currency_scale);
+            o.fees_net = format_amount(o.fees_net_minor, o.currency_scale);
             o
         })
         .collect()
@@ -499,6 +520,8 @@ mod tests {
             tick_size_minor: 1,
             executed_at: at("2030-01-07T10:00:00Z"),
             dates: None,
+            buyer_fee_minor: 0,
+            seller_fee_minor: 0,
         }
     }
 

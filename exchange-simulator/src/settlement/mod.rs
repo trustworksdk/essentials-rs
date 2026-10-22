@@ -250,6 +250,9 @@ pub struct TradeFacts {
     pub executed_at: DateTime<Utc>,
     /// The execution's own dates (SR-29); `None` for trades committed before executions carried them.
     pub dates: Option<crate::domain::TradeDates>,
+    /// Each side's fee (SR-37), in minor units; 0 for trades committed before executions carried fees.
+    pub buyer_fee_minor: i64,
+    pub seller_fee_minor: i64,
 }
 
 impl TradeFacts {
@@ -297,6 +300,8 @@ impl TradeFacts {
                 }),
                 _ => None,
             },
+            buyer_fee_minor: p["buyerFee"]["amountMinor"].as_i64().unwrap_or(0),
+            seller_fee_minor: p["sellerFee"]["amountMinor"].as_i64().unwrap_or(0),
         })
     }
 }

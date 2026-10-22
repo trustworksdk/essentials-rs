@@ -93,6 +93,7 @@ impl TestApp {
             settlement: SettlementConfig::default(),
             clearing: Default::default(),
             trades: Default::default(),
+            fees: Default::default(),
             test_control: TestControlConfig { enabled: true },
             logging: LoggingConfig {
                 filter: "warn".into(),

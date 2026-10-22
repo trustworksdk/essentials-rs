@@ -365,6 +365,8 @@ pub fn for_trade_adjustment(
         trade["priceTicks"] = json!(after.price_ticks);
         trade["previousPrice"] = json!(price(before.price_ticks));
         trade["price"] = json!(price(after.price_ticks));
+        trade["buyerFee"] = fee(after.buyer_fee_minor, instrument);
+        trade["sellerFee"] = fee(after.seller_fee_minor, instrument);
     }
     let event = |event_type: &'static str, aggregate_id: String, payload: Value| NewEvent {
         event_id: Uuid::nil(),
@@ -415,6 +417,14 @@ fn fill_payload(order: &Order, instrument: &Instrument, execution: &Execution) -
     payload["lastQuantity"] = json!(execution.quantity);
     payload["lastPriceTicks"] = json!(execution.price_ticks);
     payload["lastPrice"] = json!(instrument.ticks_to_price(execution.price_ticks));
+    // The order's own side's fee for this execution (SR-37), as FIX's `Commission` on an execution report.
+    payload["lastFee"] = fee(
+        match order.side {
+            crate::domain::Side::Buy => execution.buyer_fee_minor,
+            crate::domain::Side::Sell => execution.seller_fee_minor,
+        },
+        instrument,
+    );
     payload["tradeDate"] = json!(execution.trade_date);
     payload["intendedSettlementDate"] = json!(execution.intended_settlement_date);
     payload
@@ -485,5 +495,16 @@ fn trade_payload(
         "executedAt": execution.executed_at,
         "tradeDate": execution.trade_date,
         "intendedSettlementDate": execution.intended_settlement_date,
+        "buyerFee": fee(execution.buyer_fee_minor, instrument),
+        "sellerFee": fee(execution.seller_fee_minor, instrument),
+    })
+}
+
+/// A fee (SR-37) as events and responses carry it: `amount` (decimal), `amountMinor` and `currency`.
+pub fn fee(minor: i64, instrument: &Instrument) -> Value {
+    json!({
+        "amount": crate::settlement::format_amount(minor, instrument.currency_scale),
+        "amountMinor": minor,
+        "currency": instrument.currency,
     })
 }

@@ -60,7 +60,8 @@ const ORDER_READ_COLUMNS: &str = "id, client_order_id, instrument_id, participan
                                   updated_at, time_in_force, busted_quantity";
 /// The executions columns [`execution_row`] reads.
 const EXECUTION_COLUMNS: &str = "id, instrument_id, buy_order_id, sell_order_id, buyer_id, seller_id, price_ticks, \
-                                 quantity, executed_at, trade_date, intended_settlement_date, status";
+                                 quantity, executed_at, trade_date, intended_settlement_date, status, \
+                                 buyer_fee_minor, seller_fee_minor";
 
 /// An instrument's last trade and recent volume ([`Store::trade_summary`]).
 #[derive(Debug)]
@@ -435,8 +436,9 @@ impl Store {
             }
             let mut insert_execution = tx.prepare_cached(
                 "INSERT INTO executions (id, instrument_id, buy_order_id, sell_order_id, buyer_id, seller_id,
-                                         price_ticks, quantity, executed_at, trade_date, intended_settlement_date)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                         price_ticks, quantity, executed_at, trade_date, intended_settlement_date,
+                                         buyer_fee_minor, seller_fee_minor)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?;
             for execution in &update.executions {
                 insert_execution.execute(params![
@@ -451,6 +453,8 @@ impl Store {
                     timestamp(execution.executed_at),
                     execution.trade_date.to_string(),
                     execution.intended_settlement_date.to_string(),
+                    execution.buyer_fee_minor,
+                    execution.seller_fee_minor,
                 ])?;
             }
             let mut schedule = tx.prepare_cached(
@@ -486,13 +490,17 @@ impl Store {
         let now = timestamp(now);
         let tx = self.conn.savepoint()?;
         tx.prepare_cached(
-            "UPDATE executions SET quantity = ?2, price_ticks = ?3, status = ?4 WHERE id = ?1",
+            "UPDATE executions SET quantity = ?2, price_ticks = ?3, status = ?4, buyer_fee_minor = ?5,
+                                   seller_fee_minor = ?6
+             WHERE id = ?1",
         )?
         .execute(params![
             execution.id.to_string(),
             to_sql(execution.quantity),
             execution.price_ticks,
             execution.status.as_str(),
+            execution.buyer_fee_minor,
+            execution.seller_fee_minor,
         ])?;
         let mut update = tx.prepare_cached(
             "UPDATE orders SET busted_quantity = ?2, status = ?3, updated_at = ?4 WHERE id = ?1",
@@ -1341,6 +1349,8 @@ fn execution_row(row: &Row<'_>) -> rusqlite::Result<Execution> {
         trade_date: parsed(row, 9)?,
         intended_settlement_date: parsed(row, 10)?,
         status: parsed(row, 11)?,
+        buyer_fee_minor: row.get(12)?,
+        seller_fee_minor: row.get(13)?,
     })
 }
 

@@ -2417,6 +2417,33 @@ then 6.11, 6.12, 6.13–6.14.
   event, since storage alone was right); settlement not following; statements using the original trade, and keeping
   busted ones; the quantity allowed to go up; seeded adjustments never scheduled.
 
+**6.22 — exchange fees ✅ done (2026-10-22)**
+- **Delivered:**
+  - `crate::fees::FeeSchedule` (`fees:`, SR-37): `maker_bps`, `taker_bps`, `minimum` (major units of the instrument's
+    currency), `participants` overriding rates field by field, `exempt`. A side pays its rate of the execution's value
+    (price ticks × tick size × quantity), rounded half up, at least the minimum; the resting order's side is the maker,
+    the incoming order's the taker. Free by default.
+  - `Execution::buyer_fee_minor` and `seller_fee_minor` (migration 021), set as the trade is committed and repriced by a
+    correction (the later of the two orders stays the taker); a busted execution pays none.
+  - `buyerFee`/`sellerFee` (`amount`, `amountMinor`, `currency`) on `TradeExecuted`, `TradeCorrected` and every
+    `Trade`; `fee` (the order's own side's) in an order result's executions; `lastFee` on every fill event, the
+    correction and bust ones included.
+  - Clearing: each statement line's `fee`/`feeMinor`, each obligation's `feesNet`/`feesNetMinor`, the sum of its
+    lines' fees, from the `TradeExecuted` payload and the execution's current fees. Statements stored before 6.22
+    read with zero fees (`serde(default)`).
+  - `openapi.yaml` (`Fee`, the fields above), the README's Fees section, the default configuration.
+  - Tests: `tests/fees.rs` (SR-37's acceptance: the fees on the fill events, `TradeExecuted`, the result and the
+    statement, summing to `feesNet`; the minimum, a participant's own rate, an exempt participant, fees apart from
+    `cashNet`; a correction repricing them) and the schedule's unit tests.
+- **Decisions:**
+  - **Fees are not part of the settlement cash:** `cashNet` and the settlement instruction's amount stay the trade's
+    value, as a clearinghouse bills fees separately; `feesNet` is reported beside them.
+  - **No negative rates (rebates):** SR-37 does not ask for them.
+- **Gates:** fmt, clippy (`-D warnings`), doc, `cargo test -j 1 -p exchange-simulator` (44 targets) green after
+  `tests/events.rs`'s exact `TradeExecuted` payload gained the (zero) fees.
+- **Mutation checks**, each made a test fail (all 6): no minimum; nobody exempt; maker and taker swapped for the
+  buyer; `lastFee` from the other side; `feesNet` not summed; a correction keeping the old fees.
+
 ### Milestone 6 status
 
 All steps of the milestone are done (6.1–6.14 with 6.9a, 2026-10-18 to 2026-10-20). Not planned: SR-18 (FX, LATER).

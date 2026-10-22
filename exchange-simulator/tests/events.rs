@@ -153,6 +153,8 @@ fn acceptance_trade_produces_trade_and_fill_events() {
             "executedAt": "2026-10-14T12:00:00Z",
             "tradeDate": "2026-10-14",
             "intendedSettlementDate": "2026-10-15",
+            "buyerFee": { "amount": "0.00", "amountMinor": 0, "currency": "DKK" },
+            "sellerFee": { "amount": "0.00", "amountMinor": 0, "currency": "DKK" },
         })
     );
     for fill in [&events[2], &events[3]] {

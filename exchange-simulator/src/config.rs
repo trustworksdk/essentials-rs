@@ -46,6 +46,9 @@ pub struct Config {
     /// Seeded trade corrections and busts (SR-36); off by default.
     #[serde(default)]
     pub trades: crate::engine::TradeAdjustmentPolicy,
+    /// Exchange fees (SR-37); free by default.
+    #[serde(default)]
+    pub fees: crate::fees::FeeSchedule,
     pub clock: ClockConfig,
     pub test_control: TestControlConfig,
     pub database: DatabaseConfig,

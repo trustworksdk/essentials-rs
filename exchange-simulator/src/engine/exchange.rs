@@ -219,6 +219,8 @@ pub struct ExchangeOptions {
     pub sessions: crate::sessions::TradingSessions,
     /// Seeded trade corrections and busts (SR-36); off by default.
     pub trade_adjustments: TradeAdjustmentPolicy,
+    /// Exchange fees (SR-37); free by default.
+    pub fees: crate::fees::FeeSchedule,
 }
 
 /// Seeded trade corrections and busts (`trades:`, SR-36): each execution is busted with `bust_probability`, else
@@ -307,6 +309,7 @@ impl Default for ExchangeOptions {
             trade_dating: Default::default(),
             sessions: Default::default(),
             trade_adjustments: Default::default(),
+            fees: Default::default(),
         }
     }
 }
@@ -367,6 +370,7 @@ pub struct Exchange {
     expiries:
         std::collections::BTreeSet<(DateTime<Utc>, u64, InstrumentId, Uuid, chrono::NaiveDate)>,
     trade_adjustments: TradeAdjustmentPolicy,
+    fees: crate::fees::FeeSchedule,
     /// Seeded corrections and busts waiting for their time (SR-36), in due order.
     scheduled: std::collections::BTreeSet<crate::persistence::ScheduledAdjustment>,
 }
@@ -601,6 +605,7 @@ impl Exchange {
             sessions: options.sessions,
             expiries: Default::default(),
             trade_adjustments: options.trade_adjustments,
+            fees: options.fees,
             scheduled: Default::default(),
         };
         exchange.start_price_sources()?;
@@ -1915,6 +1920,8 @@ impl Exchange {
                     Some(execution) => {
                         trade.quantity = execution.quantity;
                         trade.price_ticks = execution.price_ticks;
+                        trade.buyer_fee_minor = execution.buyer_fee_minor;
+                        trade.seller_fee_minor = execution.seller_fee_minor;
                         current.push(trade);
                     }
                     None => current.push(trade),
@@ -2201,7 +2208,12 @@ impl Exchange {
                 "the group's transaction was rolled back".into(),
             ));
         }
+        let mut update = update;
+        let taker = update.order.side;
         let instrument = self.books[&update.order.instrument_id].instrument();
+        for execution in &mut update.executions {
+            price_fees(&self.fees, execution, instrument, taker);
+        }
         let participants = &self.participants;
         let lookup = |id: &ParticipantId| participants.get(id).cloned().flatten();
         let mut new_events = events::for_update(command, &update, instrument, &lookup, now);
@@ -2409,6 +2421,17 @@ impl Exchange {
             }
             orders.push(order);
         }
+        if after.status == ExecutionStatus::Busted {
+            (after.buyer_fee_minor, after.seller_fee_minor) = (0, 0);
+        } else {
+            // The incoming order, the taker, is the later one.
+            let taker = if orders[0].sequence > orders[1].sequence {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+            price_fees(&self.fees, &mut after, &instrument, taker);
+        }
         let mut new_events =
             events::for_trade_adjustment(&before, &after, &orders, &instrument, reason, at);
         if let Some(provider) = &self.provider
@@ -2608,6 +2631,24 @@ impl Exchange {
     fn now(&self) -> DateTime<Utc> {
         self.clock.now().trunc_subsecs(6)
     }
+}
+
+/// Sets each side's fee on an execution (SR-37): the incoming order's side pays the taker rate, the resting one's the
+/// maker rate, on the execution's value (price ticks × tick size × quantity).
+fn price_fees(
+    fees: &crate::fees::FeeSchedule,
+    execution: &mut Execution,
+    instrument: &Instrument,
+    taker: Side,
+) {
+    let value = i128::from(execution.price_ticks)
+        * i128::from(instrument.tick_size_minor)
+        * i128::from(execution.quantity);
+    let value = i64::try_from(value).unwrap_or(i64::MAX);
+    let scale = instrument.currency_scale;
+    execution.buyer_fee_minor = fees.fee(&execution.buyer_id.0, taker != Side::Buy, value, scale);
+    execution.seller_fee_minor =
+        fees.fee(&execution.seller_id.0, taker != Side::Sell, value, scale);
 }
 
 /// Statements are issued in time order, then by statement ID.

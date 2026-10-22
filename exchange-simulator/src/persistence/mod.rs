@@ -37,6 +37,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/018_trade_dates.sql"),
     include_str!("../../migrations/019_time_in_force.sql"),
     include_str!("../../migrations/020_trade_corrections.sql"),
+    include_str!("../../migrations/021_fees.sql"),
 ];
 
 /// A fresh name for an in-memory exchange database (see [`simulator_kit::persistence::memory_location`]).
