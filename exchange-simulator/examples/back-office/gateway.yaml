@@ -13,6 +13,10 @@ payments:
   deposit: { fail_probability: 0.0, min_delay_seconds: 60, max_delay_seconds: 1800 }
   withdrawal: { fail_probability: 0.0, min_delay_seconds: 600, max_delay_seconds: 14400 }
   return_probability: 0.0
+calendar:
+  # Statements, value dates and return delays on the exchange's business-day calendar, holidays included, read from
+  # its GET /api/calendar at startup (clock.follow.url). statement.cutoff and time_zone below are then not used.
+  mode: follow
 statement:
   cutoff: "17:30"
   time_zone: Europe/Copenhagen

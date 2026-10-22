@@ -5,6 +5,10 @@ clock:
   follow:
     url: http://exchange:8080
     poll_interval_ms: 250
+calendar:
+  # Statements, value dates and return delays on the exchange's business-day calendar, holidays included, read from
+  # its GET /api/calendar at startup (clock.follow.url). statement.cutoff and time_zone below are then not used.
+  mode: follow
 statement:
   cutoff: "17:30"
   time_zone: Europe/Copenhagen

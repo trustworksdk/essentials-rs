@@ -26,6 +26,8 @@ pub struct Config {
     pub payments: PaymentsConfig,
     pub statement: StatementConfig,
     #[serde(default)]
+    pub calendar: CalendarConfig,
+    #[serde(default)]
     pub events: EventsConfig,
     pub webhooks: WebhooksConfig,
     pub ids: IdsConfig,
@@ -76,6 +78,52 @@ pub struct StatementConfig {
     #[serde(default)]
     pub breaks: BreakPolicy,
     pub tick_interval_ms: u64,
+}
+
+/// Whose business-day calendar dates statements, value dates and return delays (SR-35).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CalendarConfig {
+    pub mode: CalendarMode,
+    /// `follow` only: the exchange to read the calendar from; `clock.follow.url` when absent.
+    pub follow: Option<CalendarFollowConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CalendarMode {
+    /// `statement.cutoff` in `statement.time_zone`, on weekdays.
+    #[default]
+    Own,
+    /// The exchange's calendar, holidays included, read from its `GET /api/calendar` at startup.
+    Follow,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalendarFollowConfig {
+    /// The exchange's base URL, e.g. `http://exchange:8080`.
+    pub url: String,
+}
+
+impl Config {
+    /// The URL to read the business-day calendar from in `calendar.mode: follow`; `None` in `own`.
+    pub fn calendar_follow_url(&self) -> Result<Option<String>, String> {
+        if self.calendar.mode == CalendarMode::Own {
+            return Ok(None);
+        }
+        let url = match (&self.calendar.follow, &self.clock.follow) {
+            (Some(follow), _) => follow.url.clone(),
+            (None, Some(clock)) => clock.url.clone(),
+            (None, None) => {
+                return Err(
+                    "calendar.mode: follow needs calendar.follow.url or clock.follow.url".into(),
+                );
+            }
+        };
+        reqwest::Url::parse(&url).map_err(|e| format!("calendar.follow.url: {e}"))?;
+        Ok(Some(url))
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -178,9 +226,16 @@ impl Config {
             withdrawal: p.withdrawal.clone(),
             return_probability: p.return_probability,
             max_return_days: p.max_return_days,
+            calendar: self.business_calendar()?,
         };
         policy.validate()?;
         Ok(policy)
+    }
+
+    /// The bank's business-day calendar: `statement.cutoff` in `statement.time_zone`, whether or not statements run.
+    pub fn business_calendar(&self) -> Result<CutoffCalendar, String> {
+        CutoffCalendar::parse(&self.statement.cutoff, &self.statement.time_zone)
+            .map_err(|e| format!("statement.{e}"))
     }
 
     /// The statement's policy when statements are enabled, validated.
@@ -189,8 +244,7 @@ impl Config {
         if !s.enabled {
             return Ok(None);
         }
-        let calendar =
-            CutoffCalendar::parse(&s.cutoff, &s.time_zone).map_err(|e| format!("statement.{e}"))?;
+        let calendar = self.business_calendar()?;
         crate::iban::validate(&s.account_iban)
             .map_err(|e| format!("statement.account_iban: {e}"))?;
         let currencies = self.currencies()?;

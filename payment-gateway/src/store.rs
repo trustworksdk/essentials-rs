@@ -18,11 +18,12 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/002_payments.sql"),
     simulator_kit::outbox::PARTICIPANT_FILTER,
     include_str!("../migrations/004_forced_outcomes.sql"),
+    include_str!("../migrations/005_value_dates.sql"),
 ];
 
 const PAYMENT_COLUMNS: &str = "id, sequence, idempotency_key, type, account_id, iban, holder_name, amount_minor, \
     currency, currency_scale, reference, status, reason, created_at, due_at, completed_at, failed_at, returned_at, \
-    updated_at, forced_outcome";
+    updated_at, forced_outcome, value_date";
 
 /// A text column holding one of the wire enums (type, status, kind).
 fn wire<T: std::str::FromStr<Err = String>>(row: &Row<'_>, index: usize) -> rusqlite::Result<T> {
@@ -68,16 +69,21 @@ fn payment_row(row: &Row<'_>) -> rusqlite::Result<Payment> {
                 })
             })
             .transpose()?,
+        value_date: row
+            .get::<_, Option<String>>(20)?
+            .map(|_| parsed(row, 20))
+            .transpose()?,
     })
 }
 
 fn upsert_payment(conn: &Connection, p: &Payment) -> rusqlite::Result<()> {
     conn.prepare_cached(&format!(
         "INSERT INTO payments ({PAYMENT_COLUMNS})
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
          ON CONFLICT (id) DO UPDATE SET status = excluded.status, reason = excluded.reason, due_at = excluded.due_at,
            completed_at = excluded.completed_at, failed_at = excluded.failed_at, returned_at = excluded.returned_at,
-           updated_at = excluded.updated_at, forced_outcome = excluded.forced_outcome"
+           updated_at = excluded.updated_at, forced_outcome = excluded.forced_outcome,
+           value_date = excluded.value_date"
     ))?
     .execute(params![
         p.id.to_string(),
@@ -102,6 +108,7 @@ fn upsert_payment(conn: &Connection, p: &Payment) -> rusqlite::Result<()> {
         p.forced
             .as_ref()
             .map(|f| serde_json::to_string(f).expect("an outcome serializes")),
+        p.value_date.map(|d| d.to_string()),
     ])
     .map(drop)
 }
@@ -184,6 +191,26 @@ pub fn payments(
         payment_row,
     )?
     .collect()
+}
+
+/// Gives the completed and returned payments stored before payments carried value dates (migration 005) the value date
+/// of their latest booking on `calendar`. Returns how many it dated.
+pub fn date_undated_payments(
+    conn: &Connection,
+    calendar: &simulator_kit::calendar::CutoffCalendar,
+) -> rusqlite::Result<usize> {
+    let undated: Vec<(String, DateTime<Utc>)> = conn
+        .prepare(
+            "SELECT id, COALESCE(returned_at, completed_at) FROM payments
+             WHERE value_date IS NULL AND completed_at IS NOT NULL",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, parsed(row, 1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut update = conn.prepare("UPDATE payments SET value_date = ?2 WHERE id = ?1")?;
+    for (id, booked_at) in &undated {
+        update.execute(params![id, calendar.business_date(*booked_at).to_string()])?;
+    }
+    Ok(undated.len())
 }
 
 /// Payments with a transition still to come, for resuming the lifecycle.

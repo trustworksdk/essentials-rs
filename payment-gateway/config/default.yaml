@@ -61,6 +61,12 @@ ids:
   # "random": UUIDv7. "deterministic": every ID derived from `seed` and the order of commands.
   mode: "random"
   seed: 0
+calendar:
+  # "own": statements, value dates and return delays use statement.cutoff in statement.time_zone, on weekdays.
+  # "follow": the exchange's business-day calendar, holidays included, read from its GET /api/calendar at startup
+  # (restart the gateway after changing the exchange's holidays), e.g. follow: { url: "http://exchange:8080" }.
+  # Without follow.url, clock.follow.url is used.
+  mode: "own"
 clock:
   # "system": domain time is real time. "virtual": controllable (start, running, speed), as in the exchange simulator.
   # "follow": a virtual clock that follows another simulator's GET /api/clock (its reading, speed and running state),

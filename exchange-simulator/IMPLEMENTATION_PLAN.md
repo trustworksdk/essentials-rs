@@ -1600,8 +1600,15 @@ it.
 | 6.15 | Cancel by client order id | 3 | S | **SR-30** (added to the requirements 2026-10-21, after the milestone was done). `DELETE /api/orders?participantId=…&clientOrderId=…`: the order is resolved inside the exchange thread (where submission's idempotency check resolves it), then cancelled exactly as `DELETE /api/orders/{id}` cancels it: the same `OrderResult`, the same `OrderCancelled`, `409 order_not_active` for a second cancel, `404` for an unknown `clientOrderId` within the participant. Both query parameters are required (`400` otherwise), since client order ids are unique per participant only. `openapi.yaml` gains the operation. |
 | 6.16 | The execution on every fill event | 3 | S | **SR-31** (added to the requirements 2026-10-22). `OrderPartiallyFilled` and `OrderFilled` name the execution they report for both sides: `executionId` (now always present), `lastQuantity`, `lastPriceTicks` and `lastPrice`. An incoming order that trades against several resting orders gets one fill event per execution, in execution order, each with its running totals after that execution. The event `schemaVersion` stays 1 (additive); the API documents go to 0.3.0. |
 | 6.17 | The business day on `OrderExpired` | 3 | S | **SR-32** (added to the requirements 2026-10-22, done on the 6.16 branch at the user's request). `OrderExpired` carries `businessDate`: the business day whose end expired the order, the date `BusinessDayClosed` names for that cutoff, or on a market with a session the session's date. Decided when the expiry is scheduled, from the same calendar. |
+| 6.18 | Value dates on payments | 2 | S | **SR-33** (added to the requirements 2026-10-22). `valueDate` on the gateway's payment payload: the business date of the latest booking (the completion's, then the return's) on the bank's calendar, set when the payment completes or is returned, stored with it, and equal to the statement entry's. `null` before a booking; required on `PaymentCompleted` and `PaymentReturned`. Payments stored before the column are dated at startup. |
+| 6.19 | Event-log reads by several types | 6 | S | **SR-34.** `eventType` repeated or comma-separated on both services' `GET /api/events` (an unknown type stays `400`), and an `Event-Log-Scanned-Through` header on every answer: the highest sequence the read looked at, so a filtered reader continues from there. |
+| 6.20 | Holidays, one calendar for both simulators | 4 | L | **SR-35.** Holidays on the shared business-day calendar (`simulator_kit::calendar`): `clearing.holidays` on the exchange (no `BusinessDayClosed`, clearing statement or `ClosingPriceIssued` on a holiday; trade and settlement dates skip it), `sessions.<MIC>.holidays` defaulting to them, `GET /api/calendar?from=&to=`. The gateway's `calendar.mode: follow` reads the exchange's calendar for its statements, value dates and return delays; `own` keeps today's. |
+| 6.21 | Trade corrections and busts | after 5 | L | **SR-36 (LATER), planned only.** `TradeCorrected`/`TradeBusted`, `OrderFillCorrected`/`OrderFillBusted` with the order's new running totals and the execution's SR-31 fields; settlement follows; operator calls and seeded probabilities. |
+| 6.22 | Exchange fees | after 5 | M | **SR-37 (LATER), planned only.** Maker/taker basis points with a minimum, per participant (the provider may be exempt); fees on `TradeExecuted`, the fill events (`lastFee`), the order result and the clearing statement (`feesNet`). |
+| 6.23 | Corporate actions | after 5 | L | **SR-38 (LATER), planned only.** Cash dividends (`CorporateActionAnnounced`, `DividendPaid` from settled shares at the record date) and splits (`SplitApplied`, resting orders and the reference price adjusted), from configuration or an operator call. |
 
-**Not planned:** SR-18 (FX reference rates) is marked LATER and waits for the demo's FX phase.
+**Not planned:** SR-18 (FX reference rates) is marked LATER and waits for the demo's FX phase. SR-36 to SR-38 are
+LATER too: planned as 6.21–6.23 at the user's request (2026-10-22), not implemented.
 
 **Order within the milestone:** by demo phase, as in the table: 6.1–6.3, then 6.4–6.5, then 6.6, then 6.7–6.10
 (6.7 and 6.8 before 6.9, so the provider and the feed are tested on synthetic prices before a live source is added),
@@ -2269,12 +2276,108 @@ then 6.11, 6.12, 6.13–6.14.
   the expiry instant on the calendar; the cutoff's UTC date; `businessDate` left out; the event dated by the close's
   UTC date (survived the first test set, where every close fell on the same UTC date, hence the Los Angeles cutoff).
 
+**6.18 — value dates on payments ✅ done (2026-10-22)**
+- **Delivered:**
+  - `valueDate` on the gateway's payment payload (SR-33): `PaymentPolicy` holds the bank's business-day calendar
+    (`Config::business_calendar`, `statement.cutoff` in `statement.time_zone`, now built whether or not statements
+    run), and a completion or return sets `Payment::value_date` to the business date of its booking. Stored in
+    `payments.value_date` (migration 005, `/health` `schemaVersion` 5); `store::date_undated_payments` dates the
+    completed and returned payments stored before it at startup.
+  - `openapi.yaml`: `valueDate` on `PaymentFields` (nullable, always present), a date on `PaymentCompleted` and
+    `PaymentReturned` (`Booked`). The gateway README, the back-office guide.
+  - Tests: `tests/statements.rs` `completed_and_returned_payments_carry_their_bookings_value_dates` (SR-33's
+    acceptance: completed after Tuesday's cutoff, valued Wednesday as its Wednesday statement entry; the return
+    valued Thursday as its entry; `GET /api/payments` and `/{id}` show the latest) and
+    `payments_stored_before_they_carried_value_dates_are_dated_at_startup`.
+- **Decisions:**
+  - **Stored, not derived when shown:** a later calendar change (SR-35's follow mode, a configuration edit) must not
+    move a value date away from the statement entry already drafted for it.
+  - **The API documents go to 0.4.0** for this branch (6.18–6.20): 0.3.0 is on `main` and installed locally.
+- **Gates:** fmt, clippy (`-D warnings`), doc, `cargo test -j 1 -p payment-gateway` (all 8 targets) green; the
+  exchange's `tests/openapi.rs` green after its rendition was rewritten for 0.4.0 (its code is unchanged).
+- **Mutation checks**, each made a test fail (all 4): the completion left undated; the return keeping the
+  completion's date; the completion dated by its UTC date; no dating at startup.
+
+**6.19 — event-log reads by several types ✅ done (2026-10-22)**
+- **Delivered:**
+  - `simulator_kit::api::events` (SR-34): `EventRead::parse` reads `after`, `limit` and `eventType` from the raw query,
+    `eventType` repeated or comma-separated (`form_urlencoded`, already in the tree through `url`; axum's `Query`
+    cannot collect repeated keys), each type checked against the service's `EVENT_TYPES`; `response` adds the
+    `Event-Log-Scanned-Through` header. `outbox::read_events` returns an `EventPage` with `scanned_through`. Both
+    services' `GET /api/events` use them; the exchange's `EventQuery` is gone.
+  - `scanned_through` is the last returned event's sequence when the page is full, else the log's head when the read
+    began (or `after`, if further). Without a filter that is the last returned event's sequence, or the head when none
+    is returned, as SR-34 says.
+  - Both `openapi.yaml`: `eventType` an array (`style: form`, `explode: true`, commas described), the header on `200`.
+    Both READMEs, the webhook receivers guide.
+  - Tests: `tests/event_reads.rs` (SR-34's acceptance on the exchange: two types in sequence order, repeated, comma
+    and encoded-comma forms; a read past the last match returns none with the header at the head; a full page; an
+    unfiltered empty read; unknown types `400`), the gateway's
+    `events_are_read_by_several_types_with_how_far_the_read_looked`, and the parser's unit tests in the kit.
+- **Decisions:**
+  - **The head is read before the page and bounds it.** Read after, an event committed between the two queries would
+    lie below the reported head but outside the page, and a reader continuing from the header would skip it.
+  - **No index on `event_type`:** a filtered read walks the log by sequence. An index would add a write to every event
+    on the exchange's hot path and a migration in both services; with the header, a reader scans each stretch once.
+  - **Deviation:** SR-34 says an unknown type is a `400` "as today". It was not: an unknown type matched nothing and
+    answered `200 []`. It is a `400` now, as SR-34 asks. Unknown query parameters stay `400`.
+- **Gates:** fmt, clippy (`-D warnings`), doc for the kit, the gateway and the exchange; `cargo test -j 1` of the kit
+  (`--all-features`), the gateway (8 targets) and the exchange (41 targets) green.
+- **Mutation checks**, each made a test fail (all 5): scanned through the last returned event only; a full page
+  claiming the head; no comma separation; a repeated `eventType` replacing the earlier; unknown types accepted. The
+  head being read before the page is not mutation-checked: the race it closes cannot be staged deterministically.
+
+**6.20 — holidays, one calendar for both simulators ✅ done (2026-10-22)**
+- **Delivered:**
+  - `simulator_kit::calendar::BusinessDays` (SR-35): weekdays less holidays, shared cheaply (`Arc`), with
+    `is_business_day`, `add_business_days`, `next_business_day` and `previous_business_day`. It replaces the
+    weekday-only free functions, so no caller can count business days without the holidays. `CutoffCalendar` and
+    `DailySession` carry one (`with_days`) and are `Clone`, no longer `Copy`.
+  - Exchange: `clearing.holidays` (`Config::business_days`), on the business calendar, the settlement policy
+    (`SettlementPolicy::business_days`: trade dating, intake, delays and corrections), clearing and the sessions;
+    `sessions.<MIC>.holidays` overrides them per market (`[]` trades every weekday). Business days, clearing
+    statements and closing prices iterate with the calendar's `next_business_day`, so a holiday is never closed.
+    `GET /api/calendar?from=&to=` (at most 3700 days): `cutoff`, `timeZone`, `businessDays` with `cutoffAt`,
+    `holidays`.
+  - Gateway: `calendar.mode: own | follow` (`calendar.follow.url`, else `clock.follow.url`). In `follow` the gateway
+    reads the exchange's clock, then its calendar from about a year before to nine years after, at startup, before
+    recovery, retrying every second until the exchange answers; payments (value dates, return delays) and statements
+    use it. `App::start` is now `async` for that read. Statements and return delays count business days with the
+    calendar's holidays in both modes.
+  - The `back-office` and `with-your-app` examples set `calendar.mode: follow`. Both `openapi.yaml` (the exchange's
+    `getCalendar`, `BusinessCalendar`), both READMEs, both default configurations.
+  - Tests: the kit's `holidays_are_not_business_days` and `a_holiday_has_no_cutoff_and_closes_no_session`;
+    `tests/holidays.rs` (SR-35's exchange acceptance with Thursday 2030-01-10 a holiday and T+1: a Wednesday trade
+    settles Friday, also in its `SettlementPending`; no `BusinessDayClosed`, `ClosingPriceIssued` or clearing statement
+    for Thursday; XCSE closed on Thursday, XNAS with `holidays: []` trading, its Thursday trade dated Friday and
+    settling Monday; the calendar endpoint and its `400`s); the gateway's
+    `following_the_exchanges_calendar_skips_its_holidays` (against a stand-in exchange: completed Wednesday, valued
+    Wednesday, returned one business day later on Friday, no statement for Thursday, the exchange's cutoff and time
+    zone over the gateway's own), and the missing follow URL refused at startup.
+- **Decisions:**
+  - **The calendar is read once, at startup, and the gateway waits for it.** A gateway that started on its own
+    calendar and switched later could date the same day two ways. Holidays change only with an exchange restart, so
+    the gateway is restarted after changing them (documented).
+  - **The gateway's return delay still counts from the completion's UTC date**, as before, now skipping holidays; only
+    SR-35's holiday rule was asked for.
+  - **A session inherits `clearing.holidays`**, as SR-35 says, rather than having none by default.
+  - **No cross-service test:** the gateway's test uses a stand-in exchange serving `/api/calendar` in the shape the
+    exchange's contract test checks against the document.
+- **Gates:** fmt, clippy (`-D warnings`), doc for the kit, the gateway and the exchange; `cargo test -j 1` of the kit
+  (`--all-features`), the gateway (8 targets) and the exchange (42 targets) green.
+- **Mutation checks**, each made a test fail (all 7): holidays counted as business days; `clearing.holidays` not
+  read; settlement counting weekdays only; sessions not inheriting the holidays; the gateway's payments, and
+  separately its statements, keeping its own calendar in follow mode; the calendar endpoint listing holidays outside
+  the range (survived the first test, which had no holiday outside it; Christmas was added).
+
 ### Milestone 6 status
 
 All steps of the milestone are done (6.1–6.14 with 6.9a, 2026-10-18 to 2026-10-20). Not planned: SR-18 (FX, LATER).
 SR-30 (cancel by client order id) was added on 2026-10-21 and done as step 6.15 the same day.
 SR-31 (the execution on every fill event) and SR-32 (the business day on `OrderExpired`) were added on 2026-10-22
 and done as steps 6.16 and 6.17 the same day.
+SR-33 to SR-35 (value dates, multi-type event reads, holidays) were added on 2026-10-22 and done as steps 6.18–6.20
+the same day; SR-36 to SR-38 (LATER) are planned as 6.21–6.23.
 Still on hold from Milestone 4: 4.6d (the containerized benchmark).
 
 **SR-2 manual acceptance against the real Finnhub ✅ done (2026-10-20, D19).** `config/finnhub-market.yaml` (40

@@ -6,7 +6,7 @@ use chrono::{DateTime, SubsecRound, Utc};
 use uuid::Uuid;
 
 use super::{BookError, BookUpdate, Clock, IdScheme, MatchContext, OrderBook};
-use crate::clearing::{ClearingPolicy, StoredStatement, next_business_day, previous_business_day};
+use crate::clearing::{ClearingPolicy, StoredStatement};
 use crate::clock::{ClockError, SystemClock, VirtualClock};
 use crate::domain::{
     IdentifierPolicy, Instrument, InstrumentChange, InstrumentError, InstrumentId, Order,
@@ -372,7 +372,8 @@ struct BusinessDays {
 impl BusinessDays {
     /// When the next business day closes.
     fn due(&self) -> DateTime<Utc> {
-        self.calendar.cutoff_at(next_business_day(self.cursor))
+        self.calendar
+            .cutoff_at(self.calendar.days.next_business_day(self.cursor))
     }
 
     /// The cursor for days starting at `now`: the business day before the one now belongs to, so the first day closed
@@ -381,7 +382,9 @@ impl BusinessDays {
         calendar: &simulator_kit::calendar::CutoffCalendar,
         now: DateTime<Utc>,
     ) -> chrono::NaiveDate {
-        previous_business_day(calendar.business_date(now))
+        calendar
+            .days
+            .previous_business_day(calendar.business_date(now))
     }
 }
 
@@ -402,7 +405,7 @@ impl Clearing {
         let cutoff = self
             .policy
             .calendar
-            .cutoff_at(next_business_day(self.cursor));
+            .cutoff_at(self.policy.calendar.days.next_business_day(self.cursor));
         self.pending
             .first()
             .map_or(cutoff, |p| p.draft.statement.issued_at.min(cutoff))
@@ -411,7 +414,10 @@ impl Clearing {
     /// The cursor for a clearinghouse starting at `now`: the business day before the one now belongs to, so the next
     /// cutoff is the first one after now and no past day is issued.
     fn first_cursor(policy: &ClearingPolicy, now: DateTime<Utc>) -> chrono::NaiveDate {
-        previous_business_day(policy.calendar.business_date(now))
+        policy
+            .calendar
+            .days
+            .previous_business_day(policy.calendar.business_date(now))
     }
 }
 
@@ -1726,8 +1732,8 @@ impl Exchange {
     /// Closes the next business day with `BusinessDayClosed`, committed with the moved cursor.
     fn close_business_day(&mut self) -> Result<usize, ExchangeError> {
         let days = self.days.as_ref().expect("business days run");
-        let date = next_business_day(days.cursor);
-        let calendar = days.calendar;
+        let date = days.calendar.days.next_business_day(days.cursor);
+        let calendar = days.calendar.clone();
         let mut new_events = vec![events::business_day_closed(date, &calendar)];
         new_events.extend(self.closing_prices(date, &calendar)?);
         let next = NewEvent::stamp(&mut new_events, self.next_event_sequence, self.ids);
@@ -1795,8 +1801,12 @@ impl Exchange {
     /// late are issued at once), and late statements due by `at`. Committed in one transaction, then applied.
     fn clearing_step(&mut self, at: DateTime<Utc>) -> Result<usize, ExchangeError> {
         let clearing = self.clearing.as_ref().expect("clearing runs");
-        let date = next_business_day(clearing.cursor);
-        let calendar = clearing.policy.calendar;
+        let date = clearing
+            .policy
+            .calendar
+            .days
+            .next_business_day(clearing.cursor);
+        let calendar = clearing.policy.calendar.clone();
         let mut issue: Vec<StoredStatement> = clearing
             .pending
             .iter()

@@ -1079,6 +1079,26 @@ async fn every_operation_and_event_matches_the_document() {
     )
     .await;
     expect(a, s, 400, M::GET, "/api/events?limit=5000", None).await;
+    expect(
+        a,
+        s,
+        200,
+        M::GET,
+        "/api/events?eventType=TradeExecuted,OrderFilled",
+        None,
+    )
+    .await;
+    expect(a, s, 400, M::GET, "/api/events?eventType=Nope", None).await;
+    expect(
+        a,
+        s,
+        200,
+        M::GET,
+        "/api/calendar?from=2030-01-07&to=2030-01-13",
+        None,
+    )
+    .await;
+    expect(a, s, 400, M::GET, "/api/calendar?from=2030-01-07", None).await;
     let mut seen = std::collections::BTreeSet::new();
     for event in events.as_array().unwrap() {
         spec.check_event(event);

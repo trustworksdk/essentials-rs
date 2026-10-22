@@ -40,7 +40,7 @@ async fn serve() -> anyhow::Result<()> {
             .with_env_filter(filter)
             .init(),
     }
-    let app = App::start(&config)?;
+    let app = App::start(&config).await?;
     let listener = tokio::net::TcpListener::bind(&config.server.bind)
         .await
         .with_context(|| format!("binding {}", config.server.bind))?;

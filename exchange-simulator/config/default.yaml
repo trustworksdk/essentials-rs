@@ -101,6 +101,8 @@ liquidity:
 # listed is always open. For example:
 #   sessions:
 #     XNAS: { open: "09:30", close: "16:00", time_zone: America/New_York }
+# A market is closed on `clearing.holidays`, unless its session lists its own: `holidays: ["2030-12-24"]`, or `[]` for
+# a market that trades on every weekday.
 sessions: {}
 market_data:
   # Per subscriber, instrument and kind (quote, trade, reference), at most one stream message this often, the latest;
@@ -144,6 +146,10 @@ clearing:
   enabled: false
   cutoff: "17:30"
   time_zone: "UTC"           # an IANA name, e.g. Europe/Copenhagen
+  # Dates that are not business days, e.g. ["2030-12-24", "2030-12-25"] (whether or not clearing is enabled): no
+  # BusinessDayClosed, ClosingPriceIssued or clearing statement for them, trade dates and settlement dates skip them,
+  # and markets are closed on them. GET /api/calendar lists them; a gateway with calendar.mode: follow uses them.
+  holidays: []
   # Seeded reconciliation breaks, all off by default. They change what statements say, never the trades.
   breaks:
     seed: 1

@@ -466,6 +466,16 @@ impl Store {
         outbox::events(&self.conn, after, limit, event_type)
     }
 
+    /// A page of events of the given types, and how far the read looked (SR-34).
+    pub fn read_events(
+        &self,
+        after: u64,
+        limit: u32,
+        event_types: Option<&[String]>,
+    ) -> rusqlite::Result<outbox::EventPage> {
+        outbox::read_events(&self.conn, after, limit, event_types)
+    }
+
     pub fn insert_subscription(&self, subscription: &Subscription) -> rusqlite::Result<()> {
         outbox::insert_subscription(&self.conn, subscription)
     }

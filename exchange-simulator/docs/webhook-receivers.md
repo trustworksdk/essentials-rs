@@ -146,7 +146,9 @@ With the Compose example's shared secret file, both containers read the same fil
 
 **To catch up after losing data, or to start a new consumer from history:**
 - **Pull:** read `GET /api/events?after=<last sequence you have>` page by page until it returns `[]`. This is the
-  log itself and needs no subscription.
+  log itself and needs no subscription. A consumer of a few event types filters with `eventType=A,B` and continues
+  from each answer's `Event-Log-Scanned-Through` header, not from the last event it got, so it never scans the same
+  stretch of the log twice.
 - **Push:** `POST /api/webhooks/{id}/redeliver?after=<sequence>` queues every event after that sequence for the
   subscription again, including events from before it existed. They arrive as ordinary deliveries, so your
   deduplication applies.

@@ -511,7 +511,15 @@ This API's OpenAPI 3.1 specification ([`openapi.yaml`](openapi.yaml)), as `appli
 ### `GET /api/events?after=&limit=&eventType=`
 
 Canonical events with `sequence > after` (default 0), in sequence order. `limit` is 1–1000 (default 100). To replay
-everything, pass the last `sequence` you received as `after` until the result is empty. Envelope:
+everything, pass the last `sequence` you received as `after` until the result is empty.
+
+`eventType` keeps only the listed types: repeat it (`eventType=TradeExecuted&eventType=OrderFilled`) or separate types
+by commas (`eventType=TradeExecuted,OrderFilled`). An unknown type is `400`. Every answer carries
+`Event-Log-Scanned-Through: <sequence>`, the highest sequence the read looked at: the last returned event's when the
+page is full, otherwise the log's head when the read began. A filtered read can return few or no events from a long
+stretch of the log, so continue from this header (`after=<scanned-through>`) rather than from the last event you
+received, and you never scan that stretch again. Without a filter it equals the last returned event's sequence, or the
+head when none is returned. Envelope:
 
 ```json
 { "eventId": "0199…", "sequence": 3, "eventType": "TradeExecuted", "schemaVersion": 1, "source": "exchange",
@@ -534,8 +542,8 @@ Event types and payloads (`schemaVersion` 1):
 meant to settle, `intendedSettlementDate` (tag 64), so a consumer never needs its own calendar to book or reconcile a
 trade:
 - **`tradeDate`** is the execution's date on the business-day calendar: `clearing.cutoff` in `clearing.time_zone`,
-  on weekdays, whether or not clearing runs. A trade at or after the cutoff, or on a weekend, belongs to the next
-  business day; the same calendar closes business days (`BusinessDayClosed`). With a 17:30 Copenhagen cutoff, a trade
+  on weekdays that are not `clearing.holidays`, whether or not clearing runs. A trade at or after the cutoff, or on a
+  weekend or holiday, belongs to the next business day; the same calendar closes business days (`BusinessDayClosed`). With a 17:30 Copenhagen cutoff, a trade
   at 17:29 on Tuesday is Tuesday's, one at 17:30 is Wednesday's, and one on Friday evening is Monday's.
 - **`intendedSettlementDate`** is `tradeDate` plus the instrument's market cycle (`settlement.settlement_days`, or
   `market_settlement_days` for its MIC) in business days, in every settlement mode: in `external` mode it is the date
@@ -829,12 +837,33 @@ At `clearing.cutoff`, local time in `clearing.time_zone`, every weekday, the exc
 **`BusinessDayClosed`** (`source: "exchange"`, aggregate ID the business date, `occurredAt` the cutoff):
 `businessDate`, `cutoffAt`, `nextBusinessDate` and `timeZone`. It is the authoritative end-of-day signal for a
 consumer's end-of-day work (statements, valuation, closing books):
-- **Always:** whether or not clearing is enabled, and also on a day without trades. Weekends are skipped.
+- **Always:** whether or not clearing is enabled, and also on a day without trades. Weekends and holidays are
+  skipped.
 - **Before the day's statements:** at the cutoff the day closes first, then that day's `ClearingStatementIssued`.
 - **Every day, in order:** a clock move past several cutoffs closes each day in turn, in time order with the
   settlement events around it. A running clock closes days on its own (the background tick, every
   `settlement.tick_interval_ms`). Cutoffs passed while the service was down are closed at startup, once.
 - **From now on:** a new database, or a reset, starts with the current business day; no earlier day is closed.
+
+**Holidays.** `clearing.holidays` lists dates that are not business days (whether or not clearing is enabled). On a
+holiday no `BusinessDayClosed`, `ClosingPriceIssued` or clearing statement is issued; a trade on it belongs to the next
+business day (`tradeDate`); settlement dates, delays and corrections count business days past it; and a market with a
+session is closed on it (`MARKET_CLOSED`; a `DAY` order rests until the next session closes). A session can list its
+own `holidays` instead (`[]` for a market that trades on every weekday). With Thursday a holiday and T+1, a trade on
+Wednesday settles on Friday, and Wednesday's cutoff is followed by Friday's.
+
+### `GET /api/calendar?from=&to=`
+
+The business-day calendar from `from` to `to` (dates, both included, at most 3700 days apart): `cutoff`, `timeZone`,
+`businessDays` (each `date` with its `cutoffAt`) and `holidays` (the configured ones in the range). Reference data for
+planning, and what a payment gateway with `calendar.mode: follow` reads. The current business date comes from
+`BusinessDayClosed`, not from here. `400` without both dates, with `to` before `from`, or for a longer range.
+
+```json
+{ "from": "2030-01-07", "to": "2030-01-11", "cutoff": "17:30", "timeZone": "UTC",
+  "businessDays": [ { "date": "2030-01-07", "cutoffAt": "2030-01-07T17:30:00Z" }, … ],
+  "holidays": ["2030-01-10"] }
+```
 
 Right after it, in the same commit, one **`ClosingPriceIssued`** per instrument, in instrument ID order (aggregate
 ID the instrument, correlation ID the business date, `occurredAt` the cutoff): `instrumentId`, `businessDate`,
@@ -859,7 +888,8 @@ party only (decision D8): it keeps no positions or cash, and computes every stat
 How a demo consumes and reconciles these statements, together with the payment gateway's bank statements, is in
 the guide's [Back office](docs/back-office.md) chapter.
 
-- **When:** at `clearing.cutoff`, local time in `clearing.time_zone` (daylight saving included), Monday to Friday.
+- **When:** at `clearing.cutoff`, local time in `clearing.time_zone` (daylight saving included), on business days
+  (Monday to Friday, less `clearing.holidays`).
   With `clock.mode: virtual` nothing is issued until simulated time reaches the cutoff, and a clock move issues every
   cutoff it passes, each in time order with the settlement events around it. A statement's `occurredAt` is its
   scheduled instant, so on a running clock it can follow events stamped up to one `settlement.tick_interval_ms` after

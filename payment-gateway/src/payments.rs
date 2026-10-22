@@ -6,10 +6,10 @@
 //! Every decision is a pure function of (`seed`, the payment's sequence, the decision), so outcomes do not depend on
 //! tick timing or restarts, and events carry the scheduled instant as `occurredAt`.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use simulator_kit::calendar::add_business_days;
+use simulator_kit::calendar::CutoffCalendar;
 use simulator_kit::events::NewEvent;
 use simulator_kit::rng::draw;
 use uuid::Uuid;
@@ -105,6 +105,9 @@ pub struct Payment {
     pub completed_at: Option<DateTime<Utc>>,
     pub failed_at: Option<DateTime<Utc>>,
     pub returned_at: Option<DateTime<Utc>>,
+    /// The value date of the latest booking (SR-33): the completion's, then the return's. The business date the
+    /// booking falls in, so it is the date of the statement that lists it.
+    pub value_date: Option<NaiveDate>,
     pub updated_at: DateTime<Utc>,
     /// An outcome a test forced; it replaces the seeded draws.
     pub forced: Option<ForcedOutcome>,
@@ -151,6 +154,9 @@ pub struct PaymentPolicy {
     pub withdrawal: OutcomeConfig,
     pub return_probability: f64,
     pub max_return_days: u32,
+    /// The bank's business-day calendar, which dates bookings and counts return delays: `statement.cutoff` and
+    /// `time_zone`, or the exchange's calendar with `calendar.mode: follow` (SR-35).
+    pub calendar: CutoffCalendar,
 }
 
 // Draw purposes.
@@ -249,6 +255,7 @@ impl PaymentPolicy {
                 }
                 next.status = PaymentStatus::Completed;
                 next.completed_at = Some(at);
+                next.value_date = Some(self.calendar.business_date(at));
                 next.due_at = match &current.forced {
                     Some(ForcedOutcome::Returned {
                         return_after_seconds,
@@ -261,7 +268,7 @@ impl PaymentPolicy {
                                     * f64::from(self.max_return_days))
                                     as u32)
                                     .min(self.max_return_days - 1);
-                            let date = add_business_days(at.date_naive(), days);
+                            let date = self.calendar.days.add_business_days(at.date_naive(), days);
                             date.and_time(at.time()).and_utc()
                         })
                     }
@@ -281,6 +288,7 @@ impl PaymentPolicy {
                 next.status = PaymentStatus::Returned;
                 next.reason = Some(RETURN_REASON.to_string());
                 next.returned_at = Some(at);
+                next.value_date = Some(self.calendar.business_date(at));
                 next.due_at = None;
                 let (kind, sign) = match current.payment_type {
                     PaymentType::Deposit => (BookingKind::DepositReturn, -1),
@@ -330,6 +338,7 @@ pub fn payment_view(p: &Payment) -> Value {
         "completedAt": p.completed_at,
         "failedAt": p.failed_at,
         "returnedAt": p.returned_at,
+        "valueDate": p.value_date,
         "updatedAt": p.updated_at,
     })
 }
@@ -367,6 +376,7 @@ mod tests {
             },
             return_probability: 0.0,
             max_return_days: 3,
+            calendar: CutoffCalendar::parse("17:30", "Europe/Copenhagen").unwrap(),
         };
         adjust(&mut policy);
         policy
@@ -395,6 +405,7 @@ mod tests {
             completed_at: None,
             failed_at: None,
             returned_at: None,
+            value_date: None,
             updated_at: at,
             forced: None,
         }

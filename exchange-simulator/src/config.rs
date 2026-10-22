@@ -180,6 +180,7 @@ impl SettlementConfig {
                     .map(|(mic, days)| (mic.to_ascii_uppercase(), *days))
                     .collect(),
                 clearing: None,
+                business_days: Default::default(),
                 reject_probability: self.reject_probability,
                 cancel_probability: self.cancel_probability,
                 fail_probability: self.fail_probability,
@@ -202,6 +203,9 @@ pub struct ClearingConfig {
     pub cutoff: String,
     /// IANA time zone of the cutoff, e.g. `Europe/Copenhagen`.
     pub time_zone: String,
+    /// Dates that are not business days (SR-35): no business day closes, trade and settlement dates skip them, and
+    /// markets are closed unless their session names its own holidays.
+    pub holidays: Vec<chrono::NaiveDate>,
     pub breaks: crate::clearing::BreakPolicy,
 }
 
@@ -211,6 +215,7 @@ impl Default for ClearingConfig {
             enabled: false,
             cutoff: "17:30".into(),
             time_zone: "UTC".into(),
+            holidays: Vec::new(),
             breaks: crate::clearing::BreakPolicy::default(),
         }
     }
@@ -237,7 +242,29 @@ impl Config {
     /// (`BusinessDayClosed`) whether or not clearing is enabled.
     pub fn business_calendar(&self) -> Result<crate::clearing::ClearingCalendar, String> {
         crate::clearing::ClearingCalendar::parse(&self.clearing.cutoff, &self.clearing.time_zone)
+            .map(|calendar| calendar.with_days(self.business_days()))
             .map_err(|e| format!("clearing.{e}"))
+    }
+
+    /// The business days: weekdays less `clearing.holidays` (SR-35).
+    pub fn business_days(&self) -> simulator_kit::calendar::BusinessDays {
+        simulator_kit::calendar::BusinessDays::with_holidays(self.clearing.holidays.iter().copied())
+    }
+
+    /// The settlement policy on the business days: settlement dates, delays and corrections skip holidays.
+    pub fn settlement_policy(&self) -> crate::settlement::SettlementPolicy {
+        crate::settlement::SettlementPolicy {
+            business_days: self.business_days(),
+            ..self.settlement.policy()
+        }
+    }
+
+    /// The simulator's policy on the business days, when this mode runs the simulator.
+    pub fn settlement_simulator_policy(&self) -> Option<crate::settlement::SettlementPolicy> {
+        self.settlement
+            .simulator_policy()
+            .is_some()
+            .then(|| self.settlement_policy())
     }
 
     /// The trading sessions, keyed by uppercase MIC (environment variables arrive lowercased), with the business-day
@@ -249,9 +276,16 @@ impl Config {
             .map(|(mic, s)| {
                 let mic = mic.to_ascii_uppercase();
                 crate::domain::validate_mic(&mic).map_err(|e| format!("sessions: {e}"))?;
+                let days = match &s.holidays {
+                    Some(holidays) => simulator_kit::calendar::BusinessDays::with_holidays(
+                        holidays.iter().copied(),
+                    ),
+                    None => self.business_days(),
+                };
                 let session =
                     simulator_kit::calendar::DailySession::parse(&s.open, &s.close, &s.time_zone)
-                        .map_err(|e| format!("sessions.{mic}: {e}"))?;
+                        .map_err(|e| format!("sessions.{mic}: {e}"))?
+                        .with_days(days);
                 Ok((mic, session))
             })
             .collect::<Result<_, String>>()?;
@@ -272,7 +306,7 @@ impl Config {
         Ok(Some(crate::clearing::ClearingPolicy {
             calendar,
             breaks: self.clearing.breaks.clone(),
-            cycles: self.settlement.policy(),
+            cycles: self.settlement_policy(),
         }))
     }
 }
@@ -297,6 +331,9 @@ pub struct SessionConfig {
     pub open: String,
     pub close: String,
     pub time_zone: String,
+    /// Dates the market is closed (SR-35); `clearing.holidays` when absent.
+    #[serde(default)]
+    pub holidays: Option<Vec<chrono::NaiveDate>>,
 }
 
 /// The market-data stream (see [`crate::market_data`]).

@@ -1393,7 +1393,7 @@ fn a_trade_after_a_cutoff_not_yet_handled_goes_on_the_next_statement() {
         ExchangeOptions {
             virtual_clock: Some(clock.clone()),
             settlement: Some(SettlementPolicy {
-                clearing: Some(calendar),
+                clearing: Some(calendar.clone()),
                 ..SettlementPolicy::default()
             }),
             clearing: Some(ClearingPolicy {

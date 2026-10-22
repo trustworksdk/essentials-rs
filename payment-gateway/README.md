@@ -81,7 +81,13 @@ when the database does not answer.
 
 A payment carries `paymentId`, `sequence`, `idempotencyKey`, `type`, `accountId`, `bankAccount`, `amount`,
 `amountMinor`, `currency`, `currencyScale`, `reference`, `status`, `reason`, `createdAt`, `completedAt`,
-`failedAt`, `returnedAt` and `updatedAt`.
+`failedAt`, `returnedAt`, `valueDate` and `updatedAt`.
+
+`valueDate` is the value date of the payment's latest booking: the business day the completion falls in on the bank's
+calendar (`statement.cutoff` in `statement.time_zone`, on weekdays; or the exchange's, see Following the exchange's
+calendar), then the return's. It is the date of the bank
+statement that lists the booking, and the entry there carries the same `valueDate`, whether or not statements are
+enabled. It is `null` until the payment completes, and always set on `PaymentCompleted` and `PaymentReturned`.
 
 ### `GET /api/payments/{id}` and `GET /api/payments?accountId=&status=&after=&limit=`
 
@@ -96,7 +102,7 @@ by sequence; `limit` is 1–1000, default 100.
   withdrawal), or `FAILED` with `fail_probability`, with a `reason`: `ACCOUNT_CLOSED`, `INSUFFICIENT_FUNDS` (deposits)
   or `INVALID_ACCOUNT` (withdrawals), or `REFUSED_BY_BANK`.
 - **Returned:** with `return_probability`, a completed payment is reversed 1..=`max_return_days` business days later
-  at the same time of day, `reason: RETURNED_BY_BANK`, and the reversal is booked.
+  (on the bank's calendar, holidays included) at the same time of day, `reason: RETURNED_BY_BANK`, and the reversal is booked.
 - Outcomes are a function of the seed and the payment's sequence, so they do not depend on tick timing or restarts.
   Events carry the scheduled instant as `occurredAt`.
 
@@ -104,7 +110,9 @@ by sequence; `limit` is 1–1000, default 100.
 
 Every event is in the canonical envelope the exchange simulator uses (`eventId`, `sequence`, `eventType`,
 `schemaVersion`, `source`, `simulationId`, `aggregateId`, `correlationId`, `occurredAt`, `payload`), replayable from
-`GET /api/events?after=&limit=&eventType=` and delivered to webhooks.
+`GET /api/events?after=&limit=&eventType=` and delivered to webhooks. As on the exchange, `eventType` takes several
+types (repeated or comma-separated) and every answer carries `Event-Log-Scanned-Through`, the sequence to continue
+from.
 
 | Event | Source | Aggregate / correlation ID | Payload |
 |---|---|---|---|
@@ -177,6 +185,19 @@ date, with no clocks to resume together by hand.
 - **Unreachable exchange:** the clock runs on at its last speed; a warning is logged once, and following resumes
   when the exchange answers.
 - **Events:** a change of speed or running state, or a jump, publishes `ClockChanged` with `change: follow`.
+
+## Following the exchange's calendar
+
+`calendar.mode: follow` puts statements, value dates and return delays on the exchange's business-day calendar, its
+holidays included (SR-35), so a holiday on the exchange is one on the bank too. At startup the gateway reads the
+exchange's clock, then its `GET /api/calendar` from about a year before that date to nine years after: the cutoff,
+time zone and holidays. `statement.cutoff` and `statement.time_zone` are then not used.
+- **URL:** `calendar.follow.url`, or `clock.follow.url` when absent.
+- **Startup waits for the exchange:** no date can be decided without its calendar, so the gateway retries every second
+  (logging a warning once) until it answers.
+- **Read once:** restart the gateway after changing the exchange's holidays.
+- `calendar.mode: own` (the default) keeps the gateway's own calendar: `statement.cutoff` in `statement.time_zone`,
+  on weekdays.
 
 ## Running it with the exchange
 

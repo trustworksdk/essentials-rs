@@ -68,7 +68,7 @@ impl TestApp {
 
     pub async fn restart(&mut self) {
         self.stop().await;
-        self.app = Some(App::start(&self.config).unwrap());
+        self.app = Some(App::start(&self.config).await.unwrap());
     }
 
     pub async fn stop(&mut self) {
@@ -91,6 +91,17 @@ impl TestApp {
         uri: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        let (status, _, body) = self.call_full(method, uri, body).await;
+        (status, body)
+    }
+
+    /// [`Self::call`] with the response headers.
+    pub async fn call_full(
+        &self,
+        method: Method,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
         let router = self.app.as_ref().expect("running").router.clone();
         let request = Request::builder()
             .method(method)
@@ -103,6 +114,7 @@ impl TestApp {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         let status = response.status();
+        let headers = response.headers().clone();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let value = if bytes.is_empty() {
             Value::Null
@@ -110,7 +122,7 @@ impl TestApp {
             serde_json::from_slice(&bytes)
                 .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
         };
-        (status, value)
+        (status, headers, value)
     }
 
     pub async fn get(&self, uri: &str) -> (StatusCode, Value) {

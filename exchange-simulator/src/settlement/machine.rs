@@ -4,7 +4,6 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::calendar::add_business_days;
 use super::{Instruction, SettlementPolicy, SettlementStatus, TradeFacts, draw, format_amount};
 use crate::events::{self, NewEvent};
 
@@ -159,10 +158,16 @@ impl SettlementSimulator {
             None => {
                 let trade_date = policy
                     .clearing
+                    .as_ref()
                     .map_or(trade.executed_at.date_naive(), |calendar| {
                         calendar.business_date(trade.executed_at)
                     });
-                (trade_date, add_business_days(trade_date, settlement_days))
+                (
+                    trade_date,
+                    policy
+                        .business_days
+                        .add_business_days(trade_date, settlement_days),
+                )
             }
         };
         let amount = i128::from(trade.price_ticks)
@@ -189,9 +194,9 @@ impl SettlementSimulator {
             due_at: Some(start_of(isd).max(trade.executed_at)),
             settled_at: None,
             updated_at: trade.executed_at,
-            clearing: policy.clearing.map(|calendar| {
+            clearing: policy.clearing.as_ref().map(|calendar| {
                 crate::clearing::refs(
-                    &calendar,
+                    calendar,
                     trade.executed_at,
                     &trade.instrument_id,
                     &trade.buyer_id,
@@ -257,7 +262,8 @@ impl SettlementSimulator {
                             * f64::from(policy.max_delay_days)) as u32;
                     let days = days.min(policy.max_delay_days);
                     let previous = current.intended_settlement_date;
-                    next.intended_settlement_date = add_business_days(previous, days);
+                    next.intended_settlement_date =
+                        policy.business_days.add_business_days(previous, days);
                     next.status = SettlementStatus::Delayed;
                     next.delays += 1;
                     next.due_at = Some(start_of(next.intended_settlement_date));
@@ -271,7 +277,7 @@ impl SettlementSimulator {
                     next.due_at = (draw(policy.seed, seq, next.attempts, CORRECT)
                         < policy.correct_probability)
                         .then(|| {
-                            start_of(add_business_days(
+                            start_of(policy.business_days.add_business_days(
                                 current.intended_settlement_date,
                                 policy.correction_days,
                             ))

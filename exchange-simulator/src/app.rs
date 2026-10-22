@@ -116,8 +116,8 @@ impl App {
                 }),
                 simulation_id: config.events.simulation_id.clone(),
                 delivery_signal: Some(delivery_signal.clone()),
-                settlement: config.settlement.simulator_policy().map(|mut policy| {
-                    policy.clearing = clearing.as_ref().map(|c| c.calendar);
+                settlement: config.settlement_simulator_policy().map(|mut policy| {
+                    policy.clearing = clearing.as_ref().map(|c| c.calendar.clone());
                     policy
                 }),
                 clearing: clearing.clone(),
@@ -137,7 +137,7 @@ impl App {
                 sessions: config.trading_sessions().map_err(anyhow::Error::msg)?,
                 trade_dating: crate::settlement::TradeDating {
                     calendar: Some(config.business_calendar().map_err(anyhow::Error::msg)?),
-                    cycles: config.settlement.policy(),
+                    cycles: config.settlement_policy(),
                 },
             },
         )
@@ -190,8 +190,14 @@ impl App {
         if config.settlement.simulator_policy().is_some() {
             tracing::info!(mode = ?config.settlement.mode, "settlement simulator running");
         }
-        let state = AppState::new(dispatcher, Store::new(reader), metrics, mode)
-            .with_market_data(market_data, stream_options);
+        let state = AppState::new(
+            dispatcher,
+            Store::new(reader),
+            metrics,
+            mode,
+            config.business_calendar().map_err(anyhow::Error::msg)?,
+        )
+        .with_market_data(market_data, stream_options);
         let mut router = api::router(state.clone()).merge(simulator_kit::api::clock::router(
             state.clone(),
             config.clock.operator_control,

@@ -173,15 +173,50 @@ pub fn events(
     limit: u32,
     event_type: Option<&str>,
 ) -> rusqlite::Result<Vec<EventEnvelope>> {
-    conn.prepare_cached(&format!(
-        "SELECT {EVENT_COLUMNS} FROM events e
-             WHERE e.sequence > ?1 AND (?2 IS NULL OR e.event_type = ?2)
-             ORDER BY e.sequence LIMIT ?3"
-    ))?
-    .query_map(params![to_sql(after), event_type, limit], |row| {
-        event_row(row, 0)
-    })?
-    .collect()
+    let types = event_type.map(|t| vec![t.to_string()]);
+    Ok(read_events(conn, after, limit, types.as_deref())?.events)
+}
+
+/// One page of the event log, and how far the read looked (SR-34).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EventPage {
+    pub events: Vec<EventEnvelope>,
+    /// The highest sequence the read looked at: the last returned event's when the page is full, else the log's head
+    /// when the read began (or `after`, if that is further). A reader may continue from here.
+    pub scanned_through: u64,
+}
+
+/// Canonical events with `sequence > after`, in sequence order, of the given types (`None`: every type). The head is
+/// read first and the page is bounded by it, so an event committed during the read is neither returned nor skipped.
+pub fn read_events(
+    conn: &Connection,
+    after: u64,
+    limit: u32,
+    event_types: Option<&[String]>,
+) -> rusqlite::Result<EventPage> {
+    let head = conn.query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |row| {
+        from_sql(row, 0)
+    })?;
+    let types = event_types.map(|t| serde_json::to_string(t).expect("strings serialize"));
+    let events: Vec<EventEnvelope> = conn
+        .prepare_cached(&format!(
+            "SELECT {EVENT_COLUMNS} FROM events e
+                 WHERE e.sequence > ?1 AND e.sequence <= ?2
+                   AND (?3 IS NULL OR e.event_type IN (SELECT value FROM json_each(?3)))
+                 ORDER BY e.sequence LIMIT ?4"
+        ))?
+        .query_map(params![to_sql(after), to_sql(head), types, limit], |row| {
+            event_row(row, 0)
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let scanned_through = match events.last() {
+        Some(last) if events.len() == limit as usize => last.sequence,
+        _ => head.max(after),
+    };
+    Ok(EventPage {
+        events,
+        scanned_through,
+    })
 }
 
 pub fn insert_subscription(conn: &Connection, subscription: &Subscription) -> rusqlite::Result<()> {

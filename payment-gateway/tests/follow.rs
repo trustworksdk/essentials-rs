@@ -163,6 +163,7 @@ async fn follow_mode_needs_a_url() {
     let mut config = TestApp::config_for_tests();
     config.clock.mode = ClockMode::Follow;
     let error = payment_gateway::app::App::start(&config)
+        .await
         .err()
         .expect("startup fails");
     assert!(

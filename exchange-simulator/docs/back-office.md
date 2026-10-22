@@ -28,7 +28,7 @@ by `eventId`, and use ordered subscriptions where order matters (the example dec
 
 Both services run on their own domain clock, which in a demo runs fast (`clock.speed: 1440` is a day per minute).
 Take every date and time from the events: `executedAt`, `tradeDate`, `intendedSettlementDate`, `occurredAt`,
-`completedAt`, `businessDate`. Never use your own clock to decide what day a trade or payment belongs to, or whether
+`completedAt`, `valueDate`, `businessDate`. A deposit is credited for its `valueDate`. Never use your own clock to decide what day a trade or payment belongs to, or whether
 a statement is due. The end of a business day is `BusinessDayClosed` from the exchange: start end-of-day work on it,
 before the day's clearing statements arrive. It is published on days without trades too. Right after it come the
 day's `ClosingPriceIssued` events, one per instrument: value positions at their `closingPrice`.
