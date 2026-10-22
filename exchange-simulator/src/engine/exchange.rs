@@ -304,9 +304,10 @@ pub struct Exchange {
     market_data_due: std::collections::BTreeSet<InstrumentId>,
     trade_dating: crate::settlement::TradeDating,
     sessions: crate::sessions::TradingSessions,
-    /// Resting `DAY` orders by when they expire: (expiry, sequence, instrument, order). An entry whose order is no
-    /// longer active when it comes due is dropped.
-    expiries: std::collections::BTreeSet<(DateTime<Utc>, u64, InstrumentId, Uuid)>,
+    /// Resting `DAY` orders by when they expire: (expiry, sequence, instrument, order, the business day that ends
+    /// then). An entry whose order is no longer active when it comes due is dropped.
+    expiries:
+        std::collections::BTreeSet<(DateTime<Utc>, u64, InstrumentId, Uuid, chrono::NaiveDate)>,
 }
 
 /// The liquidity provider in one instrument, as `GET /api/liquidity` shows it (SR-11).
@@ -1354,9 +1355,14 @@ impl Exchange {
 
     /// Schedules a resting `DAY` order's expiry (SR-17).
     fn schedule_expiry(&mut self, order: &Order, mic: Option<&str>, accepted_at: DateTime<Utc>) {
-        if let Some(due) = self.sessions.day_expiry(mic, accepted_at) {
-            self.expiries
-                .insert((due, order.sequence, order.instrument_id.clone(), order.id));
+        if let Some((due, business_date)) = self.sessions.day_expiry(mic, accepted_at) {
+            self.expiries.insert((
+                due,
+                order.sequence,
+                order.instrument_id.clone(),
+                order.id,
+                business_date,
+            ));
         }
     }
 
@@ -1382,7 +1388,7 @@ impl Exchange {
                 break;
             }
             self.expiries.remove(&entry);
-            let (_, _, instrument, order_id) = entry;
+            let (_, _, instrument, order_id, business_date) = entry;
             let Some(book) = self.books.get(&instrument) else {
                 continue;
             };
@@ -1390,7 +1396,7 @@ impl Exchange {
                 continue; // Filled or cancelled since.
             }
             let update = book.plan_expire(order_id)?;
-            self.commit_and_apply(Command::Expire, update, due)?;
+            self.commit_and_apply(Command::Expire { business_date }, update, due)?;
             events += 1;
             self.maintain_liquidity(Some(&instrument))?;
             self.publish_market_data(Some(&instrument));

@@ -220,6 +220,10 @@ async fn day_orders_expire_at_the_close_keeping_their_remainder_and_gtc_orders_s
         ),
         (&json!("EXPIRED"), &json!(6), &json!(4))
     );
+    assert_eq!(
+        event["payload"]["businessDate"], "2030-01-07",
+        "the day whose session closed"
+    );
     let id = day["order"]["orderId"].as_str().unwrap();
     let (_, stored) = app.get(&format!("/api/orders/{id}")).await;
     assert_eq!(stored["status"], "EXPIRED");
@@ -272,6 +276,51 @@ async fn a_day_order_on_a_market_without_a_session_ends_with_the_business_day() 
     assert!(
         position("OrderExpired") < position("BusinessDayClosed"),
         "the order ends with the day"
+    );
+    assert_eq!(expired["payload"]["businessDate"], "2030-01-07");
+
+    app.stop().await;
+}
+
+/// SR-32: a `DAY` order resting at Tuesday's cutoff is expired with `businessDate` Tuesday, the date that cutoff's
+/// `BusinessDayClosed` names. The cutoff, 17:30 in Los Angeles, falls on Wednesday in UTC.
+#[tokio::test]
+async fn an_expired_order_names_the_business_day_that_ended() {
+    let mut app = TestApp::start_with(nasdaq(|c| {
+        c.clearing.cutoff = "17:30".into();
+        c.clearing.time_zone = "America/Los_Angeles".into();
+    }))
+    .await;
+    participants(&app).await;
+    set_clock(&app, "2030-01-08T18:00:00Z").await; // Tuesday 10:00 in Los Angeles.
+    let tuesday = placed(
+        &app,
+        with(
+            limit("FREE", "A", "BUY", 10_000, 10),
+            "timeInForce",
+            json!("DAY"),
+        ),
+    )
+    .await;
+    set_clock(&app, "2030-01-09T02:00:00Z").await;
+    let all = events(&app).await;
+    let expired = all
+        .iter()
+        .find(|e| {
+            e["eventType"] == "OrderExpired" && e["aggregateId"] == tuesday["order"]["orderId"]
+        })
+        .expect("Tuesday's DAY order expired");
+    assert_eq!(expired["occurredAt"], "2030-01-09T01:30:00Z");
+    let closed = all
+        .iter()
+        .find(|e| e["eventType"] == "BusinessDayClosed" && e["occurredAt"] == expired["occurredAt"])
+        .expect("the BusinessDayClosed at the same cutoff");
+    assert_eq!(
+        (
+            &expired["payload"]["businessDate"],
+            &closed["payload"]["businessDate"]
+        ),
+        (&json!("2030-01-08"), &json!("2030-01-08"))
     );
     app.stop().await;
 }

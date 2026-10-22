@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use simulator_kit::calendar::{CutoffCalendar, DailySession};
 
 #[derive(Clone, Debug, Default)]
@@ -33,18 +33,23 @@ impl TradingSessions {
         self.session(mic).is_none_or(|s| s.is_open(at))
     }
 
-    /// When a `DAY` order accepted at `accepted_at` expires: its session's first close after then, or on a market
-    /// without a session the end of the business day it was accepted in.
+    /// When a `DAY` order accepted at `accepted_at` expires, and the business day that ends then (SR-32): its
+    /// session's first close after then and the session's date, or on a market without a session the end of the
+    /// business day it was accepted in and that day.
     pub fn day_expiry(
         &self,
         mic: Option<&str>,
         accepted_at: DateTime<Utc>,
-    ) -> Option<DateTime<Utc>> {
+    ) -> Option<(DateTime<Utc>, NaiveDate)> {
         match self.session(mic) {
-            Some(session) => Some(session.close_after(accepted_at)),
-            None => self
-                .day_end
-                .map(|calendar| calendar.cutoff_at(calendar.business_date(accepted_at))),
+            Some(session) => {
+                let close = session.close_after(accepted_at);
+                Some((close, close.with_timezone(&session.time_zone).date_naive()))
+            }
+            None => self.day_end.map(|calendar| {
+                let date = calendar.business_date(accepted_at);
+                (calendar.cutoff_at(date), date)
+            }),
         }
     }
 }
@@ -57,13 +62,23 @@ mod tests {
         text.parse().unwrap()
     }
 
+    fn date(text: &str) -> NaiveDate {
+        text.parse().unwrap()
+    }
+
     #[test]
     fn day_orders_end_at_the_close_or_the_business_day() {
         let sessions = TradingSessions::new(
-            [(
-                "XNAS".to_string(),
-                DailySession::parse("09:30", "16:00", "America/New_York").unwrap(),
-            )]
+            [
+                (
+                    "XNAS".to_string(),
+                    DailySession::parse("09:30", "16:00", "America/New_York").unwrap(),
+                ),
+                (
+                    "XPAC".to_string(),
+                    DailySession::parse("06:30", "16:00", "America/Los_Angeles").unwrap(),
+                ),
+            ]
             .into(),
             Some(CutoffCalendar::parse("17:30", "Europe/Copenhagen").unwrap()),
         );
@@ -78,12 +93,27 @@ mod tests {
         assert!(!sessions.is_open(Some("XNAS"), at("2030-01-07T21:00:00Z")));
         assert_eq!(
             sessions.day_expiry(Some("XNAS"), at("2030-01-07T15:00:00Z")),
-            Some(at("2030-01-07T21:00:00Z"))
+            Some((at("2030-01-07T21:00:00Z"), date("2030-01-07")))
+        );
+        assert_eq!(
+            sessions.day_expiry(Some("XNAS"), at("2030-01-07T22:00:00Z")),
+            Some((at("2030-01-08T21:00:00Z"), date("2030-01-08"))),
+            "after the close: the next session's"
+        );
+        assert_eq!(
+            sessions.day_expiry(Some("XPAC"), at("2030-01-07T20:00:00Z")),
+            Some((at("2030-01-08T00:00:00Z"), date("2030-01-07"))),
+            "the session's own date, not the close's UTC date"
         );
         assert_eq!(
             sessions.day_expiry(Some("XCSE"), at("2030-01-07T15:00:00Z")),
-            Some(at("2030-01-07T16:30:00Z")),
+            Some((at("2030-01-07T16:30:00Z"), date("2030-01-07"))),
             "the business day's cutoff"
+        );
+        assert_eq!(
+            sessions.day_expiry(Some("XCSE"), at("2030-01-07T17:00:00Z")),
+            Some((at("2030-01-08T16:30:00Z"), date("2030-01-08"))),
+            "after the cutoff: the next business day's"
         );
         assert_eq!(
             TradingSessions::default().day_expiry(None, at("2030-01-07T15:00:00Z")),

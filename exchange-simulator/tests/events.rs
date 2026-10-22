@@ -196,7 +196,7 @@ fn acceptance_trade_produces_trade_and_fill_events() {
 }
 
 #[test]
-fn sweep_interleaves_each_trade_with_its_maker_update() {
+fn sweep_interleaves_each_trade_with_both_fill_events() {
     let mut h = Harness::new();
     h.submit("A", Side::Sell, Some(10000), 10);
     h.submit("C", Side::Sell, Some(10100), 10);
@@ -207,12 +207,106 @@ fn sweep_interleaves_each_trade_with_its_maker_update() {
             "OrderAccepted",
             "TradeExecuted",
             "OrderFilled",
+            "OrderPartiallyFilled",
             "TradeExecuted",
             "OrderFilled",
             "OrderPartiallyFilled"
         ]
     );
-    assert_eq!(events[5].payload["remainingQuantity"], 5);
+    assert_eq!(
+        (
+            &events[3].payload["remainingQuantity"],
+            &events[3].payload["status"]
+        ),
+        (&json!(15), &json!("PARTIALLY_FILLED")),
+        "the incoming order after its first execution"
+    );
+    assert_eq!(events[6].payload["remainingQuantity"], 5);
+}
+
+/// SR-31's acceptance: a market buy of 300 against asks of 100 at 10.00, 10.01 and 10.02 gets one fill event per
+/// execution, each naming it with what it filled and at which price, and each ask's fill names the same execution.
+#[test]
+fn every_fill_event_names_its_execution() {
+    let mut h = Harness::new();
+    let asks: Vec<BookUpdate> = [("A", 1000), ("C", 1001), ("D", 1002)]
+        .into_iter()
+        .map(|(participant, price)| h.submit(participant, Side::Sell, Some(price), 100).0)
+        .collect();
+    let (buy, events) = h.submit("B", Side::Buy, None, 300);
+    assert_eq!(buy.executions.len(), 3);
+
+    let order_id = buy.order.id.to_string();
+    let taker: Vec<&NewEvent> = events
+        .iter()
+        .filter(|e| e.aggregate_id == order_id && e.event_type != "OrderAccepted")
+        .collect();
+    assert_eq!(
+        taker.iter().map(|e| e.event_type).collect::<Vec<_>>(),
+        [
+            "OrderPartiallyFilled",
+            "OrderPartiallyFilled",
+            "OrderFilled"
+        ]
+    );
+    let prices = ["10.00", "10.01", "10.02"];
+    for (i, ((fill, execution), ask)) in taker.iter().zip(&buy.executions).zip(&asks).enumerate() {
+        let trade = events
+            .iter()
+            .find(|e| e.event_type == "TradeExecuted" && e.aggregate_id == execution.id.to_string())
+            .expect("the execution's TradeExecuted");
+        let filled = 100 * (i as u64 + 1);
+        assert_eq!(
+            (
+                &fill.payload["executionId"],
+                &fill.payload["lastQuantity"],
+                &fill.payload["lastPriceTicks"],
+                &fill.payload["lastPrice"],
+                &fill.payload["filledQuantity"],
+                &fill.payload["remainingQuantity"],
+            ),
+            (
+                &json!(execution.id),
+                &trade.payload["quantity"],
+                &trade.payload["priceTicks"],
+                &json!(prices[i]),
+                &json!(filled),
+                &json!(300 - filled),
+            ),
+            "the buy's fill event for execution {i}"
+        );
+        assert_eq!(
+            fill.payload["price"],
+            json!(null),
+            "a market order's own price"
+        );
+        assert_eq!(
+            (
+                fill.payload["tradeDate"].clone(),
+                fill.payload["intendedSettlementDate"].clone()
+            ),
+            (
+                json!(execution.trade_date),
+                json!(execution.intended_settlement_date)
+            )
+        );
+
+        let maker = events
+            .iter()
+            .find(|e| e.aggregate_id == ask.order.id.to_string())
+            .expect("the ask's fill event");
+        assert_eq!(maker.event_type, "OrderFilled");
+        assert_eq!(
+            (
+                &maker.payload["executionId"],
+                &maker.payload["lastQuantity"],
+                &maker.payload["lastPrice"],
+            ),
+            (&fill.payload["executionId"], &json!(100), &json!(prices[i])),
+            "ask {i} names the same execution as the buy's event for it"
+        );
+    }
+    assert_eq!(taker[2].payload["status"], "FILLED");
 }
 
 #[test]

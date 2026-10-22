@@ -445,7 +445,7 @@ seed: 11
 instruments: [ {{ id: ACME, symbol: ACME, currency: DKK, currencyScale: 2 }} ]
 webhooks:
   - {{ url: "{url}", eventTypes: [OrderAccepted, TradeExecuted, OrderCancelled],
-      faults: {{ seed: 3, missing: {{ probability: 0.3 }}, nulls: {{ probability: 0.3 }},
+      faults: {{ seed: 4, missing: {{ probability: 0.3 }}, nulls: {{ probability: 0.3 }},
                 invalid: {{ probability: 0.3 }}, duplicateProbability: 0.2 }} }}
 steps:
   - market: {{ orders: 60, participants: 4, cancellation_probability: 0.1,
