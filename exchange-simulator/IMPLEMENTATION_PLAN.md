@@ -1598,6 +1598,8 @@ it.
 | 6.13 | Replay source and recorder | 6 | M | **SR-4.** Replays `(timestamp, referenceSymbol, price, volume)` rows (CSV or JSON lines) on the virtual clock, offset to the clock's start, optionally looping. In `finnhub` mode an optional recorder appends every applied tick in the replay format. Recordings stay local and are gitignored; vendor data is never committed. |
 | 6.14 | Market-data metrics, load profile with the provider | 6 | M | **SR-15, SR-20.** Per-instrument reference updates, staleness, subscribers, messages sent and conflated, streams closed for back-pressure; source health (connected, reconnects, rate-limit hits). A bench run with the provider on and a replayed source, reporting order-ack latency with and without the provider at the same client order rate. |
 | 6.15 | Cancel by client order id | 3 | S | **SR-30** (added to the requirements 2026-10-21, after the milestone was done). `DELETE /api/orders?participantId=…&clientOrderId=…`: the order is resolved inside the exchange thread (where submission's idempotency check resolves it), then cancelled exactly as `DELETE /api/orders/{id}` cancels it: the same `OrderResult`, the same `OrderCancelled`, `409 order_not_active` for a second cancel, `404` for an unknown `clientOrderId` within the participant. Both query parameters are required (`400` otherwise), since client order ids are unique per participant only. `openapi.yaml` gains the operation. |
+| 6.16 | The execution on every fill event | 3 | S | **SR-31** (added to the requirements 2026-10-22). `OrderPartiallyFilled` and `OrderFilled` name the execution they report for both sides: `executionId` (now always present), `lastQuantity`, `lastPriceTicks` and `lastPrice`. An incoming order that trades against several resting orders gets one fill event per execution, in execution order, each with its running totals after that execution. The event `schemaVersion` stays 1 (additive); the API documents go to 0.3.0. |
+| 6.17 | The business day on `OrderExpired` | 3 | S | **SR-32** (added to the requirements 2026-10-22, done on the 6.16 branch at the user's request). `OrderExpired` carries `businessDate`: the business day whose end expired the order, the date `BusinessDayClosed` names for that cutoff, or on a market with a session the session's date. Decided when the expiry is scheduled, from the same calendar. |
 
 **Not planned:** SR-18 (FX reference rates) is marked LATER and waits for the demo's FX phase.
 
@@ -2209,10 +2211,70 @@ then 6.11, 6.12, 6.13–6.14.
 - **Mutation checks**, each made a test fail (all 4): a client order ID never found; an unknown client order ID
   answered `409`; cancels left out of commit groups; the lookup ignoring the participant.
 
+**6.16 — the execution on every fill event ✅ done (2026-10-22)**
+- **Delivered:**
+  - `OrderPartiallyFilled` and `OrderFilled` carry, for both sides, the execution they report: `executionId` (before
+    only on a resting order's), `lastQuantity`, `lastPriceTicks` and `lastPrice` (SR-31), next to `tradeDate` and
+    `intendedSettlementDate`. `events::fill_payload` builds every fill payload; `order_payload` no longer takes an
+    execution ID.
+  - An incoming order gets one fill event per execution instead of one after them all. Each follows its
+    `TradeExecuted` and the resting order's fill event, and carries the order's running totals after that execution
+    (status `PARTIALLY_FILLED`). The last one carries the order's resulting state, as the single event did. A market
+    or IOC remainder's `OrderCancelled` still comes last.
+  - `openapi.yaml`: the four fields on `OrderEventPayload`, required on both fill events. The README's event table
+    and event order.
+  - Tests: `tests/events.rs` `every_fill_event_names_its_execution` (SR-31's first two acceptance cases, at the
+    builder) and the sweep test's new order; `tests/fill_executions.rs` (all three acceptance cases through the API:
+    the fill events, `TradeExecuted` and `OrderResult.executions[]` agree on ID, quantity and price).
+- **Decisions:**
+  - **Event order per execution: `TradeExecuted`, the resting order's fill, the incoming order's fill.** SR-31 asks
+    for the incoming order's events in execution order; interleaving them puts every fill event next to its trade.
+  - **`schemaVersion` stays 1:** the fields are additive, as before (6.3, 6.9a). A consumer that relied on one fill
+    event per incoming order sees more of them, which it already had to handle for resting orders.
+  - **The API documents go to 0.3.0** (both simulators, the five places the contract test checks, and the example
+    consumer's pom), since the exchange document changed. The payment gateway's document changes in its version
+    only.
+  - The liquidity provider's filter (`emit_order_events: false`) drops its fill events by `participantId` as before.
+- **Deviation:** `tests/faults.rs` `random_faults_are_reproducible_in_a_scenario` now uses fault seed 4 instead of 3.
+  Delivery IDs derive from event sequences, so the extra fill events re-draw every fault. With seed 3 the scenario
+  drew no `duplicate`, which its `expect` step needs (it failed twice in a row, so this was not a flake). What the test
+  checks, two identical runs, is unchanged.
+- **Gates:** fmt, clippy (`-D warnings`), doc, `cargo test -j 1 -p exchange-simulator` (all 40 targets) green; the
+  payment gateway's `tests/openapi.rs` green after its rendition was rewritten for 0.3.0.
+- **Mutation checks**, each made a test fail (all 6): the incoming order's running totals not advanced; its
+  intermediate status left `OPEN`; one incoming fill event after all executions (the old behaviour); `lastPriceTicks`
+  from the order's limit price; `lastQuantity` as the running total; every incoming fill event naming the first
+  execution.
+
+**6.17 — the business day on `OrderExpired` ✅ done (2026-10-22)**
+- **Delivered:**
+  - `OrderExpired` carries `businessDate` (SR-32). `TradingSessions::day_expiry` returns the business day with the
+    expiry instant: with a session, the session's local date of the close; without one, the business date the order
+    was accepted in on the business-day calendar (`Config::business_calendar`, the calendar `BusinessDayClosed`
+    uses), whose cutoff is the expiry. The expiry queue keeps the date, and `Command::Expire { business_date }` hands
+    it to the event builder, so recovery, which rebuilds the queue from the stored orders, dates expiries the same way.
+  - `openapi.yaml`: `businessDate` on `OrderEventPayload`, required on `OrderExpired`. The README's event table.
+  - Tests: `tests/sessions.rs` `an_expired_order_names_the_business_day_that_ended` (SR-32's acceptance, with a
+    17:30 Los Angeles cutoff that falls on the next day in UTC), `businessDate` asserted in both existing expiry tests,
+    and `sessions.rs` unit cases after the close and for a session whose close is past midnight UTC.
+- **Decisions:**
+  - **The date is decided when the expiry is scheduled, not derived from the expiry instant.** At the cutoff instant
+    the calendar already answers the next business day, which is SR-32's point: the date takes the calendar.
+  - **No version bump of its own:** the documents are already at 0.3.0 on this branch and 0.3.0 is not published.
+- **Gates:** fmt, clippy (`-D warnings`), doc, `cargo test -j 1 -p exchange-simulator` green except
+  `tests/market_data.rs` (`subscribers_and_messages_sent_and_conflated_are_counted_per_instrument`), the known flake
+  (1 run in 6 on `main`): it failed 2 of 10 runs here and passed the other 8, and neither the market-data code nor
+  its tests use the fill or expiry events.
+- **Mutation checks**, each made a test fail (all 5): the session's date taken in UTC; the cutoff's date taken from
+  the expiry instant on the calendar; the cutoff's UTC date; `businessDate` left out; the event dated by the close's
+  UTC date (survived the first test set, where every close fell on the same UTC date, hence the Los Angeles cutoff).
+
 ### Milestone 6 status
 
 All steps of the milestone are done (6.1–6.14 with 6.9a, 2026-10-18 to 2026-10-20). Not planned: SR-18 (FX, LATER).
 SR-30 (cancel by client order id) was added on 2026-10-21 and done as step 6.15 the same day.
+SR-31 (the execution on every fill event) and SR-32 (the business day on `OrderExpired`) were added on 2026-10-22
+and done as steps 6.16 and 6.17 the same day.
 Still on hold from Milestone 4: 4.6d (the containerized benchmark).
 
 **SR-2 manual acceptance against the real Finnhub ✅ done (2026-10-20, D19).** `config/finnhub-market.yaml` (40

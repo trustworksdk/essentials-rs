@@ -2,7 +2,7 @@
 //! orders and executions they describe, and never change afterwards. The global `sequence` assigned by SQLite is the
 //! replay cursor.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -165,8 +165,10 @@ pub use simulator_kit::events::{EventEnvelope, NewEvent};
 pub enum Command {
     Submit,
     Cancel,
-    /// A `DAY` order expiring at its session's close.
-    Expire,
+    /// A `DAY` order expiring at its session's close, with the business day that ended (SR-32).
+    Expire {
+        business_date: NaiveDate,
+    },
 }
 
 /// `InstrumentListed` (no `changes`) or `InstrumentUpdated` with the wire names of the fields that changed. The payload
@@ -214,9 +216,9 @@ pub fn instrument_event(
 /// The events a committed update produces, in this order:
 ///
 /// - submit, rejected: `OrderRejected`
-/// - submit: `OrderAccepted`, then for each execution `TradeExecuted` followed by the resting order's
-///   `OrderPartiallyFilled`/`OrderFilled`, then the incoming order's own fill event if it traded, then `OrderCancelled`
-///   if a market remainder was cancelled
+/// - submit: `OrderAccepted`, then for each execution `TradeExecuted` followed by the resting order's and then the
+///   incoming order's `OrderPartiallyFilled`/`OrderFilled`, each naming the execution, then `OrderCancelled` if a market
+///   or IOC remainder was cancelled
 /// - cancel: `OrderCancelled`
 ///
 /// Every event carries the subject order's ID as correlation ID. Events come back unstamped: the writer assigns their
@@ -248,20 +250,18 @@ pub fn for_update(
         push(
             ORDER_CANCELLED,
             order.id.to_string(),
-            order_payload(order, instrument, Some(CANCEL_REQUESTED), None),
+            order_payload(order, instrument, Some(CANCEL_REQUESTED)),
         );
         return events;
     }
-    if command == Command::Expire {
-        push(
-            ORDER_EXPIRED,
-            order.id.to_string(),
-            order_payload(order, instrument, None, None),
-        );
+    if let Command::Expire { business_date } = command {
+        let mut payload = order_payload(order, instrument, None);
+        payload["businessDate"] = json!(business_date);
+        push(ORDER_EXPIRED, order.id.to_string(), payload);
         return events;
     }
     if let Some(reason) = update.rejection {
-        let mut payload = order_payload(order, instrument, None, None);
+        let mut payload = order_payload(order, instrument, None);
         payload["rejectReason"] = json!(reason.code());
         push(ORDER_REJECTED, order.id.to_string(), payload);
         return events;
@@ -273,25 +273,33 @@ pub fn for_update(
     push(
         ORDER_ACCEPTED,
         order.id.to_string(),
-        order_payload(&accepted, instrument, None, None),
+        order_payload(&accepted, instrument, None),
     );
-    for (execution, maker) in update.executions.iter().zip(&update.fills) {
+    // The incoming order as it stood after each execution (SR-31); after the last one, its resulting state.
+    let mut taker = accepted;
+    let last = update.executions.len().saturating_sub(1);
+    for (i, (execution, maker)) in update.executions.iter().zip(&update.fills).enumerate() {
         push(
             TRADE_EXECUTED,
             execution.id.to_string(),
             trade_payload(execution, instrument, settlement),
         );
-        let mut payload = order_payload(maker, instrument, None, Some(execution.id));
-        add_dates(&mut payload, execution);
-        push(fill_event(maker), maker.id.to_string(), payload);
-    }
-    if order.filled_quantity() > 0 {
-        let mut payload = order_payload(order, instrument, None, None);
-        // Every execution of one command has the same dates.
-        if let Some(execution) = update.executions.first() {
-            add_dates(&mut payload, execution);
+        push(
+            fill_event(maker),
+            maker.id.to_string(),
+            fill_payload(maker, instrument, execution),
+        );
+        if i == last {
+            taker = order.clone();
+        } else {
+            taker.remaining_quantity -= execution.quantity;
+            taker.status = OrderStatus::PartiallyFilled;
         }
-        push(fill_event(order), order.id.to_string(), payload);
+        push(
+            fill_event(&taker),
+            order.id.to_string(),
+            fill_payload(&taker, instrument, execution),
+        );
     }
     // A market or IOC order's remainder is cancelled as part of the submission.
     if order.status == OrderStatus::Cancelled {
@@ -303,16 +311,23 @@ pub fn for_update(
         push(
             ORDER_CANCELLED,
             order.id.to_string(),
-            order_payload(order, instrument, Some(reason), None),
+            order_payload(order, instrument, Some(reason)),
         );
     }
     events
 }
 
-/// The execution's trade and intended settlement dates (SR-29), on a fill event.
-fn add_dates(payload: &mut Value, execution: &Execution) {
+/// A fill event's payload: the order after the execution, and the execution it reports, as a FIX execution report
+/// names it (SR-31: `ExecID`, `LastQty`, `LastPx`), with its trade and intended settlement dates (SR-29).
+fn fill_payload(order: &Order, instrument: &Instrument, execution: &Execution) -> Value {
+    let mut payload = order_payload(order, instrument, None);
+    payload["executionId"] = json!(execution.id);
+    payload["lastQuantity"] = json!(execution.quantity);
+    payload["lastPriceTicks"] = json!(execution.price_ticks);
+    payload["lastPrice"] = json!(instrument.ticks_to_price(execution.price_ticks));
     payload["tradeDate"] = json!(execution.trade_date);
     payload["intendedSettlementDate"] = json!(execution.intended_settlement_date);
+    payload
 }
 
 fn fill_event(order: &Order) -> &'static str {
@@ -323,12 +338,7 @@ fn fill_event(order: &Order) -> &'static str {
     }
 }
 
-fn order_payload(
-    order: &Order,
-    instrument: &Instrument,
-    cancel_reason: Option<&str>,
-    execution_id: Option<Uuid>,
-) -> Value {
+fn order_payload(order: &Order, instrument: &Instrument, cancel_reason: Option<&str>) -> Value {
     let mut payload = json!({
         "orderId": order.id,
         "clientOrderId": order.client_order_id,
@@ -347,9 +357,6 @@ fn order_payload(
     });
     if let Some(reason) = cancel_reason {
         payload["cancelReason"] = json!(reason);
-    }
-    if let Some(execution_id) = execution_id {
-        payload["executionId"] = json!(execution_id);
     }
     payload
 }
