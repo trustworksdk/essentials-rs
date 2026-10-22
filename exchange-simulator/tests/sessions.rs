@@ -51,6 +51,7 @@ fn nasdaq(adjust: impl FnOnce(&mut Config)) -> impl FnOnce(&mut Config) {
                 open: "09:30".into(),
                 close: "16:00".into(),
                 time_zone: "America/New_York".into(),
+                holidays: None,
             },
         )]
         .into();

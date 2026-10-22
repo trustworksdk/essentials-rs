@@ -9,7 +9,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use simulator_kit::calendar::{CutoffCalendar, add_business_days};
+use simulator_kit::calendar::CutoffCalendar;
 use simulator_kit::events::NewEvent;
 use simulator_kit::rng::draw;
 use uuid::Uuid;
@@ -154,7 +154,8 @@ pub struct PaymentPolicy {
     pub withdrawal: OutcomeConfig,
     pub return_probability: f64,
     pub max_return_days: u32,
-    /// The bank's business-day calendar, which dates bookings (`statement.cutoff` and `time_zone`).
+    /// The bank's business-day calendar, which dates bookings and counts return delays: `statement.cutoff` and
+    /// `time_zone`, or the exchange's calendar with `calendar.mode: follow` (SR-35).
     pub calendar: CutoffCalendar,
 }
 
@@ -267,7 +268,7 @@ impl PaymentPolicy {
                                     * f64::from(self.max_return_days))
                                     as u32)
                                     .min(self.max_return_days - 1);
-                            let date = add_business_days(at.date_naive(), days);
+                            let date = self.calendar.days.add_business_days(at.date_naive(), days);
                             date.and_time(at.time()).and_utc()
                         })
                     }

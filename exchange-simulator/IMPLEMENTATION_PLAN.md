@@ -2327,12 +2327,57 @@ then 6.11, 6.12, 6.13–6.14.
   claiming the head; no comma separation; a repeated `eventType` replacing the earlier; unknown types accepted. The
   head being read before the page is not mutation-checked: the race it closes cannot be staged deterministically.
 
+**6.20 — holidays, one calendar for both simulators ✅ done (2026-10-22)**
+- **Delivered:**
+  - `simulator_kit::calendar::BusinessDays` (SR-35): weekdays less holidays, shared cheaply (`Arc`), with
+    `is_business_day`, `add_business_days`, `next_business_day` and `previous_business_day`. It replaces the
+    weekday-only free functions, so no caller can count business days without the holidays. `CutoffCalendar` and
+    `DailySession` carry one (`with_days`) and are `Clone`, no longer `Copy`.
+  - Exchange: `clearing.holidays` (`Config::business_days`), on the business calendar, the settlement policy
+    (`SettlementPolicy::business_days`: trade dating, intake, delays and corrections), clearing and the sessions;
+    `sessions.<MIC>.holidays` overrides them per market (`[]` trades every weekday). Business days, clearing
+    statements and closing prices iterate with the calendar's `next_business_day`, so a holiday is never closed.
+    `GET /api/calendar?from=&to=` (at most 3700 days): `cutoff`, `timeZone`, `businessDays` with `cutoffAt`,
+    `holidays`.
+  - Gateway: `calendar.mode: own | follow` (`calendar.follow.url`, else `clock.follow.url`). In `follow` the gateway
+    reads the exchange's clock, then its calendar from about a year before to nine years after, at startup, before
+    recovery, retrying every second until the exchange answers; payments (value dates, return delays) and statements
+    use it. `App::start` is now `async` for that read. Statements and return delays count business days with the
+    calendar's holidays in both modes.
+  - The `back-office` and `with-your-app` examples set `calendar.mode: follow`. Both `openapi.yaml` (the exchange's
+    `getCalendar`, `BusinessCalendar`), both READMEs, both default configurations.
+  - Tests: the kit's `holidays_are_not_business_days` and `a_holiday_has_no_cutoff_and_closes_no_session`;
+    `tests/holidays.rs` (SR-35's exchange acceptance with Thursday 2030-01-10 a holiday and T+1: a Wednesday trade
+    settles Friday, also in its `SettlementPending`; no `BusinessDayClosed`, `ClosingPriceIssued` or clearing statement
+    for Thursday; XCSE closed on Thursday, XNAS with `holidays: []` trading, its Thursday trade dated Friday and
+    settling Monday; the calendar endpoint and its `400`s); the gateway's
+    `following_the_exchanges_calendar_skips_its_holidays` (against a stand-in exchange: completed Wednesday, valued
+    Wednesday, returned one business day later on Friday, no statement for Thursday, the exchange's cutoff and time
+    zone over the gateway's own), and the missing follow URL refused at startup.
+- **Decisions:**
+  - **The calendar is read once, at startup, and the gateway waits for it.** A gateway that started on its own
+    calendar and switched later could date the same day two ways. Holidays change only with an exchange restart, so
+    the gateway is restarted after changing them (documented).
+  - **The gateway's return delay still counts from the completion's UTC date**, as before, now skipping holidays; only
+    SR-35's holiday rule was asked for.
+  - **A session inherits `clearing.holidays`**, as SR-35 says, rather than having none by default.
+  - **No cross-service test:** the gateway's test uses a stand-in exchange serving `/api/calendar` in the shape the
+    exchange's contract test checks against the document.
+- **Gates:** fmt, clippy (`-D warnings`), doc for the kit, the gateway and the exchange; `cargo test -j 1` of the kit
+  (`--all-features`), the gateway (8 targets) and the exchange (42 targets) green.
+- **Mutation checks**, each made a test fail (all 7): holidays counted as business days; `clearing.holidays` not
+  read; settlement counting weekdays only; sessions not inheriting the holidays; the gateway's payments, and
+  separately its statements, keeping its own calendar in follow mode; the calendar endpoint listing holidays outside
+  the range (survived the first test, which had no holiday outside it; Christmas was added).
+
 ### Milestone 6 status
 
 All steps of the milestone are done (6.1–6.14 with 6.9a, 2026-10-18 to 2026-10-20). Not planned: SR-18 (FX, LATER).
 SR-30 (cancel by client order id) was added on 2026-10-21 and done as step 6.15 the same day.
 SR-31 (the execution on every fill event) and SR-32 (the business day on `OrderExpired`) were added on 2026-10-22
 and done as steps 6.16 and 6.17 the same day.
+SR-33 to SR-35 (value dates, multi-type event reads, holidays) were added on 2026-10-22 and done as steps 6.18–6.20
+the same day; SR-36 to SR-38 (LATER) are planned as 6.21–6.23.
 Still on hold from Milestone 4: 4.6d (the containerized benchmark).
 
 **SR-2 manual acceptance against the real Finnhub ✅ done (2026-10-20, D19).** `config/finnhub-market.yaml` (40

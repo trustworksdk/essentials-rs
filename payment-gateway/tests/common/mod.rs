@@ -68,7 +68,7 @@ impl TestApp {
 
     pub async fn restart(&mut self) {
         self.stop().await;
-        self.app = Some(App::start(&self.config).unwrap());
+        self.app = Some(App::start(&self.config).await.unwrap());
     }
 
     pub async fn stop(&mut self) {

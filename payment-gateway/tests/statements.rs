@@ -328,3 +328,72 @@ async fn payments_stored_before_they_carried_value_dates_are_dated_at_startup() 
     );
     app.stop().await;
 }
+
+/// SR-35: with `calendar.mode: follow` the gateway takes the exchange's calendar, holidays included, from its
+/// `GET /api/calendar`. With Thursday a holiday, a deposit completed on Wednesday is valued Wednesday, its return one
+/// business day later is booked on Friday, and no statement is issued for Thursday.
+#[tokio::test]
+async fn following_the_exchanges_calendar_skips_its_holidays() {
+    let exchange = axum::Router::new()
+        .route(
+            "/api/clock",
+            axum::routing::get(|| async {
+                axum::Json(json!({ "mode": "virtual", "running": false, "speed": 1.0,
+                                   "now": "2030-01-07T09:00:00Z" }))
+            }),
+        )
+        .route(
+            "/api/calendar",
+            axum::routing::get(|| async {
+                axum::Json(json!({ "from": "2029-01-01", "to": "2039-01-01", "cutoff": "17:30",
+                                   "timeZone": "UTC", "businessDays": [], "holidays": ["2030-01-10"] }))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, exchange).await.unwrap() });
+
+    let mut app = TestApp::start_with(move |c| {
+        c.calendar.mode = payment_gateway::config::CalendarMode::Follow;
+        c.calendar.follow = Some(payment_gateway::config::CalendarFollowConfig { url });
+        // The gateway's own calendar would differ: the exchange's must win.
+        c.statement.time_zone = "Asia/Tokyo".into();
+        c.payments.return_probability = 1.0;
+        c.payments.max_return_days = 1;
+    })
+    .await;
+    app.set_clock("2030-01-09T10:00:00Z").await; // Wednesday.
+    let deposit = app.pay("d-1", "DEPOSIT", "100.00", "DKK").await;
+    app.set_clock("2030-01-12T12:00:00Z").await; // Saturday.
+
+    let completed = &app.events("PaymentCompleted").await[0]["payload"];
+    assert_eq!(completed["valueDate"], "2030-01-09");
+    let returned = &app.events("PaymentReturned").await[0]["payload"];
+    assert!(
+        returned["returnedAt"]
+            .as_str()
+            .unwrap()
+            .starts_with("2030-01-11"),
+        "one business day after Wednesday is Friday: {returned}"
+    );
+    assert_eq!(returned["valueDate"], "2030-01-11");
+    assert_eq!(
+        statements(&app, "?date=2030-01-10").await,
+        Vec::<Value>::new()
+    );
+    let friday = statements(&app, "?date=2030-01-11").await;
+    let kinds: Vec<&Value> = friday
+        .iter()
+        .flat_map(|s| s["entries"].as_array().unwrap())
+        .map(|e| &e["kind"])
+        .collect();
+    assert_eq!(kinds, [&json!("DEPOSIT_RETURN")]);
+    assert_eq!(
+        friday[0]["cutoffAt"], "2030-01-11T17:30:00Z",
+        "the exchange's cutoff"
+    );
+    let id = deposit["paymentId"].as_str().unwrap();
+    let (_, payment) = app.get(&format!("/api/payments/{id}")).await;
+    assert_eq!(payment["valueDate"], "2030-01-11");
+    app.stop().await;
+}

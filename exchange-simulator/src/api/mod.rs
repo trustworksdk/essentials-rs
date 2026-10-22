@@ -41,6 +41,8 @@ pub struct AppState {
         crate::market_data::Sender,
         crate::market_data::StreamOptions,
     )>,
+    /// The business-day calendar `GET /api/calendar` describes (SR-35).
+    calendar: simulator_kit::calendar::CutoffCalendar,
 }
 
 impl AppState {
@@ -50,6 +52,7 @@ impl AppState {
         reader: Store,
         metrics: PrometheusHandle,
         persistence: PersistenceMode,
+        calendar: simulator_kit::calendar::CutoffCalendar,
     ) -> Self {
         Self {
             dispatcher,
@@ -57,6 +60,7 @@ impl AppState {
             metrics,
             persistence,
             market_data: None,
+            calendar,
         }
     }
 
@@ -109,6 +113,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/orderbooks/{instrument_id}", get(order_book))
         .route("/api/trades", get(list_trades))
         .route("/api/events", get(list_events))
+        .route("/api/calendar", get(calendar))
         .with_state(state.clone())
         .merge(settlements::router(state.clone()))
         .merge(clearing::router(state.clone()))
@@ -440,6 +445,53 @@ async fn list_trades(
             .map(|e| TradeView::new(e, &instruments[&e.instrument_id]))
             .collect(),
     ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CalendarQuery {
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+}
+
+/// The longest range `GET /api/calendar` answers, in days: about ten years.
+const MAX_CALENDAR_DAYS: i64 = 3700;
+
+/// The business-day calendar from `from` to `to`, both included (SR-35): every business day with its cutoff, and the
+/// holidays. Reference data for planning; the current business date comes from `BusinessDayClosed`.
+async fn calendar(
+    State(state): State<AppState>,
+    query: Result<Query<CalendarQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(CalendarQuery { from, to }) = query?;
+    if to < from || (to - from).num_days() > MAX_CALENDAR_DAYS {
+        return Err(ApiError::bad_request(format!(
+            "to must not be before from, and at most {MAX_CALENDAR_DAYS} days after it"
+        )));
+    }
+    let calendar = &state.calendar;
+    let business_days: Vec<Value> = from
+        .iter_days()
+        .take_while(|date| *date <= to)
+        .filter(|date| calendar.days.is_business_day(*date))
+        .map(|date| json!({ "date": date, "cutoffAt": calendar.cutoff_at(date) }))
+        .collect();
+    let holidays: Vec<chrono::NaiveDate> = calendar
+        .days
+        .holidays()
+        .filter(|date| (from..=to).contains(date))
+        .collect();
+    Ok(Json(json!({
+        "from": from,
+        "to": to,
+        "cutoff": calendar
+            .cutoff
+            .format(if chrono::Timelike::second(&calendar.cutoff) == 0 { "%H:%M" } else { "%H:%M:%S" })
+            .to_string(),
+        "timeZone": calendar.time_zone.name(),
+        "businessDays": business_days,
+        "holidays": holidays,
+    })))
 }
 
 /// Cursor-based replay of canonical events: those with `sequence > after` of the requested types, in sequence order,

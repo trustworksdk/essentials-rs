@@ -1,50 +1,77 @@
-//! Business days and daily cutoffs. Business days are Monday to Friday; there are no holiday calendars yet (decision
-//! D2). Used for T+N settlement dates and for end-of-day statements.
+//! Business days and daily cutoffs. Business days are Monday to Friday, less configured holidays (SR-35). Used for
+//! T+N settlement dates, end-of-day statements, value dates and trading sessions.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
 
-pub fn is_business_day(date: NaiveDate) -> bool {
-    !matches!(date.weekday(), Weekday::Sat | Weekday::Sun)
+/// Which days are business days: weekdays that are not holidays. The default has no holidays. Cheap to clone, so every
+/// calendar of a service can hold the same set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BusinessDays {
+    holidays: Arc<BTreeSet<NaiveDate>>,
 }
 
-/// The date `days` business days after `date`. A trade on a weekend counts from the following Monday, so T+0 of a
-/// Saturday trade is Monday.
-pub fn add_business_days(date: NaiveDate, days: u32) -> NaiveDate {
-    let mut current = date;
-    while !is_business_day(current) {
-        current = current.succ_opt().expect("date in range");
-    }
-    let mut remaining = days;
-    while remaining > 0 {
-        current = current.succ_opt().expect("date in range");
-        if is_business_day(current) {
-            remaining -= 1;
+impl BusinessDays {
+    pub fn with_holidays(holidays: impl IntoIterator<Item = NaiveDate>) -> Self {
+        Self {
+            holidays: Arc::new(holidays.into_iter().collect()),
         }
     }
-    current
-}
 
-/// The business day after `date`.
-pub fn next_business_day(date: NaiveDate) -> NaiveDate {
-    add_business_days(date.succ_opt().expect("date in range"), 0)
-}
-
-/// The business day before `date`.
-pub fn previous_business_day(date: NaiveDate) -> NaiveDate {
-    let mut current = date.pred_opt().expect("date in range");
-    while !is_business_day(current) {
-        current = current.pred_opt().expect("date in range");
+    /// The configured holidays, in date order (weekend dates included, if configured).
+    pub fn holidays(&self) -> impl Iterator<Item = NaiveDate> + '_ {
+        self.holidays.iter().copied()
     }
-    current
+
+    pub fn is_holiday(&self, date: NaiveDate) -> bool {
+        self.holidays.contains(&date)
+    }
+
+    pub fn is_business_day(&self, date: NaiveDate) -> bool {
+        !matches!(date.weekday(), Weekday::Sat | Weekday::Sun) && !self.is_holiday(date)
+    }
+
+    /// The date `days` business days after `date`. A trade on a day that is not a business day counts from the next
+    /// one, so T+0 of a Saturday trade is Monday.
+    pub fn add_business_days(&self, date: NaiveDate, days: u32) -> NaiveDate {
+        let mut current = date;
+        while !self.is_business_day(current) {
+            current = current.succ_opt().expect("date in range");
+        }
+        let mut remaining = days;
+        while remaining > 0 {
+            current = current.succ_opt().expect("date in range");
+            if self.is_business_day(current) {
+                remaining -= 1;
+            }
+        }
+        current
+    }
+
+    /// The business day after `date`.
+    pub fn next_business_day(&self, date: NaiveDate) -> NaiveDate {
+        self.add_business_days(date.succ_opt().expect("date in range"), 0)
+    }
+
+    /// The business day before `date`.
+    pub fn previous_business_day(&self, date: NaiveDate) -> NaiveDate {
+        let mut current = date.pred_opt().expect("date in range");
+        while !self.is_business_day(current) {
+            current = current.pred_opt().expect("date in range");
+        }
+        current
+    }
 }
 
-/// A daily cutoff: `cutoff` local time in `time_zone`, on business days (Monday to Friday), for end-of-day
-/// statements.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A daily cutoff: `cutoff` local time in `time_zone`, on business days, for end-of-day statements.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CutoffCalendar {
     pub cutoff: NaiveTime,
     pub time_zone: Tz,
+    pub days: BusinessDays,
 }
 
 impl CutoffCalendar {
@@ -56,7 +83,18 @@ impl CutoffCalendar {
         let time_zone = time_zone
             .parse()
             .map_err(|_| format!("time_zone is not a known time zone: {time_zone:?}"))?;
-        Ok(Self { cutoff, time_zone })
+        Ok(Self {
+            cutoff,
+            time_zone,
+            days: BusinessDays::default(),
+        })
+    }
+
+    /// The same calendar with these business days.
+    #[must_use]
+    pub fn with_days(mut self, days: BusinessDays) -> Self {
+        self.days = days;
+        self
     }
 
     /// The instant of `date`'s cutoff. A cutoff that falls in a daylight-saving gap moves an hour later.
@@ -77,10 +115,10 @@ impl CutoffCalendar {
     /// The business date an instant belongs to: the first business day whose cutoff is after it.
     pub fn business_date(&self, at: DateTime<Utc>) -> NaiveDate {
         let local = at.with_timezone(&self.time_zone).date_naive();
-        if is_business_day(local) && at < self.cutoff_at(local) {
+        if self.days.is_business_day(local) && at < self.cutoff_at(local) {
             local
         } else {
-            next_business_day(local)
+            self.days.next_business_day(local)
         }
     }
 
@@ -88,19 +126,20 @@ impl CutoffCalendar {
     /// this one's.
     pub fn window(&self, date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
         (
-            self.cutoff_at(previous_business_day(date)),
+            self.cutoff_at(self.days.previous_business_day(date)),
             self.cutoff_at(date),
         )
     }
 }
 
-/// A market's trading session: open from `open` to `close` local time in `time_zone`, on business days (Monday to
-/// Friday). Sessions do not span midnight.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A market's trading session: open from `open` to `close` local time in `time_zone`, on business days. Sessions do
+/// not span midnight.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DailySession {
     pub open: NaiveTime,
     pub close: NaiveTime,
     pub time_zone: Tz,
+    pub days: BusinessDays,
 }
 
 impl DailySession {
@@ -116,11 +155,19 @@ impl DailySession {
             time_zone: time_zone
                 .parse()
                 .map_err(|_| format!("time_zone is not a known time zone: {time_zone:?}"))?,
+            days: BusinessDays::default(),
         };
         if session.open >= session.close {
             return Err(format!("open ({open}) must be before close ({close})"));
         }
         Ok(session)
+    }
+
+    /// The same session with these business days: the market is closed on its holidays.
+    #[must_use]
+    pub fn with_days(mut self, days: BusinessDays) -> Self {
+        self.days = days;
+        self
     }
 
     fn at(&self, date: NaiveDate, time: NaiveTime) -> DateTime<Utc> {
@@ -140,14 +187,16 @@ impl DailySession {
     /// Whether the market is open at `at`: a business day in its time zone, at or after the open, before the close.
     pub fn is_open(&self, at: DateTime<Utc>) -> bool {
         let date = at.with_timezone(&self.time_zone).date_naive();
-        is_business_day(date) && self.at(date, self.open) <= at && at < self.at(date, self.close)
+        self.days.is_business_day(date)
+            && self.at(date, self.open) <= at
+            && at < self.at(date, self.close)
     }
 
     /// The first close strictly after `after`.
     pub fn close_after(&self, after: DateTime<Utc>) -> DateTime<Utc> {
         let mut date = after.with_timezone(&self.time_zone).date_naive();
         loop {
-            if is_business_day(date) {
+            if self.days.is_business_day(date) {
                 let close = self.at(date, self.close);
                 if close > after {
                     return close;
@@ -202,23 +251,84 @@ mod tests {
         text.parse().unwrap()
     }
 
+    /// Thursday 2030-01-10 a holiday (SR-35).
+    fn thursday_off() -> BusinessDays {
+        BusinessDays::with_holidays([d("2030-01-10")])
+    }
+
+    #[test]
+    fn holidays_are_not_business_days() {
+        let days = thursday_off();
+        assert!(!days.is_business_day(d("2030-01-10")));
+        assert!(days.is_holiday(d("2030-01-10")));
+        assert_eq!(
+            days.add_business_days(d("2030-01-09"), 1),
+            d("2030-01-11"),
+            "Wednesday T+1: Friday"
+        );
+        assert_eq!(
+            days.add_business_days(d("2030-01-10"), 0),
+            d("2030-01-11"),
+            "a holiday counts from the next day"
+        );
+        assert_eq!(days.next_business_day(d("2030-01-09")), d("2030-01-11"));
+        assert_eq!(days.previous_business_day(d("2030-01-11")), d("2030-01-09"));
+        assert_eq!(days.holidays().collect::<Vec<_>>(), [d("2030-01-10")]);
+    }
+
+    #[test]
+    fn a_holiday_has_no_cutoff_and_closes_no_session() {
+        let at = |text: &str| text.parse::<DateTime<Utc>>().unwrap();
+        let calendar = CutoffCalendar::parse("17:30", "UTC")
+            .unwrap()
+            .with_days(thursday_off());
+        assert_eq!(
+            calendar.business_date(at("2030-01-09T18:00:00Z")),
+            d("2030-01-11"),
+            "after Wednesday's cutoff: Friday"
+        );
+        assert_eq!(
+            calendar.business_date(at("2030-01-10T12:00:00Z")),
+            d("2030-01-11")
+        );
+        assert_eq!(
+            calendar.window(d("2030-01-11")),
+            (at("2030-01-09T17:30:00Z"), at("2030-01-11T17:30:00Z")),
+            "Friday's statement covers the holiday"
+        );
+        let session = DailySession::parse("09:00", "17:00", "UTC")
+            .unwrap()
+            .with_days(thursday_off());
+        assert!(!session.is_open(at("2030-01-10T12:00:00Z")));
+        assert_eq!(
+            session.close_after(at("2030-01-09T18:00:00Z")),
+            at("2030-01-11T17:00:00Z")
+        );
+    }
+
     #[test]
     fn t_plus_n_skips_weekends() {
         // 2030-01-07 is a Monday.
-        assert_eq!(add_business_days(d("2030-01-07"), 0), d("2030-01-07"));
-        assert_eq!(add_business_days(d("2030-01-07"), 2), d("2030-01-09"));
         assert_eq!(
-            add_business_days(d("2030-01-10"), 2),
+            BusinessDays::default().add_business_days(d("2030-01-07"), 0),
+            d("2030-01-07")
+        );
+        assert_eq!(
+            BusinessDays::default().add_business_days(d("2030-01-07"), 2),
+            d("2030-01-09")
+        );
+        assert_eq!(
+            BusinessDays::default().add_business_days(d("2030-01-10"), 2),
             d("2030-01-14"),
             "Thursday + 2 is Monday"
         );
         assert_eq!(
-            add_business_days(d("2030-01-11"), 1),
+            BusinessDays::default().add_business_days(d("2030-01-11"), 1),
             d("2030-01-14"),
             "Friday + 1 is Monday"
         );
         assert_eq!(
-            add_business_days(d("2030-01-11"), 5),
+            BusinessDays::default().add_business_days(d("2030-01-11"), 5),
             d("2030-01-18"),
             "a full week"
         );
@@ -227,12 +337,12 @@ mod tests {
     #[test]
     fn weekend_trades_count_from_monday() {
         assert_eq!(
-            add_business_days(d("2030-01-12"), 0),
+            BusinessDays::default().add_business_days(d("2030-01-12"), 0),
             d("2030-01-14"),
             "Saturday T+0"
         );
         assert_eq!(
-            add_business_days(d("2030-01-13"), 2),
+            BusinessDays::default().add_business_days(d("2030-01-13"), 2),
             d("2030-01-16"),
             "Sunday T+2"
         );

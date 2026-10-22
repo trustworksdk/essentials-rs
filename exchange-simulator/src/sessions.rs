@@ -46,7 +46,7 @@ impl TradingSessions {
                 let close = session.close_after(accepted_at);
                 Some((close, close.with_timezone(&session.time_zone).date_naive()))
             }
-            None => self.day_end.map(|calendar| {
+            None => self.day_end.as_ref().map(|calendar| {
                 let date = calendar.business_date(accepted_at);
                 (calendar.cutoff_at(date), date)
             }),

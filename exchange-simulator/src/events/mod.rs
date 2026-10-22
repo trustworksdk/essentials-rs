@@ -95,7 +95,7 @@ pub fn business_day_closed(
         payload: json!({
             "businessDate": date,
             "cutoffAt": cutoff_at,
-            "nextBusinessDate": simulator_kit::calendar::next_business_day(date),
+            "nextBusinessDate": calendar.days.next_business_day(date),
             "timeZone": calendar.time_zone.name(),
         }),
     }

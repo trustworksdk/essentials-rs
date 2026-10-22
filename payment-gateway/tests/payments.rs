@@ -367,7 +367,7 @@ async fn the_clock_reset_and_health_behave_as_in_the_exchange() {
     let mut config = app.config.clone();
     config.clock.mode = payment_gateway::config::ClockMode::System;
     config.clock.speed = 1.0;
-    let system = payment_gateway::app::App::start(&config).unwrap();
+    let system = payment_gateway::app::App::start(&config).await.unwrap();
     let router = system.router.clone();
     let response = tower::ServiceExt::oneshot(
         router,
@@ -401,6 +401,10 @@ async fn invalid_configuration_stops_startup() {
             "account_iban",
         ),
         (Box::new(|c| c.clock.speed = 0.0), "clock.speed"),
+        (
+            Box::new(|c| c.calendar.mode = payment_gateway::config::CalendarMode::Follow),
+            "calendar.mode: follow needs calendar.follow.url or clock.follow.url",
+        ),
     ] {
         let mut config = base.clone();
         config.database.path = std::env::temp_dir()
@@ -410,6 +414,7 @@ async fn invalid_configuration_stops_startup() {
             .into_owned();
         adjust(&mut config);
         let error = payment_gateway::app::App::start(&config)
+            .await
             .err()
             .expect("refused");
         assert!(format!("{error:#}").contains(message), "{error:#}");

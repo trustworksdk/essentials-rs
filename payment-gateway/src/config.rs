@@ -26,6 +26,8 @@ pub struct Config {
     pub payments: PaymentsConfig,
     pub statement: StatementConfig,
     #[serde(default)]
+    pub calendar: CalendarConfig,
+    #[serde(default)]
     pub events: EventsConfig,
     pub webhooks: WebhooksConfig,
     pub ids: IdsConfig,
@@ -76,6 +78,52 @@ pub struct StatementConfig {
     #[serde(default)]
     pub breaks: BreakPolicy,
     pub tick_interval_ms: u64,
+}
+
+/// Whose business-day calendar dates statements, value dates and return delays (SR-35).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CalendarConfig {
+    pub mode: CalendarMode,
+    /// `follow` only: the exchange to read the calendar from; `clock.follow.url` when absent.
+    pub follow: Option<CalendarFollowConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CalendarMode {
+    /// `statement.cutoff` in `statement.time_zone`, on weekdays.
+    #[default]
+    Own,
+    /// The exchange's calendar, holidays included, read from its `GET /api/calendar` at startup.
+    Follow,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalendarFollowConfig {
+    /// The exchange's base URL, e.g. `http://exchange:8080`.
+    pub url: String,
+}
+
+impl Config {
+    /// The URL to read the business-day calendar from in `calendar.mode: follow`; `None` in `own`.
+    pub fn calendar_follow_url(&self) -> Result<Option<String>, String> {
+        if self.calendar.mode == CalendarMode::Own {
+            return Ok(None);
+        }
+        let url = match (&self.calendar.follow, &self.clock.follow) {
+            (Some(follow), _) => follow.url.clone(),
+            (None, Some(clock)) => clock.url.clone(),
+            (None, None) => {
+                return Err(
+                    "calendar.mode: follow needs calendar.follow.url or clock.follow.url".into(),
+                );
+            }
+        };
+        reqwest::Url::parse(&url).map_err(|e| format!("calendar.follow.url: {e}"))?;
+        Ok(Some(url))
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

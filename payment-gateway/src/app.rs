@@ -25,7 +25,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn start(config: &Config) -> anyhow::Result<Self> {
+    pub async fn start(config: &Config) -> anyhow::Result<Self> {
         simulator_kit::clock::validate_speed(config.clock.speed).context("clock.speed")?;
         if config.clock.mode == ClockMode::System && config.clock.speed != 1.0 {
             anyhow::bail!(
@@ -41,8 +41,16 @@ impl App {
             _ => None,
         };
         let currencies = config.currencies().map_err(anyhow::Error::msg)?;
-        let payments = config.payment_policy().map_err(anyhow::Error::msg)?;
-        let statements = config.statement_policy().map_err(anyhow::Error::msg)?;
+        let mut payments = config.payment_policy().map_err(anyhow::Error::msg)?;
+        let mut statements = config.statement_policy().map_err(anyhow::Error::msg)?;
+        if let Some(url) = config.calendar_follow_url().map_err(anyhow::Error::msg)? {
+            let calendar = read_calendar(&url).await;
+            tracing::info!(url = %url, holidays = calendar.days.holidays().count(), "the calendar follows the exchange's");
+            payments.calendar = calendar.clone();
+            if let Some(statements) = statements.as_mut() {
+                statements.calendar = calendar;
+            }
+        }
         let busy_timeout = Duration::from_millis(config.database.busy_timeout_ms);
         let mode = config.database.mode;
         let location = match mode {
@@ -154,6 +162,66 @@ impl App {
                 tracing::error!(%error, "background task failed");
             }
         }
+    }
+}
+
+/// Reads the exchange's business-day calendar (`calendar.mode: follow`, SR-35): its clock's reading, then
+/// `GET /api/calendar` from about a year before it to nine years after, so every date the gateway decides is on the
+/// exchange's calendar. Retries every second until the exchange answers, since no date can be decided without it.
+async fn read_calendar(url: &str) -> simulator_kit::calendar::CutoffCalendar {
+    #[derive(serde::Deserialize)]
+    struct Clock {
+        now: chrono::DateTime<chrono::Utc>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Calendar {
+        cutoff: String,
+        time_zone: String,
+        holidays: Vec<chrono::NaiveDate>,
+    }
+    let base = url.trim_end_matches('/');
+    let client = reqwest::Client::new();
+    let read = async || -> anyhow::Result<simulator_kit::calendar::CutoffCalendar> {
+        let clock: Clock = client
+            .get(format!("{base}/api/clock"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let today = clock.now.date_naive();
+        let (from, to) = (
+            today - chrono::Days::new(400),
+            today + chrono::Days::new(3285),
+        );
+        let calendar: Calendar = client
+            .get(format!("{base}/api/calendar?from={from}&to={to}"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let days = simulator_kit::calendar::BusinessDays::with_holidays(calendar.holidays);
+        Ok(
+            simulator_kit::calendar::CutoffCalendar::parse(&calendar.cutoff, &calendar.time_zone)
+                .map_err(anyhow::Error::msg)?
+                .with_days(days),
+        )
+    };
+    let mut warned = false;
+    loop {
+        match read().await {
+            Ok(calendar) => return calendar,
+            Err(error) if !warned => {
+                warned = true;
+                tracing::warn!(url = %base, %error, "cannot read the exchange's calendar yet; retrying every second");
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 

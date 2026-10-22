@@ -83,6 +83,9 @@ pub struct SettlementPolicy {
     /// When clearing runs, its calendar: instructions then name the statement and obligation they settle.
     #[serde(skip)]
     pub clearing: Option<crate::clearing::ClearingCalendar>,
+    /// The business days settlement dates, delays and corrections count (SR-35: weekdays less holidays).
+    #[serde(skip)]
+    pub business_days: calendar::BusinessDays,
     pub reject_probability: f64,
     pub cancel_probability: f64,
     pub fail_probability: f64,
@@ -100,6 +103,7 @@ impl Default for SettlementPolicy {
             settlement_days: 1,
             market_settlement_days: BTreeMap::new(),
             clearing: None,
+            business_days: calendar::BusinessDays::default(),
             reject_probability: 0.0,
             cancel_probability: 0.0,
             fail_probability: 0.0,
@@ -175,13 +179,14 @@ impl TradeDating {
     ) -> crate::domain::TradeDates {
         let trade_date = self
             .calendar
+            .as_ref()
             .map_or(executed_at.date_naive(), |c| c.business_date(executed_at));
         crate::domain::TradeDates {
             trade_date,
-            intended_settlement_date: calendar::add_business_days(
-                trade_date,
-                self.cycles.settlement_days_for(mic),
-            ),
+            intended_settlement_date: self
+                .cycles
+                .business_days
+                .add_business_days(trade_date, self.cycles.settlement_days_for(mic)),
         }
     }
 }

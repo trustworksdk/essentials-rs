@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, SubsecRound, Utc};
 use rusqlite::Connection;
-use simulator_kit::calendar::{next_business_day, previous_business_day};
 use simulator_kit::clock::{Clock, ClockError, SystemClock, VirtualClock, wall_now};
 pub use simulator_kit::clock::{ClockChange, ClockState};
 use simulator_kit::events::NewEvent;
@@ -128,14 +127,17 @@ impl Statements {
         let cutoff = self
             .policy
             .calendar
-            .cutoff_at(next_business_day(self.cursor));
+            .cutoff_at(self.policy.calendar.days.next_business_day(self.cursor));
         self.pending
             .first()
             .map_or(cutoff, |p| p.draft.statement.issued_at.min(cutoff))
     }
 
     fn first_cursor(policy: &StatementPolicy, now: DateTime<Utc>) -> NaiveDate {
-        previous_business_day(policy.calendar.business_date(now))
+        policy
+            .calendar
+            .days
+            .previous_business_day(policy.calendar.business_date(now))
     }
 }
 
@@ -500,7 +502,11 @@ impl Gateway {
     /// due by `at`, committed together.
     fn statement_step(&mut self, at: DateTime<Utc>) -> Result<usize, GatewayError> {
         let statements = self.statements.as_ref().expect("statements run");
-        let date = next_business_day(statements.cursor);
+        let date = statements
+            .policy
+            .calendar
+            .days
+            .next_business_day(statements.cursor);
         let policy = &statements.policy;
         let mut issue: Vec<StoredStatement> = statements
             .pending

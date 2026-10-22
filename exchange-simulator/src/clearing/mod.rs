@@ -25,13 +25,10 @@ use uuid::Uuid;
 
 use crate::domain::{InstrumentId, ParticipantId};
 use crate::events::{self, NewEvent};
-use crate::settlement::calendar::add_business_days;
 use crate::settlement::{SettlementPolicy, TradeFacts, draw, format_amount};
 
 /// When statements are issued: the clearinghouse's cutoff calendar (see [`simulator_kit::calendar::CutoffCalendar`]).
 pub type ClearingCalendar = simulator_kit::calendar::CutoffCalendar;
-
-pub use simulator_kit::calendar::{next_business_day, previous_business_day};
 
 pub fn statement_id(date: NaiveDate, participant: &ParticipantId) -> String {
     format!("CS:{date}:{}", participant.0)
@@ -228,7 +225,9 @@ impl ClearingPolicy {
             Some(dates) => (dates.trade_date, dates.intended_settlement_date),
             None => (
                 date,
-                add_business_days(date, self.cycles.settlement_days_for(trade.mic.as_deref())),
+                self.calendar
+                    .days
+                    .add_business_days(date, self.cycles.settlement_days_for(trade.mic.as_deref())),
             ),
         };
         let mut line = StatementTrade {
