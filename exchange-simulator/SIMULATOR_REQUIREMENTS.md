@@ -591,9 +591,10 @@ amount on the pay date, and a 2:1 split doubles a resting order's quantity and h
 |---|---|
 | 0 Foundation | SR-1, SR-3, SR-5, SR-28 (MUST); SR-19 (SHOULD) |
 | 1 Identity and account core | SR-24, SR-25, SR-26 (MUST) |
-| 2 Funding | SR-21 (MUST); SR-22, SR-27 (SHOULD) |
+| 2 Funding | SR-21, SR-33 (MUST); SR-22, SR-27 (SHOULD) |
 | 3 Orders and execution | SR-2, SR-6–SR-10, SR-12, SR-13, SR-29, SR-31 (MUST); SR-16, SR-17, SR-30, SR-32 (SHOULD) |
-| 4 Settlement | SR-14 (MUST) |
+| 4 Settlement | SR-14 (MUST); SR-35 (SHOULD) |
 | 5 Reconciliation | SR-11 (SHOULD) |
-| 6 Realistic load | SR-4, SR-15, SR-20, SR-23 (SHOULD) |
+| 6 Realistic load | SR-4, SR-15, SR-20, SR-23, SR-34 (SHOULD) |
 | FX | SR-18 (LATER) |
+| After phase 5 | SR-36, SR-37, SR-38 (LATER) |
