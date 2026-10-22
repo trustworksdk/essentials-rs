@@ -523,6 +523,117 @@ impl Store {
         tx.commit()
     }
 
+    /// Writes a corporate action (SR-38) in one transaction: the action announced, paid or applied, the resting orders
+    /// a split adjusted (quantity, remainder, limit price, status), and the events.
+    pub fn commit_corporate_action(
+        &mut self,
+        action: &crate::corporate_actions::CorporateAction,
+        orders: &[Order],
+        new_events: &[NewEvent],
+        outbox: Outbox<'_>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.savepoint()?;
+        tx.prepare_cached(
+            "INSERT INTO corporate_actions (id, kind, instrument_id, ex_date, record_date, pay_date,
+                                            amount_per_share_minor, ratio_new, ratio_old, effective_date,
+                                            announced_at, done_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT (id) DO UPDATE SET done_at = excluded.done_at",
+        )?
+        .execute(params![
+            action.id,
+            action.kind.as_str(),
+            action.instrument_id.0,
+            action.ex_date.map(|d| d.to_string()),
+            action.record_date.map(|d| d.to_string()),
+            action.pay_date.map(|d| d.to_string()),
+            action.amount_per_share_minor,
+            to_sql(action.ratio.0),
+            to_sql(action.ratio.1),
+            action.effective_date.map(|d| d.to_string()),
+            timestamp(action.announced_at),
+            action.done_at.map(timestamp),
+        ])?;
+        let mut update = tx.prepare_cached(
+            "UPDATE orders SET quantity = ?2, remaining_quantity = ?3, limit_price_ticks = ?4, status = ?5,
+                               updated_at = ?6
+             WHERE id = ?1",
+        )?;
+        for order in orders {
+            update.execute(params![
+                order.id.to_string(),
+                to_sql(order.quantity),
+                to_sql(order.remaining_quantity),
+                order.limit_price_ticks,
+                order.status.as_str(),
+                action.done_at.map(timestamp),
+            ])?;
+        }
+        drop(update);
+        write_events(&tx, new_events, &outbox)?;
+        tx.commit()
+    }
+
+    /// Every corporate action, in due order then ID.
+    pub fn corporate_actions(
+        &self,
+    ) -> rusqlite::Result<Vec<crate::corporate_actions::CorporateAction>> {
+        let date = |row: &Row<'_>, i: usize| -> rusqlite::Result<Option<chrono::NaiveDate>> {
+            row.get::<_, Option<String>>(i)?
+                .map(|_| parsed(row, i))
+                .transpose()
+        };
+        self.conn
+            .prepare_cached(
+                "SELECT id, kind, instrument_id, ex_date, record_date, pay_date, amount_per_share_minor, ratio_new,
+                        ratio_old, effective_date, announced_at, done_at
+                 FROM corporate_actions ORDER BY COALESCE(pay_date, effective_date), id",
+            )?
+            .query_map([], |row| {
+                Ok(crate::corporate_actions::CorporateAction {
+                    id: row.get(0)?,
+                    kind: parsed(row, 1)?,
+                    instrument_id: InstrumentId(row.get(2)?),
+                    ex_date: date(row, 3)?,
+                    record_date: date(row, 4)?,
+                    pay_date: date(row, 5)?,
+                    amount_per_share_minor: row.get(6)?,
+                    ratio: (from_sql(row, 7)?, from_sql(row, 8)?),
+                    effective_date: date(row, 9)?,
+                    announced_at: parsed(row, 10)?,
+                    done_at: row
+                        .get::<_, Option<String>>(11)?
+                        .map(|_| parsed(row, 11))
+                        .transpose()?,
+                })
+            })?
+            .collect()
+    }
+
+    /// Each side of the instrument's executions that are not busted, for holdings (SR-38).
+    pub fn positions(
+        &self,
+        instrument: &InstrumentId,
+    ) -> rusqlite::Result<Vec<crate::corporate_actions::Position>> {
+        self.conn
+            .prepare_cached(
+                "SELECT buyer_id, quantity, executed_at, intended_settlement_date FROM executions
+                 WHERE instrument_id = ?1 AND status != 'BUSTED' AND intended_settlement_date IS NOT NULL
+                 UNION ALL
+                 SELECT seller_id, -quantity, executed_at, intended_settlement_date FROM executions
+                 WHERE instrument_id = ?1 AND status != 'BUSTED' AND intended_settlement_date IS NOT NULL",
+            )?
+            .query_map([&instrument.0], |row| {
+                Ok(crate::corporate_actions::Position {
+                    participant_id: ParticipantId(row.get(0)?),
+                    quantity: row.get(1)?,
+                    executed_at: parsed(row, 2)?,
+                    intended_settlement_date: parsed(row, 3)?,
+                })
+            })?
+            .collect()
+    }
+
     /// The seeded corrections and busts still to come (SR-36), in due order.
     pub fn scheduled_adjustments(&self) -> rusqlite::Result<Vec<ScheduledAdjustment>> {
         self.conn

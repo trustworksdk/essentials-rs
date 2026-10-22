@@ -303,6 +303,19 @@ impl OrderBook {
         }
     }
 
+    /// Replaces the resting orders after a split (SR-38) with `orders`, their adjusted states: each keeps its place in
+    /// time priority at its new price, and one no longer active leaves the book.
+    pub fn replace_resting(&mut self, mut orders: Vec<Order>) {
+        self.bids.clear();
+        self.asks.clear();
+        self.orders.clear();
+        orders.sort_by_key(|o| o.sequence);
+        for order in &orders {
+            self.reconcile(order);
+        }
+        self.version += 1;
+    }
+
     /// Plans and applies in one step, for callers with nothing to persist in between.
     pub fn submit(
         &mut self,

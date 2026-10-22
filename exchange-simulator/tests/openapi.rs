@@ -661,6 +661,48 @@ async fn every_operation_and_event_matches_the_document() {
     )
     .await;
 
+    // Corporate actions (SR-38), paid and applied as the clock moves on below.
+    let dividend = json!({ "kind": "CASH_DIVIDEND", "instrumentId": "ACME", "exDate": "2030-01-14",
+                           "recordDate": "2030-01-14", "payDate": "2030-01-15", "amountPerShare": "0.25" });
+    expect(
+        a,
+        s,
+        201,
+        M::POST,
+        "/api/corporate-actions",
+        Some(dividend.clone()),
+    )
+    .await;
+    expect(a, s, 409, M::POST, "/api/corporate-actions", Some(dividend)).await;
+    expect(
+        a,
+        s,
+        201,
+        M::POST,
+        "/api/corporate-actions",
+        Some(json!({ "kind": "SPLIT", "instrumentId": "ACME", "ratio": "2:1", "effectiveDate": "2030-01-16" })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        400,
+        M::POST,
+        "/api/corporate-actions",
+        Some(json!({ "kind": "SPLIT", "instrumentId": "ACME", "ratio": "x" })),
+    )
+    .await;
+    expect(
+        a,
+        s,
+        422,
+        M::POST,
+        "/api/corporate-actions",
+        Some(json!({ "kind": "SPLIT", "instrumentId": "NOPE", "ratio": "2:1", "effectiveDate": "2030-01-16" })),
+    )
+    .await;
+    expect(a, s, 200, M::GET, "/api/corporate-actions", None).await;
+
     // Settlement, simulated and reported.
     expect(a, s, 200, M::GET, "/api/settlements?status=PENDING", None).await;
     expect(a, s, 400, M::GET, "/api/settlements?status=LOST", None).await;

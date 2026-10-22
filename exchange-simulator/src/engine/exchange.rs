@@ -84,6 +84,10 @@ pub enum ExchangeError {
     ExecutionBusted(Uuid),
     #[error("invalid trade correction: {0}")]
     InvalidCorrection(String),
+    #[error("invalid corporate action: {0}")]
+    InvalidCorporateAction(String),
+    #[error("corporate action {0} was already announced")]
+    DuplicateCorporateAction(String),
     #[error("instrument {0} already exists")]
     DuplicateInstrument(InstrumentId),
     #[error("symbol {symbol} is already listed on {mic}")]
@@ -221,6 +225,8 @@ pub struct ExchangeOptions {
     pub trade_adjustments: TradeAdjustmentPolicy,
     /// Exchange fees (SR-37); free by default.
     pub fees: crate::fees::FeeSchedule,
+    /// Corporate actions from configuration (SR-38), announced once.
+    pub corporate_actions: Vec<crate::corporate_actions::ActionSpec>,
 }
 
 /// Seeded trade corrections and busts (`trades:`, SR-36): each execution is busted with `bust_probability`, else
@@ -310,6 +316,7 @@ impl Default for ExchangeOptions {
             sessions: Default::default(),
             trade_adjustments: Default::default(),
             fees: Default::default(),
+            corporate_actions: Vec::new(),
         }
     }
 }
@@ -371,6 +378,9 @@ pub struct Exchange {
         std::collections::BTreeSet<(DateTime<Utc>, u64, InstrumentId, Uuid, chrono::NaiveDate)>,
     trade_adjustments: TradeAdjustmentPolicy,
     fees: crate::fees::FeeSchedule,
+    declared_actions: Vec<crate::corporate_actions::ActionSpec>,
+    /// Announced corporate actions not yet paid or applied (SR-38), in due order.
+    actions: Vec<crate::corporate_actions::CorporateAction>,
     /// Seeded corrections and busts waiting for their time (SR-36), in due order.
     scheduled: std::collections::BTreeSet<crate::persistence::ScheduledAdjustment>,
 }
@@ -606,6 +616,8 @@ impl Exchange {
             expiries: Default::default(),
             trade_adjustments: options.trade_adjustments,
             fees: options.fees,
+            declared_actions: options.corporate_actions,
+            actions: Vec::new(),
             scheduled: Default::default(),
         };
         exchange.start_price_sources()?;
@@ -618,6 +630,7 @@ impl Exchange {
             .collect();
         exchange.start_liquidity()?;
         exchange.reconcile_instruments()?;
+        exchange.reconcile_corporate_actions()?;
         if let Some(policy) = options.clearing {
             policy.breaks.validate().map_err(ExchangeError::Clearing)?;
             let (cursor, after) = match exchange.store.clearing_cursor()? {
@@ -1738,6 +1751,7 @@ impl Exchange {
         self.reconcile_webhooks()?;
         self.start_liquidity()?;
         self.reconcile_instruments()?;
+        self.reconcile_corporate_actions()?;
         tracing::info!(epoch = self.epoch, "exchange state reset");
         Ok(())
     }
@@ -1781,11 +1795,13 @@ impl Exchange {
             let clearing = self.clearing.as_ref().map(Clearing::due);
             let expiry = self.expiries.first().map(|e| e.0);
             let adjustment = self.scheduled.first().map(|a| a.due_at);
+            let action = self.actions.first().map(|a| a.due_at());
             match close
                 .into_iter()
                 .chain(clearing)
                 .chain(expiry)
                 .chain(adjustment)
+                .chain(action)
                 .min()
             {
                 Some(due) if due <= now => {
@@ -1797,6 +1813,10 @@ impl Exchange {
                     // A seeded correction or bust before the cutoff shows on that day's statement.
                     if adjustment == Some(due) {
                         total += self.adjust_due(due)?;
+                    }
+                    // Dividends and splits at the start of their day.
+                    if action == Some(due) {
+                        total += self.act_due(due)?;
                     }
                     if close == Some(due) {
                         total += self.close_business_day()?;
@@ -2608,6 +2628,303 @@ impl Exchange {
                 })
             })
             .collect()
+    }
+
+    /// Announces a corporate action now (SR-38), for an operator.
+    pub fn announce_corporate_action(
+        &mut self,
+        spec: &crate::corporate_actions::ActionSpec,
+    ) -> Result<crate::corporate_actions::CorporateAction, ExchangeError> {
+        let now = self.now();
+        self.announce_at(spec, now)
+    }
+
+    /// Every corporate action, in due order.
+    pub fn corporate_actions(
+        &self,
+    ) -> Result<Vec<(crate::corporate_actions::CorporateAction, Instrument)>, ExchangeError> {
+        Ok(self
+            .store
+            .corporate_actions()?
+            .into_iter()
+            .filter_map(|a| {
+                let instrument = self.books.get(&a.instrument_id)?.instrument().clone();
+                Some((a, instrument))
+            })
+            .collect())
+    }
+
+    /// Validates and stores a corporate action with its `CorporateActionAnnounced`; it is paid or applied when due.
+    fn announce_at(
+        &mut self,
+        spec: &crate::corporate_actions::ActionSpec,
+        now: DateTime<Utc>,
+    ) -> Result<crate::corporate_actions::CorporateAction, ExchangeError> {
+        use crate::corporate_actions::{CORPORATE_ACTION_ANNOUNCED, CorporateAction, event};
+        let instrument = self
+            .books
+            .get(&spec.instrument_id)
+            .ok_or_else(|| ExchangeError::UnknownInstrument(spec.instrument_id.clone()))?
+            .instrument()
+            .clone();
+        let action = CorporateAction::announce(spec, &instrument, now)
+            .map_err(ExchangeError::InvalidCorporateAction)?;
+        if self
+            .store
+            .corporate_actions()?
+            .iter()
+            .any(|a| a.id == action.id)
+        {
+            return Err(ExchangeError::DuplicateCorporateAction(action.id));
+        }
+        let events = vec![event(
+            CORPORATE_ACTION_ANNOUNCED,
+            &action,
+            None,
+            now,
+            action.view(&instrument),
+        )];
+        self.commit_action(&action, &[], events)?;
+        self.actions.push(action.clone());
+        self.actions
+            .sort_by(|a, b| (a.due_at(), &a.id).cmp(&(b.due_at(), &b.id)));
+        Ok(action)
+    }
+
+    /// Loads the actions still to come, makes the reference prices follow the splits already applied, and announces the
+    /// configured actions not yet announced: at recovery and after a reset.
+    fn reconcile_corporate_actions(&mut self) -> Result<(), ExchangeError> {
+        use crate::corporate_actions::{ActionKind, CorporateAction};
+        let stored = self.store.corporate_actions()?;
+        for applied in stored
+            .iter()
+            .filter(|a| a.kind == ActionKind::Split && a.done_at.is_some())
+        {
+            self.prices
+                .apply_split(&applied.instrument_id, applied.ratio);
+        }
+        self.actions = stored
+            .iter()
+            .filter(|a| a.done_at.is_none())
+            .cloned()
+            .collect();
+        let now = self.now();
+        for spec in self.declared_actions.clone() {
+            let instrument = self
+                .books
+                .get(&spec.instrument_id)
+                .ok_or_else(|| ExchangeError::UnknownInstrument(spec.instrument_id.clone()))?
+                .instrument()
+                .clone();
+            let id = CorporateAction::announce(&spec, &instrument, now)
+                .map_err(|e| {
+                    ExchangeError::InvalidCorporateAction(format!("corporate_actions: {e}"))
+                })?
+                .id;
+            if !stored.iter().any(|a| a.id == id) {
+                self.announce_at(&spec, now)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pays the dividends and applies the splits due by `due`, each in its own commit stamped at its due time.
+    fn act_due(&mut self, due: DateTime<Utc>) -> Result<usize, ExchangeError> {
+        let mut events = 0;
+        while self.actions.first().is_some_and(|a| a.due_at() <= due) {
+            let action = self.actions.remove(0);
+            events += match action.kind {
+                crate::corporate_actions::ActionKind::CashDividend => self.pay_dividend(action)?,
+                crate::corporate_actions::ActionKind::Split => self.apply_split(action)?,
+            };
+        }
+        Ok(events)
+    }
+
+    /// The splits of `instrument` applied so far, as (effective instant, `new:old`), for holdings.
+    fn applied_splits(
+        &self,
+        instrument: &InstrumentId,
+    ) -> Result<Vec<crate::corporate_actions::AppliedSplit>, ExchangeError> {
+        Ok(self
+            .store
+            .corporate_actions()?
+            .into_iter()
+            .filter(|a| {
+                a.kind == crate::corporate_actions::ActionKind::Split
+                    && a.done_at.is_some()
+                    && &a.instrument_id == instrument
+            })
+            .map(|a| (a.due_at(), a.ratio))
+            .collect())
+    }
+
+    /// One `DividendPaid` per participant holding a positive quantity at the record date (SR-38).
+    fn pay_dividend(
+        &mut self,
+        mut action: crate::corporate_actions::CorporateAction,
+    ) -> Result<usize, ExchangeError> {
+        use crate::corporate_actions::{DIVIDEND_PAID, event, holdings};
+        let at = action.due_at();
+        let Some(book) = self.books.get(&action.instrument_id) else {
+            return Ok(0);
+        };
+        let instrument = book.instrument().clone();
+        let record = action.record_date.expect("a dividend has a record date");
+        let held = holdings(
+            &self.store.positions(&action.instrument_id)?,
+            record,
+            &self.applied_splits(&action.instrument_id)?,
+        );
+        let mut new_events = Vec::new();
+        for (participant, quantity) in held.into_iter().filter(|(_, q)| *q > 0) {
+            let amount = quantity.saturating_mul(action.amount_per_share_minor);
+            let mut payload = action.view(&instrument);
+            payload["participantId"] = serde_json::json!(participant);
+            payload["quantity"] = serde_json::json!(quantity);
+            payload["amountMinor"] = serde_json::json!(amount);
+            payload["amount"] = serde_json::json!(crate::settlement::format_amount(
+                amount,
+                instrument.currency_scale
+            ));
+            new_events.push(event(
+                DIVIDEND_PAID,
+                &action,
+                Some(&participant),
+                at,
+                payload,
+            ));
+        }
+        action.done_at = Some(at);
+        for e in &mut new_events {
+            e.payload["status"] = serde_json::json!("DONE");
+        }
+        let count = new_events.len();
+        self.commit_action(&action, &[], new_events)?;
+        Ok(count)
+    }
+
+    /// Applies a split (SR-38): resting orders scaled in quantity and price, keeping time priority (one left with
+    /// nothing is cancelled), the reference price following, and one `SplitApplied` per participant with holdings or
+    /// resting orders in the instrument, listing its adjusted orders.
+    fn apply_split(
+        &mut self,
+        mut action: crate::corporate_actions::CorporateAction,
+    ) -> Result<usize, ExchangeError> {
+        use crate::corporate_actions::{
+            SPLIT_APPLIED, event, holdings, split_price, split_quantity,
+        };
+        let at = action.due_at();
+        let Some(book) = self.books.get(&action.instrument_id) else {
+            return Ok(0);
+        };
+        let instrument = book.instrument().clone();
+        let effective = action
+            .effective_date
+            .expect("a split has an effective date");
+        let mut adjusted = Vec::new();
+        let mut changes: std::collections::BTreeMap<ParticipantId, Vec<serde_json::Value>> =
+            Default::default();
+        for order in book.orders() {
+            let mut next = order.clone();
+            next.remaining_quantity = split_quantity(order.remaining_quantity, action.ratio);
+            next.quantity = order.quantity - order.remaining_quantity + next.remaining_quantity;
+            next.limit_price_ticks = order
+                .limit_price_ticks
+                .map(|p| split_price(p, action.ratio));
+            if next.remaining_quantity == 0 {
+                next.status = OrderStatus::Cancelled;
+            }
+            changes
+                .entry(order.participant_id.clone())
+                .or_default()
+                .push(serde_json::json!({
+                    "orderId": order.id,
+                    "clientOrderId": order.client_order_id,
+                    "side": order.side,
+                    "status": next.status,
+                    "previousQuantity": order.quantity,
+                    "quantity": next.quantity,
+                    "previousRemainingQuantity": order.remaining_quantity,
+                    "remainingQuantity": next.remaining_quantity,
+                    "previousPriceTicks": order.limit_price_ticks,
+                    "priceTicks": next.limit_price_ticks,
+                    "previousPrice": order.limit_price_ticks.map(|t| instrument.ticks_to_price(t)),
+                    "price": next.limit_price_ticks.map(|t| instrument.ticks_to_price(t)),
+                }));
+            adjusted.push(next);
+        }
+        // Holdings settled before the effective date, before and after the split.
+        let before = holdings(
+            &self.store.positions(&action.instrument_id)?,
+            effective.pred_opt().expect("date in range"),
+            &self.applied_splits(&action.instrument_id)?,
+        );
+        let participants: std::collections::BTreeSet<ParticipantId> = before
+            .iter()
+            .filter(|(_, q)| **q != 0)
+            .map(|(p, _)| p.clone())
+            .chain(changes.keys().cloned())
+            .collect();
+        action.done_at = Some(at);
+        let mut new_events = Vec::new();
+        for participant in participants {
+            let held = before.get(&participant).copied().unwrap_or(0);
+            let after = i64::try_from(
+                i128::from(held) * i128::from(action.ratio.0) / i128::from(action.ratio.1),
+            )
+            .unwrap_or(i64::MAX);
+            let mut payload = action.view(&instrument);
+            payload["participantId"] = serde_json::json!(participant);
+            payload["quantityBefore"] = serde_json::json!(held);
+            payload["quantityAfter"] = serde_json::json!(after);
+            payload["orders"] =
+                serde_json::json!(changes.get(&participant).cloned().unwrap_or_default());
+            new_events.push(event(
+                SPLIT_APPLIED,
+                &action,
+                Some(&participant),
+                at,
+                payload,
+            ));
+        }
+        let count = new_events.len();
+        self.commit_action(&action, &adjusted, new_events)?;
+        self.books
+            .get_mut(&action.instrument_id)
+            .expect("checked above")
+            .replace_resting(adjusted);
+        self.prices.apply_split(&action.instrument_id, action.ratio);
+        self.maintain_liquidity(Some(&action.instrument_id))?;
+        self.publish_market_data(Some(&action.instrument_id));
+        Ok(count)
+    }
+
+    /// Stamps and commits a corporate action's events with the action and the orders it changed.
+    fn commit_action(
+        &mut self,
+        action: &crate::corporate_actions::CorporateAction,
+        orders: &[Order],
+        mut new_events: Vec<NewEvent>,
+    ) -> Result<(), ExchangeError> {
+        let next = NewEvent::stamp(&mut new_events, self.next_event_sequence, self.ids);
+        let outbox = Outbox {
+            subscriptions: self.webhooks.subscriptions(),
+            simulation_id: self.simulation_id.as_deref(),
+            ids: self.ids,
+            due: wall_now(),
+            schema_version: events::SCHEMA_VERSION,
+            parties: self.webhooks.parties(),
+        };
+        self.store
+            .commit_corporate_action(action, orders, &new_events, outbox)?;
+        self.next_event_sequence = next;
+        for event in &new_events {
+            ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type)
+                .increment(1);
+        }
+        self.wake_delivery(&new_events);
+        Ok(())
     }
 
     /// Wakes the delivery worker if any of `events` has a subscriber.

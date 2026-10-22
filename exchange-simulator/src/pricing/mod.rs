@@ -253,6 +253,9 @@ pub struct PriceSources {
     live: Option<LiveSource>,
     /// `None` without a replay file: `replay` sources are then refused.
     replay: Option<std::sync::Arc<replay::Replay>>,
+    /// The splits applied per instrument (SR-38), as one `new:old`: published prices of sources that are not live are
+    /// divided by it. A live feed's prices already reflect a real split.
+    splits: HashMap<InstrumentId, (u64, u64)>,
 }
 
 impl PriceSources {
@@ -266,7 +269,25 @@ impl PriceSources {
             active: HashMap::new(),
             live: None,
             replay: None,
+            splits: HashMap::new(),
         })
+    }
+
+    /// Records a split `new:old` of the instrument (SR-38): its published prices follow, unless its source is live.
+    pub fn apply_split(&mut self, id: &InstrumentId, (new, old): (u64, u64)) {
+        let factor = self.splits.entry(id.clone()).or_insert((1, 1));
+        *factor = (factor.0 * new, factor.1 * old);
+    }
+
+    /// `reference` scaled by the instrument's splits.
+    fn split(&self, id: &InstrumentId, reference: Option<Reference>) -> Option<Reference> {
+        match (reference, self.splits.get(id)) {
+            (Some(mut reference), Some(&ratio)) if reference.kind != PriceSourceKind::Finnhub => {
+                reference.ticks = crate::corporate_actions::split_price(reference.ticks, ratio);
+                Some(reference)
+            }
+            (reference, _) => reference,
+        }
     }
 
     /// These sources with `replay` prices from `replay`.
@@ -370,7 +391,8 @@ impl PriceSources {
     /// `None` for an unknown instrument or a `none` source.
     pub fn reference(&mut self, id: &InstrumentId, now: DateTime<Utc>) -> Option<Reference> {
         let (live, replay) = (self.live.clone(), self.replay.clone());
-        read(self.active.get_mut(id)?, live, replay, now, true)
+        let reference = read(self.active.get_mut(id)?, live, replay, now, true);
+        self.split(id, reference)
     }
 
     /// The instrument's reference price at `at`, which may be in the past, without moving the source: a synthetic
@@ -391,18 +413,20 @@ impl PriceSources {
             *step = 0;
         }
         // A copy: nothing it adopts is recorded.
-        read(
+        let reference = read(
             &mut active,
             self.live.clone(),
             self.replay.clone(),
             at,
             false,
-        )
+        );
+        self.split(id, reference)
     }
 
     /// Forgets every source (after a reset).
     pub fn clear(&mut self) {
         self.active.clear();
+        self.splits.clear();
         self.sync_wanted();
     }
 

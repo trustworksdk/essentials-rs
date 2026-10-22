@@ -6,6 +6,7 @@ pub mod api;
 pub mod app;
 pub mod clearing;
 pub mod config;
+pub mod corporate_actions;
 pub mod domain;
 pub mod engine;
 pub mod events;

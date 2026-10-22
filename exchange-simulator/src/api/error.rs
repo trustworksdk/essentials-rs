@@ -51,7 +51,10 @@ impl From<ExchangeError> for ApiError {
             E::ExternalOutcomesDisabled => (StatusCode::CONFLICT, "external_outcomes_disabled"),
             E::UnknownExecution(_) => (StatusCode::NOT_FOUND, "not_found"),
             E::ExecutionBusted(_) => (StatusCode::CONFLICT, "execution_busted"),
-            E::InvalidCorrection(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
+            E::InvalidCorrection(_) | E::InvalidCorporateAction(_) => {
+                (StatusCode::BAD_REQUEST, "invalid_request")
+            }
+            E::DuplicateCorporateAction(_) => (StatusCode::CONFLICT, "already_exists"),
             E::InvalidReport(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             E::ReportConflict { .. } => (StatusCode::CONFLICT, "report_conflict"),
             E::Clock(ClockError::Speed(_)) => (StatusCode::BAD_REQUEST, "invalid_clock_speed"),

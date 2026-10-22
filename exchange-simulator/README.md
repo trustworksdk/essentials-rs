@@ -543,6 +543,26 @@ Each side of an execution pays the exchange a fee (SR-37), configured under `fee
   from the cash settled: `cashNet` and the settlement amount do not include them.
 - A correction reprices both fees (`TradeCorrected` carries the new ones); a busted execution pays none.
 
+### Corporate actions: `POST /api/corporate-actions` and `GET /api/corporate-actions`
+
+Cash dividends and splits (SR-38), announced by an operator or under `corporate_actions:` in the configuration
+(announced once, at startup). Each announcement emits `CorporateActionAnnounced`; the same instrument, kind and pay or
+effective date is announced once (`409`). `GET` lists every action with its `status`, `ANNOUNCED` or `DONE`.
+- **Holdings are contractual:** a participant's net quantity over its executions that are not busted and settle
+  (`intendedSettlementDate`) on or before the date in question, in every settlement mode, scaled by earlier splits.
+- **Cash dividend** `{"kind": "CASH_DIVIDEND", "instrumentId": "ACME", "exDate": "2030-01-08", "recordDate":
+  "2030-01-09", "payDate": "2030-01-11", "amountPerShare": "0.50"}`: at 00:00 UTC on the pay date, one `DividendPaid`
+  per participant holding a positive quantity at the record date, with `quantity`, `amount` and `amountMinor`
+  (quantity × amount per share). `amountPerShare` has at most the currency's decimals.
+- **Split** `{"kind": "SPLIT", "instrumentId": "ACME", "ratio": "2:1", "effectiveDate": "2030-01-09"}` (`new:old`): at
+  00:00 UTC on the effective date, resting orders keep their time priority with their remainder × new / old (rounded
+  down; one left with nothing is cancelled) and their limit price × old / new (to the nearest tick, at least one). The
+  reference price of a source that is not live follows, also after a restart; a live feed already reflects a real
+  split. One `SplitApplied` per participant with holdings or resting orders: `quantityBefore` (settled before the
+  effective date), `quantityAfter`, and `orders`, each adjusted order before and after.
+- Corporate-action events carry `participantId` where they concern one participant, so webhook participant filters
+  apply. Settlement instructions and trades already made are not adjusted.
+
 ### `GET /health`
 
 `{"status": "ok", "schemaVersion": <n>, "persistence": "<mode>"}` (`schemaVersion` is the number of the last applied
@@ -580,6 +600,8 @@ Event types and payloads (`schemaVersion` 1):
 | `TradeExecuted` | execution | `executionId`, `instrumentId`, `instrument` {`id`, `symbol`, `mic`, `isin`, `cusip`, `currency`}, `buyOrderId`, `sellOrderId`, `buyerId`, `sellerId`, `buyerSettlement`, `sellerSettlement` (each party's settlement details at execution time, or `null`), `priceTicks`, `price`, `quantity`, `currency`, `currencyScale`, `tickSizeMinor`, `executedAt`, `tradeDate`, `intendedSettlementDate`, `buyerFee` and `sellerFee` (see Fees) |
 | `OrderPartiallyFilled` / `OrderFilled` | order | order after the execution, with the execution it reports: `executionId` (FIX `ExecID`, as on `TradeExecuted`), `lastQuantity` (`LastQty`), `lastPriceTicks` and `lastPrice` (`LastPx`), `lastFee` (the order's side's fee, `Commission`), `tradeDate` and `intendedSettlementDate`. One per execution for each side: an incoming order that trades against several resting orders gets one per execution, in execution order, with its running totals after that execution |
 | `OrderCancelled` | order | order with `cancelReason`: `REQUESTED`, `MARKET_REMAINDER` or `IOC_REMAINDER` |
+| `CorporateActionAnnounced` | corporate action | the action as `GET /api/corporate-actions` shows it (see Corporate actions) |
+| `DividendPaid` / `SplitApplied` | corporate action | the action, `participantId`, and the payment or the adjustment (see Corporate actions); correlation ID the participant |
 | `TradeCorrected` | execution | `executionId`, the orders and parties, `previousQuantity`, `quantity`, `previousPriceTicks`, `priceTicks`, `previousPrice`, `price`, `currency`, `reason`, `tradeDate`, `intendedSettlementDate` |
 | `TradeBusted` | execution | `executionId`, the orders and parties, the busted `quantity`, `priceTicks` and `price`, `currency`, `reason`, `tradeDate`, `intendedSettlementDate` |
 | `OrderFillCorrected` / `OrderFillBusted` | order | order after the change, with the execution's `executionId`, `lastQuantity`, `lastPriceTicks`, `lastPrice` (corrected, or busted) and `reason`; a correction also `previousLastQuantity`, `previousLastPriceTicks`, `previousLastPrice`. Correlation ID the execution |

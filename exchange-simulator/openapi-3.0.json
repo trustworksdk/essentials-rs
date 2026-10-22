@@ -95,6 +95,24 @@
           }
         }
       },
+      "CorporateActionAnnouncedEvent": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CorporateActionAnnouncedEvent"
+            }
+          }
+        }
+      },
+      "DividendPaidEvent": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/DividendPaidEvent"
+            }
+          }
+        }
+      },
       "InstrumentListedEvent": {
         "content": {
           "application/json": {
@@ -253,6 +271,15 @@
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/SettlementRejectedEvent"
+            }
+          }
+        }
+      },
+      "SplitAppliedEvent": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/SplitAppliedEvent"
             }
           }
         }
@@ -1019,6 +1046,188 @@
           }
         }
       },
+      "CorporateAction": {
+        "additionalProperties": false,
+        "properties": {
+          "amountPerShare": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "amountPerShareMinor": {
+            "type": "integer"
+          },
+          "announcedAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "corporateActionId": {
+            "description": "`CA:<instrument>:<kind>:<payDate or effectiveDate>`",
+            "type": "string"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "effectiveDate": {
+            "$ref": "#/components/schemas/Date"
+          },
+          "exDate": {
+            "$ref": "#/components/schemas/Date"
+          },
+          "instrumentId": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "CASH_DIVIDEND",
+              "SPLIT"
+            ],
+            "type": "string"
+          },
+          "payDate": {
+            "$ref": "#/components/schemas/Date"
+          },
+          "ratio": {
+            "type": "string"
+          },
+          "recordDate": {
+            "$ref": "#/components/schemas/Date"
+          },
+          "status": {
+            "enum": [
+              "ANNOUNCED",
+              "DONE"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "corporateActionId",
+          "kind",
+          "instrumentId",
+          "announcedAt",
+          "status"
+        ],
+        "type": "object"
+      },
+      "CorporateActionAnnouncedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/EventEnvelope"
+          }
+        ],
+        "description": "Aggregate ID the action; no correlation ID.",
+        "properties": {
+          "eventType": {
+            "enum": [
+              "CorporateActionAnnounced"
+            ],
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/CorporateAction"
+          },
+          "source": {
+            "enum": [
+              "exchange"
+            ],
+            "type": "string"
+          }
+        }
+      },
+      "CorporateActionFields": {
+        "description": "The action as announced, on its paid and applied events.",
+        "properties": {
+          "amountPerShare": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "amountPerShareMinor": {
+            "type": "integer"
+          },
+          "announcedAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "corporateActionId": {
+            "type": "string"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "effectiveDate": {
+            "$ref": "#/components/schemas/Date"
+          },
+          "exDate": {
+            "$ref": "#/components/schemas/Date"
+          },
+          "instrumentId": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "CASH_DIVIDEND",
+              "SPLIT"
+            ],
+            "type": "string"
+          },
+          "payDate": {
+            "$ref": "#/components/schemas/Date"
+          },
+          "ratio": {
+            "type": "string"
+          },
+          "recordDate": {
+            "$ref": "#/components/schemas/Date"
+          },
+          "status": {
+            "enum": [
+              "ANNOUNCED",
+              "DONE"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "CorporateActionRequest": {
+        "additionalProperties": false,
+        "description": "A cash dividend takes `exDate` ≤ `recordDate` ≤ `payDate` and `amountPerShare` (at most the currency's decimals); a split takes `ratio` (`new:old`, not 1:1) and `effectiveDate`.",
+        "properties": {
+          "amountPerShare": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "effectiveDate": {
+            "$ref": "#/components/schemas/Date"
+          },
+          "exDate": {
+            "$ref": "#/components/schemas/Date"
+          },
+          "instrumentId": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "CASH_DIVIDEND",
+              "SPLIT"
+            ],
+            "type": "string"
+          },
+          "payDate": {
+            "$ref": "#/components/schemas/Date"
+          },
+          "ratio": {
+            "examples": [
+              "2:1"
+            ],
+            "pattern": "^[0-9]+:[0-9]+$",
+            "type": "string"
+          },
+          "recordDate": {
+            "$ref": "#/components/schemas/Date"
+          }
+        },
+        "required": [
+          "kind",
+          "instrumentId"
+        ],
+        "type": "object"
+      },
       "Date": {
         "format": "date",
         "type": "string"
@@ -1087,6 +1296,61 @@
           "DEAD"
         ],
         "type": "string"
+      },
+      "DividendPaidEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/EventEnvelope"
+          }
+        ],
+        "description": "Aggregate ID the action, correlation ID the participant; `occurredAt` 00:00 UTC on the pay date.",
+        "properties": {
+          "eventType": {
+            "enum": [
+              "DividendPaid"
+            ],
+            "type": "string"
+          },
+          "payload": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CorporateActionFields"
+              }
+            ],
+            "properties": {
+              "amount": {
+                "$ref": "#/components/schemas/Amount"
+              },
+              "amountMinor": {
+                "type": "integer"
+              },
+              "participantId": {
+                "type": "string"
+              },
+              "quantity": {
+                "description": "Holdings at the record date.",
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "participantId",
+              "quantity",
+              "amount",
+              "amountMinor",
+              "recordDate",
+              "payDate",
+              "amountPerShare",
+              "currency"
+            ]
+          },
+          "source": {
+            "enum": [
+              "exchange"
+            ],
+            "type": "string"
+          }
+        }
       },
       "Error": {
         "additionalProperties": false,
@@ -1172,6 +1436,9 @@
           "TradeBusted",
           "OrderFillCorrected",
           "OrderFillBusted",
+          "CorporateActionAnnounced",
+          "DividendPaid",
+          "SplitApplied",
           "InstrumentListed",
           "InstrumentUpdated",
           "ClockChanged",
@@ -3891,6 +4158,121 @@
         ],
         "type": "string"
       },
+      "SplitAppliedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/EventEnvelope"
+          }
+        ],
+        "description": "Aggregate ID the action, correlation ID the participant; `occurredAt` 00:00 UTC on the effective date.",
+        "properties": {
+          "eventType": {
+            "enum": [
+              "SplitApplied"
+            ],
+            "type": "string"
+          },
+          "payload": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CorporateActionFields"
+              }
+            ],
+            "properties": {
+              "orders": {
+                "description": "The participant's resting orders as the split adjusted them.",
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "clientOrderId": {
+                      "nullable": true,
+                      "type": "string"
+                    },
+                    "orderId": {
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "previousPrice": {
+                      "nullable": true,
+                      "type": "string"
+                    },
+                    "previousPriceTicks": {
+                      "nullable": true,
+                      "type": "integer"
+                    },
+                    "previousQuantity": {
+                      "type": "integer"
+                    },
+                    "previousRemainingQuantity": {
+                      "type": "integer"
+                    },
+                    "price": {
+                      "nullable": true,
+                      "type": "string"
+                    },
+                    "priceTicks": {
+                      "nullable": true,
+                      "type": "integer"
+                    },
+                    "quantity": {
+                      "type": "integer"
+                    },
+                    "remainingQuantity": {
+                      "type": "integer"
+                    },
+                    "side": {
+                      "$ref": "#/components/schemas/Side"
+                    },
+                    "status": {
+                      "$ref": "#/components/schemas/OrderStatus"
+                    }
+                  },
+                  "required": [
+                    "orderId",
+                    "clientOrderId",
+                    "side",
+                    "status",
+                    "previousQuantity",
+                    "quantity",
+                    "previousRemainingQuantity",
+                    "remainingQuantity",
+                    "previousPriceTicks",
+                    "priceTicks",
+                    "previousPrice",
+                    "price"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "participantId": {
+                "type": "string"
+              },
+              "quantityAfter": {
+                "type": "integer"
+              },
+              "quantityBefore": {
+                "description": "Holdings settled before the effective date.",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "participantId",
+              "quantityBefore",
+              "quantityAfter",
+              "orders",
+              "ratio",
+              "effectiveDate"
+            ]
+          },
+          "source": {
+            "enum": [
+              "exchange"
+            ],
+            "type": "string"
+          }
+        }
+      },
       "Subscription": {
         "allOf": [
           {
@@ -4818,6 +5200,69 @@
         "summary": "Change how fast the virtual clock runs",
         "tags": [
           "clock"
+        ]
+      }
+    },
+    "/api/corporate-actions": {
+      "get": {
+        "operationId": "listCorporateActions",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/CorporateAction"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Corporate actions."
+          }
+        },
+        "summary": "Every corporate action, announced or done, in due order",
+        "tags": [
+          "corporate-actions"
+        ]
+      },
+      "post": {
+        "description": "SR-38. A cash dividend is paid at 00:00 UTC on its pay date, one `DividendPaid` per participant holding a positive quantity at the record date: its non-busted executions settling on or before then, net. A split `new:old` applies at 00:00 UTC on its effective date: resting orders' remainders × new / old (rounded down; one left with nothing is cancelled), their limit prices × old / new (to the nearest tick), the reference price of a source that is not live likewise, and one `SplitApplied` per participant with holdings or resting orders. The same action (instrument, kind, pay or effective date) is announced once (`409`).",
+        "operationId": "announceCorporateAction",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CorporateActionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CorporateAction"
+                }
+              }
+            },
+            "description": "Announced."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          }
+        },
+        "summary": "Announce a cash dividend or a split",
+        "tags": [
+          "corporate-actions"
         ]
       }
     },
@@ -6866,6 +7311,10 @@
     {
       "description": "The business-day calendar, as reference data.",
       "name": "calendar"
+    },
+    {
+      "description": "Cash dividends and splits (SR-38).",
+      "name": "corporate-actions"
     },
     {
       "description": "Simulated time, readable always; speed, freeze and resume with `clock.operator_control`.",

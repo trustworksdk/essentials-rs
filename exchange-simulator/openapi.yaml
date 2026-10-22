@@ -40,6 +40,8 @@ tags:
     description: End-of-day clearing statements.
   - name: calendar
     description: The business-day calendar, as reference data.
+  - name: corporate-actions
+    description: Cash dividends and splits (SR-38).
   - name: clock
     description: Simulated time, readable always; speed, freeze and resume with `clock.operator_control`.
   - name: webhooks
@@ -481,6 +483,45 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/corporate-actions:
+    get:
+      tags: [corporate-actions]
+      operationId: listCorporateActions
+      summary: Every corporate action, announced or done, in due order
+      responses:
+        "200":
+          description: Corporate actions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CorporateAction" }
+    post:
+      tags: [corporate-actions]
+      operationId: announceCorporateAction
+      summary: Announce a cash dividend or a split
+      description: >-
+        SR-38. A cash dividend is paid at 00:00 UTC on its pay date, one `DividendPaid` per participant holding a
+        positive quantity at the record date: its non-busted executions settling on or before then, net. A split
+        `new:old` applies at 00:00 UTC on its effective date: resting orders' remainders × new / old (rounded down;
+        one left with nothing is cancelled), their limit prices × old / new (to the nearest tick), the reference price
+        of a source that is not live likewise, and one `SplitApplied` per participant with holdings or resting orders.
+        The same action (instrument, kind, pay or effective date) is announced once (`409`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CorporateActionRequest" }
+      responses:
+        "201":
+          description: Announced.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CorporateAction" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
 
   /api/events:
     get:
@@ -1134,6 +1175,24 @@ webhooks:
       operationId: onOrderExpired
       requestBody: { $ref: "#/components/requestBodies/OrderExpiredEvent" }
       responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
+  CorporateActionAnnounced:
+    post:
+      summary: A cash dividend or a split was announced (SR-38)
+      operationId: onCorporateActionAnnounced
+      requestBody: { $ref: "#/components/requestBodies/CorporateActionAnnouncedEvent" }
+      responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
+  DividendPaid:
+    post:
+      summary: A participant was paid a cash dividend on its holdings at the record date (SR-38)
+      operationId: onDividendPaid
+      requestBody: { $ref: "#/components/requestBodies/DividendPaidEvent" }
+      responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
+  SplitApplied:
+    post:
+      summary: A split was applied to a participant's holdings and resting orders (SR-38)
+      operationId: onSplitApplied
+      requestBody: { $ref: "#/components/requestBodies/SplitAppliedEvent" }
+      responses: { "2XX": { $ref: "#/components/responses/WebhookAck" } }
   TradeCorrected:
     post:
       summary: An execution's price or quantity was corrected (SR-36)
@@ -1333,6 +1392,12 @@ components:
       content: { application/json: { schema: { $ref: "#/components/schemas/TradeExecutedEvent" } } }
     TradeCorrectedEvent:
       content: { application/json: { schema: { $ref: "#/components/schemas/TradeCorrectedEvent" } } }
+    CorporateActionAnnouncedEvent:
+      content: { application/json: { schema: { $ref: "#/components/schemas/CorporateActionAnnouncedEvent" } } }
+    DividendPaidEvent:
+      content: { application/json: { schema: { $ref: "#/components/schemas/DividendPaidEvent" } } }
+    SplitAppliedEvent:
+      content: { application/json: { schema: { $ref: "#/components/schemas/SplitAppliedEvent" } } }
     TradeBustedEvent:
       content: { application/json: { schema: { $ref: "#/components/schemas/TradeBustedEvent" } } }
     OrderFillCorrectedEvent:
@@ -2098,7 +2163,8 @@ components:
 
     EventType:
       enum: [OrderAccepted, OrderRejected, OrderPartiallyFilled, OrderFilled, OrderCancelled, OrderExpired, TradeExecuted,
-             TradeCorrected, TradeBusted, OrderFillCorrected, OrderFillBusted,
+             TradeCorrected, TradeBusted, OrderFillCorrected, OrderFillBusted, CorporateActionAnnounced, DividendPaid,
+             SplitApplied,
              InstrumentListed, InstrumentUpdated, ClockChanged, BusinessDayClosed, ClosingPriceIssued, SettlementPending, SettlementCompleted, SettlementFailed, SettlementRejected, SettlementDelayed,
              SettlementCorrected, SettlementCancelled, SettlementOutcomeReported, ClearingStatementIssued]
     EventEnvelope:
@@ -2311,6 +2377,115 @@ components:
         eventType: { const: TradeExecuted }
         source: { const: exchange }
         payload: { $ref: "#/components/schemas/TradeExecutedPayload" }
+    CorporateActionRequest:
+      type: object
+      additionalProperties: false
+      required: [kind, instrumentId]
+      description: >-
+        A cash dividend takes `exDate` ≤ `recordDate` ≤ `payDate` and `amountPerShare` (at most the currency's
+        decimals); a split takes `ratio` (`new:old`, not 1:1) and `effectiveDate`.
+      properties:
+        kind: { enum: [CASH_DIVIDEND, SPLIT] }
+        instrumentId: { type: string }
+        exDate: { $ref: "#/components/schemas/Date" }
+        recordDate: { $ref: "#/components/schemas/Date" }
+        payDate: { $ref: "#/components/schemas/Date" }
+        amountPerShare: { $ref: "#/components/schemas/Amount" }
+        ratio: { type: string, pattern: "^[0-9]+:[0-9]+$", examples: ["2:1"] }
+        effectiveDate: { $ref: "#/components/schemas/Date" }
+    CorporateAction:
+      type: object
+      additionalProperties: false
+      required: [corporateActionId, kind, instrumentId, announcedAt, status]
+      properties:
+        corporateActionId: { type: string, description: "`CA:<instrument>:<kind>:<payDate or effectiveDate>`" }
+        kind: { enum: [CASH_DIVIDEND, SPLIT] }
+        instrumentId: { type: string }
+        announcedAt: { $ref: "#/components/schemas/Timestamp" }
+        status: { enum: [ANNOUNCED, DONE] }
+        exDate: { $ref: "#/components/schemas/Date" }
+        recordDate: { $ref: "#/components/schemas/Date" }
+        payDate: { $ref: "#/components/schemas/Date" }
+        amountPerShare: { $ref: "#/components/schemas/Amount" }
+        amountPerShareMinor: { type: integer }
+        currency: { type: string }
+        ratio: { type: string }
+        effectiveDate: { $ref: "#/components/schemas/Date" }
+    CorporateActionAnnouncedEvent:
+      allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
+      description: Aggregate ID the action; no correlation ID.
+      properties:
+        eventType: { const: CorporateActionAnnounced }
+        source: { const: exchange }
+        payload: { $ref: "#/components/schemas/CorporateAction" }
+    DividendPaidEvent:
+      allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
+      description: Aggregate ID the action, correlation ID the participant; `occurredAt` 00:00 UTC on the pay date.
+      properties:
+        eventType: { const: DividendPaid }
+        source: { const: exchange }
+        payload:
+          allOf: [{ $ref: "#/components/schemas/CorporateActionFields" }]
+          required: [participantId, quantity, amount, amountMinor, recordDate, payDate, amountPerShare, currency]
+          properties:
+            participantId: { type: string }
+            quantity: { type: integer, minimum: 1, description: Holdings at the record date. }
+            amount: { $ref: "#/components/schemas/Amount" }
+            amountMinor: { type: integer }
+          unevaluatedProperties: false
+    SplitAppliedEvent:
+      allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
+      description: >-
+        Aggregate ID the action, correlation ID the participant; `occurredAt` 00:00 UTC on the effective date.
+      properties:
+        eventType: { const: SplitApplied }
+        source: { const: exchange }
+        payload:
+          allOf: [{ $ref: "#/components/schemas/CorporateActionFields" }]
+          required: [participantId, quantityBefore, quantityAfter, orders, ratio, effectiveDate]
+          properties:
+            participantId: { type: string }
+            quantityBefore: { type: integer, description: Holdings settled before the effective date. }
+            quantityAfter: { type: integer }
+            orders:
+              type: array
+              description: The participant's resting orders as the split adjusted them.
+              items:
+                type: object
+                additionalProperties: false
+                required: [orderId, clientOrderId, side, status, previousQuantity, quantity, previousRemainingQuantity,
+                           remainingQuantity, previousPriceTicks, priceTicks, previousPrice, price]
+                properties:
+                  orderId: { type: string, format: uuid }
+                  clientOrderId: { type: [string, "null"] }
+                  side: { $ref: "#/components/schemas/Side" }
+                  status: { $ref: "#/components/schemas/OrderStatus" }
+                  previousQuantity: { type: integer }
+                  quantity: { type: integer }
+                  previousRemainingQuantity: { type: integer }
+                  remainingQuantity: { type: integer }
+                  previousPriceTicks: { type: [integer, "null"] }
+                  priceTicks: { type: [integer, "null"] }
+                  previousPrice: { type: [string, "null"] }
+                  price: { type: [string, "null"] }
+          unevaluatedProperties: false
+    CorporateActionFields:
+      type: object
+      description: The action as announced, on its paid and applied events.
+      properties:
+        corporateActionId: { type: string }
+        kind: { enum: [CASH_DIVIDEND, SPLIT] }
+        instrumentId: { type: string }
+        announcedAt: { $ref: "#/components/schemas/Timestamp" }
+        status: { enum: [ANNOUNCED, DONE] }
+        exDate: { $ref: "#/components/schemas/Date" }
+        recordDate: { $ref: "#/components/schemas/Date" }
+        payDate: { $ref: "#/components/schemas/Date" }
+        amountPerShare: { $ref: "#/components/schemas/Amount" }
+        amountPerShareMinor: { type: integer }
+        currency: { type: string }
+        ratio: { type: string }
+        effectiveDate: { $ref: "#/components/schemas/Date" }
     TradeCorrectedEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
       description: Aggregate and correlation ID the execution.

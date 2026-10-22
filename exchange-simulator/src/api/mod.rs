@@ -114,6 +114,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/trades", get(list_trades))
         .route("/api/trades/{execution_id}/correction", post(correct_trade))
         .route("/api/trades/{execution_id}/bust", post(bust_trade))
+        .route(
+            "/api/corporate-actions",
+            get(list_corporate_actions).post(announce_corporate_action),
+        )
         .route("/api/events", get(list_events))
         .route("/api/calendar", get(calendar))
         .with_state(state.clone())
@@ -469,6 +473,29 @@ async fn adjust_trade(
             .map(|o| OrderView::new(o, &adjusted.instrument))
             .collect(),
     }))
+}
+
+/// Announces a corporate action (SR-38): a cash dividend or a split, paid or applied when due.
+async fn announce_corporate_action(
+    State(state): State<AppState>,
+    body: Result<Json<crate::corporate_actions::ActionSpec>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let Json(spec) = body?;
+    let (action, instrument) = state.dispatcher.announce_corporate_action(spec).await?;
+    Ok((StatusCode::CREATED, Json(action.view(&instrument))))
+}
+
+/// Every corporate action, announced, paid or applied, in due order.
+async fn list_corporate_actions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let actions = state.dispatcher.corporate_actions().await?;
+    Ok(Json(
+        actions
+            .iter()
+            .map(|(action, instrument)| action.view(instrument))
+            .collect(),
+    ))
 }
 
 async fn list_trades(

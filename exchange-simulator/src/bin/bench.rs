@@ -701,6 +701,7 @@ impl Service {
             clearing: Default::default(),
             trades: Default::default(),
             fees: Default::default(),
+            corporate_actions: Vec::new(),
             test_control: TestControlConfig::default(),
             logging: LoggingConfig {
                 filter: "warn".into(),

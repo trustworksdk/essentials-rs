@@ -1608,7 +1608,7 @@ it.
 | 6.23 | Corporate actions | after 5 | L | **SR-38 (LATER)**, implemented 2026-10-22 at the user's request. Cash dividends (`CorporateActionAnnounced`, `DividendPaid` from settled shares at the record date) and splits (`SplitApplied`, resting orders and the reference price adjusted), from configuration or an operator call. |
 
 **Not planned:** SR-18 (FX reference rates) is marked LATER and waits for the demo's FX phase. SR-36 to SR-38 are
-LATER too: planned as 6.21–6.23 at the user's request (2026-10-22), not implemented.
+LATER too, but were done as 6.21–6.23 at the user's request (2026-10-22).
 
 **Order within the milestone:** by demo phase, as in the table: 6.1–6.3, then 6.4–6.5, then 6.6, then 6.7–6.10
 (6.7 and 6.8 before 6.9, so the provider and the feed are tested on synthetic prices before a live source is added),
@@ -2444,6 +2444,41 @@ then 6.11, 6.12, 6.13–6.14.
 - **Mutation checks**, each made a test fail (all 6): no minimum; nobody exempt; maker and taker swapped for the
   buyer; `lastFee` from the other side; `feesNet` not summed; a correction keeping the old fees.
 
+**6.23 — corporate actions ✅ done (2026-10-22)**
+- **User decision (2026-10-22):** holdings are contractual: a participant's net quantity over its executions that are
+  not busted and settle on or before the date in question, the same in every settlement mode.
+- **Delivered:**
+  - `crate::corporate_actions` (SR-38): `ActionSpec` (configuration and API), `CorporateAction` validated and keyed
+    `CA:<instrument>:<kind>:<date>`, `holdings` (scaled by splits applied after each execution, without losing a
+    fraction between splits), `split_price` (to the nearest tick, at least one) and `split_quantity` (rounded down).
+  - Stored in `corporate_actions` (migration 022) with `Store::commit_corporate_action`; `POST`/`GET
+    /api/corporate-actions`; `corporate_actions:` in the configuration, announced once at startup and after a reset.
+  - The tick pays a dividend at 00:00 UTC on its pay date (`DividendPaid` per positive holding at the record date) and
+    applies a split at 00:00 UTC on its effective date: resting orders scaled and rebuilt in time priority
+    (`OrderBook::replace_resting`), one left with nothing cancelled; `PriceSources::apply_split` scales published prices
+    of sources that are not live, restored at startup from the applied splits; the provider re-quotes; `SplitApplied`
+    per participant with holdings or resting orders, listing its adjusted orders.
+  - `openapi.yaml` (two operations, `CorporateAction`, three events and webhooks), the README, the default
+    configuration.
+  - Tests: `tests/corporate_actions.rs` (SR-38's acceptance: a dividend on 100 settled shares paid as 100 × the amount,
+    a holder settling after the record date and a short seller paid nothing; a 2:1 split doubling a resting order and
+    halving its price, the book, the reference price across a restart, `SplitApplied`; the `400`, `409` and `422`;
+    configured actions announced once across a restart), the module's unit tests; the contract test announces, pays
+    and applies them.
+- **Decisions:**
+  - **Due at 00:00 UTC** on the pay or effective date, as settlement is: before that day's trading.
+  - **`SplitApplied` lists the participant's adjusted orders** so a member that tracks orders by events sees the
+    change; there is no separate order event.
+  - **Not adjusted:** trades already made, settlement instructions, market data prints and closing prices before the
+    split.
+  - **Deviation:** the contract test found nothing wrong with a `$ref` to a missing response component until a call
+    exercised it; the operation now uses the existing `Unprocessable`.
+- **Gates:** fmt, clippy (`-D warnings`, after naming `AppliedSplit` for a complex type), doc, `cargo test -j 1 -p
+  exchange-simulator` (45 targets) green.
+- **Mutation checks**, each made a test fail (all 8): holdings ignoring the settlement date; short holders paid; the
+  amount not per share; prices not split; the reference not split when applied, and not after a restart; configured
+  actions announced at every start; the book not rebuilt.
+
 ### Milestone 6 status
 
 All steps of the milestone are done (6.1–6.14 with 6.9a, 2026-10-18 to 2026-10-20). Not planned: SR-18 (FX, LATER).
@@ -2451,7 +2486,7 @@ SR-30 (cancel by client order id) was added on 2026-10-21 and done as step 6.15 
 SR-31 (the execution on every fill event) and SR-32 (the business day on `OrderExpired`) were added on 2026-10-22
 and done as steps 6.16 and 6.17 the same day.
 SR-33 to SR-35 (value dates, multi-type event reads, holidays) were added on 2026-10-22 and done as steps 6.18–6.20
-the same day; SR-36 to SR-38 (LATER) are planned as 6.21–6.23.
+the same day; SR-36 to SR-38 (LATER) were done as 6.21–6.23 at the user's request, also on 2026-10-22.
 Still on hold from Milestone 4: 4.6d (the containerized benchmark).
 
 **SR-2 manual acceptance against the real Finnhub ✅ done (2026-10-20, D19).** `config/finnhub-market.yaml` (40

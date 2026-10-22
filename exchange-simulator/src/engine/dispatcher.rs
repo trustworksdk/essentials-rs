@@ -105,6 +105,21 @@ enum Request {
         String,
         Reply<super::TradeAdjusted>,
     ),
+    AnnounceCorporateAction(
+        crate::corporate_actions::ActionSpec,
+        Reply<(
+            crate::corporate_actions::CorporateAction,
+            crate::domain::Instrument,
+        )>,
+    ),
+    CorporateActions(
+        Reply<
+            Vec<(
+                crate::corporate_actions::CorporateAction,
+                crate::domain::Instrument,
+            )>,
+        >,
+    ),
     ChangeClock(ClockChange, Reply<ClockState>),
     ClaimDeliveries(u32, std::time::Duration, Reply<Vec<DeliveryJob>>),
     RecordDeliveries(Vec<DeliveryResult>, Reply<()>),
@@ -135,6 +150,8 @@ impl Request {
             Self::Tick(..) => "tick",
             Self::ReportSettlement(..) => "report_settlement",
             Self::AdjustTrade(..) => "adjust_trade",
+            Self::AnnounceCorporateAction(..) => "announce_corporate_action",
+            Self::CorporateActions(..) => "corporate_actions",
             Self::ChangeClock(..) => "change_clock",
             Self::ClaimDeliveries(..) => "claim_deliveries",
             Self::RecordDeliveries(..) => "record_deliveries",
@@ -290,6 +307,34 @@ impl Dispatcher {
     ) -> Result<super::TradeAdjusted, DispatchError> {
         self.call(|reply| Request::AdjustTrade(id, change, reason, reply))
             .await
+    }
+
+    /// Announces a corporate action (see [`Exchange::announce_corporate_action`]).
+    pub async fn announce_corporate_action(
+        &self,
+        spec: crate::corporate_actions::ActionSpec,
+    ) -> Result<
+        (
+            crate::corporate_actions::CorporateAction,
+            crate::domain::Instrument,
+        ),
+        DispatchError,
+    > {
+        self.call(|reply| Request::AnnounceCorporateAction(spec, reply))
+            .await
+    }
+
+    /// Every corporate action, with its instrument.
+    pub async fn corporate_actions(
+        &self,
+    ) -> Result<
+        Vec<(
+            crate::corporate_actions::CorporateAction,
+            crate::domain::Instrument,
+        )>,
+        DispatchError,
+    > {
+        self.call(Request::CorporateActions).await
     }
 
     /// Changes one instrument's liquidity (see [`Exchange::patch_liquidity`]).
@@ -593,6 +638,18 @@ fn handle(exchange: &mut Exchange, request: Request) -> &'static str {
         Request::AdjustTrade(id, change, reason, reply) => {
             answer(reply, exchange.adjust_trade(id, change, &reason))
         }
+        Request::AnnounceCorporateAction(spec, reply) => {
+            let result = exchange.announce_corporate_action(&spec).map(|action| {
+                let instrument = exchange
+                    .book(&action.instrument_id)
+                    .expect("announced on a listed instrument")
+                    .instrument()
+                    .clone();
+                (action, instrument)
+            });
+            answer(reply, result)
+        }
+        Request::CorporateActions(reply) => answer(reply, exchange.corporate_actions()),
         Request::ClockState(reply) => {
             let _ = reply.send(exchange.clock_state());
             "ok"
