@@ -337,7 +337,7 @@ async fn the_clock_reset_and_health_behave_as_in_the_exchange() {
     let (_, health) = app.get("/health").await;
     assert_eq!(
         health,
-        json!({ "status": "ok", "schemaVersion": 4, "persistence": "durable" })
+        json!({ "status": "ok", "schemaVersion": 5, "persistence": "durable" })
     );
     let (_, clock) = app.get("/test/clock").await;
     assert_eq!(

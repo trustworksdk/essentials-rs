@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Exchange simulator API
-  version: 0.3.0
+  version: 0.4.0
   summary: A stock exchange simulator with price-time matching, settlement and clearing simulation, and signed webhooks.
   description: |
     Commands are answered after they are committed to SQLite. Field names are camelCase, enums use their upper-case

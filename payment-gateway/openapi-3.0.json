@@ -348,6 +348,14 @@
           }
         }
       },
+      "Booked": {
+        "description": "A payment event that books a movement carries the booking's value date.",
+        "properties": {
+          "valueDate": {
+            "$ref": "#/components/schemas/Date"
+          }
+        }
+      },
       "BookingKind": {
         "enum": [
           "DEPOSIT",
@@ -807,6 +815,9 @@
             "allOf": [
               {
                 "$ref": "#/components/schemas/PaymentFields"
+              },
+              {
+                "$ref": "#/components/schemas/Booked"
               }
             ]
           },
@@ -907,6 +918,12 @@
           },
           "updatedAt": {
             "$ref": "#/components/schemas/Timestamp"
+          },
+          "valueDate": {
+            "description": "The value date of the latest booking: the completion's, then the return's. The business date the booking falls in, and the date of the bank statement that lists it. `null` until the payment completes.",
+            "format": "date",
+            "nullable": true,
+            "type": "string"
           }
         },
         "required": [
@@ -927,6 +944,7 @@
           "completedAt",
           "failedAt",
           "returnedAt",
+          "valueDate",
           "updatedAt"
         ],
         "type": "object"
@@ -1024,6 +1042,9 @@
             "allOf": [
               {
                 "$ref": "#/components/schemas/PaymentFields"
+              },
+              {
+                "$ref": "#/components/schemas/Booked"
               }
             ]
           },
@@ -1443,7 +1464,7 @@
       "name": "Apache-2.0"
     },
     "title": "Payment gateway simulator API",
-    "version": "0.3.0"
+    "version": "0.4.0"
   },
   "openapi": "3.0.3",
   "paths": {

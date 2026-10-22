@@ -205,6 +205,7 @@ impl Gateway {
             outbox::save_virtual_clock(&conn, virtual_clock.now(), virtual_clock.is_running())?;
             clock = Box::new(virtual_clock.clone());
         }
+        store::date_undated_payments(&conn, &options.payments.calendar)?;
         let open = store::open_payments(&conn)?;
         let mut gateway = Self {
             last_payment: store::last_payment_sequence(&conn)?,
@@ -329,6 +330,7 @@ impl Gateway {
             completed_at: None,
             failed_at: None,
             returned_at: None,
+            value_date: None,
             updated_at: now,
             forced: None,
         };

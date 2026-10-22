@@ -1600,8 +1600,15 @@ it.
 | 6.15 | Cancel by client order id | 3 | S | **SR-30** (added to the requirements 2026-10-21, after the milestone was done). `DELETE /api/orders?participantId=…&clientOrderId=…`: the order is resolved inside the exchange thread (where submission's idempotency check resolves it), then cancelled exactly as `DELETE /api/orders/{id}` cancels it: the same `OrderResult`, the same `OrderCancelled`, `409 order_not_active` for a second cancel, `404` for an unknown `clientOrderId` within the participant. Both query parameters are required (`400` otherwise), since client order ids are unique per participant only. `openapi.yaml` gains the operation. |
 | 6.16 | The execution on every fill event | 3 | S | **SR-31** (added to the requirements 2026-10-22). `OrderPartiallyFilled` and `OrderFilled` name the execution they report for both sides: `executionId` (now always present), `lastQuantity`, `lastPriceTicks` and `lastPrice`. An incoming order that trades against several resting orders gets one fill event per execution, in execution order, each with its running totals after that execution. The event `schemaVersion` stays 1 (additive); the API documents go to 0.3.0. |
 | 6.17 | The business day on `OrderExpired` | 3 | S | **SR-32** (added to the requirements 2026-10-22, done on the 6.16 branch at the user's request). `OrderExpired` carries `businessDate`: the business day whose end expired the order, the date `BusinessDayClosed` names for that cutoff, or on a market with a session the session's date. Decided when the expiry is scheduled, from the same calendar. |
+| 6.18 | Value dates on payments | 2 | S | **SR-33** (added to the requirements 2026-10-22). `valueDate` on the gateway's payment payload: the business date of the latest booking (the completion's, then the return's) on the bank's calendar, set when the payment completes or is returned, stored with it, and equal to the statement entry's. `null` before a booking; required on `PaymentCompleted` and `PaymentReturned`. Payments stored before the column are dated at startup. |
+| 6.19 | Event-log reads by several types | 6 | S | **SR-34.** `eventType` repeated or comma-separated on both services' `GET /api/events` (an unknown type stays `400`), and an `Event-Log-Scanned-Through` header on every answer: the highest sequence the read looked at, so a filtered reader continues from there. |
+| 6.20 | Holidays, one calendar for both simulators | 4 | L | **SR-35.** Holidays on the shared business-day calendar (`simulator_kit::calendar`): `clearing.holidays` on the exchange (no `BusinessDayClosed`, clearing statement or `ClosingPriceIssued` on a holiday; trade and settlement dates skip it), `sessions.<MIC>.holidays` defaulting to them, `GET /api/calendar?from=&to=`. The gateway's `calendar.mode: follow` reads the exchange's calendar for its statements, value dates and return delays; `own` keeps today's. |
+| 6.21 | Trade corrections and busts | after 5 | L | **SR-36 (LATER), planned only.** `TradeCorrected`/`TradeBusted`, `OrderFillCorrected`/`OrderFillBusted` with the order's new running totals and the execution's SR-31 fields; settlement follows; operator calls and seeded probabilities. |
+| 6.22 | Exchange fees | after 5 | M | **SR-37 (LATER), planned only.** Maker/taker basis points with a minimum, per participant (the provider may be exempt); fees on `TradeExecuted`, the fill events (`lastFee`), the order result and the clearing statement (`feesNet`). |
+| 6.23 | Corporate actions | after 5 | L | **SR-38 (LATER), planned only.** Cash dividends (`CorporateActionAnnounced`, `DividendPaid` from settled shares at the record date) and splits (`SplitApplied`, resting orders and the reference price adjusted), from configuration or an operator call. |
 
-**Not planned:** SR-18 (FX reference rates) is marked LATER and waits for the demo's FX phase.
+**Not planned:** SR-18 (FX reference rates) is marked LATER and waits for the demo's FX phase. SR-36 to SR-38 are
+LATER too: planned as 6.21–6.23 at the user's request (2026-10-22), not implemented.
 
 **Order within the milestone:** by demo phase, as in the table: 6.1–6.3, then 6.4–6.5, then 6.6, then 6.7–6.10
 (6.7 and 6.8 before 6.9, so the provider and the feed are tested on synthetic prices before a live source is added),
@@ -2268,6 +2275,28 @@ then 6.11, 6.12, 6.13–6.14.
 - **Mutation checks**, each made a test fail (all 5): the session's date taken in UTC; the cutoff's date taken from
   the expiry instant on the calendar; the cutoff's UTC date; `businessDate` left out; the event dated by the close's
   UTC date (survived the first test set, where every close fell on the same UTC date, hence the Los Angeles cutoff).
+
+**6.18 — value dates on payments ✅ done (2026-10-22)**
+- **Delivered:**
+  - `valueDate` on the gateway's payment payload (SR-33): `PaymentPolicy` holds the bank's business-day calendar
+    (`Config::business_calendar`, `statement.cutoff` in `statement.time_zone`, now built whether or not statements
+    run), and a completion or return sets `Payment::value_date` to the business date of its booking. Stored in
+    `payments.value_date` (migration 005, `/health` `schemaVersion` 5); `store::date_undated_payments` dates the
+    completed and returned payments stored before it at startup.
+  - `openapi.yaml`: `valueDate` on `PaymentFields` (nullable, always present), a date on `PaymentCompleted` and
+    `PaymentReturned` (`Booked`). The gateway README, the back-office guide.
+  - Tests: `tests/statements.rs` `completed_and_returned_payments_carry_their_bookings_value_dates` (SR-33's
+    acceptance: completed after Tuesday's cutoff, valued Wednesday as its Wednesday statement entry; the return
+    valued Thursday as its entry; `GET /api/payments` and `/{id}` show the latest) and
+    `payments_stored_before_they_carried_value_dates_are_dated_at_startup`.
+- **Decisions:**
+  - **Stored, not derived when shown:** a later calendar change (SR-35's follow mode, a configuration edit) must not
+    move a value date away from the statement entry already drafted for it.
+  - **The API documents go to 0.4.0** for this branch (6.18–6.20): 0.3.0 is on `main` and installed locally.
+- **Gates:** fmt, clippy (`-D warnings`), doc, `cargo test -j 1 -p payment-gateway` (all 8 targets) green; the
+  exchange's `tests/openapi.rs` green after its rendition was rewritten for 0.4.0 (its code is unchanged).
+- **Mutation checks**, each made a test fail (all 4): the completion left undated; the return keeping the
+  completion's date; the completion dated by its UTC date; no dating at startup.
 
 ### Milestone 6 status
 

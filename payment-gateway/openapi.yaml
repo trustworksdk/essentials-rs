@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Payment gateway simulator API
-  version: 0.3.0
+  version: 0.4.0
   summary: Deposits and withdrawals with seeded outcomes, signed webhooks, and end-of-day bank statements.
   description: |
     The payment provider and bank for the trading demo. Amounts are decimal strings in major currency units on the
@@ -807,7 +807,8 @@ components:
     PaymentFields:
       type: object
       required: [paymentId, sequence, idempotencyKey, type, accountId, bankAccount, amount, amountMinor, currency,
-                 currencyScale, reference, status, reason, createdAt, completedAt, failedAt, returnedAt, updatedAt]
+                 currencyScale, reference, status, reason, createdAt, completedAt, failedAt, returnedAt, valueDate,
+                 updatedAt]
       properties:
         paymentId: { type: string, format: uuid }
         sequence: { type: integer, minimum: 1 }
@@ -828,7 +829,17 @@ components:
         completedAt: { $ref: "#/components/schemas/NullableTimestamp" }
         failedAt: { $ref: "#/components/schemas/NullableTimestamp" }
         returnedAt: { $ref: "#/components/schemas/NullableTimestamp" }
+        valueDate:
+          type: [string, "null"]
+          format: date
+          description: >-
+            The value date of the latest booking: the completion's, then the return's. The business date the booking
+            falls in, and the date of the bank statement that lists it. `null` until the payment completes.
         updatedAt: { $ref: "#/components/schemas/Timestamp" }
+    Booked:
+      description: A payment event that books a movement carries the booking's value date.
+      properties:
+        valueDate: { $ref: "#/components/schemas/Date" }
     Payment:
       allOf: [{ $ref: "#/components/schemas/PaymentFields" }]
       properties:
@@ -911,7 +922,9 @@ components:
       properties:
         eventType: { const: PaymentCompleted }
         source: { const: payment-gateway }
-        payload: { allOf: [{ $ref: "#/components/schemas/PaymentFields" }], unevaluatedProperties: false }
+        payload:
+          allOf: [{ $ref: "#/components/schemas/PaymentFields" }, { $ref: "#/components/schemas/Booked" }]
+          unevaluatedProperties: false
     PaymentFailedEvent:
       allOf: [{ $ref: "#/components/schemas/EventEnvelope" }]
       properties:
@@ -923,7 +936,9 @@ components:
       properties:
         eventType: { const: PaymentReturned }
         source: { const: payment-gateway }
-        payload: { allOf: [{ $ref: "#/components/schemas/PaymentFields" }], unevaluatedProperties: false }
+        payload:
+          allOf: [{ $ref: "#/components/schemas/PaymentFields" }, { $ref: "#/components/schemas/Booked" }]
+          unevaluatedProperties: false
     ClockChangedPayload:
       type: object
       additionalProperties: false

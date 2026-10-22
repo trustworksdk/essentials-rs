@@ -81,7 +81,12 @@ when the database does not answer.
 
 A payment carries `paymentId`, `sequence`, `idempotencyKey`, `type`, `accountId`, `bankAccount`, `amount`,
 `amountMinor`, `currency`, `currencyScale`, `reference`, `status`, `reason`, `createdAt`, `completedAt`,
-`failedAt`, `returnedAt` and `updatedAt`.
+`failedAt`, `returnedAt`, `valueDate` and `updatedAt`.
+
+`valueDate` is the value date of the payment's latest booking: the business day the completion falls in on the bank's
+calendar (`statement.cutoff` in `statement.time_zone`, on weekdays), then the return's. It is the date of the bank
+statement that lists the booking, and the entry there carries the same `valueDate`, whether or not statements are
+enabled. It is `null` until the payment completes, and always set on `PaymentCompleted` and `PaymentReturned`.
 
 ### `GET /api/payments/{id}` and `GET /api/payments?accountId=&status=&after=&limit=`
 

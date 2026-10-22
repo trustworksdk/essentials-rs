@@ -250,3 +250,81 @@ async fn statements_can_be_turned_off_and_a_reset_starts_them_again() {
     );
     app.stop().await;
 }
+
+/// SR-33: a completed or returned payment carries the value date of its booking, the date of the statement entry
+/// that lists it, on the event and on `GET /api/payments`.
+#[tokio::test]
+async fn completed_and_returned_payments_carry_their_bookings_value_dates() {
+    let mut app = TestApp::start().await;
+    app.set_clock("2030-01-08T17:31:00Z").await; // Tuesday, past the 17:30 cutoff.
+    let deposit = app.pay("d-1", "DEPOSIT", "100.00", "DKK").await;
+    assert_eq!(deposit["valueDate"], Value::Null, "nothing booked yet");
+    let id = deposit["paymentId"].as_str().unwrap();
+    let (status, body) = app
+        .post(
+            &format!("/test/payments/{id}/outcome"),
+            json!({ "outcome": "RETURNED", "returnAfterSeconds": 86_400 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    app.set_clock("2030-01-11T18:00:00Z").await;
+
+    let entry_date = |date: &str, kind: &str| {
+        let date = date.to_string();
+        let kind = kind.to_string();
+        let app = &app;
+        async move {
+            let day = statements(app, &format!("?date={date}")).await;
+            let entries: Vec<Value> = day
+                .iter()
+                .flat_map(|s| s["entries"].as_array().unwrap().clone())
+                .filter(|e| e["kind"] == kind.as_str())
+                .collect();
+            assert_eq!(entries.len(), 1, "{kind} on {date}'s statement: {day:?}");
+            entries[0]["valueDate"].clone()
+        }
+    };
+    let completed = &app.events("PaymentCompleted").await[0]["payload"];
+    assert_eq!(
+        completed["valueDate"], "2030-01-09",
+        "completed after Tuesday's cutoff"
+    );
+    assert_eq!(
+        completed["valueDate"],
+        entry_date("2030-01-09", "DEPOSIT").await
+    );
+    let returned = &app.events("PaymentReturned").await[0]["payload"];
+    assert_eq!(
+        returned["valueDate"], "2030-01-10",
+        "returned after Wednesday's cutoff"
+    );
+    assert_eq!(
+        returned["valueDate"],
+        entry_date("2030-01-10", "DEPOSIT_RETURN").await
+    );
+    let (_, payment) = app.get(&format!("/api/payments/{id}")).await;
+    assert_eq!(payment["valueDate"], "2030-01-10", "the latest booking's");
+    let (_, listed) = app.get("/api/payments").await;
+    assert_eq!(listed[0]["valueDate"], "2030-01-10");
+    app.stop().await;
+}
+
+/// Payments completed before payments carried value dates are dated at the next startup, on the current calendar.
+#[tokio::test]
+async fn payments_stored_before_they_carried_value_dates_are_dated_at_startup() {
+    let mut app = TestApp::start().await;
+    app.set_clock("2030-01-08T17:31:00Z").await;
+    let deposit = app.pay("d-1", "DEPOSIT", "100.00", "DKK").await;
+    app.set_clock("2030-01-08T23:00:00Z").await;
+    app.db()
+        .execute("UPDATE payments SET value_date = NULL", [])
+        .unwrap();
+    app.restart().await;
+    let id = deposit["paymentId"].as_str().unwrap();
+    let (_, payment) = app.get(&format!("/api/payments/{id}")).await;
+    assert_eq!(
+        (&payment["status"], &payment["valueDate"]),
+        (&json!("COMPLETED"), &json!("2030-01-09"))
+    );
+    app.stop().await;
+}

@@ -178,9 +178,16 @@ impl Config {
             withdrawal: p.withdrawal.clone(),
             return_probability: p.return_probability,
             max_return_days: p.max_return_days,
+            calendar: self.business_calendar()?,
         };
         policy.validate()?;
         Ok(policy)
+    }
+
+    /// The bank's business-day calendar: `statement.cutoff` in `statement.time_zone`, whether or not statements run.
+    pub fn business_calendar(&self) -> Result<CutoffCalendar, String> {
+        CutoffCalendar::parse(&self.statement.cutoff, &self.statement.time_zone)
+            .map_err(|e| format!("statement.{e}"))
     }
 
     /// The statement's policy when statements are enabled, validated.
@@ -189,8 +196,7 @@ impl Config {
         if !s.enabled {
             return Ok(None);
         }
-        let calendar =
-            CutoffCalendar::parse(&s.cutoff, &s.time_zone).map_err(|e| format!("statement.{e}"))?;
+        let calendar = self.business_calendar()?;
         crate::iban::validate(&s.account_iban)
             .map_err(|e| format!("statement.account_iban: {e}"))?;
         let currencies = self.currencies()?;
