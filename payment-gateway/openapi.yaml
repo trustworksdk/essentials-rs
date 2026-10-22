@@ -148,10 +148,25 @@ paths:
       parameters:
         - { name: after, in: query, description: Events with a sequence greater than this; default 0., schema: { type: integer, minimum: 0 } }
         - { $ref: "#/components/parameters/Limit" }
-        - { name: eventType, in: query, schema: { $ref: "#/components/schemas/EventType" } }
+        - name: eventType
+          in: query
+          description: >-
+            The event types to return; every type when absent. Repeat the parameter (`eventType=A&eventType=B`) or
+            separate types by commas (`eventType=A,B`). An unknown type is a `400`.
+          style: form
+          explode: true
+          schema: { type: array, items: { $ref: "#/components/schemas/EventType" } }
       responses:
         "200":
           description: Events.
+          headers:
+            Event-Log-Scanned-Through:
+              description: >-
+                The highest sequence the read looked at; continue with `after` set to it. A filtered read can return
+                few or no events from a long stretch of the log, and this spares scanning that stretch again: it is the
+                last returned event's sequence when the page is full, else the log's head when the read began.
+              required: true
+              schema: { type: integer, minimum: 0 }
           content:
             application/json:
               schema:

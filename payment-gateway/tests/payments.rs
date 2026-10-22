@@ -476,3 +476,53 @@ async fn webhook_participant_filters_are_refused() {
     );
     app.stop().await;
 }
+
+/// SR-34 on the gateway: several event types, repeated or comma-separated, and the scanned-through header.
+#[tokio::test]
+async fn events_are_read_by_several_types_with_how_far_the_read_looked() {
+    let mut app = TestApp::start().await;
+    app.pay("d-1", "DEPOSIT", "100.00", "DKK").await;
+    app.pay("w-1", "WITHDRAWAL", "50.00", "DKK").await;
+    app.set_clock("2030-01-07T15:00:00Z").await;
+    let all = app.all_events().await;
+    let read = async |query: &str| {
+        let (status, headers, body) = app
+            .call_full(Method::GET, &format!("/api/events?{query}"), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        let scanned: u64 = headers["event-log-scanned-through"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let sequences: Vec<u64> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["sequence"].as_u64().unwrap())
+            .collect();
+        (sequences, scanned)
+    };
+    let head = all.last().unwrap()["sequence"].as_u64().unwrap();
+    let expected: Vec<u64> = all
+        .iter()
+        .filter(|e| e["eventType"] == "PaymentPending" || e["eventType"] == "PaymentCompleted")
+        .map(|e| e["sequence"].as_u64().unwrap())
+        .collect();
+    assert_eq!(expected.len(), 4);
+    assert_eq!(
+        read("eventType=PaymentPending&eventType=PaymentCompleted").await,
+        (expected.clone(), head)
+    );
+    assert_eq!(
+        read("eventType=PaymentPending,PaymentCompleted").await,
+        (expected, head)
+    );
+    assert_eq!(
+        read("eventType=PaymentFailed&after=1").await,
+        (vec![], head)
+    );
+    let (status, _) = app.get("/api/events?eventType=PaymentPending,Nope").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    app.stop().await;
+}

@@ -136,6 +136,17 @@ impl TestApp {
         uri: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        let (status, _, body) = self.call_full(method, uri, body).await;
+        (status, body)
+    }
+
+    /// [`Self::call`] with the response headers.
+    pub async fn call_full(
+        &self,
+        method: Method,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
         let request = Request::builder().method(method).uri(uri);
         let request = match body {
             Some(body) => request
@@ -154,13 +165,14 @@ impl TestApp {
             .await
             .unwrap();
         let status = response.status();
+        let headers = response.headers().clone();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body = if bytes.is_empty() {
             Value::Null
         } else {
             serde_json::from_slice(&bytes).unwrap()
         };
-        (status, body)
+        (status, headers, body)
     }
 
     pub async fn get(&self, uri: &str) -> (StatusCode, Value) {

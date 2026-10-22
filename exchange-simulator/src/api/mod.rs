@@ -13,12 +13,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde_json::{Value, json};
+use simulator_kit::api::events::EventRead;
 use uuid::Uuid;
 
 pub use error::ApiError;
@@ -26,7 +27,6 @@ pub use model::*;
 
 use crate::domain::{Instrument, InstrumentChange, InstrumentId, Participant};
 use crate::engine::{CancelTarget, DispatchError, Dispatcher, ExchangeError, SubmitOutcome};
-use crate::events::EventEnvelope;
 use crate::persistence::{ExecutionFilter, InstrumentFilter, PersistenceMode, Store};
 
 /// Shared handler state.
@@ -442,22 +442,17 @@ async fn list_trades(
     ))
 }
 
-/// Cursor-based replay of canonical events: those with `sequence > after`, in sequence order.
+/// Cursor-based replay of canonical events: those with `sequence > after` of the requested types, in sequence order,
+/// with how far the read looked (SR-34).
 async fn list_events(
     State(state): State<AppState>,
-    query: Result<Query<EventQuery>, QueryRejection>,
-) -> Result<Json<Vec<EventEnvelope>>, ApiError> {
-    let Query(q) = query?;
-    let limit = q.limit.unwrap_or(100);
-    if !(1..=1000).contains(&limit) {
-        return Err(ApiError::bad_request("limit must be between 1 and 1000"));
-    }
-    let after = q.after.unwrap_or(0);
-    Ok(Json(
-        state
-            .read(move |store| store.events(after, limit, q.event_type.as_deref()))
-            .await?,
-    ))
+    RawQuery(query): RawQuery,
+) -> Result<axum::response::Response, ApiError> {
+    let read = EventRead::parse(query.as_deref(), crate::events::EVENT_TYPES)?;
+    let page = state
+        .read(move |store| store.read_events(read.after, read.limit, read.event_types.as_deref()))
+        .await?;
+    Ok(simulator_kit::api::events::response(page))
 }
 
 /// Prometheus text exposition. The outbox gauges are refreshed from SQLite on each scrape.

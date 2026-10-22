@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -14,6 +14,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use simulator_kit::api::ApiError;
+use simulator_kit::api::events::EventRead;
 use simulator_kit::api::webhooks::WebhookBackend;
 use simulator_kit::clock::ClockError;
 use simulator_kit::outbox;
@@ -356,25 +357,18 @@ async fn list_payments(
     Ok(Json(payments.iter().map(payment_view).collect()))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct EventQuery {
-    #[serde(default)]
-    after: u64,
-    limit: Option<u32>,
-    event_type: Option<String>,
-}
-
+/// Events with `sequence > after` of the requested types, in sequence order, with how far the read looked (SR-34).
 async fn events(
     State(state): State<AppState>,
-    query: Result<Query<EventQuery>, QueryRejection>,
-) -> Result<Json<Vec<simulator_kit::events::EventEnvelope>>, ApiError> {
-    let Query(query) = query?;
-    let limit = limit(query.limit)?;
-    let events = state
-        .read(move |conn| outbox::events(conn, query.after, limit, query.event_type.as_deref()))
+    RawQuery(query): RawQuery,
+) -> Result<axum::response::Response, ApiError> {
+    let read = EventRead::parse(query.as_deref(), crate::gateway::EVENT_TYPES)?;
+    let page = state
+        .read(move |conn| {
+            outbox::read_events(conn, read.after, read.limit, read.event_types.as_deref())
+        })
         .await?;
-    Ok(Json(events))
+    Ok(simulator_kit::api::events::response(page))
 }
 
 #[derive(Debug, Deserialize)]

@@ -1591,11 +1591,17 @@
             "$ref": "#/components/parameters/Limit"
           },
           {
+            "description": "The event types to return; every type when absent. Repeat the parameter (`eventType=A&eventType=B`) or separate types by commas (`eventType=A,B`). An unknown type is a `400`.",
+            "explode": true,
             "in": "query",
             "name": "eventType",
             "schema": {
-              "$ref": "#/components/schemas/EventType"
-            }
+              "items": {
+                "$ref": "#/components/schemas/EventType"
+              },
+              "type": "array"
+            },
+            "style": "form"
           }
         ],
         "responses": {
@@ -1610,7 +1616,17 @@
                 }
               }
             },
-            "description": "Events."
+            "description": "Events.",
+            "headers": {
+              "Event-Log-Scanned-Through": {
+                "description": "The highest sequence the read looked at; continue with `after` set to it. A filtered read can return few or no events from a long stretch of the log, and this spares scanning that stretch again: it is the last returned event's sequence when the page is full, else the log's head when the read began.",
+                "required": true,
+                "schema": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"

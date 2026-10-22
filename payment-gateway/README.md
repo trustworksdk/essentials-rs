@@ -109,7 +109,9 @@ by sequence; `limit` is 1–1000, default 100.
 
 Every event is in the canonical envelope the exchange simulator uses (`eventId`, `sequence`, `eventType`,
 `schemaVersion`, `source`, `simulationId`, `aggregateId`, `correlationId`, `occurredAt`, `payload`), replayable from
-`GET /api/events?after=&limit=&eventType=` and delivered to webhooks.
+`GET /api/events?after=&limit=&eventType=` and delivered to webhooks. As on the exchange, `eventType` takes several
+types (repeated or comma-separated) and every answer carries `Event-Log-Scanned-Through`, the sequence to continue
+from.
 
 | Event | Source | Aggregate / correlation ID | Payload |
 |---|---|---|---|

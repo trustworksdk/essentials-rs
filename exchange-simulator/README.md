@@ -511,7 +511,15 @@ This API's OpenAPI 3.1 specification ([`openapi.yaml`](openapi.yaml)), as `appli
 ### `GET /api/events?after=&limit=&eventType=`
 
 Canonical events with `sequence > after` (default 0), in sequence order. `limit` is 1–1000 (default 100). To replay
-everything, pass the last `sequence` you received as `after` until the result is empty. Envelope:
+everything, pass the last `sequence` you received as `after` until the result is empty.
+
+`eventType` keeps only the listed types: repeat it (`eventType=TradeExecuted&eventType=OrderFilled`) or separate types
+by commas (`eventType=TradeExecuted,OrderFilled`). An unknown type is `400`. Every answer carries
+`Event-Log-Scanned-Through: <sequence>`, the highest sequence the read looked at: the last returned event's when the
+page is full, otherwise the log's head when the read began. A filtered read can return few or no events from a long
+stretch of the log, so continue from this header (`after=<scanned-through>`) rather than from the last event you
+received, and you never scan that stretch again. Without a filter it equals the last returned event's sequence, or the
+head when none is returned. Envelope:
 
 ```json
 { "eventId": "0199…", "sequence": 3, "eventType": "TradeExecuted", "schemaVersion": 1, "source": "exchange",

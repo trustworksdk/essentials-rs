@@ -2298,6 +2298,35 @@ then 6.11, 6.12, 6.13–6.14.
 - **Mutation checks**, each made a test fail (all 4): the completion left undated; the return keeping the
   completion's date; the completion dated by its UTC date; no dating at startup.
 
+**6.19 — event-log reads by several types ✅ done (2026-10-22)**
+- **Delivered:**
+  - `simulator_kit::api::events` (SR-34): `EventRead::parse` reads `after`, `limit` and `eventType` from the raw query,
+    `eventType` repeated or comma-separated (`form_urlencoded`, already in the tree through `url`; axum's `Query`
+    cannot collect repeated keys), each type checked against the service's `EVENT_TYPES`; `response` adds the
+    `Event-Log-Scanned-Through` header. `outbox::read_events` returns an `EventPage` with `scanned_through`. Both
+    services' `GET /api/events` use them; the exchange's `EventQuery` is gone.
+  - `scanned_through` is the last returned event's sequence when the page is full, else the log's head when the read
+    began (or `after`, if further). Without a filter that is the last returned event's sequence, or the head when none
+    is returned, as SR-34 says.
+  - Both `openapi.yaml`: `eventType` an array (`style: form`, `explode: true`, commas described), the header on `200`.
+    Both READMEs, the webhook receivers guide.
+  - Tests: `tests/event_reads.rs` (SR-34's acceptance on the exchange: two types in sequence order, repeated, comma
+    and encoded-comma forms; a read past the last match returns none with the header at the head; a full page; an
+    unfiltered empty read; unknown types `400`), the gateway's
+    `events_are_read_by_several_types_with_how_far_the_read_looked`, and the parser's unit tests in the kit.
+- **Decisions:**
+  - **The head is read before the page and bounds it.** Read after, an event committed between the two queries would
+    lie below the reported head but outside the page, and a reader continuing from the header would skip it.
+  - **No index on `event_type`:** a filtered read walks the log by sequence. An index would add a write to every event
+    on the exchange's hot path and a migration in both services; with the header, a reader scans each stretch once.
+  - **Deviation:** SR-34 says an unknown type is a `400` "as today". It was not: an unknown type matched nothing and
+    answered `200 []`. It is a `400` now, as SR-34 asks. Unknown query parameters stay `400`.
+- **Gates:** fmt, clippy (`-D warnings`), doc for the kit, the gateway and the exchange; `cargo test -j 1` of the kit
+  (`--all-features`), the gateway (8 targets) and the exchange (41 targets) green.
+- **Mutation checks**, each made a test fail (all 5): scanned through the last returned event only; a full page
+  claiming the head; no comma separation; a repeated `eventType` replacing the earlier; unknown types accepted. The
+  head being read before the page is not mutation-checked: the race it closes cannot be staged deterministically.
+
 ### Milestone 6 status
 
 All steps of the milestone are done (6.1–6.14 with 6.9a, 2026-10-18 to 2026-10-20). Not planned: SR-18 (FX, LATER).
