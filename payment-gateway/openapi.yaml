@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Payment gateway simulator API
-  version: 0.5.0
+  version: 0.6.0
   summary: Deposits and withdrawals with seeded outcomes, signed webhooks, and end-of-day bank statements.
   description: |
     The payment provider and bank for the trading demo. Amounts are decimal strings in major currency units on the

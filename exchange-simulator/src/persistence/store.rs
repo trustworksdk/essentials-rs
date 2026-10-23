@@ -668,14 +668,14 @@ impl Store {
         outbox::events(&self.conn, after, limit, event_type)
     }
 
-    /// A page of events of the given types, and how far the read looked (SR-34).
+    /// A page of the events that pass `filter` (SR-34, SR-39), and how far the read looked.
     pub fn read_events(
         &self,
         after: u64,
         limit: u32,
-        event_types: Option<&[String]>,
+        filter: &outbox::EventFilter<'_>,
     ) -> rusqlite::Result<outbox::EventPage> {
-        outbox::read_events(&self.conn, after, limit, event_types)
+        outbox::read_events(&self.conn, after, limit, filter)
     }
 
     pub fn insert_subscription(&self, subscription: &Subscription) -> rusqlite::Result<()> {

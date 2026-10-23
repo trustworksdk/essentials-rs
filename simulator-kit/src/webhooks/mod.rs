@@ -159,11 +159,16 @@ impl Subscription {
     /// Whether its participant filter lets through an event involving `parties`: no filter, an event that involves
     /// no participant, or one of the listed participants among them.
     pub fn involves(&self, parties: &[String]) -> bool {
-        match &self.participants {
-            None => true,
-            Some(listed) => parties.is_empty() || parties.iter().any(|p| listed.contains(p)),
-        }
+        self.participants
+            .as_deref()
+            .is_none_or(|listed| involves(listed, parties))
     }
+}
+
+/// The participant filter's rule, for subscriptions and event-log reads (SR-39) alike: an event involving `parties`
+/// passes a filter listing `listed` when it involves no participant or one of the listed ones.
+pub fn involves(listed: &[String], parties: &[String]) -> bool {
+    parties.is_empty() || parties.iter().any(|p| listed.contains(p))
 }
 
 /// A claimed delivery: one event for one subscription.

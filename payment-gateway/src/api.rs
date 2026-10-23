@@ -357,15 +357,18 @@ async fn list_payments(
     Ok(Json(payments.iter().map(payment_view).collect()))
 }
 
-/// Events with `sequence > after` of the requested types, in sequence order, with how far the read looked (SR-34).
+/// Events with `sequence > after` of the requested types, in sequence order, with how far the read looked (SR-34). The
+/// gateway has no participants, so a `participant` filter is a `400` (SR-39).
 async fn events(
     State(state): State<AppState>,
     RawQuery(query): RawQuery,
 ) -> Result<axum::response::Response, ApiError> {
     let read = EventRead::parse(query.as_deref(), crate::gateway::EVENT_TYPES)?;
+    read.filter(None)?;
     let page = state
         .read(move |conn| {
-            outbox::read_events(conn, read.after, read.limit, read.event_types.as_deref())
+            let filter = read.filter(None).expect("checked above");
+            outbox::read_events(conn, read.after, read.limit, &filter)
         })
         .await?;
     Ok(simulator_kit::api::events::response(page))

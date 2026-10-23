@@ -582,15 +582,21 @@ async fn calendar(
     })))
 }
 
-/// Cursor-based replay of canonical events: those with `sequence > after` of the requested types, in sequence order,
-/// with how far the read looked (SR-34).
+/// Cursor-based replay of canonical events: those with `sequence > after` of the requested types and participants, in
+/// sequence order, with how far the read looked (SR-34, SR-39).
 async fn list_events(
     State(state): State<AppState>,
     RawQuery(query): RawQuery,
 ) -> Result<axum::response::Response, ApiError> {
     let read = EventRead::parse(query.as_deref(), crate::events::EVENT_TYPES)?;
+    read.filter(Some(crate::events::parties))?;
     let page = state
-        .read(move |store| store.read_events(read.after, read.limit, read.event_types.as_deref()))
+        .read(move |store| {
+            let filter = read
+                .filter(Some(crate::events::parties))
+                .expect("checked above");
+            store.read_events(read.after, read.limit, &filter)
+        })
         .await?;
     Ok(simulator_kit::api::events::response(page))
 }

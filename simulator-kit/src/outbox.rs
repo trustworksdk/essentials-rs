@@ -174,7 +174,11 @@ pub fn events(
     event_type: Option<&str>,
 ) -> rusqlite::Result<Vec<EventEnvelope>> {
     let types = event_type.map(|t| vec![t.to_string()]);
-    Ok(read_events(conn, after, limit, types.as_deref())?.events)
+    let filter = EventFilter {
+        event_types: types.as_deref(),
+        participants: None,
+    };
+    Ok(read_events(conn, after, limit, &filter)?.events)
 }
 
 /// One page of the event log, and how far the read looked (SR-34).
@@ -186,18 +190,37 @@ pub struct EventPage {
     pub scanned_through: u64,
 }
 
-/// Canonical events with `sequence > after`, in sequence order, of the given types (`None`: every type). The head is
-/// read first and the page is bounded by it, so an event committed during the read is neither returned nor skipped.
+/// Which events an event-log read returns.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EventFilter<'a> {
+    /// Events of these types (SR-34); `None`: every type.
+    pub event_types: Option<&'a [String]>,
+    /// Events involving one of these participants, found by the service's [`Parties`], plus events that involve none
+    /// (SR-39), as a subscription's participant filter; `None`: every participant's.
+    pub participants: Option<(&'a [String], Parties)>,
+}
+
+/// Canonical events with `sequence > after`, in sequence order, that pass `filter`. The head is read first and the
+/// page is bounded by it, so an event committed during the read is neither returned nor skipped.
 pub fn read_events(
     conn: &Connection,
     after: u64,
     limit: u32,
-    event_types: Option<&[String]>,
+    filter: &EventFilter<'_>,
 ) -> rusqlite::Result<EventPage> {
     let head = conn.query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |row| {
         from_sql(row, 0)
     })?;
-    let types = event_types.map(|t| serde_json::to_string(t).expect("strings serialize"));
+    let types = filter
+        .event_types
+        .map(|t| serde_json::to_string(t).expect("strings serialize"));
+    // The participants are found in Rust, so with them SQL cannot bound the page: the rows are read lazily and the
+    // read stops at the page's last event (-1: no limit in SQLite).
+    let sql_limit = if filter.participants.is_some() {
+        -1
+    } else {
+        i64::from(limit)
+    };
     let events: Vec<EventEnvelope> = conn
         .prepare_cached(&format!(
             "SELECT {EVENT_COLUMNS} FROM events e
@@ -205,9 +228,17 @@ pub fn read_events(
                    AND (?3 IS NULL OR e.event_type IN (SELECT value FROM json_each(?3)))
                  ORDER BY e.sequence LIMIT ?4"
         ))?
-        .query_map(params![to_sql(after), to_sql(head), types, limit], |row| {
-            event_row(row, 0)
-        })?
+        .query_map(
+            params![to_sql(after), to_sql(head), types, sql_limit],
+            |row| event_row(row, 0),
+        )?
+        .filter(|event| match (event, filter.participants) {
+            (Ok(event), Some((listed, parties))) => {
+                crate::webhooks::involves(listed, &parties(&event.event_type, &event.payload))
+            }
+            _ => true,
+        })
+        .take(limit as usize)
         .collect::<rusqlite::Result<_>>()?;
     let scanned_through = match events.last() {
         Some(last) if events.len() == limit as usize => last.sequence,
@@ -792,5 +823,107 @@ mod tests {
         assert!(schema.iter().all(|s| !s.contains("--")));
         assert_eq!(next_event_sequence(&conn).unwrap(), 1);
         assert!(subscriptions(&conn).unwrap().is_empty());
+    }
+
+    fn party(_event_type: &str, payload: &serde_json::Value) -> Vec<String> {
+        payload
+            .get("participantId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .into_iter()
+            .collect()
+    }
+
+    /// A log of seven events: participants A, B, none, B, B, A, B.
+    fn log() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let mut events: Vec<NewEvent> = [
+            Some("A"),
+            Some("B"),
+            None,
+            Some("B"),
+            Some("B"),
+            Some("A"),
+            Some("B"),
+        ]
+        .into_iter()
+        .map(|participant| NewEvent {
+            event_id: Uuid::nil(),
+            sequence: 0,
+            event_type: if participant.is_some() {
+                "Mine"
+            } else {
+                "Shared"
+            },
+            source: "test",
+            aggregate_id: "x".into(),
+            correlation_id: None,
+            occurred_at: DateTime::UNIX_EPOCH,
+            payload: participant.map_or(
+                serde_json::json!({}),
+                |p| serde_json::json!({ "participantId": p }),
+            ),
+        })
+        .collect();
+        NewEvent::stamp(&mut events, 1, IdScheme::Random);
+        let outbox = Outbox {
+            subscriptions: &[],
+            simulation_id: None,
+            ids: IdScheme::Random,
+            due: DateTime::UNIX_EPOCH,
+            schema_version: 1,
+            parties: None,
+        };
+        write_events(&conn, &events, &outbox).unwrap();
+        conn
+    }
+
+    fn read(conn: &Connection, after: u64, limit: u32, participants: &[&str]) -> (Vec<u64>, u64) {
+        let listed: Vec<String> = participants.iter().map(|p| p.to_string()).collect();
+        let filter = EventFilter {
+            event_types: None,
+            participants: Some((&listed, party)),
+        };
+        let page = read_events(conn, after, limit, &filter).unwrap();
+        (
+            page.events.iter().map(|e| e.sequence).collect(),
+            page.scanned_through,
+        )
+    }
+
+    #[test]
+    fn a_participant_filter_keeps_the_listed_and_the_uninvolved_and_bounds_the_page() {
+        let conn = log();
+        assert_eq!(
+            read(&conn, 0, 100, &["A"]),
+            (vec![1, 3, 6], 7),
+            "a short page: the head"
+        );
+        assert_eq!(read(&conn, 0, 100, &["A", "B"]), ((1..=7).collect(), 7));
+        assert_eq!(read(&conn, 0, 100, &["C"]), (vec![3], 7));
+        assert_eq!(
+            read(&conn, 0, 2, &["A"]),
+            (vec![1, 3], 3),
+            "a full page: its last event"
+        );
+        assert_eq!(
+            read(&conn, 3, 1, &["A"]),
+            (vec![6], 6),
+            "filtered events before the page are skipped"
+        );
+        assert_eq!(read(&conn, 6, 100, &["A"]), (vec![], 7));
+        let types = vec!["Mine".to_string()];
+        let filter = EventFilter {
+            event_types: Some(&types),
+            participants: Some((&["A".to_string()], party)),
+        };
+        let page = read_events(&conn, 0, 100, &filter).unwrap();
+        let sequences: Vec<u64> = page.events.iter().map(|e| e.sequence).collect();
+        assert_eq!(
+            (sequences, page.scanned_through),
+            (vec![1, 6], 7),
+            "with a type filter"
+        );
     }
 }

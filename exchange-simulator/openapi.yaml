@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Exchange simulator API
-  version: 0.5.0
+  version: 0.6.0
   summary: A stock exchange simulator with price-time matching, settlement and clearing simulation, and signed webhooks.
   description: |
     Commands are answered after they are committed to SQLite. Field names are camelCase, enums use their upper-case
@@ -539,6 +539,16 @@ paths:
           style: form
           explode: true
           schema: { type: array, items: { $ref: "#/components/schemas/EventType" } }
+        - name: participant
+          in: query
+          description: >-
+            The participants whose events to return; every participant's when absent. An event is returned when it
+            involves one of them (an order's participant, either side of a trade, settlement or outcome report, a
+            statement's participant) or involves none, such as instrument events and `BusinessDayClosed`: the rule of
+            a webhook subscription's `participants`. Repeat the parameter or separate IDs by commas, as `eventType`.
+          style: form
+          explode: true
+          schema: { type: array, maxItems: 100, items: { type: string, minLength: 1, maxLength: 64 } }
       responses:
         "200":
           description: Events.

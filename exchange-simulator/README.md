@@ -583,7 +583,13 @@ by commas (`eventType=TradeExecuted,OrderFilled`). An unknown type is `400`. Eve
 page is full, otherwise the log's head when the read began. A filtered read can return few or no events from a long
 stretch of the log, so continue from this header (`after=<scanned-through>`) rather than from the last event you
 received, and you never scan that stretch again. Without a filter it equals the last returned event's sequence, or the
-head when none is returned. Envelope:
+head when none is returned.
+
+`participant` keeps the events of the listed participants, repeated or comma-separated as `eventType`
+(`participant=DEMO-BROKER&eventType=ClearingStatementIssued`), with the rule of a webhook subscription's
+`participants`: an event is returned when it names one of them (`participantId`, `buyerId` or `sellerId`) or names
+none (`InstrumentListed`, `BusinessDayClosed`, …). A member's catch-up reader therefore skips the other members'
+statements and settlement events; `Event-Log-Scanned-Through` covers what the filter left out. Envelope:
 
 ```json
 { "eventId": "0199…", "sequence": 3, "eventType": "TradeExecuted", "schemaVersion": 1, "source": "exchange",
