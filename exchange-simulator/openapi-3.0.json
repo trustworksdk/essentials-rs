@@ -4973,7 +4973,7 @@
       "name": "Apache-2.0"
     },
     "title": "Exchange simulator API",
-    "version": "0.5.0"
+    "version": "0.6.0"
   },
   "openapi": "3.0.3",
   "paths": {
@@ -5289,6 +5289,22 @@
               "items": {
                 "$ref": "#/components/schemas/EventType"
               },
+              "type": "array"
+            },
+            "style": "form"
+          },
+          {
+            "description": "The participants whose events to return; every participant's when absent. An event is returned when it involves one of them (an order's participant, either side of a trade, settlement or outcome report, a statement's participant) or involves none, such as instrument events and `BusinessDayClosed`: the rule of a webhook subscription's `participants`. Repeat the parameter or separate IDs by commas, as `eventType`.",
+            "explode": true,
+            "in": "query",
+            "name": "participant",
+            "schema": {
+              "items": {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 100,
               "type": "array"
             },
             "style": "form"

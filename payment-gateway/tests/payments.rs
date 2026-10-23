@@ -529,5 +529,8 @@ async fn events_are_read_by_several_types_with_how_far_the_read_looked() {
     );
     let (status, _) = app.get("/api/events?eventType=PaymentPending,Nope").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    // SR-39's participant filter is the exchange's: the gateway has no participants to filter by.
+    let (status, body) = app.get("/api/events?participant=DEMO-BROKER").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     app.stop().await;
 }

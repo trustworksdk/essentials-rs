@@ -112,7 +112,7 @@ Every event is in the canonical envelope the exchange simulator uses (`eventId`,
 `schemaVersion`, `source`, `simulationId`, `aggregateId`, `correlationId`, `occurredAt`, `payload`), replayable from
 `GET /api/events?after=&limit=&eventType=` and delivered to webhooks. As on the exchange, `eventType` takes several
 types (repeated or comma-separated) and every answer carries `Event-Log-Scanned-Through`, the sequence to continue
-from.
+from. The exchange's `participant` filter is a `400` here: the gateway has no participants.
 
 | Event | Source | Aggregate / correlation ID | Payload |
 |---|---|---|---|

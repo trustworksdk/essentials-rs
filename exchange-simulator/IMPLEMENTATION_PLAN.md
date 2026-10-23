@@ -1606,6 +1606,7 @@ it.
 | 6.21 | Trade corrections and busts | after 5 | L | **SR-36 (LATER)**, implemented 2026-10-22 at the user's request. `TradeCorrected`/`TradeBusted`, `OrderFillCorrected`/`OrderFillBusted` with the order's new running totals and the execution's SR-31 fields; settlement follows; operator calls and seeded probabilities. |
 | 6.22 | Exchange fees | after 5 | M | **SR-37 (LATER)**, implemented 2026-10-22 at the user's request. Maker/taker basis points with a minimum, per participant (the provider may be exempt); fees on `TradeExecuted`, the fill events (`lastFee`), the order result and the clearing statement (`feesNet`). |
 | 6.23 | Corporate actions | after 5 | L | **SR-38 (LATER)**, implemented 2026-10-22 at the user's request. Cash dividends (`CorporateActionAnnounced`, `DividendPaid` from settled shares at the record date) and splits (`SplitApplied`, resting orders and the reference price adjusted), from configuration or an operator call. |
+| 6.24 | Participant filter on the event log | 6 | S | **SR-39** (added to the requirements 2026-10-23). `participant` on the exchange's `GET /api/events`, repeated or comma-separated as `eventType`, with a subscription's participant rule (an event naming a listed participant, or naming none); `Event-Log-Scanned-Through` covers the filtered read. The gateway refuses it, as it refuses subscription `participants`. The API documents go to 0.6.0. |
 
 **Not planned:** SR-18 (FX reference rates) is marked LATER and waits for the demo's FX phase. SR-36 to SR-38 are
 LATER too, but were done as 6.21–6.23 at the user's request (2026-10-22).
@@ -2482,6 +2483,43 @@ then 6.11, 6.12, 6.13–6.14.
   amount not per share; prices not split; the reference not split when applied, and not after a restart; configured
   actions announced at every start; the book not rebuilt.
 
+**6.24 — participant filter on the event log ✅ done (2026-10-23)**
+- **Delivered:**
+  - `simulator_kit::webhooks::involves`, the participant filter's rule, now shared by `Subscription::involves` and
+    the event-log read (SR-39), so the two cannot drift apart.
+  - `simulator_kit::api::events`: `EventRead::parse` reads `participant`, repeated or comma-separated, each ID 1 to 64
+    characters and not blank, at most 100 (the limits of a subscription's `participants`); `EventRead::filter` builds
+    an `outbox::EventFilter` from the service's `Parties` and is a `400` where the service has none.
+  - `outbox::read_events` takes an `EventFilter` (types, participants). With participants the rows are read lazily
+    without an SQL limit, filtered by the service's `Parties`, and the read stops at the page's last event;
+    `scanned_through` keeps its SR-34 meaning (the last returned event's sequence on a full page, else the head).
+  - The exchange's `GET /api/events` passes `events::parties`; the gateway's refuses `participant`.
+  - The exchange's `openapi.yaml` (the `participant` parameter), its README and the webhook receivers guide, the
+    gateway README. The API documents go to 0.6.0 (both crates, both documents, `api-specs/pom.xml`, the example
+    consumer); both 3.0 renditions regenerated.
+  - Tests: `tests/event_reads.rs` `a_member_reads_only_its_own_statements_and_continues_past_the_others` (SR-39's
+    acceptance: `participant=DEMO-BROKER&eventType=ClearingStatementIssued` returns the firm's statement and not its
+    counterparties', the header at the head, and the next read from it returns nothing) and
+    `the_participant_filter_follows_the_subscription_rule` (against the unfiltered log: events naming no participant
+    kept, repeated, comma and encoded-comma forms, a full page and its continuation, `400`s); the gateway's events
+    test refuses `participant`; unit tests for the parser and `read_events` in the kit.
+- **Decisions:**
+  - **Filtered in Rust, not SQL:** the participants come from the service's `Parties` function, the one webhook
+    filters use. A `json_extract` clause would repeat that function in SQL and could drift from it. The read walks the
+    log by sequence, as SR-34's type filter already does, and the header spares a reader scanning a stretch twice.
+  - **Commas separate IDs, as for `eventType`.** A participant ID containing a comma cannot be filtered by; no
+    configured or test participant has one.
+  - **The acceptance test's counterparty is an ordinary member (`C`), not `LP`:** `LP` is the built-in provider's ID,
+    whose API orders are not published and follow the provider's quoting, so a test cannot trade as it through the
+    API. The filter does not depend on who the other member is.
+- **Gates:** fmt, clippy (`-D warnings`), doc for the kit, the gateway and the exchange; `cargo test -j 1` of the kit
+  (`--all-features`, 45 tests), the gateway (8 targets) and the exchange (45 targets, 344 tests) green;
+  `M2_DIR=$HOME/.m2 api-specs/check.sh` green (0.6.0 installed to `~/.m2`, both clients compile).
+- **Mutation checks**, each made a test fail (all 9): events naming no participant dropped; the SQL limit kept with a
+  participant filter; the participant filter ignored in `read_events`; no comma separation; a repeated `participant`
+  replacing the earlier; no 100-ID bound; a participant filter accepted without `Parties`; the exchange's store
+  dropping the filter; the gateway not refusing it.
+
 ### Milestone 6 status
 
 All steps of the milestone are done (6.1–6.14 with 6.9a, 2026-10-18 to 2026-10-20). Not planned: SR-18 (FX, LATER).
@@ -2490,6 +2528,7 @@ SR-31 (the execution on every fill event) and SR-32 (the business day on `OrderE
 and done as steps 6.16 and 6.17 the same day.
 SR-33 to SR-35 (value dates, multi-type event reads, holidays) were added on 2026-10-22 and done as steps 6.18–6.20
 the same day; SR-36 to SR-38 (LATER) were done as 6.21–6.23 at the user's request, also on 2026-10-22.
+SR-39 (participant filter on the event log) was added on 2026-10-23 and done as step 6.24 the same day.
 Still on hold from Milestone 4: 4.6d (the containerized benchmark).
 
 **SR-2 manual acceptance against the real Finnhub ✅ done (2026-10-20, D19).** `config/finnhub-market.yaml` (40
