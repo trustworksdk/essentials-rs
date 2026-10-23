@@ -9,8 +9,8 @@ use super::{BookError, BookUpdate, Clock, IdScheme, MatchContext, OrderBook};
 use crate::clearing::{ClearingPolicy, StoredStatement};
 use crate::clock::{ClockError, SystemClock, VirtualClock};
 use crate::domain::{
-    IdentifierPolicy, Instrument, InstrumentChange, InstrumentError, InstrumentId, Order,
-    OrderStatus, OrderType, Participant, ParticipantId, Side, TimeInForce,
+    Execution, ExecutionStatus, IdentifierPolicy, Instrument, InstrumentChange, InstrumentError,
+    InstrumentId, Order, OrderStatus, OrderType, Participant, ParticipantId, Side, TimeInForce,
 };
 use crate::events::NewEvent;
 use crate::events::{self, Command};
@@ -80,6 +80,14 @@ pub enum ExchangeError {
     },
     #[error("order {id} is {status} and cannot be cancelled")]
     OrderNotActive { id: Uuid, status: OrderStatus },
+    #[error("execution {0} was busted and cannot change")]
+    ExecutionBusted(Uuid),
+    #[error("invalid trade correction: {0}")]
+    InvalidCorrection(String),
+    #[error("invalid corporate action: {0}")]
+    InvalidCorporateAction(String),
+    #[error("corporate action {0} was already announced")]
+    DuplicateCorporateAction(String),
     #[error("instrument {0} already exists")]
     DuplicateInstrument(InstrumentId),
     #[error("symbol {symbol} is already listed on {mic}")]
@@ -213,6 +221,63 @@ pub struct ExchangeOptions {
     pub trade_dating: crate::settlement::TradeDating,
     /// Trading sessions by market (plan item 6.10). The default has none: every market is always open.
     pub sessions: crate::sessions::TradingSessions,
+    /// Seeded trade corrections and busts (SR-36); off by default.
+    pub trade_adjustments: TradeAdjustmentPolicy,
+    /// Exchange fees (SR-37); free by default.
+    pub fees: crate::fees::FeeSchedule,
+    /// Corporate actions from configuration (SR-38), announced once.
+    pub corporate_actions: Vec<crate::corporate_actions::ActionSpec>,
+}
+
+/// Seeded trade corrections and busts (`trades:`, SR-36): each execution is busted with `bust_probability`, else
+/// corrected by one tick with `correct_probability`, at a seeded instant before the cutoff of the business day
+/// `max_correction_days` after its trade date.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TradeAdjustmentPolicy {
+    pub seed: u64,
+    pub correct_probability: f64,
+    pub bust_probability: f64,
+    pub max_correction_days: u32,
+}
+
+impl TradeAdjustmentPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        let (correct, bust) = (self.correct_probability, self.bust_probability);
+        if !(0.0..=1.0).contains(&correct) || !(0.0..=1.0).contains(&bust) || correct + bust > 1.0 {
+            return Err(
+                "trades: correct_probability and bust_probability must be between 0 and 1, and sum to at most 1"
+                    .into(),
+            );
+        }
+        if self.max_correction_days > 30 {
+            return Err("trades.max_correction_days must be at most 30".into());
+        }
+        Ok(())
+    }
+
+    fn active(&self) -> bool {
+        self.correct_probability > 0.0 || self.bust_probability > 0.0
+    }
+}
+
+/// A trade correction or bust (SR-36).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TradeChange {
+    /// A new price and/or a lower quantity; at least one must change.
+    Correct {
+        price_ticks: Option<i64>,
+        quantity: Option<u64>,
+    },
+    Bust,
+}
+
+/// A committed correction or bust: the execution and both orders after it.
+#[derive(Clone, Debug)]
+pub struct TradeAdjusted {
+    pub execution: Execution,
+    pub orders: Vec<Order>,
+    pub instrument: Instrument,
 }
 
 /// How the liquidity provider runs (`liquidity:` in the configuration).
@@ -249,6 +314,9 @@ impl Default for ExchangeOptions {
             market_data: None,
             trade_dating: Default::default(),
             sessions: Default::default(),
+            trade_adjustments: Default::default(),
+            fees: Default::default(),
+            corporate_actions: Vec::new(),
         }
     }
 }
@@ -308,6 +376,13 @@ pub struct Exchange {
     /// then). An entry whose order is no longer active when it comes due is dropped.
     expiries:
         std::collections::BTreeSet<(DateTime<Utc>, u64, InstrumentId, Uuid, chrono::NaiveDate)>,
+    trade_adjustments: TradeAdjustmentPolicy,
+    fees: crate::fees::FeeSchedule,
+    declared_actions: Vec<crate::corporate_actions::ActionSpec>,
+    /// Announced corporate actions not yet paid or applied (SR-38), in due order.
+    actions: Vec<crate::corporate_actions::CorporateAction>,
+    /// Seeded corrections and busts waiting for their time (SR-36), in due order.
+    scheduled: std::collections::BTreeSet<crate::persistence::ScheduledAdjustment>,
 }
 
 /// The liquidity provider in one instrument, as `GET /api/liquidity` shows it (SR-11).
@@ -539,12 +614,23 @@ impl Exchange {
             trade_dating: options.trade_dating,
             sessions: options.sessions,
             expiries: Default::default(),
+            trade_adjustments: options.trade_adjustments,
+            fees: options.fees,
+            declared_actions: options.corporate_actions,
+            actions: Vec::new(),
+            scheduled: Default::default(),
         };
         exchange.start_price_sources()?;
         exchange.reconcile_webhooks()?;
         exchange.schedule_expiries()?;
+        exchange.scheduled = exchange
+            .store
+            .scheduled_adjustments()?
+            .into_iter()
+            .collect();
         exchange.start_liquidity()?;
         exchange.reconcile_instruments()?;
+        exchange.reconcile_corporate_actions()?;
         if let Some(policy) = options.clearing {
             policy.breaks.validate().map_err(ExchangeError::Clearing)?;
             let (cursor, after) = match exchange.store.clearing_cursor()? {
@@ -1339,6 +1425,7 @@ impl Exchange {
             sequence: self.last_sequence + 1,
             status: OrderStatus::Open,
             time_in_force,
+            busted_quantity: 0,
         };
         let started = std::time::Instant::now();
         let mut ctx = MatchContext {
@@ -1456,6 +1543,7 @@ impl Exchange {
     fn reload(&mut self) -> Result<(), ExchangeError> {
         self.books = load_books(&self.store)?;
         self.schedule_expiries()?;
+        self.scheduled = self.store.scheduled_adjustments()?.into_iter().collect();
         // The group's trades are gone: forget their prints, and take the last trade and volume from storage again.
         for state in self.market_data.values_mut() {
             state.pending.clear();
@@ -1630,6 +1718,7 @@ impl Exchange {
         self.store.reset()?;
         self.books.clear();
         self.expiries.clear();
+        self.scheduled.clear();
         self.prices.clear();
         self.market_data.clear();
         self.participants.clear();
@@ -1662,6 +1751,7 @@ impl Exchange {
         self.reconcile_webhooks()?;
         self.start_liquidity()?;
         self.reconcile_instruments()?;
+        self.reconcile_corporate_actions()?;
         tracing::info!(epoch = self.epoch, "exchange state reset");
         Ok(())
     }
@@ -1704,12 +1794,29 @@ impl Exchange {
             let close = self.days.as_ref().map(BusinessDays::due);
             let clearing = self.clearing.as_ref().map(Clearing::due);
             let expiry = self.expiries.first().map(|e| e.0);
-            match close.into_iter().chain(clearing).chain(expiry).min() {
+            let adjustment = self.scheduled.first().map(|a| a.due_at);
+            let action = self.actions.first().map(|a| a.due_at());
+            match close
+                .into_iter()
+                .chain(clearing)
+                .chain(expiry)
+                .chain(adjustment)
+                .chain(action)
+                .min()
+            {
                 Some(due) if due <= now => {
                     total += self.settlement_step(due)?;
                     // DAY orders end with their trading day, before the business day closes.
                     if expiry == Some(due) {
                         total += self.expire_due(due)?;
+                    }
+                    // A seeded correction or bust before the cutoff shows on that day's statement.
+                    if adjustment == Some(due) {
+                        total += self.adjust_due(due)?;
+                    }
+                    // Dividends and splits at the start of their day.
+                    if action == Some(due) {
+                        total += self.act_due(due)?;
                     }
                     if close == Some(due) {
                         total += self.close_business_day()?;
@@ -1824,7 +1931,24 @@ impl Exchange {
                 .map(TradeFacts::from_event)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(ExchangeError::Clearing)?;
-            for draft in clearing.policy.draft(date, &trades) {
+            let after = trades.last().map_or(clearing.after, |t| t.sequence);
+            // As the executions stand now (SR-36): corrected in place, busted ones left out.
+            let mut current = Vec::with_capacity(trades.len());
+            for mut trade in trades {
+                match self.store.execution(trade.execution_id)? {
+                    Some(execution) if execution.status == ExecutionStatus::Busted => {}
+                    Some(execution) => {
+                        trade.quantity = execution.quantity;
+                        trade.price_ticks = execution.price_ticks;
+                        trade.buyer_fee_minor = execution.buyer_fee_minor;
+                        trade.seller_fee_minor = execution.seller_fee_minor;
+                        current.push(trade);
+                    }
+                    None => current.push(trade),
+                }
+            }
+            let clearing = self.clearing.as_ref().expect("clearing runs");
+            for draft in clearing.policy.draft(date, &current) {
                 let stored = StoredStatement {
                     draft,
                     issued: false,
@@ -1836,7 +1960,6 @@ impl Exchange {
                     waiting.push(stored);
                 }
             }
-            let after = trades.last().map_or(clearing.after, |t| t.sequence);
             cursor = Some((date, after));
         }
         issue.sort_by(|a, b| issue_order(a).cmp(&issue_order(b)));
@@ -2105,7 +2228,12 @@ impl Exchange {
                 "the group's transaction was rolled back".into(),
             ));
         }
+        let mut update = update;
+        let taker = update.order.side;
         let instrument = self.books[&update.order.instrument_id].instrument();
+        for execution in &mut update.executions {
+            price_fees(&self.fees, execution, instrument, taker);
+        }
         let participants = &self.participants;
         let lookup = |id: &ParticipantId| participants.get(id).cloned().flatten();
         let mut new_events = events::for_update(command, &update, instrument, &lookup, now);
@@ -2153,8 +2281,16 @@ impl Exchange {
             consumer: SETTLEMENT_CONSUMER,
             cursor: plan.cursor,
         });
-        self.store
-            .commit(&update, &new_events, settlement_write, outbox, now)?;
+        let scheduled = self.schedule_adjustments(&update);
+        self.store.commit(
+            &update,
+            &new_events,
+            settlement_write,
+            &scheduled,
+            outbox,
+            now,
+        )?;
+        self.scheduled.extend(scheduled);
         self.next_event_sequence = next;
         let book = self
             .books
@@ -2217,6 +2353,580 @@ impl Exchange {
         Ok(SubmitOutcome::Processed(update))
     }
 
+    /// Corrects or busts an execution now (SR-36), for an operator.
+    pub fn adjust_trade(
+        &mut self,
+        execution_id: Uuid,
+        change: TradeChange,
+        reason: &str,
+    ) -> Result<TradeAdjusted, ExchangeError> {
+        let now = self.now();
+        self.adjust_trade_at(execution_id, change, reason, now)
+    }
+
+    /// Corrects or busts an execution at `at`, in one commit: the execution changed in place or marked busted, both
+    /// orders' busted quantities and statuses (nothing goes back on the book), `TradeCorrected`/`TradeBusted` and
+    /// each order's `OrderFillCorrected`/`OrderFillBusted`, and the settlement instruction's answer. Clearing
+    /// statements drafted later see the execution's new state; issued ones are not reissued.
+    fn adjust_trade_at(
+        &mut self,
+        execution_id: Uuid,
+        change: TradeChange,
+        reason: &str,
+        at: DateTime<Utc>,
+    ) -> Result<TradeAdjusted, ExchangeError> {
+        let before = self
+            .store
+            .execution(execution_id)?
+            .ok_or(ExchangeError::UnknownExecution(execution_id))?;
+        if before.status == ExecutionStatus::Busted {
+            return Err(ExchangeError::ExecutionBusted(execution_id));
+        }
+        let mut after = before.clone();
+        match change {
+            TradeChange::Bust => after.status = ExecutionStatus::Busted,
+            TradeChange::Correct {
+                price_ticks,
+                quantity,
+            } => {
+                after.price_ticks = price_ticks.unwrap_or(before.price_ticks);
+                after.quantity = quantity.unwrap_or(before.quantity);
+                if after.price_ticks <= 0 {
+                    return Err(ExchangeError::InvalidCorrection(
+                        "priceTicks must be positive".into(),
+                    ));
+                }
+                if !(1..=before.quantity).contains(&after.quantity) {
+                    return Err(ExchangeError::InvalidCorrection(format!(
+                        "quantity must be between 1 and the executed {}",
+                        before.quantity
+                    )));
+                }
+                if after.price_ticks == before.price_ticks && after.quantity == before.quantity {
+                    return Err(ExchangeError::InvalidCorrection(
+                        "the correction changes neither price nor quantity".into(),
+                    ));
+                }
+                after.status = ExecutionStatus::Corrected;
+            }
+        }
+        let removed = match after.status {
+            ExecutionStatus::Busted => before.quantity,
+            _ => before.quantity - after.quantity,
+        };
+        let instrument = self
+            .books
+            .get(&before.instrument_id)
+            .ok_or_else(|| ExchangeError::UnknownInstrument(before.instrument_id.clone()))?
+            .instrument()
+            .clone();
+        let mut orders = Vec::with_capacity(2);
+        for order_id in [before.buy_order_id, before.sell_order_id] {
+            let mut order = match self.books[&before.instrument_id].order(order_id) {
+                Some(resting) => resting.clone(),
+                None => {
+                    self.store
+                        .order(order_id)?
+                        .ok_or(ExchangeError::UnknownOrder(order_id))?
+                        .order
+                }
+            };
+            order.busted_quantity += removed;
+            if order.filled_quantity() == 0 {
+                order.status = match order.status {
+                    OrderStatus::Filled => OrderStatus::Cancelled,
+                    OrderStatus::PartiallyFilled => OrderStatus::Open,
+                    other => other,
+                };
+            }
+            orders.push(order);
+        }
+        if after.status == ExecutionStatus::Busted {
+            (after.buyer_fee_minor, after.seller_fee_minor) = (0, 0);
+        } else {
+            // The incoming order, the taker, is the later one.
+            let taker = if orders[0].sequence > orders[1].sequence {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+            price_fees(&self.fees, &mut after, &instrument, taker);
+        }
+        let mut new_events =
+            events::for_trade_adjustment(&before, &after, &orders, &instrument, reason, at);
+        if let Some(provider) = &self.provider
+            && !provider.policy.emit_order_events
+        {
+            let lp = provider.policy.participant.0.as_str();
+            new_events.retain(|e| {
+                e.event_type == events::TRADE_CORRECTED
+                    || e.event_type == events::TRADE_BUSTED
+                    || e.payload["participantId"] != lp
+            });
+        }
+        let mut next = NewEvent::stamp(&mut new_events, self.next_event_sequence, self.ids);
+        let settlement_plan = match &self.settlement {
+            Some(simulator) => match self.store.settlement(execution_id)? {
+                Some(stored) => {
+                    let corrected = (after.status != ExecutionStatus::Busted)
+                        .then_some((after.quantity, after.price_ticks));
+                    simulator.adjust(&stored, corrected, at)
+                }
+                None => None,
+            },
+            None => None,
+        };
+        let mut settlement_events: Vec<NewEvent> = settlement_plan
+            .iter()
+            .flat_map(|plan| plan.transitions.iter().map(|t| t.event.clone()))
+            .collect();
+        next = NewEvent::stamp(&mut settlement_events, next, self.ids);
+        new_events.extend(settlement_events);
+        let outbox = Outbox {
+            subscriptions: self.webhooks.subscriptions(),
+            simulation_id: self.simulation_id.as_deref(),
+            ids: self.ids,
+            due: wall_now(),
+            schema_version: events::SCHEMA_VERSION,
+            parties: self.webhooks.parties(),
+        };
+        let settlement_write = settlement_plan.as_ref().map(|plan| SettlementWrite {
+            instructions: plan.transitions.iter().map(|t| &t.instruction).collect(),
+            consumer: SETTLEMENT_CONSUMER,
+            cursor: plan.cursor,
+        });
+        self.store.commit_trade_adjustment(
+            &after,
+            &orders,
+            &new_events,
+            settlement_write,
+            outbox,
+            at,
+        )?;
+        self.next_event_sequence = next;
+        let book = self
+            .books
+            .get_mut(&before.instrument_id)
+            .expect("checked above");
+        for order in &orders {
+            book.amend(order);
+        }
+        if let (Some(plan), Some(simulator)) = (&settlement_plan, self.settlement.as_mut()) {
+            simulator.apply(plan);
+        }
+        if let Some(provider) = &mut self.provider {
+            let lp = &provider.policy.participant;
+            let signed = match (&before.buyer_id, &before.seller_id) {
+                (buyer, _) if buyer == lp => -(removed as i64),
+                (_, seller) if seller == lp => removed as i64,
+                _ => 0,
+            };
+            if signed != 0 {
+                provider
+                    .quoting
+                    .entry(before.instrument_id.clone())
+                    .or_default()
+                    .inventory += signed;
+            }
+        }
+        self.scheduled.retain(|a| a.execution_id != execution_id);
+        for event in &new_events {
+            ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type)
+                .increment(1);
+        }
+        self.wake_delivery(&new_events);
+        Ok(TradeAdjusted {
+            execution: after,
+            orders,
+            instrument,
+        })
+    }
+
+    /// Runs the seeded corrections and busts due by `due`, each in its own commit stamped at its due time. A
+    /// correction moves the price one tick, down unless that would leave no price; an execution busted in the
+    /// meantime is skipped.
+    fn adjust_due(&mut self, due: DateTime<Utc>) -> Result<usize, ExchangeError> {
+        let mut events = 0;
+        while let Some(scheduled) = self.scheduled.first().copied() {
+            if scheduled.due_at > due {
+                break;
+            }
+            self.scheduled.remove(&scheduled);
+            let Some(execution) = self.store.execution(scheduled.execution_id)? else {
+                continue;
+            };
+            if execution.status == ExecutionStatus::Busted {
+                self.store.drop_scheduled_adjustment(execution.id)?;
+                continue;
+            }
+            let (change, reason) = if scheduled.bust {
+                (TradeChange::Bust, "SIMULATED_BUST")
+            } else {
+                let down = execution.id.as_u128() % 2 == 0 && execution.price_ticks > 1;
+                let price_ticks = execution.price_ticks + if down { -1 } else { 1 };
+                (
+                    TradeChange::Correct {
+                        price_ticks: Some(price_ticks),
+                        quantity: None,
+                    },
+                    "SIMULATED_CORRECTION",
+                )
+            };
+            self.adjust_trade_at(execution.id, change, reason, scheduled.due_at)?;
+            events += 1;
+        }
+        Ok(events)
+    }
+
+    /// The seeded corrections and busts for an update's executions (SR-36): drawn per execution from the policy's
+    /// seed, the incoming order's sequence and the execution's place, due at a seeded instant between the trade and
+    /// the cutoff `max_correction_days` business days after its trade date.
+    fn schedule_adjustments(
+        &self,
+        update: &BookUpdate,
+    ) -> Vec<crate::persistence::ScheduledAdjustment> {
+        let policy = &self.trade_adjustments;
+        if !policy.active() {
+            return Vec::new();
+        }
+        const KIND: u64 = 41;
+        const WHEN: u64 = 42;
+        let sequence = update.order.sequence;
+        update
+            .executions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, execution)| {
+                let place = i as u32;
+                let u = simulator_kit::rng::draw(policy.seed, sequence, place, KIND);
+                let bust = u < policy.bust_probability;
+                if !bust && u >= policy.bust_probability + policy.correct_probability {
+                    return None;
+                }
+                let last = match &self.days {
+                    Some(days) => days.calendar.cutoff_at(
+                        days.calendar
+                            .days
+                            .add_business_days(execution.trade_date, policy.max_correction_days),
+                    ),
+                    None => {
+                        execution.executed_at
+                            + chrono::Duration::days(i64::from(policy.max_correction_days.max(1)))
+                    }
+                };
+                let span = (last - execution.executed_at)
+                    .num_microseconds()
+                    .unwrap_or(0)
+                    .max(1);
+                let offset = (simulator_kit::rng::draw(policy.seed, sequence, place, WHEN)
+                    * span as f64) as i64;
+                Some(crate::persistence::ScheduledAdjustment {
+                    due_at: execution.executed_at
+                        + chrono::Duration::microseconds(offset.clamp(1, span - 1).max(1)),
+                    execution_id: execution.id,
+                    bust,
+                })
+            })
+            .collect()
+    }
+
+    /// Announces a corporate action now (SR-38), for an operator.
+    pub fn announce_corporate_action(
+        &mut self,
+        spec: &crate::corporate_actions::ActionSpec,
+    ) -> Result<crate::corporate_actions::CorporateAction, ExchangeError> {
+        let now = self.now();
+        self.announce_at(spec, now)
+    }
+
+    /// Every corporate action, in due order.
+    pub fn corporate_actions(
+        &self,
+    ) -> Result<Vec<(crate::corporate_actions::CorporateAction, Instrument)>, ExchangeError> {
+        Ok(self
+            .store
+            .corporate_actions()?
+            .into_iter()
+            .filter_map(|a| {
+                let instrument = self.books.get(&a.instrument_id)?.instrument().clone();
+                Some((a, instrument))
+            })
+            .collect())
+    }
+
+    /// Validates and stores a corporate action with its `CorporateActionAnnounced`; it is paid or applied when due.
+    fn announce_at(
+        &mut self,
+        spec: &crate::corporate_actions::ActionSpec,
+        now: DateTime<Utc>,
+    ) -> Result<crate::corporate_actions::CorporateAction, ExchangeError> {
+        use crate::corporate_actions::{CORPORATE_ACTION_ANNOUNCED, CorporateAction, event};
+        let instrument = self
+            .books
+            .get(&spec.instrument_id)
+            .ok_or_else(|| ExchangeError::UnknownInstrument(spec.instrument_id.clone()))?
+            .instrument()
+            .clone();
+        let action = CorporateAction::announce(spec, &instrument, now)
+            .map_err(ExchangeError::InvalidCorporateAction)?;
+        if self
+            .store
+            .corporate_actions()?
+            .iter()
+            .any(|a| a.id == action.id)
+        {
+            return Err(ExchangeError::DuplicateCorporateAction(action.id));
+        }
+        let events = vec![event(
+            CORPORATE_ACTION_ANNOUNCED,
+            &action,
+            None,
+            now,
+            action.view(&instrument),
+        )];
+        self.commit_action(&action, &[], events)?;
+        self.actions.push(action.clone());
+        self.actions
+            .sort_by(|a, b| (a.due_at(), &a.id).cmp(&(b.due_at(), &b.id)));
+        Ok(action)
+    }
+
+    /// Loads the actions still to come, makes the reference prices follow the splits already applied, and announces the
+    /// configured actions not yet announced: at recovery and after a reset.
+    fn reconcile_corporate_actions(&mut self) -> Result<(), ExchangeError> {
+        use crate::corporate_actions::{ActionKind, CorporateAction};
+        let stored = self.store.corporate_actions()?;
+        for applied in stored
+            .iter()
+            .filter(|a| a.kind == ActionKind::Split && a.done_at.is_some())
+        {
+            self.prices
+                .apply_split(&applied.instrument_id, applied.ratio);
+        }
+        self.actions = stored
+            .iter()
+            .filter(|a| a.done_at.is_none())
+            .cloned()
+            .collect();
+        let now = self.now();
+        for spec in self.declared_actions.clone() {
+            let instrument = self
+                .books
+                .get(&spec.instrument_id)
+                .ok_or_else(|| ExchangeError::UnknownInstrument(spec.instrument_id.clone()))?
+                .instrument()
+                .clone();
+            let id = CorporateAction::announce(&spec, &instrument, now)
+                .map_err(|e| {
+                    ExchangeError::InvalidCorporateAction(format!("corporate_actions: {e}"))
+                })?
+                .id;
+            if !stored.iter().any(|a| a.id == id) {
+                self.announce_at(&spec, now)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pays the dividends and applies the splits due by `due`, each in its own commit stamped at its due time.
+    fn act_due(&mut self, due: DateTime<Utc>) -> Result<usize, ExchangeError> {
+        let mut events = 0;
+        while self.actions.first().is_some_and(|a| a.due_at() <= due) {
+            let action = self.actions.remove(0);
+            events += match action.kind {
+                crate::corporate_actions::ActionKind::CashDividend => self.pay_dividend(action)?,
+                crate::corporate_actions::ActionKind::Split => self.apply_split(action)?,
+            };
+        }
+        Ok(events)
+    }
+
+    /// The splits of `instrument` applied so far, as (effective instant, `new:old`), for holdings.
+    fn applied_splits(
+        &self,
+        instrument: &InstrumentId,
+    ) -> Result<Vec<crate::corporate_actions::AppliedSplit>, ExchangeError> {
+        Ok(self
+            .store
+            .corporate_actions()?
+            .into_iter()
+            .filter(|a| {
+                a.kind == crate::corporate_actions::ActionKind::Split
+                    && a.done_at.is_some()
+                    && &a.instrument_id == instrument
+            })
+            .map(|a| (a.due_at(), a.ratio))
+            .collect())
+    }
+
+    /// One `DividendPaid` per participant holding a positive quantity at the record date (SR-38).
+    fn pay_dividend(
+        &mut self,
+        mut action: crate::corporate_actions::CorporateAction,
+    ) -> Result<usize, ExchangeError> {
+        use crate::corporate_actions::{DIVIDEND_PAID, event, holdings};
+        let at = action.due_at();
+        let Some(book) = self.books.get(&action.instrument_id) else {
+            return Ok(0);
+        };
+        let instrument = book.instrument().clone();
+        let record = action.record_date.expect("a dividend has a record date");
+        let held = holdings(
+            &self.store.positions(&action.instrument_id)?,
+            record,
+            &self.applied_splits(&action.instrument_id)?,
+        );
+        let mut new_events = Vec::new();
+        for (participant, quantity) in held.into_iter().filter(|(_, q)| *q > 0) {
+            let amount = quantity.saturating_mul(action.amount_per_share_minor);
+            let mut payload = action.view(&instrument);
+            payload["participantId"] = serde_json::json!(participant);
+            payload["quantity"] = serde_json::json!(quantity);
+            payload["amountMinor"] = serde_json::json!(amount);
+            payload["amount"] = serde_json::json!(crate::settlement::format_amount(
+                amount,
+                instrument.currency_scale
+            ));
+            new_events.push(event(
+                DIVIDEND_PAID,
+                &action,
+                Some(&participant),
+                at,
+                payload,
+            ));
+        }
+        action.done_at = Some(at);
+        for e in &mut new_events {
+            e.payload["status"] = serde_json::json!("DONE");
+        }
+        let count = new_events.len();
+        self.commit_action(&action, &[], new_events)?;
+        Ok(count)
+    }
+
+    /// Applies a split (SR-38): resting orders scaled in quantity and price, keeping time priority (one left with
+    /// nothing is cancelled), the reference price following, and one `SplitApplied` per participant with holdings or
+    /// resting orders in the instrument, listing its adjusted orders.
+    fn apply_split(
+        &mut self,
+        mut action: crate::corporate_actions::CorporateAction,
+    ) -> Result<usize, ExchangeError> {
+        use crate::corporate_actions::{
+            SPLIT_APPLIED, event, holdings, split_price, split_quantity,
+        };
+        let at = action.due_at();
+        let Some(book) = self.books.get(&action.instrument_id) else {
+            return Ok(0);
+        };
+        let instrument = book.instrument().clone();
+        let effective = action
+            .effective_date
+            .expect("a split has an effective date");
+        let mut adjusted = Vec::new();
+        let mut changes: std::collections::BTreeMap<ParticipantId, Vec<serde_json::Value>> =
+            Default::default();
+        for order in book.orders() {
+            let mut next = order.clone();
+            next.remaining_quantity = split_quantity(order.remaining_quantity, action.ratio);
+            next.quantity = order.quantity - order.remaining_quantity + next.remaining_quantity;
+            next.limit_price_ticks = order
+                .limit_price_ticks
+                .map(|p| split_price(p, action.ratio));
+            if next.remaining_quantity == 0 {
+                next.status = OrderStatus::Cancelled;
+            }
+            changes
+                .entry(order.participant_id.clone())
+                .or_default()
+                .push(serde_json::json!({
+                    "orderId": order.id,
+                    "clientOrderId": order.client_order_id,
+                    "side": order.side,
+                    "status": next.status,
+                    "previousQuantity": order.quantity,
+                    "quantity": next.quantity,
+                    "previousRemainingQuantity": order.remaining_quantity,
+                    "remainingQuantity": next.remaining_quantity,
+                    "previousPriceTicks": order.limit_price_ticks,
+                    "priceTicks": next.limit_price_ticks,
+                    "previousPrice": order.limit_price_ticks.map(|t| instrument.ticks_to_price(t)),
+                    "price": next.limit_price_ticks.map(|t| instrument.ticks_to_price(t)),
+                }));
+            adjusted.push(next);
+        }
+        // Holdings settled before the effective date, before and after the split.
+        let before = holdings(
+            &self.store.positions(&action.instrument_id)?,
+            effective.pred_opt().expect("date in range"),
+            &self.applied_splits(&action.instrument_id)?,
+        );
+        let participants: std::collections::BTreeSet<ParticipantId> = before
+            .iter()
+            .filter(|(_, q)| **q != 0)
+            .map(|(p, _)| p.clone())
+            .chain(changes.keys().cloned())
+            .collect();
+        action.done_at = Some(at);
+        let mut new_events = Vec::new();
+        for participant in participants {
+            let held = before.get(&participant).copied().unwrap_or(0);
+            let after = i64::try_from(
+                i128::from(held) * i128::from(action.ratio.0) / i128::from(action.ratio.1),
+            )
+            .unwrap_or(i64::MAX);
+            let mut payload = action.view(&instrument);
+            payload["participantId"] = serde_json::json!(participant);
+            payload["quantityBefore"] = serde_json::json!(held);
+            payload["quantityAfter"] = serde_json::json!(after);
+            payload["orders"] =
+                serde_json::json!(changes.get(&participant).cloned().unwrap_or_default());
+            new_events.push(event(
+                SPLIT_APPLIED,
+                &action,
+                Some(&participant),
+                at,
+                payload,
+            ));
+        }
+        let count = new_events.len();
+        self.commit_action(&action, &adjusted, new_events)?;
+        self.books
+            .get_mut(&action.instrument_id)
+            .expect("checked above")
+            .replace_resting(adjusted);
+        self.prices.apply_split(&action.instrument_id, action.ratio);
+        self.maintain_liquidity(Some(&action.instrument_id))?;
+        self.publish_market_data(Some(&action.instrument_id));
+        Ok(count)
+    }
+
+    /// Stamps and commits a corporate action's events with the action and the orders it changed.
+    fn commit_action(
+        &mut self,
+        action: &crate::corporate_actions::CorporateAction,
+        orders: &[Order],
+        mut new_events: Vec<NewEvent>,
+    ) -> Result<(), ExchangeError> {
+        let next = NewEvent::stamp(&mut new_events, self.next_event_sequence, self.ids);
+        let outbox = Outbox {
+            subscriptions: self.webhooks.subscriptions(),
+            simulation_id: self.simulation_id.as_deref(),
+            ids: self.ids,
+            due: wall_now(),
+            schema_version: events::SCHEMA_VERSION,
+            parties: self.webhooks.parties(),
+        };
+        self.store
+            .commit_corporate_action(action, orders, &new_events, outbox)?;
+        self.next_event_sequence = next;
+        for event in &new_events {
+            ::metrics::counter!(crate::metrics::EVENTS, "event_type" => event.event_type)
+                .increment(1);
+        }
+        self.wake_delivery(&new_events);
+        Ok(())
+    }
+
     /// Wakes the delivery worker if any of `events` has a subscriber.
     fn wake_delivery(&self, events: &[NewEvent]) {
         self.signal_deliveries(self.delivers(events));
@@ -2238,6 +2948,24 @@ impl Exchange {
     fn now(&self) -> DateTime<Utc> {
         self.clock.now().trunc_subsecs(6)
     }
+}
+
+/// Sets each side's fee on an execution (SR-37): the incoming order's side pays the taker rate, the resting one's the
+/// maker rate, on the execution's value (price ticks × tick size × quantity).
+fn price_fees(
+    fees: &crate::fees::FeeSchedule,
+    execution: &mut Execution,
+    instrument: &Instrument,
+    taker: Side,
+) {
+    let value = i128::from(execution.price_ticks)
+        * i128::from(instrument.tick_size_minor)
+        * i128::from(execution.quantity);
+    let value = i64::try_from(value).unwrap_or(i64::MAX);
+    let scale = instrument.currency_scale;
+    execution.buyer_fee_minor = fees.fee(&execution.buyer_id.0, taker != Side::Buy, value, scale);
+    execution.seller_fee_minor =
+        fees.fee(&execution.seller_id.0, taker != Side::Sell, value, scale);
 }
 
 /// Statements are issued in time order, then by statement ID.

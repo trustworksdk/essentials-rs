@@ -223,6 +223,8 @@ pub struct OrderView {
     pub quantity: u64,
     pub remaining_quantity: u64,
     pub filled_quantity: u64,
+    /// Quantity whose fills were busted or corrected away; not reinstated (SR-36).
+    pub busted_quantity: u64,
     pub status: OrderStatus,
     pub sequence: u64,
     pub time_in_force: crate::domain::TimeInForce,
@@ -250,6 +252,7 @@ impl OrderView {
             quantity: order.quantity,
             remaining_quantity: order.remaining_quantity,
             filled_quantity: order.filled_quantity(),
+            busted_quantity: order.busted_quantity,
             status: order.status,
             sequence: order.sequence,
             time_in_force: order.time_in_force,
@@ -283,7 +286,15 @@ impl OrderResult {
             order: view,
             executions: executions
                 .iter()
-                .map(|e| TradeView::new(e, instrument))
+                .map(|e| {
+                    let mut view = TradeView::new(e, instrument);
+                    // The order's own side's fee (SR-37).
+                    view.fee = Some(match order.side {
+                        crate::domain::Side::Buy => view.buyer_fee.clone(),
+                        crate::domain::Side::Sell => view.seller_fee.clone(),
+                    });
+                    view
+                })
                 .collect(),
             duplicate: false,
         }
@@ -307,6 +318,14 @@ pub struct TradeView {
     /// The business day the trade belongs to, and the day it is meant to settle (SR-29).
     pub trade_date: chrono::NaiveDate,
     pub intended_settlement_date: chrono::NaiveDate,
+    /// `EXECUTED`, `CORRECTED` (price and quantity are the corrected ones) or `BUSTED` (SR-36).
+    pub status: crate::domain::ExecutionStatus,
+    /// What each side pays the exchange (SR-37).
+    pub buyer_fee: serde_json::Value,
+    pub seller_fee: serde_json::Value,
+    /// In an order's result only: the order's own side's fee.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee: Option<serde_json::Value>,
 }
 
 impl TradeView {
@@ -325,8 +344,38 @@ impl TradeView {
             executed_at: e.executed_at,
             trade_date: e.trade_date,
             intended_settlement_date: e.intended_settlement_date,
+            status: e.status,
+            buyer_fee: crate::events::fee(e.buyer_fee_minor, instrument),
+            seller_fee: crate::events::fee(e.seller_fee_minor, instrument),
+            fee: None,
         }
     }
+}
+
+/// A trade correction (`POST /api/trades/{executionId}/correction`, SR-36): a new price, a lower quantity, or both.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TradeCorrectionRequest {
+    pub price_ticks: Option<i64>,
+    pub quantity: Option<u64>,
+    /// Defaults to `OPERATOR_CORRECTION`.
+    pub reason: Option<String>,
+}
+
+/// A trade bust (`POST /api/trades/{executionId}/bust`, SR-36).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TradeBustRequest {
+    /// Defaults to `OPERATOR_BUST`.
+    pub reason: Option<String>,
+}
+
+/// A correction's or bust's answer: the execution and both orders after it, the buy order first.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradeAdjustmentResult {
+    pub trade: TradeView,
+    pub orders: Vec<OrderView>,
 }
 
 /// Names an order by the participant's own ID (SR-30). Both are required: client order IDs are unique per participant

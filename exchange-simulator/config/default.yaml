@@ -139,6 +139,28 @@ settlement:
   max_delay_days: 3
   max_delays: 2
   correction_days: 1
+# Corporate actions (SR-38), announced once at startup, e.g.
+#   corporate_actions:
+#     - { kind: CASH_DIVIDEND, instrument_id: ACME, ex_date: 2030-01-08, record_date: 2030-01-09,
+#         pay_date: 2030-01-11, amount_per_share: "0.50" }
+#     - { kind: SPLIT, instrument_id: ACME, ratio: "2:1", effective_date: 2030-01-09 }
+corporate_actions: []
+fees:
+  # Exchange fees (SR-37), free by default: per execution and side, maker_bps (the resting order's side) or taker_bps
+  # (the incoming order's) of the execution's value, rounded half up, at least `minimum` in the instrument's currency.
+  # participants: { B: { taker_bps: 0.5 } } overrides rates per participant; exempt: [LP] pays nothing.
+  maker_bps: 0.0
+  taker_bps: 0.0
+  participants: {}
+  exempt: []
+trades:
+  # Seeded trade corrections and busts (SR-36), off by default. Each execution is busted with bust_probability, else
+  # corrected by one tick with correct_probability, at a seeded instant before the cutoff max_correction_days business
+  # days after its trade date. Operators correct and bust through POST /api/trades/{executionId}/correction and /bust.
+  seed: 0
+  correct_probability: 0.0
+  bust_probability: 0.0
+  max_correction_days: 1
 clearing:
   # End-of-day clearing statements: at `cutoff` (local time in `time_zone`) on each business day, one
   # ClearingStatementIssued per participant that traded since the previous cutoff, with its trades and net obligations

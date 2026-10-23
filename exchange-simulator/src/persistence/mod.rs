@@ -6,7 +6,8 @@ mod store;
 pub use simulator_kit::outbox::{AttemptRow, DeliveryRecord, DeliveryStats, Outbox};
 pub use simulator_kit::persistence::{PersistenceMode, configure, open_reader, schema_version};
 pub use store::{
-    DayTrading, ExecutionFilter, InstrumentFilter, OrderRecord, SettlementWrite, Store,
+    DayTrading, ExecutionFilter, InstrumentFilter, OrderRecord, ScheduledAdjustment,
+    SettlementWrite, Store,
 };
 
 use std::path::Path;
@@ -35,6 +36,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/017_liquidity.sql"),
     include_str!("../../migrations/018_trade_dates.sql"),
     include_str!("../../migrations/019_time_in_force.sql"),
+    include_str!("../../migrations/020_trade_corrections.sql"),
+    include_str!("../../migrations/021_fees.sql"),
+    include_str!("../../migrations/022_corporate_actions.sql"),
 ];
 
 /// A fresh name for an in-memory exchange database (see [`simulator_kit::persistence::memory_location`]).
@@ -114,6 +118,7 @@ mod tests {
                 "clearing_cursor",
                 "clearing_statements",
                 "consumer_offsets",
+                "corporate_actions",
                 "events",
                 "executions",
                 "instruments",
@@ -121,6 +126,7 @@ mod tests {
                 "participants",
                 "settlement_instructions",
                 "settlement_reports",
+                "trade_adjustments",
                 "virtual_clock",
                 "webhook_attempts",
                 "webhook_deliveries",

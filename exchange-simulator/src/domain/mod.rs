@@ -9,7 +9,8 @@ pub use identifiers::{IdentifierError, validate_cusip, validate_isin, validate_m
 pub use instrument::{IdentifierPolicy, Instrument, InstrumentChange, InstrumentError, PriceError};
 pub(crate) use order::wire_enum;
 pub use order::{
-    Execution, Order, OrderStatus, OrderType, ParseEnumError, Side, TimeInForce, TradeDates,
+    Execution, ExecutionStatus, Order, OrderStatus, OrderType, ParseEnumError, Side, TimeInForce,
+    TradeDates,
 };
 
 use serde::{Deserialize, Serialize};

@@ -135,6 +135,69 @@ impl SettlementSimulator {
         self.version += 1;
     }
 
+    /// Plans an instruction's answer to its trade being corrected or busted (SR-36), from `stored`, its state in
+    /// storage: a bust cancels it (`SettlementCancelled`, reason `TRADE_BUSTED`), a correction takes the corrected
+    /// quantity and price and recomputes the amount (`SettlementCorrected`, reason `TRADE_CORRECTED`). A correction
+    /// keeps the instruction's status and due transition, except that a settled one becomes `CORRECTED`. An
+    /// instruction that was rejected, failed or cancelled has nothing to answer: `None`.
+    pub fn adjust(
+        &self,
+        stored: &Instruction,
+        corrected: Option<(u64, i64)>,
+        at: DateTime<Utc>,
+    ) -> Option<SettlementPlan> {
+        let current = self.open.get(&stored.execution_id).unwrap_or(stored);
+        if matches!(
+            current.status,
+            SettlementStatus::Rejected | SettlementStatus::Failed | SettlementStatus::Cancelled
+        ) {
+            return None;
+        }
+        let mut next = current.clone();
+        next.updated_at = at;
+        let (event_type, extra) = match corrected {
+            None => {
+                next.status = SettlementStatus::Cancelled;
+                next.due_at = None;
+                (
+                    events::SETTLEMENT_CANCELLED,
+                    json!({ "reason": "TRADE_BUSTED" }),
+                )
+            }
+            Some((quantity, price_ticks)) => {
+                let amount = i128::from(price_ticks)
+                    * i128::from(current.tick_size_minor)
+                    * i128::from(quantity);
+                next.quantity = quantity;
+                next.price_ticks = price_ticks;
+                next.amount_minor = i64::try_from(amount).unwrap_or(i64::MAX);
+                if current.status == SettlementStatus::Settled {
+                    next.status = SettlementStatus::Corrected;
+                    next.due_at = None;
+                }
+                (
+                    events::SETTLEMENT_CORRECTED,
+                    json!({
+                        "reason": "TRADE_CORRECTED",
+                        "previousSettlementAmount": format_amount(current.amount_minor, current.currency_scale),
+                        "previousAmountMinor": current.amount_minor,
+                        "previousQuantity": current.quantity,
+                        "previousPriceTicks": current.price_ticks,
+                    }),
+                )
+            }
+        };
+        let event = settlement_event(event_type, &next, at, extra);
+        Some(SettlementPlan {
+            base_version: self.version,
+            transitions: vec![Transition {
+                instruction: next,
+                event,
+            }],
+            cursor: self.cursor,
+        })
+    }
+
     fn reconcile(&mut self, instruction: Instruction) {
         let id = instruction.execution_id;
         if let Some(old) = self.open.remove(&id)

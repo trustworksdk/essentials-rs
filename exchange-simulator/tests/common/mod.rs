@@ -92,6 +92,9 @@ impl TestApp {
             ids: IdsConfig::default(),
             settlement: SettlementConfig::default(),
             clearing: Default::default(),
+            trades: Default::default(),
+            fees: Default::default(),
+            corporate_actions: Vec::new(),
             test_control: TestControlConfig { enabled: true },
             logging: LoggingConfig {
                 filter: "warn".into(),

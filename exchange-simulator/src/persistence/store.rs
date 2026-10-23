@@ -54,6 +54,14 @@ pub struct OrderRecord {
 
 const ORDER_COLUMNS: &str = "id, client_order_id, instrument_id, participant_id, side, order_type, limit_price_ticks, \
                              quantity, remaining_quantity, sequence, status, created_at, updated_at, time_in_force";
+/// [`ORDER_COLUMNS`] as read: with the busted quantity (SR-36), which only a trade correction or bust writes.
+const ORDER_READ_COLUMNS: &str = "id, client_order_id, instrument_id, participant_id, side, order_type, \
+                                  limit_price_ticks, quantity, remaining_quantity, sequence, status, created_at, \
+                                  updated_at, time_in_force, busted_quantity";
+/// The executions columns [`execution_row`] reads.
+const EXECUTION_COLUMNS: &str = "id, instrument_id, buy_order_id, sell_order_id, buyer_id, seller_id, price_ticks, \
+                                 quantity, executed_at, trade_date, intended_settlement_date, status, \
+                                 buyer_fee_minor, seller_fee_minor";
 
 /// An instrument's last trade and recent volume ([`Store::trade_summary`]).
 #[derive(Debug)]
@@ -231,16 +239,15 @@ impl Store {
 
     pub fn executions(&self, filter: &ExecutionFilter) -> rusqlite::Result<Vec<Execution>> {
         self.conn
-            .prepare_cached(
-                "SELECT id, instrument_id, buy_order_id, sell_order_id, buyer_id, seller_id, price_ticks, quantity,
-                        executed_at, trade_date, intended_settlement_date
+            .prepare_cached(&format!(
+                "SELECT {EXECUTION_COLUMNS}
                  FROM executions
                  WHERE (?1 IS NULL OR instrument_id = ?1)
                    AND (?2 IS NULL OR buyer_id = ?2 OR seller_id = ?2)
                    AND (?3 IS NULL OR buy_order_id = ?3 OR sell_order_id = ?3)
                  ORDER BY rowid
-                 LIMIT ?4",
-            )?
+                 LIMIT ?4"
+            ))?
             .query_map(
                 params![
                     filter.instrument_id.as_ref().map(|i| &i.0),
@@ -248,23 +255,19 @@ impl Store {
                     filter.order_id.map(|o| o.to_string()),
                     filter.limit,
                 ],
-                |row| {
-                    Ok(Execution {
-                        id: parsed(row, 0)?,
-                        instrument_id: InstrumentId(row.get(1)?),
-                        buy_order_id: parsed(row, 2)?,
-                        sell_order_id: parsed(row, 3)?,
-                        buyer_id: ParticipantId(row.get(4)?),
-                        seller_id: ParticipantId(row.get(5)?),
-                        price_ticks: row.get(6)?,
-                        quantity: from_sql(row, 7)?,
-                        executed_at: parsed(row, 8)?,
-                        trade_date: parsed(row, 9)?,
-                        intended_settlement_date: parsed(row, 10)?,
-                    })
-                },
+                execution_row,
             )?
             .collect()
+    }
+
+    /// One execution in its current state (corrected or busted, SR-36); `None` when there is no such execution.
+    pub fn execution(&self, id: Uuid) -> rusqlite::Result<Option<Execution>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {EXECUTION_COLUMNS} FROM executions WHERE id = ?1"
+            ))?
+            .query_row([id.to_string()], execution_row)
+            .optional()
     }
 
     /// Executions stored before they carried dates (migration 018).
@@ -340,7 +343,7 @@ impl Store {
     pub fn active_orders(&self) -> rusqlite::Result<Vec<Order>> {
         self.conn
             .prepare_cached(&format!(
-                "SELECT {ORDER_COLUMNS} FROM orders WHERE status IN ('OPEN', 'PARTIALLY_FILLED') ORDER BY sequence"
+                "SELECT {ORDER_READ_COLUMNS} FROM orders WHERE status IN ('OPEN', 'PARTIALLY_FILLED') ORDER BY sequence"
             ))?
             .query_map([], |row| order_record(row).map(|record| record.order))?
             .collect()
@@ -350,7 +353,7 @@ impl Store {
     pub fn active_day_orders(&self) -> rusqlite::Result<Vec<OrderRecord>> {
         self.conn
             .prepare_cached(&format!(
-                "SELECT {ORDER_COLUMNS} FROM orders
+                "SELECT {ORDER_READ_COLUMNS} FROM orders
                  WHERE status IN ('OPEN', 'PARTIALLY_FILLED') AND time_in_force = 'DAY' ORDER BY sequence"
             ))?
             .query_map([], order_record)?
@@ -367,7 +370,9 @@ impl Store {
 
     pub fn order(&self, id: Uuid) -> rusqlite::Result<Option<OrderRecord>> {
         self.conn
-            .prepare_cached(&format!("SELECT {ORDER_COLUMNS} FROM orders WHERE id = ?1"))?
+            .prepare_cached(&format!(
+                "SELECT {ORDER_READ_COLUMNS} FROM orders WHERE id = ?1"
+            ))?
             .query_row([id.to_string()], order_record)
             .optional()
     }
@@ -379,7 +384,7 @@ impl Store {
     ) -> rusqlite::Result<Option<OrderRecord>> {
         self.conn
             .prepare_cached(&format!(
-                "SELECT {ORDER_COLUMNS} FROM orders WHERE participant_id = ?1 AND client_order_id = ?2"
+                "SELECT {ORDER_READ_COLUMNS} FROM orders WHERE participant_id = ?1 AND client_order_id = ?2"
             ))?
             .query_row(params![participant.0, client_order_id], order_record)
             .optional()
@@ -397,6 +402,7 @@ impl Store {
         update: &BookUpdate,
         new_events: &[NewEvent],
         settlement: Option<SettlementWrite<'_>>,
+        scheduled: &[ScheduledAdjustment],
         outbox: Outbox<'_>,
         now: DateTime<Utc>,
     ) -> rusqlite::Result<()> {
@@ -430,8 +436,9 @@ impl Store {
             }
             let mut insert_execution = tx.prepare_cached(
                 "INSERT INTO executions (id, instrument_id, buy_order_id, sell_order_id, buyer_id, seller_id,
-                                         price_ticks, quantity, executed_at, trade_date, intended_settlement_date)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                         price_ticks, quantity, executed_at, trade_date, intended_settlement_date,
+                                         buyer_fee_minor, seller_fee_minor)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?;
             for execution in &update.executions {
                 insert_execution.execute(params![
@@ -446,6 +453,18 @@ impl Store {
                     timestamp(execution.executed_at),
                     execution.trade_date.to_string(),
                     execution.intended_settlement_date.to_string(),
+                    execution.buyer_fee_minor,
+                    execution.seller_fee_minor,
+                ])?;
+            }
+            let mut schedule = tx.prepare_cached(
+                "INSERT INTO trade_adjustments (execution_id, due_at, kind) VALUES (?1, ?2, ?3)",
+            )?;
+            for adjustment in scheduled {
+                schedule.execute(params![
+                    adjustment.execution_id.to_string(),
+                    timestamp(adjustment.due_at),
+                    adjustment.kind(),
                 ])?;
             }
             write_events(&tx, new_events, &outbox)?;
@@ -454,6 +473,189 @@ impl Store {
             }
         }
         tx.commit()
+    }
+
+    /// Writes a trade correction or bust (SR-36) in one transaction: the execution as corrected or busted, both
+    /// orders' busted quantities and statuses, the events, the settlement instruction's answer, and the removal of
+    /// the execution's scheduled adjustment, if any.
+    pub fn commit_trade_adjustment(
+        &mut self,
+        execution: &Execution,
+        orders: &[Order],
+        new_events: &[NewEvent],
+        settlement: Option<SettlementWrite<'_>>,
+        outbox: Outbox<'_>,
+        now: DateTime<Utc>,
+    ) -> rusqlite::Result<()> {
+        let now = timestamp(now);
+        let tx = self.conn.savepoint()?;
+        tx.prepare_cached(
+            "UPDATE executions SET quantity = ?2, price_ticks = ?3, status = ?4, buyer_fee_minor = ?5,
+                                   seller_fee_minor = ?6
+             WHERE id = ?1",
+        )?
+        .execute(params![
+            execution.id.to_string(),
+            to_sql(execution.quantity),
+            execution.price_ticks,
+            execution.status.as_str(),
+            execution.buyer_fee_minor,
+            execution.seller_fee_minor,
+        ])?;
+        let mut update = tx.prepare_cached(
+            "UPDATE orders SET busted_quantity = ?2, status = ?3, updated_at = ?4 WHERE id = ?1",
+        )?;
+        for order in orders {
+            update.execute(params![
+                order.id.to_string(),
+                to_sql(order.busted_quantity),
+                order.status.as_str(),
+                now,
+            ])?;
+        }
+        drop(update);
+        tx.prepare_cached("DELETE FROM trade_adjustments WHERE execution_id = ?1")?
+            .execute([execution.id.to_string()])?;
+        write_events(&tx, new_events, &outbox)?;
+        if let Some(settlement) = &settlement {
+            write_settlement(&tx, settlement)?;
+        }
+        tx.commit()
+    }
+
+    /// Writes a corporate action (SR-38) in one transaction: the action announced, paid or applied, the resting orders
+    /// a split adjusted (quantity, remainder, limit price, status), and the events.
+    pub fn commit_corporate_action(
+        &mut self,
+        action: &crate::corporate_actions::CorporateAction,
+        orders: &[Order],
+        new_events: &[NewEvent],
+        outbox: Outbox<'_>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.savepoint()?;
+        tx.prepare_cached(
+            "INSERT INTO corporate_actions (id, kind, instrument_id, ex_date, record_date, pay_date,
+                                            amount_per_share_minor, ratio_new, ratio_old, effective_date,
+                                            announced_at, done_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT (id) DO UPDATE SET done_at = excluded.done_at",
+        )?
+        .execute(params![
+            action.id,
+            action.kind.as_str(),
+            action.instrument_id.0,
+            action.ex_date.map(|d| d.to_string()),
+            action.record_date.map(|d| d.to_string()),
+            action.pay_date.map(|d| d.to_string()),
+            action.amount_per_share_minor,
+            to_sql(action.ratio.0),
+            to_sql(action.ratio.1),
+            action.effective_date.map(|d| d.to_string()),
+            timestamp(action.announced_at),
+            action.done_at.map(timestamp),
+        ])?;
+        let mut update = tx.prepare_cached(
+            "UPDATE orders SET quantity = ?2, remaining_quantity = ?3, limit_price_ticks = ?4, status = ?5,
+                               updated_at = ?6
+             WHERE id = ?1",
+        )?;
+        for order in orders {
+            update.execute(params![
+                order.id.to_string(),
+                to_sql(order.quantity),
+                to_sql(order.remaining_quantity),
+                order.limit_price_ticks,
+                order.status.as_str(),
+                action.done_at.map(timestamp),
+            ])?;
+        }
+        drop(update);
+        write_events(&tx, new_events, &outbox)?;
+        tx.commit()
+    }
+
+    /// Every corporate action, in due order then ID.
+    pub fn corporate_actions(
+        &self,
+    ) -> rusqlite::Result<Vec<crate::corporate_actions::CorporateAction>> {
+        let date = |row: &Row<'_>, i: usize| -> rusqlite::Result<Option<chrono::NaiveDate>> {
+            row.get::<_, Option<String>>(i)?
+                .map(|_| parsed(row, i))
+                .transpose()
+        };
+        self.conn
+            .prepare_cached(
+                "SELECT id, kind, instrument_id, ex_date, record_date, pay_date, amount_per_share_minor, ratio_new,
+                        ratio_old, effective_date, announced_at, done_at
+                 FROM corporate_actions ORDER BY COALESCE(pay_date, effective_date), id",
+            )?
+            .query_map([], |row| {
+                Ok(crate::corporate_actions::CorporateAction {
+                    id: row.get(0)?,
+                    kind: parsed(row, 1)?,
+                    instrument_id: InstrumentId(row.get(2)?),
+                    ex_date: date(row, 3)?,
+                    record_date: date(row, 4)?,
+                    pay_date: date(row, 5)?,
+                    amount_per_share_minor: row.get(6)?,
+                    ratio: (from_sql(row, 7)?, from_sql(row, 8)?),
+                    effective_date: date(row, 9)?,
+                    announced_at: parsed(row, 10)?,
+                    done_at: row
+                        .get::<_, Option<String>>(11)?
+                        .map(|_| parsed(row, 11))
+                        .transpose()?,
+                })
+            })?
+            .collect()
+    }
+
+    /// Each side of the instrument's executions that are not busted, for holdings (SR-38).
+    pub fn positions(
+        &self,
+        instrument: &InstrumentId,
+    ) -> rusqlite::Result<Vec<crate::corporate_actions::Position>> {
+        self.conn
+            .prepare_cached(
+                "SELECT buyer_id, quantity, executed_at, intended_settlement_date FROM executions
+                 WHERE instrument_id = ?1 AND status != 'BUSTED' AND intended_settlement_date IS NOT NULL
+                 UNION ALL
+                 SELECT seller_id, -quantity, executed_at, intended_settlement_date FROM executions
+                 WHERE instrument_id = ?1 AND status != 'BUSTED' AND intended_settlement_date IS NOT NULL",
+            )?
+            .query_map([&instrument.0], |row| {
+                Ok(crate::corporate_actions::Position {
+                    participant_id: ParticipantId(row.get(0)?),
+                    quantity: row.get(1)?,
+                    executed_at: parsed(row, 2)?,
+                    intended_settlement_date: parsed(row, 3)?,
+                })
+            })?
+            .collect()
+    }
+
+    /// The seeded corrections and busts still to come (SR-36), in due order.
+    pub fn scheduled_adjustments(&self) -> rusqlite::Result<Vec<ScheduledAdjustment>> {
+        self.conn
+            .prepare_cached(
+                "SELECT due_at, execution_id, kind FROM trade_adjustments ORDER BY due_at, execution_id",
+            )?
+            .query_map([], |row| {
+                Ok(ScheduledAdjustment {
+                    due_at: parsed(row, 0)?,
+                    execution_id: parsed(row, 1)?,
+                    bust: row.get::<_, String>(2)? == "BUST",
+                })
+            })?
+            .collect()
+    }
+
+    /// Drops a scheduled adjustment whose execution was busted before it came due.
+    pub fn drop_scheduled_adjustment(&self, execution_id: Uuid) -> rusqlite::Result<()> {
+        self.conn
+            .prepare_cached("DELETE FROM trade_adjustments WHERE execution_id = ?1")?
+            .execute([execution_id.to_string()])
+            .map(drop)
     }
 
     /// Canonical events with `sequence > after`, in sequence order, optionally of one type.
@@ -838,7 +1040,7 @@ impl Store {
             .prepare_cached(
                 "SELECT instrument_id,
                         SUM(CASE WHEN buyer_id = ?1 THEN quantity ELSE -quantity END)
-                 FROM executions WHERE buyer_id = ?1 OR seller_id = ?1
+                 FROM executions WHERE (buyer_id = ?1 OR seller_id = ?1) AND status != 'BUSTED'
                  GROUP BY instrument_id ORDER BY instrument_id",
             )?
             .query_map([&participant.0], |row| {
@@ -989,6 +1191,21 @@ impl Store {
     /// Makes every in-flight delivery due now. Used at startup, when no claim can still be in progress.
     pub fn release_claims(&self, now: DateTime<Utc>) -> rusqlite::Result<usize> {
         outbox::release_claims(&self.conn, now)
+    }
+}
+
+/// A seeded trade correction or bust waiting for its time (SR-36). Ordered by due time, then execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScheduledAdjustment {
+    pub due_at: DateTime<Utc>,
+    pub execution_id: Uuid,
+    /// A bust, else a correction of the price by one tick.
+    pub bust: bool,
+}
+
+impl ScheduledAdjustment {
+    fn kind(&self) -> &'static str {
+        if self.bust { "BUST" } else { "CORRECT" }
     }
 }
 
@@ -1229,6 +1446,25 @@ fn insert_instrument(conn: &Connection, instrument: &Instrument) -> rusqlite::Re
     .map(drop)
 }
 
+fn execution_row(row: &Row<'_>) -> rusqlite::Result<Execution> {
+    Ok(Execution {
+        id: parsed(row, 0)?,
+        instrument_id: InstrumentId(row.get(1)?),
+        buy_order_id: parsed(row, 2)?,
+        sell_order_id: parsed(row, 3)?,
+        buyer_id: ParticipantId(row.get(4)?),
+        seller_id: ParticipantId(row.get(5)?),
+        price_ticks: row.get(6)?,
+        quantity: from_sql(row, 7)?,
+        executed_at: parsed(row, 8)?,
+        trade_date: parsed(row, 9)?,
+        intended_settlement_date: parsed(row, 10)?,
+        status: parsed(row, 11)?,
+        buyer_fee_minor: row.get(12)?,
+        seller_fee_minor: row.get(13)?,
+    })
+}
+
 fn order_record(row: &Row<'_>) -> rusqlite::Result<OrderRecord> {
     Ok(OrderRecord {
         order: Order {
@@ -1244,6 +1480,7 @@ fn order_record(row: &Row<'_>) -> rusqlite::Result<OrderRecord> {
             sequence: from_sql(row, 9)?,
             status: parsed(row, 10)?,
             time_in_force: parsed(row, 13)?,
+            busted_quantity: from_sql(row, 14)?,
         },
         created_at: parsed(row, 11)?,
         updated_at: parsed(row, 12)?,

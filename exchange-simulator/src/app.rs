@@ -135,6 +135,15 @@ impl App {
                 liquidity: Some(config.liquidity.policy().map_err(anyhow::Error::msg)?),
                 market_data: Some(market_data.clone()),
                 sessions: config.trading_sessions().map_err(anyhow::Error::msg)?,
+                trade_adjustments: {
+                    config.trades.validate().map_err(anyhow::Error::msg)?;
+                    config.trades.clone()
+                },
+                fees: {
+                    config.fees.validate().map_err(anyhow::Error::msg)?;
+                    config.fees.clone()
+                },
+                corporate_actions: config.corporate_actions.clone(),
                 trade_dating: crate::settlement::TradeDating {
                     calendar: Some(config.business_calendar().map_err(anyhow::Error::msg)?),
                     cycles: config.settlement_policy(),

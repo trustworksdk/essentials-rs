@@ -35,6 +35,8 @@ fn trade(sequence: u64, at: DateTime<Utc>) -> TradeFacts {
         tick_size_minor: 1,
         executed_at: at,
         dates: None,
+        buyer_fee_minor: 0,
+        seller_fee_minor: 0,
     }
 }
 

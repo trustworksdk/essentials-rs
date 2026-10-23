@@ -29,6 +29,14 @@ pub const ORDER_CANCELLED: &str = "OrderCancelled";
 /// A `DAY` order still open when its session closed (SR-17).
 pub const ORDER_EXPIRED: &str = "OrderExpired";
 pub const TRADE_EXECUTED: &str = "TradeExecuted";
+/// An execution's price or quantity was corrected after the fact (SR-36, FIX `ExecType` `G`).
+pub const TRADE_CORRECTED: &str = "TradeCorrected";
+/// An execution was cancelled after the fact (SR-36, FIX `ExecType` `H`).
+pub const TRADE_BUSTED: &str = "TradeBusted";
+/// An order's fill was corrected: the order's new running totals and the corrected execution (SR-36).
+pub const ORDER_FILL_CORRECTED: &str = "OrderFillCorrected";
+/// An order's fill was busted: the order's new running totals and the busted execution (SR-36).
+pub const ORDER_FILL_BUSTED: &str = "OrderFillBusted";
 /// An instrument was listed, through the API or from configuration.
 pub const INSTRUMENT_LISTED: &str = "InstrumentListed";
 /// A business day ended at its cutoff (`source: "exchange"`), also on days without trades.
@@ -61,6 +69,13 @@ pub const EVENT_TYPES: &[&str] = &[
     ORDER_CANCELLED,
     ORDER_EXPIRED,
     TRADE_EXECUTED,
+    TRADE_CORRECTED,
+    TRADE_BUSTED,
+    ORDER_FILL_CORRECTED,
+    ORDER_FILL_BUSTED,
+    crate::corporate_actions::CORPORATE_ACTION_ANNOUNCED,
+    crate::corporate_actions::DIVIDEND_PAID,
+    crate::corporate_actions::SPLIT_APPLIED,
     INSTRUMENT_LISTED,
     INSTRUMENT_UPDATED,
     CLOCK_CHANGED,
@@ -317,6 +332,86 @@ pub fn for_update(
     events
 }
 
+/// The events of a trade correction or bust (SR-36), unstamped: `TradeCorrected` or `TradeBusted` (aggregate the
+/// execution), then each order's `OrderFillCorrected` or `OrderFillBusted` (aggregate the order), the buy order's first.
+/// Every one carries the execution ID as correlation ID, and `reason`.
+pub fn for_trade_adjustment(
+    before: &Execution,
+    after: &Execution,
+    orders: &[Order],
+    instrument: &Instrument,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Vec<NewEvent> {
+    let busted = after.status == crate::domain::ExecutionStatus::Busted;
+    let price = |ticks: i64| instrument.ticks_to_price(ticks);
+    let mut trade = json!({
+        "executionId": after.id,
+        "instrumentId": after.instrument_id,
+        "buyOrderId": after.buy_order_id,
+        "sellOrderId": after.sell_order_id,
+        "buyerId": after.buyer_id,
+        "sellerId": after.seller_id,
+        "currency": instrument.currency,
+        "reason": reason,
+        "tradeDate": after.trade_date,
+        "intendedSettlementDate": after.intended_settlement_date,
+    });
+    if busted {
+        trade["quantity"] = json!(before.quantity);
+        trade["priceTicks"] = json!(before.price_ticks);
+        trade["price"] = json!(price(before.price_ticks));
+    } else {
+        trade["previousQuantity"] = json!(before.quantity);
+        trade["quantity"] = json!(after.quantity);
+        trade["previousPriceTicks"] = json!(before.price_ticks);
+        trade["priceTicks"] = json!(after.price_ticks);
+        trade["previousPrice"] = json!(price(before.price_ticks));
+        trade["price"] = json!(price(after.price_ticks));
+        trade["buyerFee"] = fee(after.buyer_fee_minor, instrument);
+        trade["sellerFee"] = fee(after.seller_fee_minor, instrument);
+    }
+    let event = |event_type: &'static str, aggregate_id: String, payload: Value| NewEvent {
+        event_id: Uuid::nil(),
+        sequence: 0,
+        event_type,
+        source: EXCHANGE_SOURCE,
+        aggregate_id,
+        correlation_id: Some(after.id.to_string()),
+        occurred_at: now,
+        payload,
+    };
+    let mut events = vec![event(
+        if busted {
+            TRADE_BUSTED
+        } else {
+            TRADE_CORRECTED
+        },
+        after.id.to_string(),
+        trade,
+    )];
+    for order in orders {
+        // The busted execution as it stood, or the corrected one, in SR-31's fields.
+        let mut payload = fill_payload(order, instrument, if busted { before } else { after });
+        if !busted {
+            payload["previousLastQuantity"] = json!(before.quantity);
+            payload["previousLastPriceTicks"] = json!(before.price_ticks);
+            payload["previousLastPrice"] = json!(price(before.price_ticks));
+        }
+        payload["reason"] = json!(reason);
+        events.push(event(
+            if busted {
+                ORDER_FILL_BUSTED
+            } else {
+                ORDER_FILL_CORRECTED
+            },
+            order.id.to_string(),
+            payload,
+        ));
+    }
+    events
+}
+
 /// A fill event's payload: the order after the execution, and the execution it reports, as a FIX execution report
 /// names it (SR-31: `ExecID`, `LastQty`, `LastPx`), with its trade and intended settlement dates (SR-29).
 fn fill_payload(order: &Order, instrument: &Instrument, execution: &Execution) -> Value {
@@ -325,6 +420,14 @@ fn fill_payload(order: &Order, instrument: &Instrument, execution: &Execution) -
     payload["lastQuantity"] = json!(execution.quantity);
     payload["lastPriceTicks"] = json!(execution.price_ticks);
     payload["lastPrice"] = json!(instrument.ticks_to_price(execution.price_ticks));
+    // The order's own side's fee for this execution (SR-37), as FIX's `Commission` on an execution report.
+    payload["lastFee"] = fee(
+        match order.side {
+            crate::domain::Side::Buy => execution.buyer_fee_minor,
+            crate::domain::Side::Sell => execution.seller_fee_minor,
+        },
+        instrument,
+    );
     payload["tradeDate"] = json!(execution.trade_date);
     payload["intendedSettlementDate"] = json!(execution.intended_settlement_date);
     payload
@@ -351,6 +454,7 @@ fn order_payload(order: &Order, instrument: &Instrument, cancel_reason: Option<&
         "quantity": order.quantity,
         "remainingQuantity": order.remaining_quantity,
         "filledQuantity": order.filled_quantity(),
+        "bustedQuantity": order.busted_quantity,
         "status": order.status,
         "sequence": order.sequence,
         "timeInForce": order.time_in_force,
@@ -394,5 +498,16 @@ fn trade_payload(
         "executedAt": execution.executed_at,
         "tradeDate": execution.trade_date,
         "intendedSettlementDate": execution.intended_settlement_date,
+        "buyerFee": fee(execution.buyer_fee_minor, instrument),
+        "sellerFee": fee(execution.seller_fee_minor, instrument),
+    })
+}
+
+/// A fee (SR-37) as events and responses carry it: `amount` (decimal), `amountMinor` and `currency`.
+pub fn fee(minor: i64, instrument: &Instrument) -> Value {
+    json!({
+        "amount": crate::settlement::format_amount(minor, instrument.currency_scale),
+        "amountMinor": minor,
+        "currency": instrument.currency,
     })
 }

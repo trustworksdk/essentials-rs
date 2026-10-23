@@ -1603,12 +1603,12 @@ it.
 | 6.18 | Value dates on payments | 2 | S | **SR-33** (added to the requirements 2026-10-22). `valueDate` on the gateway's payment payload: the business date of the latest booking (the completion's, then the return's) on the bank's calendar, set when the payment completes or is returned, stored with it, and equal to the statement entry's. `null` before a booking; required on `PaymentCompleted` and `PaymentReturned`. Payments stored before the column are dated at startup. |
 | 6.19 | Event-log reads by several types | 6 | S | **SR-34.** `eventType` repeated or comma-separated on both services' `GET /api/events` (an unknown type stays `400`), and an `Event-Log-Scanned-Through` header on every answer: the highest sequence the read looked at, so a filtered reader continues from there. |
 | 6.20 | Holidays, one calendar for both simulators | 4 | L | **SR-35.** Holidays on the shared business-day calendar (`simulator_kit::calendar`): `clearing.holidays` on the exchange (no `BusinessDayClosed`, clearing statement or `ClosingPriceIssued` on a holiday; trade and settlement dates skip it), `sessions.<MIC>.holidays` defaulting to them, `GET /api/calendar?from=&to=`. The gateway's `calendar.mode: follow` reads the exchange's calendar for its statements, value dates and return delays; `own` keeps today's. |
-| 6.21 | Trade corrections and busts | after 5 | L | **SR-36 (LATER), planned only.** `TradeCorrected`/`TradeBusted`, `OrderFillCorrected`/`OrderFillBusted` with the order's new running totals and the execution's SR-31 fields; settlement follows; operator calls and seeded probabilities. |
-| 6.22 | Exchange fees | after 5 | M | **SR-37 (LATER), planned only.** Maker/taker basis points with a minimum, per participant (the provider may be exempt); fees on `TradeExecuted`, the fill events (`lastFee`), the order result and the clearing statement (`feesNet`). |
-| 6.23 | Corporate actions | after 5 | L | **SR-38 (LATER), planned only.** Cash dividends (`CorporateActionAnnounced`, `DividendPaid` from settled shares at the record date) and splits (`SplitApplied`, resting orders and the reference price adjusted), from configuration or an operator call. |
+| 6.21 | Trade corrections and busts | after 5 | L | **SR-36 (LATER)**, implemented 2026-10-22 at the user's request. `TradeCorrected`/`TradeBusted`, `OrderFillCorrected`/`OrderFillBusted` with the order's new running totals and the execution's SR-31 fields; settlement follows; operator calls and seeded probabilities. |
+| 6.22 | Exchange fees | after 5 | M | **SR-37 (LATER)**, implemented 2026-10-22 at the user's request. Maker/taker basis points with a minimum, per participant (the provider may be exempt); fees on `TradeExecuted`, the fill events (`lastFee`), the order result and the clearing statement (`feesNet`). |
+| 6.23 | Corporate actions | after 5 | L | **SR-38 (LATER)**, implemented 2026-10-22 at the user's request. Cash dividends (`CorporateActionAnnounced`, `DividendPaid` from settled shares at the record date) and splits (`SplitApplied`, resting orders and the reference price adjusted), from configuration or an operator call. |
 
 **Not planned:** SR-18 (FX reference rates) is marked LATER and waits for the demo's FX phase. SR-36 to SR-38 are
-LATER too: planned as 6.21–6.23 at the user's request (2026-10-22), not implemented.
+LATER too, but were done as 6.21–6.23 at the user's request (2026-10-22).
 
 **Order within the milestone:** by demo phase, as in the table: 6.1–6.3, then 6.4–6.5, then 6.6, then 6.7–6.10
 (6.7 and 6.8 before 6.9, so the provider and the feed are tested on synthetic prices before a live source is added),
@@ -2370,6 +2370,115 @@ then 6.11, 6.12, 6.13–6.14.
   separately its statements, keeping its own calendar in follow mode; the calendar endpoint listing holidays outside
   the range (survived the first test, which had no holiday outside it; Christmas was added).
 
+**6.21 — trade corrections and busts ✅ done (2026-10-22)**
+- **User decisions (2026-10-22):** a bust, or a correction lowering the quantity, does not reinstate the orders:
+  their filled quantity drops, the quantity is recorded as busted, and nothing goes back on the book; a `FILLED` order
+  whose fills are all busted becomes `CANCELLED`. Corrections may move the price to any tick and the quantity only
+  down.
+- **Delivered:**
+  - `POST /api/trades/{executionId}/correction` (`priceTicks`, `quantity`, `reason`) and `/bust` (`reason`) (SR-36),
+    through the dispatcher (`Request::AdjustTrade`, outside commit groups) to `Exchange::adjust_trade`. One commit
+    (`Store::commit_trade_adjustment`): the execution corrected in place or marked `BUSTED` (`executions.status`,
+    migration 020), both orders' `busted_quantity` and status, the events, the settlement instruction's answer, and the
+    execution's scheduled adjustment removed.
+  - `Order::busted_quantity`: `filledQuantity` is quantity − remaining − busted; `bustedQuantity` on every order
+    payload and `Order` view. A resting order's state is amended in the book (`OrderBook::amend`), its remainder and
+    place untouched. `Trade` gains `status` (`EXECUTED`, `CORRECTED`, `BUSTED`).
+  - Events `TradeCorrected`/`TradeBusted` (aggregate the execution) and per order `OrderFillCorrected`/
+    `OrderFillBusted` with the order's running totals and SR-31's execution fields (`previousLast*` on a correction);
+    correlation ID the execution; the provider's order events filtered as before.
+  - `SettlementSimulator::adjust`: a bust cancels the instruction (`SettlementCancelled`, `TRADE_BUSTED`); a
+    correction recomputes the amount (`SettlementCorrected`, `TRADE_CORRECTED`, `previousQuantity`,
+    `previousPriceTicks`), keeping the status and due transition, a settled instruction becoming `CORRECTED`. Rejected,
+    failed and cancelled instructions are left alone.
+  - Clearing drafts from each execution's current state (corrected values, busted ones left out); issued statements
+    are not reissued. The provider's inventory moves back by the busted quantity; its net positions skip busted
+    executions.
+  - Seeded: `trades.seed`, `correct_probability`, `bust_probability`, `max_correction_days`. Drawn per execution at
+    the trade and stored with it (`trade_adjustments`), due at a seeded instant before the cutoff
+    `max_correction_days` business days after the trade date, run by the tick in time order (before that instant's
+    business-day close), reasons `SIMULATED_BUST` and `SIMULATED_CORRECTION` (one tick).
+  - `openapi.yaml` (two operations, `TradeAdjustment`, four events and webhooks, the settlement reasons), the README,
+    the default configuration. The API documents go to 0.5.0 for this branch (6.21–6.23).
+  - Tests: `tests/trade_corrections.rs` (SR-36's acceptance: a bust's orders, events to both members, the cancelled
+    settlement, `409` after; a correction on the trade, the fills and the settlement amount, a quantity correction,
+    the `400`s and `404`; statements drafted after a correction and not reissued after a bust; seeded busts and
+    corrections across a restart, within their window); the contract test corrects and busts a trade.
+- **Decisions:**
+  - **Market data and closing prices are not adjusted:** the last trade and session volume keep the original prints.
+  - **A correction keeps a pending instruction pending**: only its amount changes; SR-36 asks only that settlement
+    follows.
+  - **Seeded corrections move the price by one tick** (down unless that leaves no price); seeded busts and corrections
+    never touch the quantity.
+- **Gates:** fmt, clippy (`-D warnings`), doc, `cargo test -j 1 -p exchange-simulator` (43 targets) green; the
+  schema test lists `trade_adjustments`. The gateway's contract test green at 0.5.0 (its code is unchanged).
+- **Mutation checks**, each made a test fail (all 8): the orders keeping their fills; a fully busted `FILLED` order
+  staying filled; the resting order not amended in the book (survived until the test also checked the later fill's
+  event, since storage alone was right); settlement not following; statements using the original trade, and keeping
+  busted ones; the quantity allowed to go up; seeded adjustments never scheduled.
+
+**6.22 — exchange fees ✅ done (2026-10-22)**
+- **Delivered:**
+  - `crate::fees::FeeSchedule` (`fees:`, SR-37): `maker_bps`, `taker_bps`, `minimum` (major units of the instrument's
+    currency), `participants` overriding rates field by field, `exempt`. A side pays its rate of the execution's value
+    (price ticks × tick size × quantity), rounded half up, at least the minimum; the resting order's side is the maker,
+    the incoming order's the taker. Free by default.
+  - `Execution::buyer_fee_minor` and `seller_fee_minor` (migration 021), set as the trade is committed and repriced by a
+    correction (the later of the two orders stays the taker); a busted execution pays none.
+  - `buyerFee`/`sellerFee` (`amount`, `amountMinor`, `currency`) on `TradeExecuted`, `TradeCorrected` and every
+    `Trade`; `fee` (the order's own side's) in an order result's executions; `lastFee` on every fill event, the
+    correction and bust ones included.
+  - Clearing: each statement line's `fee`/`feeMinor`, each obligation's `feesNet`/`feesNetMinor`, the sum of its
+    lines' fees, from the `TradeExecuted` payload and the execution's current fees. Statements stored before 6.22
+    read with zero fees (`serde(default)`).
+  - `openapi.yaml` (`Fee`, the fields above), the README's Fees section, the default configuration.
+  - Tests: `tests/fees.rs` (SR-37's acceptance: the fees on the fill events, `TradeExecuted`, the result and the
+    statement, summing to `feesNet`; the minimum, a participant's own rate, an exempt participant, fees apart from
+    `cashNet`; a correction repricing them) and the schedule's unit tests.
+- **Decisions:**
+  - **Fees are not part of the settlement cash:** `cashNet` and the settlement instruction's amount stay the trade's
+    value, as a clearinghouse bills fees separately; `feesNet` is reported beside them.
+  - **No negative rates (rebates):** SR-37 does not ask for them.
+- **Gates:** fmt, clippy (`-D warnings`), doc, `cargo test -j 1 -p exchange-simulator` (44 targets) green after
+  `tests/events.rs`'s exact `TradeExecuted` payload gained the (zero) fees.
+- **Mutation checks**, each made a test fail (all 6): no minimum; nobody exempt; maker and taker swapped for the
+  buyer; `lastFee` from the other side; `feesNet` not summed; a correction keeping the old fees.
+
+**6.23 — corporate actions ✅ done (2026-10-22)**
+- **User decision (2026-10-22):** holdings are contractual: a participant's net quantity over its executions that are
+  not busted and settle on or before the date in question, the same in every settlement mode.
+- **Delivered:**
+  - `crate::corporate_actions` (SR-38): `ActionSpec` (configuration and API), `CorporateAction` validated and keyed
+    `CA:<instrument>:<kind>:<date>`, `holdings` (scaled by splits applied after each execution, without losing a
+    fraction between splits), `split_price` (to the nearest tick, at least one) and `split_quantity` (rounded down).
+  - Stored in `corporate_actions` (migration 022) with `Store::commit_corporate_action`; `POST`/`GET
+    /api/corporate-actions`; `corporate_actions:` in the configuration, announced once at startup and after a reset.
+  - The tick pays a dividend at 00:00 UTC on its pay date (`DividendPaid` per positive holding at the record date) and
+    applies a split at 00:00 UTC on its effective date: resting orders scaled and rebuilt in time priority
+    (`OrderBook::replace_resting`), one left with nothing cancelled; `PriceSources::apply_split` scales published prices
+    of sources that are not live, restored at startup from the applied splits; the provider re-quotes; `SplitApplied`
+    per participant with holdings or resting orders, listing its adjusted orders.
+  - `openapi.yaml` (two operations, `CorporateAction`, three events and webhooks), the README, the default
+    configuration.
+  - Tests: `tests/corporate_actions.rs` (SR-38's acceptance: a dividend on 100 settled shares paid as 100 × the amount,
+    a holder settling after the record date and a short seller paid nothing; a 2:1 split doubling a resting order and
+    halving its price, the book, the reference price across a restart, `SplitApplied`; the `400`, `409` and `422`;
+    configured actions announced once across a restart), the module's unit tests; the contract test announces, pays
+    and applies them.
+- **Decisions:**
+  - **Due at 00:00 UTC** on the pay or effective date, as settlement is: before that day's trading.
+  - **`SplitApplied` lists the participant's adjusted orders** so a member that tracks orders by events sees the
+    change; there is no separate order event.
+  - **Not adjusted:** trades already made, settlement instructions, market data prints and closing prices before the
+    split.
+  - **Deviation:** the contract test found nothing wrong with a `$ref` to a missing response component until a call
+    exercised it; the operation now uses the existing `Unprocessable`.
+- **Gates:** fmt, clippy (`-D warnings`, after naming `AppliedSplit` for a complex type), doc, `cargo test -j 1 -p
+  exchange-simulator` (45 targets) green.
+- **Mutation checks**, each made a test fail (all 8): holdings ignoring the settlement date; short holders paid; the
+  amount not per share; prices not split; the reference not split when applied, and not after a restart; configured
+  actions announced at every start; the book not rebuilt.
+
 ### Milestone 6 status
 
 All steps of the milestone are done (6.1–6.14 with 6.9a, 2026-10-18 to 2026-10-20). Not planned: SR-18 (FX, LATER).
@@ -2377,7 +2486,7 @@ SR-30 (cancel by client order id) was added on 2026-10-21 and done as step 6.15 
 SR-31 (the execution on every fill event) and SR-32 (the business day on `OrderExpired`) were added on 2026-10-22
 and done as steps 6.16 and 6.17 the same day.
 SR-33 to SR-35 (value dates, multi-type event reads, holidays) were added on 2026-10-22 and done as steps 6.18–6.20
-the same day; SR-36 to SR-38 (LATER) are planned as 6.21–6.23.
+the same day; SR-36 to SR-38 (LATER) were done as 6.21–6.23 at the user's request, also on 2026-10-22.
 Still on hold from Milestone 4: 4.6d (the containerized benchmark).
 
 **SR-2 manual acceptance against the real Finnhub ✅ done (2026-10-20, D19).** `config/finnhub-market.yaml` (40
