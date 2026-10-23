@@ -2473,6 +2473,9 @@ then 6.11, 6.12, 6.13–6.14.
     split.
   - **Deviation:** the contract test found nothing wrong with a `$ref` to a missing response component until a call
     exercised it; the operation now uses the existing `Unprocessable`.
+  - **Deviation:** installing 0.5.0 (`api-specs/check.sh`) failed: the split ratio's `examples` keyword is OpenAPI 3.1
+    only and passed into the 3.0 rendition, which openapi-generator rejects. Replaced by a description; both clients
+    compile from the 3.0 renditions again. `check.sh` belongs in the gates of any step that changes a document.
 - **Gates:** fmt, clippy (`-D warnings`, after naming `AppliedSplit` for a complex type), doc, `cargo test -j 1 -p
   exchange-simulator` (45 targets) green.
 - **Mutation checks**, each made a test fail (all 8): holdings ignoring the settlement date; short holders paid; the
